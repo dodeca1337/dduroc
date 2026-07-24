@@ -57,6 +57,12 @@ impl Compression {
 /// Сигнатура заголовка блока.
 pub const BLOCK_MAGIC: [u8; 2] = *b"DB";
 
+/// Во сколько раз распакованное тело может превосходить сжатое.
+///
+/// Для LZ4 это 255: минимальная последовательность, дающая максимум выхода, —
+/// токен, двухбайтовое смещение и цепочка байт длины по 255 каждый.
+const MAX_EXPANSION: u32 = 255;
+
 /// Заголовок блока.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
@@ -142,6 +148,23 @@ impl BlockHeader {
                 what: "block body",
                 value: u64::from(body_len.max(raw_len)),
                 max: u64::from(Self::MAX_BODY),
+            });
+        }
+        // Потолка мало: буфер распаковки выделяется по `raw_len`, а тело в
+        // тридцать байт не может развернуться в шестьдесят четыре мегабайта.
+        // Сверяем одну длину с другой — так размер аллокации ограничен тем,
+        // что реально лежит в файле, а не только константой формата.
+        let bound = match compression {
+            Compression::None => body_len,
+            // Предел раздувания LZ4 — 255:1: последовательность «токен +
+            // смещение + байты длины» не даёт большего на байт входа.
+            Compression::Lz4 | Compression::Zstd => body_len.saturating_mul(MAX_EXPANSION),
+        };
+        if raw_len > bound {
+            return Err(Error::LimitExceeded {
+                what: "block raw_len",
+                value: u64::from(raw_len),
+                max: u64::from(bound),
             });
         }
 
@@ -708,6 +731,53 @@ mod tests {
         bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
             BlockHeader::parse(&bytes),
+            Err(Error::LimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn raw_len_is_checked_against_body_len() {
+        // raw_len в пределах потолка формата, но несоразмерна телу: тридцать
+        // байт не разворачиваются в шестьдесят четыре мегабайта. Без сверки
+        // одной длины с другой такой заголовок заставлял бы читателя выделить
+        // буфер по размеру, которого в файле нет и близко.
+        let h = BlockHeader {
+            body_len: 30,
+            raw_len: BlockHeader::MAX_BODY - 1,
+            seq: 0,
+            base: Micros(0),
+            count: 1,
+            compression: Compression::Lz4,
+            crc: 0,
+        };
+        let err = BlockHeader::parse(&h.to_bytes()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::LimitExceeded {
+                    what: "block raw_len",
+                    ..
+                }
+            ),
+            "получено {err}"
+        );
+
+        // Достижимое раздувание принимается: предел LZ4 — 255:1.
+        let ok = BlockHeader {
+            raw_len: 30 * 255,
+            ..h
+        };
+        assert!(BlockHeader::parse(&ok.to_bytes()).is_ok());
+
+        // Без сжатия длины обязаны совпадать.
+        let uncompressed = BlockHeader {
+            body_len: 30,
+            raw_len: 31,
+            compression: Compression::None,
+            ..h
+        };
+        assert!(matches!(
+            BlockHeader::parse(&uncompressed.to_bytes()),
             Err(Error::LimitExceeded { .. })
         ));
     }

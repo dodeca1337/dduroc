@@ -853,6 +853,42 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_identity_survives_an_unsealed_segment() {
+        // Живое хранилище: сегмент ещё пишется, footer'а нет, а с ним нет и
+        // таблицы серий. Идентичность приходится собирать проходом по телам —
+        // тем же, которым находятся смещения блоков.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+        let store = Store::open(cfg.clone()).unwrap();
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let temp = ns.series(MetricId(1), &[("sensor", "pa")]).unwrap();
+        for i in 0..10 {
+            temp.sample_f32(20.0 + i as f32).unwrap();
+        }
+        ns.sync().unwrap(); // данные на диске, но сегмент не запечатан
+
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        for order in [Order::Oldest, Order::Newest] {
+            let result = reader
+                .query(&Query::new().kinds(KindFilter::TELEMETRY).order(order))
+                .unwrap();
+            assert_eq!(result.entries.len(), 10, "порядок {order:?}");
+            assert!(
+                result.entries.iter().all(|e| matches!(
+                    &e.kind,
+                    EntryKind::Sample {
+                        metric_name: Some("temp"),
+                        unit: Some("°C"),
+                        ..
+                    }
+                )),
+                "порядок {order:?}: серия обезличена в незапечатанном сегменте"
+            );
+        }
+        store.shutdown();
+    }
+
+    #[test]
     fn telemetry_identity_survives_time_range_seek() {
         // Запрос с нижней границей пропускает начальные блоки по
         // footer-индексу — вместе с лежащими там определениями серий.

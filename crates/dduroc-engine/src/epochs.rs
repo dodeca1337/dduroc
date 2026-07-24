@@ -143,6 +143,13 @@ impl Epochs {
     }
 }
 
+/// Исход чтения файла эпох.
+enum Loaded {
+    Missing,
+    Corrupt,
+    Ok(Epochs),
+}
+
 /// Файл эпох: чтение, регистрация run'а, обновление якоря.
 #[derive(Debug)]
 pub struct EpochStore {
@@ -158,7 +165,7 @@ impl EpochStore {
     /// ровно до микросекунды.
     pub fn open_and_register(root: &Path, boottime_at_init_us: u64) -> Result<Self> {
         let path = root.join(EPOCHS_FILE);
-        let mut epochs = Self::load(&path)?;
+        let mut epochs = Self::load_for_write(&path)?;
         let kernel_boot_id = read_kernel_boot_id()?;
 
         // Та же загрузка железа, что и у предыдущего run'а? Сверяем UUID ядра.
@@ -210,20 +217,40 @@ impl EpochStore {
     }
 
     /// Открыть только для чтения (вьюер, офлайн-анализ) — run не регистрируется.
+    ///
+    /// **Ничего не пишет.** Дамп, принесённый на анализ, может лежать на
+    /// носителе только для чтения, принадлежать другому прибору или быть
+    /// вещественным доказательством разбираемой аварии: карантин повреждённого
+    /// файла — операция записи, и в этом режиме она недопустима.
     pub fn open_read_only(root: &Path) -> Result<Epochs> {
-        Self::load(&root.join(EPOCHS_FILE))
+        Ok(match Self::read(&root.join(EPOCHS_FILE))? {
+            Loaded::Ok(e) => e,
+            // Относительное время самодостаточно; без эпох теряется только
+            // конверсия в UTC.
+            Loaded::Missing | Loaded::Corrupt => Epochs::default(),
+        })
     }
 
-    fn load(path: &Path) -> Result<Epochs> {
+    /// Прочитать файл, не трогая его.
+    fn read(path: &Path) -> Result<Loaded> {
         let Some(bytes) = fsutil::read_optional(path)? else {
-            return Ok(Epochs::default());
+            return Ok(Loaded::Missing);
         };
-        // Повреждённый файл эпох не должен мешать записи: относительное время
-        // самодостаточно, теряется только конверсия в UTC для старых run'ов.
-        // Молча затирать его нельзя — сохраняем как .corrupt для разбора.
-        match postcard::from_bytes(&bytes) {
-            Ok(e) => Ok(e),
-            Err(_) => {
+        Ok(match postcard::from_bytes(&bytes) {
+            Ok(e) => Loaded::Ok(e),
+            Err(_) => Loaded::Corrupt,
+        })
+    }
+
+    /// То же для пишущей стороны: повреждённый файл уводится в карантин.
+    ///
+    /// Молча затирать его нельзя — по нему разбирают, что случилось с
+    /// привязкой ко времени.
+    fn load_for_write(path: &Path) -> Result<Epochs> {
+        match Self::read(path)? {
+            Loaded::Ok(e) => Ok(e),
+            Loaded::Missing => Ok(Epochs::default()),
+            Loaded::Corrupt => {
                 let backup = path.with_extension("corrupt");
                 let _ = std::fs::rename(path, &backup);
                 Ok(Epochs::default())
@@ -418,6 +445,39 @@ mod tests {
             dir.path().join("epochs.corrupt").exists(),
             "повреждённый файл сохранён для разбора, а не затёрт"
         );
+    }
+
+    #[test]
+    fn read_only_open_never_writes() {
+        // Дамп на анализ приходит с чужого прибора, иногда с носителя только
+        // для чтения, иногда как вещдок по разбираемой аварии. Читатель не
+        // имеет права его менять — даже ради карантина повреждённого файла.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EPOCHS_FILE);
+        std::fs::write(&path, b"\xff\xff\xff not postcard").unwrap();
+
+        let epochs = EpochStore::open_read_only(dir.path()).unwrap();
+        assert_eq!(
+            epochs,
+            Epochs::default(),
+            "без эпох — только относительное время"
+        );
+        assert!(path.exists(), "файл обязан остаться на месте");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"\xff\xff\xff not postcard",
+            "содержимое не тронуто"
+        );
+        assert!(
+            !dir.path().join("epochs.corrupt").exists(),
+            "карантин — операция записи, читателю она запрещена"
+        );
+
+        // Целый файл читается как обычно.
+        let mut s = store(dir.path(), 1_000);
+        s.record_sync(1_700_000_000_000, SyncSource::Gps).unwrap();
+        let epochs = EpochStore::open_read_only(dir.path()).unwrap();
+        assert_eq!(epochs.runs.len(), 1);
     }
 
     #[test]

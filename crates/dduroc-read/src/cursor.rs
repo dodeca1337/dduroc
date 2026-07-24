@@ -181,24 +181,39 @@ fn remember_series(table: &mut Vec<Option<SeriesDefinition>>, def: &dduroc_forma
     });
 }
 
-/// Прямой проход по сегменту, собирающий только определения серий.
-fn collect_series(
+/// Пройти незапечатанный сегмент, попутно собрав определения серий.
+///
+/// Смещения блоков и таблица серий добываются из одних и тех же прочитанных
+/// байт. Раздельные проходы означали бы чтение сегмента целиком дважды — а
+/// сегмент бывает в сотни мегабайт, и второй проход стоил бы столько же,
+/// сколько сам запрос.
+///
+/// `want_series` включает разбор тел. Без него достаточно заголовков: при
+/// прямом обходе определение серии встречается в потоке раньше своих сэмплов
+/// и наполняет таблицу по ходу дела.
+fn scan_with_series(
     reader: &SegmentReader,
-    offsets: &[u64],
-    table: &mut Vec<Option<SeriesDefinition>>,
-) {
+    series: &mut Vec<Option<SeriesDefinition>>,
+    want_series: bool,
+) -> (Vec<u64>, Option<(u64, String)>) {
+    let mut offsets = Vec::new();
     let mut buf = Vec::new();
-    for &offset in offsets {
-        if reader.read_block_at(offset, &mut buf).is_err() {
-            continue;
-        }
-        let Ok(Some(block)) = parse_block(&buf) else {
-            continue;
-        };
-        for item in block.records() {
-            if let Ok((_, Record::SeriesDef(def))) = item {
-                remember_series(table, &def);
+    let mut offset = SegmentReader::first_block_offset();
+    loop {
+        match reader.read_block_at(offset, &mut buf) {
+            Ok(Some(next)) => {
+                offsets.push(offset);
+                if want_series && let Ok(Some(block)) = parse_block(&buf) {
+                    for item in block.records() {
+                        if let Ok((_, Record::SeriesDef(def))) = item {
+                            remember_series(series, &def);
+                        }
+                    }
+                }
+                offset = next;
             }
+            Ok(None) => return (offsets, None),
+            Err(e) => return (offsets, Some((offset, e.to_string()))),
         }
     }
 }
@@ -256,13 +271,41 @@ impl SegmentCursor {
             });
         }
         let mut damaged = Vec::new();
-        let mut offsets = match reader.footer() {
-            Some(footer) => footer.blocks.iter().map(|b| b.offset).collect(),
+        let mut series: Vec<Option<SeriesDefinition>> = Vec::new();
+        // Запечатанный сегмент отдаёт и то, и другое из footer'а — ради этого
+        // таблица серий там и продублирована: определение серии пишется в тело
+        // один раз, и при чтении с середины, в обратном порядке или после
+        // битого блока его в потоке уже не встретить.
+        let mut offsets: Vec<u64> = match reader.footer() {
+            Some(footer) => {
+                series = footer
+                    .series
+                    .iter()
+                    .map(|s| {
+                        Some(SeriesDefinition {
+                            metric: s.metric,
+                            value_type: s.value_type,
+                            tags: s
+                                .tags
+                                .iter()
+                                .filter_map(|r| r.ok())
+                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                                .collect(),
+                        })
+                    })
+                    .collect();
+                footer.blocks.iter().map(|b| b.offset).collect()
+            }
             None => {
                 // Незапечатанный сегмент сканируется; обрыв скана — обычное
                 // следствие потери питания. Уже найденные блоки остаются в
                 // выборке, а о месте обрыва сообщается явно.
-                let (offsets, stopped) = reader.scan_block_offsets();
+                //
+                // Тела разбираются только при обратном обходе: там определения
+                // серий оказываются позади своих сэмплов, и собрать их нужно
+                // заранее. У сегмента без телеметрии проход всё равно ничего
+                // не найдёт, зато читает он ровно то, что и так читает скан.
+                let (offsets, stopped) = scan_with_series(&reader, &mut series, reverse);
                 if let Some((offset, reason)) = stopped {
                     damaged.push(Damage {
                         path: path.to_owned(),
@@ -273,38 +316,6 @@ impl SegmentCursor {
                 offsets
             }
         };
-
-        // Таблица серий: из footer'а, если сегмент запечатан.
-        let mut series: Vec<Option<SeriesDefinition>> = match reader.footer() {
-            Some(footer) => footer
-                .series
-                .iter()
-                .map(|s| {
-                    Some(SeriesDefinition {
-                        metric: s.metric,
-                        value_type: s.value_type,
-                        tags: s
-                            .tags
-                            .iter()
-                            .filter_map(|r| r.ok())
-                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                            .collect(),
-                    })
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-
-        // Незапечатанный сегмент читается с конца: определения серий лежат
-        // в теле перед своими сэмплами, то есть в обратном обходе — уже
-        // позади. Собираем их предварительным прямым проходом.
-        //
-        // Условие именно «не запечатан», а не «таблица пуста»: у сегмента
-        // без телеметрии таблица пуста законно, и лишний полный проход по
-        // нему обошёлся бы дороже самого запроса.
-        if reverse && !reader.is_sealed() {
-            collect_series(&reader, &offsets, &mut series);
-        }
 
         if reverse {
             offsets.reverse();
@@ -502,6 +513,51 @@ pub struct ChannelScope {
     pub prefilter: Option<Prefilter>,
 }
 
+/// Отобрать сегменты, которые могут содержать записи из диапазона.
+///
+/// Имя сегмента несёт время его **первой** записи, поэтому верхняя граница
+/// отсекается точно: сегмент, начавшийся позже `to`, не нужен заведомо.
+///
+/// Нижнюю границу так отсечь нельзя: сегмент мог начаться раньше `from` и
+/// содержать нужные записи. Отбрасывается только тот, за которым идёт
+/// сегмент того же run'а, начинающийся **строго раньше** `from`, — тогда
+/// все записи первого лежат до начала второго, то есть до `from`.
+///
+/// Сравнение именно строгое. При `next.base == from` последняя запись
+/// текущего сегмента может иметь время ровно `from`: часы монотонны, но не
+/// строго возрастают, и во всплеске два соседних события получают одну и ту
+/// же микросекунду. Нестрогое сравнение выбрасывало бы такую запись из
+/// выборки, которая её включает.
+fn select_segments(
+    all: &[SegmentName],
+    from: Option<Micros>,
+    to: Option<Micros>,
+    boot: Option<u32>,
+) -> Vec<SegmentName> {
+    let mut segments = Vec::new();
+    for (i, name) in all.iter().enumerate() {
+        if let Some(b) = boot
+            && name.boot.0 != b
+        {
+            continue;
+        }
+        if let Some(to) = to
+            && name.base > to
+        {
+            continue;
+        }
+        if let Some(from) = from
+            && let Some(next) = all.get(i + 1)
+            && next.base < from
+            && next.boot == name.boot
+        {
+            continue;
+        }
+        segments.push(*name);
+    }
+    segments
+}
+
 impl ChannelCursor {
     /// Открыть канал, отобрав сегменты по диапазону времени.
     pub fn open(
@@ -520,32 +576,7 @@ impl ChannelCursor {
         let inventory = dduroc_engine::rotation::Inventory::scan(dir).map_err(ReadError::Engine)?;
         let all: Vec<SegmentName> = inventory.iter().map(|e| e.name).collect();
 
-        // Сегмент начинается со времени в имени, поэтому отбор по верхней
-        // границе точен: сегмент, начавшийся позже `to`, заведомо не нужен.
-        // Нижнюю границу так отсечь нельзя — сегмент мог начаться раньше и
-        // содержать нужные записи, поэтому отбрасывается только тот, за
-        // которым идёт сегмент, тоже начинающийся раньше `from`.
-        let mut segments: Vec<SegmentName> = Vec::new();
-        for (i, name) in all.iter().enumerate() {
-            if let Some(b) = boot
-                && name.boot.0 != b
-            {
-                continue;
-            }
-            if let Some(to) = to
-                && name.base > to
-            {
-                continue;
-            }
-            if let Some(from) = from
-                && let Some(next) = all.get(i + 1)
-                && next.base <= from
-                && next.boot == name.boot
-            {
-                continue;
-            }
-            segments.push(*name);
-        }
+        let mut segments = select_segments(&all, from, to, boot);
         if reverse {
             segments.reverse();
         }
@@ -678,5 +709,98 @@ impl std::fmt::Debug for ChannelCursor {
             .field("next", &self.next)
             .field("damaged", &self.damaged.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dduroc_format::BootCounter;
+
+    fn seg(boot: u32, base: u64) -> SegmentName {
+        SegmentName::new(BootCounter(boot), Micros(base))
+    }
+
+    fn bases(v: &[SegmentName]) -> Vec<u64> {
+        v.iter().map(|n| n.base.0).collect()
+    }
+
+    #[test]
+    fn lower_bound_keeps_the_segment_that_may_hold_it() {
+        // Три сегмента одного запуска: [0..100), [100..200), [200..).
+        let all = [seg(0, 0), seg(0, 100), seg(0, 200)];
+
+        // from ровно на границе. Последняя запись первого сегмента может
+        // иметь время ровно 100: часы монотонны, но не строго возрастают, и
+        // во всплеске два соседних события получают одну микросекунду.
+        // Отбросить первый сегмент значило бы потерять эту запись.
+        assert_eq!(
+            bases(&select_segments(&all, Some(Micros(100)), None, None)),
+            vec![0, 100, 200],
+            "сегмент, чья последняя запись может лежать ровно на границе, нужен"
+        );
+
+        // from строго внутри второго: первый заведомо весь позади.
+        assert_eq!(
+            bases(&select_segments(&all, Some(Micros(101)), None, None)),
+            vec![100, 200]
+        );
+        assert_eq!(
+            bases(&select_segments(&all, Some(Micros(250)), None, None)),
+            vec![200]
+        );
+        // Позже всех данных: последний сегмент всё равно проверяется — он
+        // открыт и мог получить записи после составления инвентаря.
+        assert_eq!(
+            bases(&select_segments(&all, Some(Micros(9_999)), None, None)),
+            vec![200]
+        );
+    }
+
+    #[test]
+    fn upper_bound_is_exact() {
+        let all = [seg(0, 0), seg(0, 100), seg(0, 200)];
+        // Имя несёт время первой записи, поэтому сегмент, начавшийся позже
+        // `to`, не нужен заведомо. Начавшийся ровно на `to` — нужен.
+        assert_eq!(
+            bases(&select_segments(&all, None, Some(Micros(100)), None)),
+            vec![0, 100]
+        );
+        assert_eq!(
+            bases(&select_segments(&all, None, Some(Micros(99)), None)),
+            vec![0]
+        );
+        assert!(select_segments(&all, None, Some(Micros(0)), None).len() == 1);
+    }
+
+    #[test]
+    fn boot_filter_and_run_boundary() {
+        // Нижняя граница не должна отбрасывать сегмент через границу запуска:
+        // время у разных run'ов своё, и «следующий начался раньше» там
+        // ничего не означает.
+        let all = [seg(0, 500), seg(1, 10), seg(1, 900)];
+        assert_eq!(
+            bases(&select_segments(&all, Some(Micros(400)), None, None)),
+            vec![500, 10, 900],
+            "сегмент run'а 0 не отбрасывается по времени run'а 1"
+        );
+
+        assert_eq!(
+            bases(&select_segments(&all, None, None, Some(1))),
+            vec![10, 900]
+        );
+        assert!(select_segments(&all, None, None, Some(7)).is_empty());
+    }
+
+    #[test]
+    fn empty_and_single() {
+        assert!(select_segments(&[], Some(Micros(5)), Some(Micros(9)), None).is_empty());
+        let one = [seg(0, 100)];
+        // Единственный сегмент не отбрасывается никогда: за ним ничего нет,
+        // и его верхняя граница неизвестна без чтения.
+        assert_eq!(
+            bases(&select_segments(&one, Some(Micros(u64::MAX)), None, None)),
+            vec![100]
+        );
     }
 }

@@ -42,3 +42,4 @@ pub use segment::{Scan, SegmentReader, SegmentWriter};
 pub use staged::{NsId, Staged, StagedRecord};
 pub use stats::Stats;
 pub use store::{Store, StoreConfig};
+pub use writer::QueueSizes;

@@ -126,11 +126,22 @@ impl SegmentName {
     }
 
     /// Разобрать имя файла. `None` — файл не наш (чужой мусор в каталоге).
+    ///
+    /// Принимается ровно то, что порождает `Display`, и ничего сверх: строгая
+    /// ширина, только строчные шестнадцатеричные цифры. `from_str_radix` сам
+    /// по себе глотает знак (`+000002a`), а прописные буквы дают ещё одно
+    /// написание того же числа — и один сегмент оказался бы в учёте дважды,
+    /// под разными именами, тогда как на диске файл один.
     pub fn parse(name: &str) -> Option<Self> {
+        fn is_lower_hex(s: &str, width: usize) -> bool {
+            s.len() == width
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+
         let stem = name.strip_suffix(".seg")?;
         let (boot, base) = stem.split_once('-')?;
-        // Строгая ширина: иначе порядок имён перестал бы совпадать с временным.
-        if boot.len() != 8 || base.len() != 16 {
+        if !is_lower_hex(boot, 8) || !is_lower_hex(base, 16) {
             return None;
         }
         Some(Self {
@@ -239,5 +250,32 @@ mod tests {
         assert_eq!(SegmentName::parse("2a-3b9aca00.seg"), None);
         assert_eq!(SegmentName::parse("0000002a-000000003b9aca0.seg"), None);
         assert_eq!(SegmentName::parse("zzzzzzzz-000000003b9aca00.seg"), None);
+    }
+
+    #[test]
+    fn parse_accepts_only_what_display_produces() {
+        // Каждое из этих имён `from_str_radix` разобрал бы, и сегмент получил
+        // бы второе написание: в инвентаре он оказался бы двумя записями, а
+        // на диске остался бы одним файлом.
+        for junk in [
+            "+000002a-000000003b9aca00.seg", // знак вместо цифры
+            "0000002A-000000003b9aca00.seg", // прописные
+            "0000002a-000000003B9ACA00.seg", // прописные во второй половине
+            "0000002a-+00000003b9aca00.seg", // знак во второй половине
+            "0000002a-000000003b9aca00.SEG", // расширение не то
+            " 000002a-000000003b9aca00.seg", // пробел
+        ] {
+            assert_eq!(
+                SegmentName::parse(junk),
+                None,
+                "{junk:?} не порождается Display и не должно разбираться"
+            );
+        }
+
+        // А то, что Display породил, — обязано разбираться обратно.
+        for (boot, base) in [(0u32, 0u64), (u32::MAX, u64::MAX), (0xabcdef, 0x123456789)] {
+            let n = SegmentName::new(BootCounter(boot), Micros(base));
+            assert_eq!(SegmentName::parse(&n.to_string()), Some(n));
+        }
     }
 }

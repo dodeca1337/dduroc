@@ -52,6 +52,12 @@ pub enum Error {
     #[error("повреждён {path}: {reason}")]
     Corrupt { path: PathBuf, reason: String },
 
+    #[error(
+        "хранилище {0} уже открыто: два писателя на одном каталоге выдавали бы \
+         одинаковые номера запусков и сталкивались бы именами сегментов"
+    )]
+    StoreBusy(PathBuf),
+
     #[error("хранилище закрывается")]
     ShuttingDown,
 

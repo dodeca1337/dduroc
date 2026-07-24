@@ -140,8 +140,13 @@ impl<'a> Value<'a> {
             ValueType::Blob => {
                 let (len, n) = varint::read_u64(input)?;
                 let len = usize::try_from(len).map_err(|_| Error::Truncated)?;
-                let bytes = input.get(n..n + len).ok_or(Error::Truncated)?;
-                Ok((Value::Blob(bytes), n + len))
+                // Длина пришла из файла и может быть любой. `n + len` без
+                // проверки переполняет usize — на 32-битной цели (armv7) это
+                // достижимо длиной около четырёх гигабайт, то есть обычным
+                // мусором в повреждённом блоке, а не экзотикой.
+                let end = n.checked_add(len).ok_or(Error::Truncated)?;
+                let bytes = input.get(n..end).ok_or(Error::Truncated)?;
+                Ok((Value::Blob(bytes), end))
             }
         }
     }
@@ -217,6 +222,24 @@ mod tests {
         varint::write_u64(&mut buf, 10);
         buf.extend_from_slice(&[1, 2, 3]);
         assert_eq!(Value::decode(ValueType::Blob, &buf), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn absurd_blob_length_does_not_overflow() {
+        // Длина blob'а приходит из файла. Сложение «смещение + длина» без
+        // проверки переполняет usize: на armv7 (32 бита) хватает четырёх
+        // гигабайт, на 64-битной сборке — значений около u64::MAX. Результат
+        // переполнения в debug — паника прямо в разборе чужого дампа.
+        for len in [u64::MAX, u64::from(u32::MAX), 1 << 40] {
+            let mut buf = Vec::new();
+            varint::write_u64(&mut buf, len);
+            buf.extend_from_slice(&[1, 2, 3, 4]);
+            assert_eq!(
+                Value::decode(ValueType::Blob, &buf),
+                Err(Error::Truncated),
+                "длина {len} обязана быть отвергнута, а не переполнить сложение"
+            );
+        }
     }
 
     #[test]

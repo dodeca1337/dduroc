@@ -324,8 +324,13 @@ fn bench_write(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("span/open_close", |b| {
         b.iter(|| {
-            let span = ns.span(bench::spans::Work).unwrap();
-            black_box(span.id());
+            // Режим здесь насыщенный, как и у остальных замеров группы:
+            // отказ переполненной очереди штатен и входит в измеряемую смесь.
+            // `unwrap` превращал бы её в падение замера, стоило производителю
+            // стать чуть быстрее writer'а.
+            if let Ok(span) = ns.span(bench::spans::Work) {
+                black_box(span.id());
+            }
         });
     });
 

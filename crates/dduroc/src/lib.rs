@@ -93,6 +93,7 @@ pub use dduroc_engine::schema::{
 pub use dduroc_engine::staged::{OwnedValue, Payload};
 pub use dduroc_engine::stats::Stats;
 pub use dduroc_engine::store::{Store, StoreConfig};
+pub use dduroc_engine::writer::QueueSizes;
 pub use dduroc_engine::{Clock, Error, Result};
 pub use dduroc_format::{
     EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId, ValueType,
@@ -342,5 +343,74 @@ mod tests {
         // Событие внутри спана привязано к нему.
         let in_span = result.entries.iter().filter(|e| e.span.is_some()).count();
         assert_eq!(in_span, 1);
+    }
+
+    #[test]
+    fn every_lost_record_is_accounted_for_in_the_stream() {
+        // Дыра, о которой нигде не сказано, неотличима от тишины. Отметки о
+        // потерях выталкиваются по таймеру, поэтому потери, случившиеся между
+        // последним таймером и остановкой, попадают в поток только если их
+        // выталкивают ещё и при завершении, — а именно тогда очередь
+        // переполнена чаще всего: процесс останавливают под нагрузкой.
+        //
+        // Останавливаемся без `sync`: проверяется путь остановки как таковой.
+        use dduroc_read::{EntryKind, KindFilter, Order, Query, Reader};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Крошечная очередь делает переполнение воспроизводимым, а не
+        // зависящим от того, чем ещё занята машина.
+        let config = StoreConfig::new(dir.path())
+            .with_budget(32 * 1024 * 1024)
+            .with_queues(QueueSizes {
+                normal: 4,
+                critical: 4,
+            });
+        let refused = {
+            let store = Store::open(config.clone()).unwrap();
+            let ns = store
+                .namespace("orc-radio-0", testing::SCHEMA, &config)
+                .unwrap();
+
+            let mut refused = 0u64;
+            for _ in 0..20_000 {
+                if ns.log(testing::events::PowerSet { dbm: 27.5 }).is_err() {
+                    refused += 1;
+                }
+            }
+            store.shutdown();
+            assert_eq!(
+                store.stats().dropped,
+                refused,
+                "счётчик обязан совпасть с числом отказов"
+            );
+            refused
+        };
+        assert!(refused > 0, "тест бессмыслен без переполнения очереди");
+
+        let reader = Reader::open(dir.path(), &[testing::SCHEMA]).unwrap();
+        let result = reader
+            .query(&Query::new().order(Order::Oldest).kinds(KindFilter {
+                text: true,
+                ..KindFilter::LOGS
+            }))
+            .unwrap();
+
+        let announced: u64 = result
+            .entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Text { text, .. } => text
+                    .strip_prefix("потеряно записей: ")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|n| n.parse::<u64>().ok()),
+                _ => None,
+            })
+            .sum();
+
+        assert_eq!(
+            announced, refused,
+            "в потоке объявлено {announced} потерь при {refused} реальных: \
+             остаток не выталкивается при остановке"
+        );
     }
 }

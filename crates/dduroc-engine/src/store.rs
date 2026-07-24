@@ -9,7 +9,7 @@ use crate::namespace::{Namespace, NsMeta};
 use crate::schema::{Schema, StorageClass};
 use crate::staged::{DropCounters, NsId, SeriesEntry};
 use crate::stats::{Counters, Stats};
-use crate::writer::{NsSetup, SeriesRegistry, Writer};
+use crate::writer::{NsSetup, QueueSizes, SeriesRegistry, Writer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -42,6 +42,8 @@ pub struct StoreConfig {
     pub channels: HashMap<String, ChannelConfig>,
     /// Бюджет по умолчанию на канал неймспейса.
     pub default_budget_bytes: u64,
+    /// Ёмкости очередей записи. Выделяются целиком при открытии хранилища.
+    pub queues: QueueSizes,
 }
 
 impl StoreConfig {
@@ -51,11 +53,22 @@ impl StoreConfig {
             root: root.into(),
             channels: HashMap::new(),
             default_budget_bytes: 64 * 1024 * 1024,
+            queues: QueueSizes::default(),
         }
     }
 
     pub fn with_budget(mut self, bytes: u64) -> Self {
         self.default_budget_bytes = bytes;
+        self
+    }
+
+    /// Задать ёмкости очередей записи.
+    ///
+    /// Меньшая очередь экономит память, но раньше начинает терять записи на
+    /// всплесках; большая переживает всплеск, но откладывает момент, когда
+    /// отставание диска станет заметно.
+    pub fn with_queues(mut self, queues: QueueSizes) -> Self {
+        self.queues = queues;
         self
     }
 
@@ -117,7 +130,7 @@ impl Store {
         let clock = Clock::with_base(base_us);
 
         let counters = Arc::new(Counters::default());
-        let writer = Writer::spawn(Arc::clone(&counters))?;
+        let writer = Writer::spawn(Arc::clone(&counters), config.queues)?;
 
         Ok(Arc::new(Self {
             root: config.root.clone(),
@@ -202,10 +215,7 @@ impl Store {
 
         let series: Arc<std::sync::RwLock<Vec<SeriesEntry>>> = SeriesRegistry::new_shared();
         let drops = Arc::new(DropCounters::new(channel_configs.len()));
-        let boot = {
-            let epochs = self.epochs.lock().map_err(|_| Error::ShuttingDown)?;
-            dduroc_format::BootCounter(epochs.current_run().boot_counter)
-        };
+        let boot = dduroc_format::BootCounter(self.boot_counter());
 
         let id = self.writer.register(NsSetup {
             name: name.to_owned(),
@@ -241,6 +251,17 @@ impl Store {
         ))
     }
 
+    /// Эпохи под мьютексом, с восстановлением после отравления.
+    ///
+    /// Отравление означает панику в другом потоке, но не противоречивые
+    /// данные: под мьютексом выполняются только короткие операции над уже
+    /// разобранной структурой. Отказ обошёлся бы дороже — `boot_counter`
+    /// подменился бы нулём, который неотличим от настоящего первого запуска,
+    /// и сегменты чужого run'а стали бы «своими».
+    fn locked_epochs(&self) -> std::sync::MutexGuard<'_, EpochStore> {
+        self.epochs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Зафиксировать синхронизацию времени.
     ///
     /// Возвращает `false`, если источник менее достоверен, чем уже
@@ -252,27 +273,28 @@ impl Store {
         if !is_plausible_utc_ms(utc_ms) {
             return Ok(false);
         }
-        self.epochs
-            .lock()
-            .map_err(|_| Error::ShuttingDown)?
-            .record_sync(utc_ms, source)
+        self.locked_epochs().record_sync(utc_ms, source)
     }
 
     /// Перевести относительное время в UTC (мс). `None` — нет якоря.
     pub fn to_utc_ms(&self, boot_counter: u32, micros: u64) -> Option<i64> {
-        self.epochs
-            .lock()
-            .ok()?
+        self.locked_epochs()
             .epochs()
             .to_utc_ms(boot_counter, micros)
     }
 
     /// Текущий `boot_counter`.
     pub fn boot_counter(&self) -> u32 {
-        self.epochs
-            .lock()
-            .map(|e| e.current_run().boot_counter)
-            .unwrap_or(0)
+        self.locked_epochs().current_run().boot_counter
+    }
+
+    /// Жив ли writer-поток.
+    ///
+    /// `false` означает, что записи больше не доходят до диска: либо
+    /// хранилище остановлено, либо поток погиб. Потери при этом учтены в
+    /// [`Stats::dropped`].
+    pub fn is_writing(&self) -> bool {
+        self.writer.is_alive()
     }
 
     /// Дождаться, пока всё накопленное окажется на носителе.
@@ -361,10 +383,11 @@ fn acquire_lock(root: &Path) -> Result<File> {
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
         |e| {
             if matches!(e, rustix::io::Errno::WOULDBLOCK) {
-                Error::Corrupt {
-                    path: path.clone(),
-                    reason: "хранилище уже открыто другим процессом".to_owned(),
-                }
+                // Блокировка привязана к описанию открытого файла, а не к
+                // процессу: конфликт возникает и при повторном открытии того
+                // же корня внутри одного процесса — а это ровно та ошибка,
+                // которую нужно поймать.
+                Error::StoreBusy(root.to_owned())
             } else {
                 Error::Io {
                     context: format!("блокировка {}", path.display()),
@@ -474,18 +497,34 @@ mod tests {
     }
 
     #[test]
-    fn second_process_cannot_open_same_root() {
+    fn second_open_of_the_same_root_is_refused() {
+        // Два писателя на одном каталоге перезаписывали бы epochs.bin друг
+        // друга и выдавали бы одинаковые boot_counter — имена сегментов
+        // столкнулись бы. flock привязан к описанию открытого файла, поэтому
+        // конфликт ловится и внутри одного процесса.
         let dir = tempfile::tempdir().unwrap();
-        let _first = Store::open(StoreConfig::new(dir.path())).unwrap();
+        let first = Store::open(StoreConfig::new(dir.path())).unwrap();
 
-        // Тот же процесс: flock переоткрывается тем же процессом свободно,
-        // поэтому проверяем именно поведение блокировки через отдельный fd.
-        let path = dir.path().join(LOCK_FILE);
-        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        // В пределах одного процесса flock не конфликтует — это документированное
-        // поведение ядра; проверяем, что файл создан и блокировка взята.
-        assert!(path.exists(), "файл блокировки создан");
-        drop(f);
+        let err = Store::open(StoreConfig::new(dir.path())).unwrap_err();
+        assert!(matches!(err, Error::StoreBusy(_)), "получено {err}");
+
+        // Освобождённый корень открывается снова: иначе перезапуск сервиса
+        // упирался бы в собственный файл блокировки.
+        first.shutdown();
+        drop(first);
+        Store::open(StoreConfig::new(dir.path())).expect("корень освободился");
+    }
+
+    #[test]
+    fn writer_liveness_is_reported_honestly() {
+        // До остановки писать можно, после — нет. Прежняя проверка смотрела
+        // на заполненность очередей и отвечала «жив» на любом состоянии,
+        // включая мёртвый поток.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path())).unwrap();
+        assert!(store.is_writing(), "сразу после открытия writer работает");
+        store.shutdown();
+        assert!(!store.is_writing(), "после остановки записи не идут");
     }
 
     #[test]

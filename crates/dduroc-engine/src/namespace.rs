@@ -417,30 +417,45 @@ impl SpanGuard {
 
     /// Закрыть явно, увидев ошибку записи. Обычно не нужно: закрытие
     /// происходит при уничтожении.
+    ///
+    /// В отличие от уничтожения, здесь действует обычная политика канала:
+    /// у критического спана вызывающий подождёт места в очереди, зато конец
+    /// спана гарантированно не потеряется.
     pub fn close(mut self) -> Result<()> {
         self.closed = true;
-        self.write_end()
+        self.write_end(true)
     }
 
-    fn write_end(&self) -> Result<()> {
-        self.ns.inner.writer.write(
-            Staged {
-                ns: self.ns.inner.id,
-                channel: self.channel,
-                at: self.ns.now(),
-                record: StagedRecord::SpanEnd { span: self.span },
-            },
-            self.critical,
-            &self.ns.inner.drops,
-        )
+    fn write_end(&self, may_wait: bool) -> Result<()> {
+        let item = Staged {
+            ns: self.ns.inner.id,
+            channel: self.channel,
+            at: self.ns.now(),
+            record: StagedRecord::SpanEnd { span: self.span },
+        };
+        let writer = &self.ns.inner.writer;
+        if may_wait {
+            writer.write(item, self.critical, &self.ns.inner.drops)
+        } else {
+            writer.write_no_wait(item, self.critical, &self.ns.inner.drops)
+        }
     }
 }
 
 impl Drop for SpanGuard {
     fn drop(&mut self) {
         if !self.closed {
-            // Ошибку здесь показать некому; она уже учтена счётчиком потерь.
-            let _ = self.write_end();
+            // Без ожидания места — намеренно. `Drop` вызывается в том числе
+            // при развёртке стека после паники, и у критического спана
+            // обычный путь ждал бы место в очереди до пяти секунд: аварийное
+            // завершение превратилось бы в зависание, а вложенные стражи
+            // сложили бы свои таймауты друг к другу.
+            //
+            // Цена — конец спана может быть потерян под давлением. Он учтён
+            // счётчиком потерь и отметкой в потоке, а незакрытый спан читатель
+            // и так обязан уметь показать: спан, оборванный крахом процесса,
+            // выглядит точно так же.
+            let _ = self.write_end(false);
         }
     }
 }

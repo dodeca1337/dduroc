@@ -44,9 +44,41 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-/// Ёмкость очередей по умолчанию.
-const NORMAL_QUEUE: usize = 8192;
-const CRITICAL_QUEUE: usize = 1024;
+/// Ёмкости очередей.
+///
+/// Очередь выделяется целиком при открытии хранилища: crossbeam резервирует
+/// весь буфер сразу. При 32-байтовом inline-payload'е запись занимает под
+/// сотню байт, то есть значения по умолчанию стоят около трёх четвертей
+/// мегабайта на процесс — на armv7 это заметно, и прибор, который пишет
+/// редко, вправе выбрать очередь поменьше.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueSizes {
+    /// Обычная очередь: при переполнении запись теряется.
+    pub normal: usize,
+    /// Критическая: при переполнении вызывающий ждёт места.
+    pub critical: usize,
+}
+
+impl Default for QueueSizes {
+    fn default() -> Self {
+        Self {
+            normal: 8192,
+            critical: 1024,
+        }
+    }
+}
+
+impl QueueSizes {
+    /// Нулевая ёмкость означала бы рандеву на каждой записи: писать стало бы
+    /// можно только в темпе writer'а, и обычный канал перестал бы отличаться
+    /// от критического.
+    fn sanitized(self) -> Self {
+        Self {
+            normal: self.normal.max(1),
+            critical: self.critical.max(1),
+        }
+    }
+}
 
 /// Сколько записей writer забирает за один заход перед тем, как заняться
 /// таймерами. Ограничение нужно, чтобы поток телеметрии не заморозил
@@ -122,9 +154,10 @@ pub struct Writer {
 
 impl Writer {
     /// Запустить writer-поток.
-    pub fn spawn(counters: Arc<Counters>) -> Result<Arc<Self>> {
-        let (normal_tx, normal_rx) = crossbeam_channel::bounded(NORMAL_QUEUE);
-        let (critical_tx, critical_rx) = crossbeam_channel::bounded(CRITICAL_QUEUE);
+    pub fn spawn(counters: Arc<Counters>, queues: QueueSizes) -> Result<Arc<Self>> {
+        let queues = queues.sanitized();
+        let (normal_tx, normal_rx) = crossbeam_channel::bounded(queues.normal);
+        let (critical_tx, critical_rx) = crossbeam_channel::bounded(queues.critical);
         let (control_tx, control_rx) = crossbeam_channel::bounded(64);
 
         let loop_state = WriterLoop {
@@ -174,17 +207,34 @@ impl Writer {
         }
     }
 
+    /// Поставить запись, ни при каких условиях не блокируя вызывающего.
+    ///
+    /// Очередь выбирается та же, что и обычно, — порядок критических записей
+    /// между собой сохраняется; отличается только реакция на переполнение.
+    /// Нужно там, где ожидание недопустимо в принципе: `Drop` стража спана
+    /// вызывается в том числе при развёртке стека после паники, и пятисекундное
+    /// ожидание места превратило бы аварийное завершение в зависание.
     #[inline]
-    fn write_normal(&self, item: Staged, drops: &DropCounters) -> Result<()> {
-        match self.normal.try_send(item) {
+    pub fn write_no_wait(&self, item: Staged, critical: bool, drops: &DropCounters) -> Result<()> {
+        let queue = if critical {
+            &self.critical
+        } else {
+            &self.normal
+        };
+        match queue.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(item)) => {
                 Counters::bump(&self.counters.dropped);
                 drops.record(item.channel);
                 Err(Error::QueueFull)
             }
-            Err(TrySendError::Disconnected(_)) => Err(Error::WriterDead),
+            Err(TrySendError::Disconnected(item)) => Err(self.writer_died(item)),
         }
+    }
+
+    #[inline]
+    fn write_normal(&self, item: Staged, drops: &DropCounters) -> Result<()> {
+        self.write_no_wait(item, false, drops)
     }
 
     fn write_critical(&self, item: Staged, drops: &DropCounters) -> Result<()> {
@@ -201,13 +251,25 @@ impl Writer {
                         drops.record(item.channel);
                         Err(Error::QueueFull)
                     }
-                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                        Err(Error::WriterDead)
+                    Err(crossbeam_channel::SendTimeoutError::Disconnected(item)) => {
+                        Err(self.writer_died(item))
                     }
                 }
             }
-            Err(TrySendError::Disconnected(_)) => Err(Error::WriterDead),
+            Err(TrySendError::Disconnected(item)) => Err(self.writer_died(item)),
         }
+    }
+
+    /// Учесть запись, потерянную из-за смерти writer'а.
+    ///
+    /// Отказ очереди из-за отсутствия потребителя — такая же потеря, как
+    /// переполнение, и обязан быть виден в `Stats`: иначе `is_clean()`
+    /// отчитался бы о благополучии на хранилище, в которое давно ничего
+    /// не пишется.
+    #[cold]
+    fn writer_died(&self, _item: Staged) -> Error {
+        Counters::bump(&self.counters.dropped);
+        Error::WriterDead
     }
 
     /// Вытолкнуть накопленное и дождаться `fdatasync`.
@@ -235,8 +297,21 @@ impl Writer {
     }
 
     /// Жив ли writer-поток.
+    ///
+    /// Спрашивается у самого потока, а не у очередей: заполненная очередь
+    /// означает лишь отставание диска, а пустая — что писать нечего. Ни то,
+    /// ни другое не говорит, работает ли потребитель.
     pub fn is_alive(&self) -> bool {
-        !self.control.is_full() || !self.normal.is_full()
+        match self.handle.lock() {
+            // `None` — поток уже присоединён в `shutdown`.
+            Ok(guard) => guard.as_ref().is_some_and(|h| !h.is_finished()),
+            // Мьютекс отравлен паникой в `shutdown`; сам поток при этом
+            // жив-здоров, а очередь на приём работает.
+            Err(poisoned) => poisoned
+                .into_inner()
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+        }
     }
 }
 
@@ -457,7 +532,16 @@ impl WriterLoop {
         // приходят переупорядоченными (поток взял метку и был вытеснен),
         // а блок и индекс должны остаться монотонными. Сортировка
         // устойчивая — SpanStart не обгонит одновременный SpanEnd.
-        self.batch.sort_by_key(|s| (s.ns.0, s.channel.0, s.at.0));
+        //
+        // Проверка «уже отсортировано» не украшение: устойчивая сортировка
+        // выделяет временный буфер на половину батча, то есть до полутора
+        // сотен килобайт на каждый заход. Батч приходит упорядоченным почти
+        // всегда — очередь FIFO, а время монотонно, — и линейная проверка
+        // избавляет от этой аллокации в общем случае.
+        let key = |s: &Staged| (s.ns.0, s.channel.0, s.at.0);
+        if !self.batch.is_sorted_by_key(key) {
+            self.batch.sort_by_key(key);
+        }
 
         let batch = std::mem::take(&mut self.batch);
         for item in &batch {
@@ -951,6 +1035,12 @@ impl WriterLoop {
 
     /// Финальное закрытие: дописать и запечатать всё.
     fn finish(&mut self) {
+        // Отметки о потерях выталкиваются ДО запечатывания. Иначе дыра,
+        // образовавшаяся между последним `tick` и остановкой, не попадала бы
+        // в поток вовсе — а это ровно тот момент, когда очередь переполнена
+        // чаще всего: процесс завершается под нагрузкой.
+        self.emit_drop_notices();
+
         let counters = Arc::clone(&self.counters);
         for ns in &mut self.namespaces {
             for ch in &mut ns.channels {
