@@ -331,18 +331,31 @@ pub struct ChannelCursor {
     pub channel: String,
 }
 
+/// Параметры открытия канала.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelScope {
+    pub from: Option<Micros>,
+    pub to: Option<Micros>,
+    pub boot: Option<u32>,
+    pub reverse: bool,
+    pub expect_store: Option<u64>,
+}
+
 impl ChannelCursor {
     /// Открыть канал, отобрав сегменты по диапазону времени.
     pub fn open(
         dir: &Path,
         namespace: String,
         channel: String,
-        from: Option<Micros>,
-        to: Option<Micros>,
-        boot: Option<u32>,
-        reverse: bool,
-        expect_store: Option<u64>,
+        scope: &ChannelScope,
     ) -> Result<Self> {
+        let ChannelScope {
+            from,
+            to,
+            boot,
+            reverse,
+            expect_store,
+        } = *scope;
         let inventory = dduroc_engine::rotation::Inventory::scan(dir).map_err(ReadError::Engine)?;
         let all: Vec<SegmentName> = inventory.iter().map(|e| e.name).collect();
 

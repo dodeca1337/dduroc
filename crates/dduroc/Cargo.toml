@@ -1,0 +1,20 @@
+[package]
+name = "dduroc"
+description = "Система логирования и телеметрии для embedded Linux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dduroc-engine.workspace = true
+dduroc-format.workspace = true
+dduroc-macros.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dduroc-read.workspace = true
+tempfile.workspace = true

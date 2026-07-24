@@ -2,7 +2,7 @@
 
 use crate::cursor::{ChannelCursor, Damage, OwnedRecord, OwnedSampleValue};
 use crate::error::{ReadError, Result};
-use crate::query::{KindFilter, Order, Query};
+use crate::query::{Order, Query};
 use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
 use dduroc_engine::schema::{EventDesc, MetricDesc, Schema, SpanDesc};
@@ -290,7 +290,13 @@ impl Reader {
 
     fn open_cursors(&self, q: &Query) -> Result<Vec<ChannelCursor>> {
         let mut cursors = Vec::new();
-        let reverse = q.order == Order::Newest;
+        let scope = crate::cursor::ChannelScope {
+            from: q.from,
+            to: q.to,
+            boot: q.boot,
+            reverse: q.order == Order::Newest,
+            expect_store: self.store_id,
+        };
 
         for ns in self.namespaces()? {
             if !q.namespaces.matches(&ns.name) {
@@ -305,11 +311,7 @@ impl Reader {
                     &dir,
                     ns.name.clone(),
                     channel.clone(),
-                    q.from,
-                    q.to,
-                    q.boot,
-                    reverse,
-                    self.store_id,
+                    &scope,
                 )?);
             }
         }
@@ -514,6 +516,8 @@ fn read_store_id(root: &Path) -> Option<u64> {
 
 /// Отрендерить сообщение по шаблону схемы.
 ///
+/// Используется слоем представления (GraphQL, вьюер).
+///
 /// Шаблоны на диске не хранятся: `{поле}` подставляется декодером,
 /// сгенерированным макросом схемы. Без декодера возвращается сам шаблон.
 pub fn render(schema: &Schema, event: EventId, payload: &[u8], lang: &str) -> Option<String> {
@@ -528,6 +532,7 @@ pub fn render(schema: &Schema, event: EventId, payload: &[u8], lang: &str) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::KindFilter;
     use dduroc_engine::schema::{Language, StorageClass};
     use dduroc_engine::store::{Store, StoreConfig};
     use dduroc_format::{MetricId, ProtocolVersion, SpanKindId, ValueType};

@@ -20,4 +20,4 @@ mod reader;
 pub use cursor::{Damage, OwnedRecord, OwnedSampleValue, RawEntry};
 pub use error::{ReadError, Result};
 pub use query::{Filter, KindFilter, NsSelect, Order, Query};
-pub use reader::{Entry, EntryKind, NamespaceInfo, QueryResult, Reader};
+pub use reader::{Entry, EntryKind, NamespaceInfo, QueryResult, Reader, render as reader_render};
