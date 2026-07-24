@@ -6,7 +6,7 @@ use crate::query::{Order, Query};
 use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
 use dduroc_engine::schema::Schema;
-use dduroc_format::{EventId, Level, Micros, SeriesLocal, SpanId};
+use dduroc_format::{EventId, Level, Micros, SpanId};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -209,10 +209,6 @@ impl Reader {
     pub fn query(&self, q: &Query) -> Result<QueryResult> {
         let (mut cursors, schemas) = self.open_cursors(q)?;
         let mut result = QueryResult::default();
-        // Определения серий: сегментно-локальные номера действительны в
-        // пределах своего сегмента, поэтому таблица ведётся на курсор.
-        let mut series: Vec<HashMap<SeriesLocal, SeriesInfo>> =
-            (0..cursors.len()).map(|_| HashMap::new()).collect();
         let limit = q.limit.unwrap_or(usize::MAX);
 
         loop {
@@ -238,27 +234,6 @@ impl Reader {
                 continue;
             };
 
-            // Определения серий не выдаются наружу: это служебные записи,
-            // задача которых — восстановить идентичность сэмплов.
-            if let OwnedRecord::SeriesDef {
-                series: local,
-                metric,
-                value_type: _,
-                tags,
-            } = &raw.record
-            {
-                let desc = schemas[idx].as_ref().and_then(|s| s.metric(*metric));
-                series[idx].insert(
-                    *local,
-                    SeriesInfo {
-                        name: desc.map(|d| d.name),
-                        unit: desc.map(|d| d.unit),
-                        tags: tags.clone(),
-                    },
-                );
-                continue;
-            }
-
             if !q.in_range(raw.at) {
                 // Записи вне диапазона пропускаются, но обход продолжается:
                 // сегмент мог начаться раньше `from`.
@@ -271,14 +246,8 @@ impl Reader {
 
             let ns_name = std::sync::Arc::clone(&cursors[idx].namespace);
             let ch_name = std::sync::Arc::clone(&cursors[idx].channel);
-            let Some(entry) = self.build_entry(
-                ns_name,
-                ch_name,
-                schemas[idx].as_ref(),
-                &raw,
-                &series[idx],
-                q,
-            ) else {
+            let Some(entry) = self.build_entry(ns_name, ch_name, schemas[idx].as_ref(), &raw, q)
+            else {
                 continue;
             };
 
@@ -343,7 +312,6 @@ impl Reader {
         channel: std::sync::Arc<str>,
         schema: Option<&Schema>,
         raw: &crate::cursor::RawEntry,
-        series: &HashMap<SeriesLocal, SeriesInfo>,
         q: &Query,
     ) -> Option<Entry> {
         let kinds = q.filter.kinds;
@@ -444,19 +412,26 @@ impl Reader {
                 }
                 (EntryKind::SpanEnd { span: *span }, Some(*span))
             }
-            OwnedRecord::Sample {
-                series: local,
-                value,
-            } => {
+            OwnedRecord::Sample { value, .. } => {
                 if !kinds.samples {
                     return None;
                 }
-                let info = series.get(local);
+                // Идентичность серии разрешена курсором внутри сегмента:
+                // сегментно-локальные номера переиспользуются, и связывать
+                // их на уровне канала значило бы подменить одну метрику другой.
+                let desc = raw
+                    .series
+                    .as_ref()
+                    .and_then(|d| schema.and_then(|s| s.metric(d.metric)));
                 (
                     EntryKind::Sample {
-                        metric_name: info.and_then(|i| i.name),
-                        unit: info.and_then(|i| i.unit),
-                        tags: info.map(|i| i.tags.clone()).unwrap_or_default(),
+                        metric_name: desc.map(|d| d.name),
+                        unit: desc.map(|d| d.unit),
+                        tags: raw
+                            .series
+                            .as_ref()
+                            .map(|d| d.tags.clone())
+                            .unwrap_or_default(),
                         value: value.clone(),
                     },
                     None,
@@ -488,14 +463,6 @@ impl Reader {
             kind,
         })
     }
-}
-
-/// Восстановленная идентичность серии.
-#[derive(Debug, Clone)]
-struct SeriesInfo {
-    name: Option<&'static str>,
-    unit: Option<&'static str>,
-    tags: Vec<(String, String)>,
 }
 
 /// Собрать предикат отбора, применяемый до материализации записи.
@@ -804,6 +771,80 @@ mod tests {
                 .entries
                 .iter()
                 .all(|e| matches!(e.kind, EntryKind::Sample { .. }))
+        );
+    }
+
+    #[test]
+    fn telemetry_keeps_identity_in_newest_order() {
+        // Определение серии пишется в тело один раз, перед первым сэмплом.
+        // При обратном обходе — режиме по умолчанию — сэмпл встречается
+        // РАНЬШЕ своего определения, поэтому восстанавливать идентичность
+        // из потока нельзя: вся телеметрия приходила бы обезличенной.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+
+        for order in [Order::Oldest, Order::Newest] {
+            let result = reader
+                .query(&Query::new().kinds(KindFilter::TELEMETRY).order(order))
+                .unwrap();
+            assert_eq!(result.entries.len(), 20, "порядок {order:?}");
+            for e in &result.entries {
+                match &e.kind {
+                    EntryKind::Sample {
+                        metric_name,
+                        unit,
+                        tags,
+                        ..
+                    } => {
+                        assert_eq!(*metric_name, Some("temp"), "порядок {order:?}");
+                        assert_eq!(*unit, Some("°C"));
+                        assert_eq!(tags, &[("sensor".to_owned(), "pa".to_owned())]);
+                    }
+                    other => panic!("ожидался сэмпл: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn telemetry_identity_survives_time_range_seek() {
+        // Запрос с нижней границей пропускает начальные блоки по
+        // footer-индексу — вместе с лежащими там определениями серий.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+
+        let all = reader
+            .query(
+                &Query::new()
+                    .kinds(KindFilter::TELEMETRY)
+                    .order(Order::Oldest),
+            )
+            .unwrap();
+        let mid = all.entries[all.entries.len() / 2].at;
+
+        let narrowed = reader
+            .query(&Query {
+                from: Some(mid),
+                order: Order::Oldest,
+                filter: crate::Filter {
+                    kinds: KindFilter::TELEMETRY,
+                    ..Default::default()
+                },
+                ..Query::new()
+            })
+            .unwrap();
+        assert!(!narrowed.entries.is_empty());
+        assert!(
+            narrowed.entries.iter().all(|e| matches!(
+                &e.kind,
+                EntryKind::Sample {
+                    metric_name: Some("temp"),
+                    ..
+                }
+            )),
+            "идентичность серии обязана пережить перескок по времени"
         );
     }
 

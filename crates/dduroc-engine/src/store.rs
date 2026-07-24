@@ -91,7 +91,7 @@ pub struct Store {
     next_span: Arc<AtomicU32>,
     /// Открытые неймспейсы: повторное открытие того же имени в одном
     /// процессе дало бы два независимых состояния на одном каталоге.
-    open: Mutex<HashMap<String, NsId>>,
+    open: Mutex<HashMap<String, Option<NsId>>>,
     /// Держится открытым, пока живёт хранилище: снимается ядром при
     /// завершении процесса, в том числе аварийном.
     _lock: File,
@@ -164,12 +164,24 @@ impl Store {
             reason: Box::leak(e.to_string().into_boxed_str()),
         })?;
 
+        // Занятость помечается под той же блокировкой, что и проверка:
+        // между «свободен» и «занял» два потока успевали получить по
+        // независимому writer-состоянию на один каталог, и оба писали бы
+        // сегменты с одинаковыми именами.
         {
-            let open = self.open.lock().map_err(|_| Error::ShuttingDown)?;
+            let mut open = self.open.lock().map_err(|_| Error::ShuttingDown)?;
             if open.contains_key(name) {
                 return Err(Error::NamespaceBusy(name.to_owned()));
             }
+            open.insert(name.to_owned(), None);
         }
+        // Дальше любой ранний выход обязан снять пометку, иначе имя
+        // останется занятым до конца жизни процесса.
+        let guard = ReserveGuard {
+            store: self,
+            name,
+            armed: true,
+        };
 
         let dir = self.root.join(name);
         fsutil::create_dir_all_synced(&dir)?;
@@ -206,12 +218,13 @@ impl Store {
             drops: Arc::clone(&drops),
         })?;
 
-        self.open
-            .lock()
-            .map_err(|_| Error::ShuttingDown)?
-            .insert(name.to_owned(), id);
+        if let Ok(mut open) = self.open.lock() {
+            open.insert(name.to_owned(), Some(id));
+        }
+        guard.disarm();
 
         Ok(Namespace::new(
+            Arc::clone(self) as Arc<dyn std::any::Any + Send + Sync>,
             id,
             name.to_owned(),
             schema,
@@ -267,6 +280,29 @@ impl Store {
     /// Завершить работу: дописать, запечатать сегменты, остановить writer.
     pub fn shutdown(&self) {
         self.writer.shutdown();
+    }
+}
+
+/// Снимает пометку «имя занято», если подъём неймспейса не дошёл до конца.
+struct ReserveGuard<'a> {
+    store: &'a Store,
+    name: &'a str,
+    armed: bool,
+}
+
+impl ReserveGuard<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReserveGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut open) = self.store.open.lock()
+        {
+            open.remove(self.name);
+        }
     }
 }
 

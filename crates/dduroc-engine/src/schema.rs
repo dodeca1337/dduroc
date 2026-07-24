@@ -229,6 +229,16 @@ pub enum SchemaError {
 
     #[error("схема {schema:?}: имя пустое")]
     EmptyName { schema: &'static str },
+
+    #[error(
+        "схема {schema:?}: {kind} {name:?} нарушает порядок идентификаторов — \
+         поиск дескриптора идёт бинарно и требует возрастания"
+    )]
+    Unsorted {
+        schema: &'static str,
+        kind: &'static str,
+        name: &'static str,
+    },
 }
 
 impl Schema {
@@ -268,6 +278,25 @@ impl Schema {
             self.spans.iter().map(|s| (s.id.0, s.name)),
         )?;
 
+        // Дескрипторы обязаны идти по возрастанию идентификаторов: поиск по
+        // ним бинарный и выполняется на каждую запись. Макрос `schema!`
+        // раскладывает их сам, но схему можно объявить и вручную.
+        check_sorted(
+            self.name,
+            "event",
+            self.events.iter().map(|e| (e.id.0, e.name)),
+        )?;
+        check_sorted(
+            self.name,
+            "metric",
+            self.metrics.iter().map(|m| (m.id.0, m.name)),
+        )?;
+        check_sorted(
+            self.name,
+            "span",
+            self.spans.iter().map(|s| (s.id.0, s.name)),
+        )?;
+
         for e in self.events {
             if e.templates.len() != self.languages.len() {
                 return Err(SchemaError::TemplateCount {
@@ -302,16 +331,32 @@ impl Schema {
         Ok(())
     }
 
+    /// Найти тип сообщения по идентификатору.
+    ///
+    /// Вызывается на **каждую** записываемую и читаемую запись, поэтому
+    /// поиск бинарный: линейный обход двухсот с лишним дескрипторов на
+    /// событие заметен уже на x86 и тем более на armv7. Упорядоченность
+    /// проверяется в [`Schema::validate`], а не предполагается.
     pub fn event(&self, id: EventId) -> Option<&'static EventDesc> {
-        self.events.iter().find(|e| e.id == id)
+        match self.events.binary_search_by_key(&id.0, |e| e.id.0) {
+            Ok(i) => Some(&self.events[i]),
+            // Схема не отсортирована (не прошла validate) — честно ищем.
+            Err(_) => self.events.iter().find(|e| e.id == id),
+        }
     }
 
     pub fn metric(&self, id: MetricId) -> Option<&'static MetricDesc> {
-        self.metrics.iter().find(|m| m.id == id)
+        match self.metrics.binary_search_by_key(&id.0, |m| m.id.0) {
+            Ok(i) => Some(&self.metrics[i]),
+            Err(_) => self.metrics.iter().find(|m| m.id == id),
+        }
     }
 
     pub fn span(&self, id: SpanKindId) -> Option<&'static SpanDesc> {
-        self.spans.iter().find(|s| s.id == id)
+        match self.spans.binary_search_by_key(&id.0, |s| s.id.0) {
+            Ok(i) => Some(&self.spans[i]),
+            Err(_) => self.spans.iter().find(|s| s.id == id),
+        }
     }
 
     pub fn language_index(&self, code: &str) -> Option<usize> {
@@ -340,6 +385,22 @@ impl Schema {
     pub fn migration(&self, from: u16) -> Option<&'static Migration> {
         self.migrations.iter().find(|m| m.from == from)
     }
+}
+
+/// Проверить возрастание идентификаторов: по ним идёт бинарный поиск.
+fn check_sorted(
+    schema: &'static str,
+    kind: &'static str,
+    items: impl Iterator<Item = (u16, &'static str)>,
+) -> Result<(), SchemaError> {
+    let mut prev: Option<u16> = None;
+    for (id, name) in items {
+        if prev.is_some_and(|p| id <= p) {
+            return Err(SchemaError::Unsorted { schema, kind, name });
+        }
+        prev = Some(id);
+    }
+    Ok(())
 }
 
 fn check_unique(

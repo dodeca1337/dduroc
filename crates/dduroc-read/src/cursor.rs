@@ -31,6 +31,21 @@ pub struct RawEntry {
     pub at: Micros,
     pub boot: u32,
     pub record: OwnedRecord,
+    /// Идентичность серии у сэмплов, разрешённая **внутри сегмента**.
+    ///
+    /// Номер серии сегментно-локален и переиспользуется с нуля в каждом
+    /// сегменте, поэтому восстанавливать идентичность на уровне канала
+    /// нельзя: сэмпл напряжения из нового сегмента унаследовал бы
+    /// определение температуры из предыдущего.
+    pub series: Option<SeriesDefinition>,
+}
+
+/// Идентичность серии телеметрии.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesDefinition {
+    pub metric: dduroc_format::MetricId,
+    pub value_type: dduroc_format::ValueType,
+    pub tags: Vec<(String, String)>,
 }
 
 /// Владеющая копия записи: курсор переиспользует буфер блока, поэтому
@@ -142,6 +157,52 @@ fn own(record: &Record<'_>) -> OwnedRecord {
     }
 }
 
+/// Запомнить определение серии в таблице сегмента.
+fn remember_series(table: &mut Vec<Option<SeriesDefinition>>, def: &dduroc_format::SeriesDef<'_>) {
+    let idx = def.series.0 as usize;
+    // Номер серии приходит из файла: расширяем таблицу только в разумных
+    // пределах, иначе повреждённая запись задала бы размер аллокации.
+    const MAX_SERIES: usize = 64 * 1024;
+    if idx >= MAX_SERIES {
+        return;
+    }
+    if idx >= table.len() {
+        table.resize(idx + 1, None);
+    }
+    table[idx] = Some(SeriesDefinition {
+        metric: def.metric,
+        value_type: def.value_type,
+        tags: def
+            .tags
+            .iter()
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+    });
+}
+
+/// Прямой проход по сегменту, собирающий только определения серий.
+fn collect_series(
+    reader: &SegmentReader,
+    offsets: &[u64],
+    table: &mut Vec<Option<SeriesDefinition>>,
+) {
+    let mut buf = Vec::new();
+    for &offset in offsets {
+        if reader.read_block_at(offset, &mut buf).is_err() {
+            continue;
+        }
+        let Ok(Some(block)) = parse_block(&buf) else {
+            continue;
+        };
+        for item in block.records() {
+            if let Ok((_, Record::SeriesDef(def))) = item {
+                remember_series(table, &def);
+            }
+        }
+    }
+}
+
 /// Курсор по записям одного сегмента.
 pub struct SegmentCursor {
     reader: SegmentReader,
@@ -158,6 +219,13 @@ pub struct SegmentCursor {
     reverse: bool,
     /// Отбор до материализации.
     prefilter: Option<Prefilter>,
+    /// Таблица серий сегмента: индекс — сегментно-локальный номер.
+    ///
+    /// У запечатанного сегмента берётся из footer'а, куда она продублирована
+    /// ровно для этого: определение серии пишется в тело один раз, и при
+    /// чтении с середины, в обратном порядке или после битого блока его
+    /// в потоке уже не встретить.
+    series: Vec<Option<SeriesDefinition>>,
     /// Блоки, которые не удалось прочитать.
     damaged: Vec<Damage>,
 }
@@ -187,7 +255,53 @@ impl SegmentCursor {
                 found: reader.header().store_id,
             });
         }
-        let mut offsets = reader.block_offsets().map_err(ReadError::Engine)?;
+        let mut damaged = Vec::new();
+        let mut offsets = match reader.footer() {
+            Some(footer) => footer.blocks.iter().map(|b| b.offset).collect(),
+            None => {
+                // Незапечатанный сегмент сканируется; обрыв скана — обычное
+                // следствие потери питания. Уже найденные блоки остаются в
+                // выборке, а о месте обрыва сообщается явно.
+                let (offsets, stopped) = reader.scan_block_offsets();
+                if let Some((offset, reason)) = stopped {
+                    damaged.push(Damage {
+                        path: path.to_owned(),
+                        offset,
+                        reason,
+                    });
+                }
+                offsets
+            }
+        };
+
+        // Таблица серий: из footer'а, если сегмент запечатан.
+        let mut series: Vec<Option<SeriesDefinition>> = match reader.footer() {
+            Some(footer) => footer
+                .series
+                .iter()
+                .map(|s| {
+                    Some(SeriesDefinition {
+                        metric: s.metric,
+                        value_type: s.value_type,
+                        tags: s
+                            .tags
+                            .iter()
+                            .filter_map(|r| r.ok())
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                            .collect(),
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // Незапечатанный сегмент читается с конца: определения серий лежат
+        // в теле перед своими сэмплами, то есть в обратном обходе — уже
+        // позади. Собираем их предварительным прямым проходом.
+        if series.is_empty() && reverse {
+            collect_series(&reader, &offsets, &mut series);
+        }
+
         if reverse {
             offsets.reverse();
         }
@@ -200,7 +314,8 @@ impl SegmentCursor {
             pos: 0,
             reverse,
             prefilter,
-            damaged: Vec::new(),
+            series,
+            damaged,
         })
     }
 
@@ -302,19 +417,31 @@ impl SegmentCursor {
             for item in block.records() {
                 match item {
                     Ok((at, record)) => {
+                        // Определение серии — служебная запись: она наполняет
+                        // таблицу сегмента и наружу не выдаётся.
+                        if let Record::SeriesDef(def) = &record {
+                            remember_series(&mut self.series, def);
+                            continue;
+                        }
                         // Отбор до владеющей копии: отброшенная запись не
                         // должна стоить аллокации своего payload'а.
-                        let keep = match &self.prefilter {
-                            Some(f) => matches!(record, Record::SeriesDef(_)) || f(&record),
-                            None => true,
-                        };
-                        if keep {
-                            self.buffered.push(RawEntry {
-                                at,
-                                boot,
-                                record: own(&record),
-                            });
+                        if let Some(f) = &self.prefilter
+                            && !f(&record)
+                        {
+                            continue;
                         }
+                        let series = match &record {
+                            Record::Sample(s) => {
+                                self.series.get(s.series.0 as usize).and_then(|d| d.clone())
+                            }
+                            _ => None,
+                        };
+                        self.buffered.push(RawEntry {
+                            at,
+                            boot,
+                            record: own(&record),
+                            series,
+                        });
                     }
                     Err(e) => {
                         broken = Some(e.to_string());

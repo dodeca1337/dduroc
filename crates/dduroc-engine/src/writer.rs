@@ -56,6 +56,19 @@ const DRAIN_LIMIT: usize = 4096;
 /// Максимальное ожидание места в критической очереди.
 const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Сон, когда обслуживать нечего.
+const IDLE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Нижняя граница ожидания в цикле: без неё просроченный дедлайн даёт
+/// нулевой таймаут и вырождается в busy-wait на целое ядро.
+const MIN_TIMEOUT: Duration = Duration::from_millis(1);
+
+/// Потолок числа проходов при вычерпывании очередей перед `sync`/`shutdown`.
+///
+/// Без него поток, пишущий быстрее, чем успевает writer, не дал бы
+/// завершиться ни `sync`, ни `shutdown` — процесс не смог бы остановиться.
+const DRAIN_ROUNDS: usize = 64;
+
 /// Источник отметок о служебных событиях в потоке записей.
 const DIAG_TARGET: &str = "dduroc";
 
@@ -118,6 +131,7 @@ impl Writer {
             namespaces: Vec::new(),
             counters: Arc::clone(&counters),
             batch: Vec::new(),
+            active: Vec::new(),
         };
 
         let handle = std::thread::Builder::new()
@@ -233,6 +247,10 @@ impl Writer {
 struct ChannelState {
     config: ChannelConfig,
     dir: PathBuf,
+    /// Неизменные атрибуты, которые уходят в заголовок каждого сегмента.
+    protocol_version: ProtocolVersion,
+    store_id: u64,
+    boot: BootCounter,
     inventory: Inventory,
     /// Открытый сегмент. `None` — канал ещё ничего не писал либо закрыт
     /// по бездействию: пустой неймспейс не должен занимать ни файлового
@@ -249,18 +267,26 @@ struct ChannelState {
     last_time: Micros,
     block_opened: Option<Instant>,
     last_sync: Instant,
-    last_activity: Instant,
     dirty_since_sync: bool,
 }
 
 impl ChannelState {
-    fn new(dir: PathBuf, config: ChannelConfig) -> Result<Self> {
+    fn new(
+        dir: PathBuf,
+        config: ChannelConfig,
+        protocol_version: ProtocolVersion,
+        store_id: u64,
+        boot: BootCounter,
+    ) -> Result<Self> {
         let inventory = Inventory::scan(&dir)?;
         let now = Instant::now();
         Ok(Self {
             builder: BlockBuilder::with_capacity(config.block_max_bytes.min(64 * 1024)),
             config,
             dir,
+            protocol_version,
+            store_id,
+            boot,
             inventory,
             segment: None,
             footer: FooterBuilder::new(),
@@ -268,7 +294,6 @@ impl ChannelState {
             last_time: Micros(0),
             block_opened: None,
             last_sync: now,
-            last_activity: now,
             dirty_since_sync: false,
         })
     }
@@ -297,9 +322,6 @@ impl ChannelState {
 struct NsState {
     #[allow(dead_code)]
     name: String,
-    protocol_version: ProtocolVersion,
-    store_id: u64,
-    boot: BootCounter,
     channels: Vec<ChannelState>,
     series: Arc<RwLock<Vec<SeriesEntry>>>,
     drops: Arc<DropCounters>,
@@ -314,6 +336,14 @@ struct WriterLoop {
     counters: Arc<Counters>,
     /// Переиспользуемый буфер батча.
     batch: Vec<Staged>,
+    /// Каналы, которым есть что обслуживать: открытый блок, несинхронизованные
+    /// данные или незапечатанный сегмент.
+    ///
+    /// Обходить все каналы подряд нельзя: при заявленных двадцати четырёх
+    /// тысячах неймспейсов их десятки тысяч, и полный проход на каждом
+    /// обороте цикла съел бы процессор впустую. Пишущих в любой момент —
+    /// единицы.
+    active: Vec<(usize, usize)>,
 }
 
 impl WriterLoop {
@@ -340,7 +370,13 @@ impl WriterLoop {
 
             if got == 0 {
                 // Ждём либо новую запись, либо ближайший дедлайн.
-                let timeout = self.next_deadline().unwrap_or(Duration::from_millis(250));
+                // Просроченный дедлайн даёт нулевой таймаут, а нулевой
+                // таймаут в `select!` — мгновенный возврат: цикл сжёг бы
+                // целое ядро. Нижняя граница делает такой оборот безвредным.
+                let timeout = self
+                    .next_deadline()
+                    .unwrap_or(IDLE_TIMEOUT)
+                    .max(MIN_TIMEOUT);
                 let mut stop = false;
                 crossbeam_channel::select! {
                     recv(critical) -> item => if let Ok(item) = item { self.batch.push(item); self.apply_batch(); },
@@ -375,12 +411,19 @@ impl WriterLoop {
     /// сегменты поверх недописанного — записи исчезали бы, хотя `log()`
     /// вернул `Ok`.
     fn drain_pending(&mut self, normal: &Receiver<Staged>, critical: &Receiver<Staged>) {
-        loop {
+        for _ in 0..DRAIN_ROUNDS {
             let got = self.drain(critical) + self.drain(normal);
             if got == 0 {
-                break;
+                return;
             }
             self.apply_batch();
+        }
+        // Очередь всё ещё пополняется быстрее, чем вычерпывается. Дальше
+        // ждать нельзя: остановка процесса не должна зависеть от того,
+        // перестанут ли прикладные потоки писать.
+        let leftover = normal.len() + critical.len();
+        if leftover > 0 {
+            Counters::add(&self.counters.dropped, leftover as u64);
         }
     }
 
@@ -409,16 +452,33 @@ impl WriterLoop {
 
         let batch = std::mem::take(&mut self.batch);
         for item in &batch {
-            if let Err(e) = self.push(item) {
+            if self.push(item).is_err() {
+                // Логировать нельзя — очередь наша собственная; падать тоже:
+                // отказ носителя не должен уносить с собой весь механизм
+                // логирования, включая остальные каналы. Считаем и идём
+                // дальше, ошибка видна через `Stats::io_errors`.
                 Counters::bump(&self.counters.io_errors);
-                // Логировать нельзя — очередь наша собственная. Считаем и
-                // продолжаем: отказ одного канала не должен ронять остальные.
-                debug_assert!(false, "ошибка записи: {e}");
-                let _ = e;
             }
         }
         self.batch = batch;
         self.batch.clear();
+
+        // Group commit: критический канал синхронизируется ОДИН раз на батч.
+        // Синхронизация на каждую запись, как было поначалу, превращала
+        // всплеск из пятисот аварийных сообщений в пятьсот блоков и пятьсот
+        // fdatasync — секунды записи и лишний износ флеша там, где хватает
+        // одного обращения к носителю.
+        let counters = Arc::clone(&self.counters);
+        for &(ns_idx, ch_idx) in &self.active {
+            let ch = &mut self.namespaces[ns_idx].channels[ch_idx];
+            if ch.config.durability == Durability::Immediate && ch.dirty_since_sync {
+                let done = Self::flush_block(ch, &counters)
+                    .and_then(|()| Self::sync_channel(ch, &counters));
+                if done.is_err() {
+                    Counters::bump(&counters.io_errors);
+                }
+            }
+        }
     }
 
     fn push(&mut self, item: &Staged) -> Result<()> {
@@ -439,21 +499,22 @@ impl WriterLoop {
             _ => None,
         };
 
-        let ns = &mut self.namespaces[ns_idx];
-        let (protocol_version, store_id, boot) = (ns.protocol_version, ns.store_id, ns.boot);
-        let ch = &mut ns.channels[ch_idx];
+        let ch = &mut self.namespaces[ns_idx].channels[ch_idx];
+
+        // Монотонность внутри канала: время из прошлого подтягивается вперёд.
+        // Считается ДО открытия блока: именем и базой нового сегмента должно
+        // стать время его первой записи, как требует формат, а не время
+        // предыдущей (у нового канала — ноль).
+        let at = Micros(item.at.0.max(ch.last_time.0));
+        ch.last_time = at;
 
         // Блок открывается против конкретного сегмента: решать, куда он
         // ляжет, в момент выталкивания нельзя — определения серий уже
         // посчитаны против текущего сегмента и уехали бы в чужой.
         if ch.builder.is_empty() {
-            Self::ensure_room(ch, protocol_version, store_id, boot, &self.counters)?;
+            Self::ensure_room(ch, at, &self.counters)?;
             ch.block_opened = Some(Instant::now());
         }
-
-        // Монотонность внутри канала: время из прошлого подтягивается вперёд.
-        let at = Micros(item.at.0.max(ch.last_time.0));
-        ch.last_time = at;
 
         let series_local = match series_entry {
             Some((series, Some(entry))) => Some(Self::intern_series(ch, series, &entry, at)?),
@@ -469,17 +530,13 @@ impl WriterLoop {
         if let Some(id) = item.event_id() {
             ch.footer.add_event(id);
         }
-        ch.last_activity = Instant::now();
         ch.dirty_since_sync = true;
+        if !self.active.contains(&(ns_idx, ch_idx)) {
+            self.active.push((ns_idx, ch_idx));
+        }
 
         if ch.builder.body_len() >= ch.config.block_max_bytes {
             Self::flush_block(ch, &self.counters)?;
-        }
-        // Критический канал синхронизирует немедленно: group commit забирает
-        // всё, что успело накопиться, поэтому всплеск стоит одного fdatasync.
-        if ch.config.durability == Durability::Immediate {
-            Self::flush_block(ch, &self.counters)?;
-            Self::sync_channel(ch, &self.counters)?;
         }
         Ok(())
     }
@@ -510,13 +567,7 @@ impl WriterLoop {
     }
 
     /// Убедиться, что в активном сегменте хватит места на целый блок.
-    fn ensure_room(
-        ch: &mut ChannelState,
-        protocol_version: ProtocolVersion,
-        store_id: u64,
-        boot: BootCounter,
-        counters: &Counters,
-    ) -> Result<()> {
+    fn ensure_room(ch: &mut ChannelState, at: Micros, counters: &Counters) -> Result<()> {
         let need = ch.config.block_max_bytes as u64 + BlockHeader::SIZE as u64 * 2;
 
         if let Some(seg) = &ch.segment
@@ -527,20 +578,15 @@ impl WriterLoop {
         if ch.segment.is_some() {
             Self::seal_segment(ch, counters)?;
         }
-        Self::open_segment(ch, protocol_version, store_id, boot, counters)
+        Self::open_segment(ch, at, counters)
     }
 
-    fn open_segment(
-        ch: &mut ChannelState,
-        protocol_version: ProtocolVersion,
-        store_id: u64,
-        boot: BootCounter,
-        counters: &Counters,
-    ) -> Result<()> {
+    fn open_segment(ch: &mut ChannelState, at: Micros, counters: &Counters) -> Result<()> {
+        let (protocol_version, store_id, boot) = (ch.protocol_version, ch.store_id, ch.boot);
         // Имя сегмента — (boot, время его первой записи). Совпадение имён
         // возможно только при регрессе времени; сдвигаем на микросекунду,
         // чтобы не затереть существующий файл.
-        let mut base = ch.last_time;
+        let mut base = at;
         for attempt in 0..64 {
             let header = SegmentHeader {
                 protocol_version,
@@ -590,6 +636,12 @@ impl WriterLoop {
     }
 
     fn flush_block(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
+        // Отметка о незакрытом блоке снимается ПЕРВЫМ делом, до любых ранних
+        // выходов и до возможной ошибки записи. Иначе просроченный дедлайн
+        // остаётся навсегда, `next_deadline` возвращает нулевой таймаут, и
+        // цикл writer'а превращается в busy-loop на целое ядро.
+        ch.block_opened = None;
+
         if ch.builder.is_empty() {
             return Ok(());
         }
@@ -602,9 +654,22 @@ impl WriterLoop {
         let header = ch
             .builder
             .finish(seg.next_seq(), ch.config.compression, &mut out)?;
+
+        // Резерв в `ensure_room` рассчитан по `block_max_bytes`, но одна
+        // крупная запись могла перевалить порог: писать за границу
+        // преаллокации нельзя — там нет зарезервированного на носителе места,
+        // и запись упёрлась бы в ENOSPC уже посреди блока.
+        if !seg.fits(out.len() as u64) {
+            Self::seal_segment(ch, counters)?;
+            Self::open_segment(ch, header.base, counters)?;
+            let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
+            // Нумерация блоков в новом сегменте начинается заново.
+            dduroc_format::restamp_seq(&mut out, seg.next_seq())?;
+        }
+
+        let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
         let offset = seg.append_block(&out)?;
         ch.footer.add_block(offset, &header, last);
-        ch.block_opened = None;
         Counters::bump(&counters.blocks_written);
         Counters::add(&counters.bytes_written, out.len() as u64);
         Ok(())
@@ -696,19 +761,26 @@ impl WriterLoop {
         self.emit_drop_notices();
 
         let now = Instant::now();
-        for ns_idx in 0..self.namespaces.len() {
-            for ch_idx in 0..self.namespaces[ns_idx].channels.len() {
-                let counters = Arc::clone(&self.counters);
-                let ch = &mut self.namespaces[ns_idx].channels[ch_idx];
+        let counters = Arc::clone(&self.counters);
+        let active = std::mem::take(&mut self.active);
+        for &(ns_idx, ch_idx) in &active {
+            let ch = &mut self.namespaces[ns_idx].channels[ch_idx];
 
-                let flush_due = ch.flush_deadline().is_some_and(|d| d <= now);
-                if flush_due && let Err(_e) = Self::flush_block(ch, &counters) {
-                    Counters::bump(&counters.io_errors);
-                }
-                let sync_due = ch.sync_deadline().is_some_and(|d| d <= now);
-                if sync_due && let Err(_e) = Self::sync_channel(ch, &counters) {
-                    Counters::bump(&counters.io_errors);
-                }
+            if ch.flush_deadline().is_some_and(|d| d <= now)
+                && Self::flush_block(ch, &counters).is_err()
+            {
+                Counters::bump(&counters.io_errors);
+            }
+            if ch.sync_deadline().is_some_and(|d| d <= now)
+                && Self::sync_channel(ch, &counters).is_err()
+            {
+                Counters::bump(&counters.io_errors);
+            }
+
+            // Канал, которому больше нечего обслуживать, покидает список:
+            // иначе он оставался бы в нём до конца жизни процесса.
+            if ch.block_opened.is_some() || ch.dirty_since_sync {
+                self.active.push((ns_idx, ch_idx));
             }
         }
     }
@@ -801,14 +873,17 @@ impl WriterLoop {
         let mut channels = Vec::with_capacity(setup.channels.len());
         for cfg in setup.channels {
             crate::fsutil::create_dir_all_synced(&setup.dir.join(&cfg.name))?;
-            channels.push(ChannelState::new(setup.dir.join(&cfg.name), cfg)?);
+            channels.push(ChannelState::new(
+                setup.dir.join(&cfg.name),
+                cfg,
+                setup.protocol_version,
+                setup.store_id,
+                setup.boot,
+            )?);
         }
         let id = NsId(self.namespaces.len() as u32);
         self.namespaces.push(NsState {
             name: setup.name,
-            protocol_version: setup.protocol_version,
-            store_id: setup.store_id,
-            boot: setup.boot,
             channels,
             series: setup.series,
             drops: setup.drops,

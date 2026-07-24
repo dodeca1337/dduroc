@@ -44,7 +44,7 @@ pub mod segment;
 mod value;
 pub mod varint;
 
-pub use block::{Block, BlockBuilder, BlockHeader, Compression};
+pub use block::{Block, BlockBuilder, BlockHeader, Compression, restamp_seq};
 pub use error::{Error, Result};
 pub use footer::{Footer, FooterBuilder, Trailer};
 pub use ids::{

@@ -106,6 +106,12 @@ pub struct Namespace {
 
 #[derive(Debug)]
 struct NamespaceInner {
+    /// Хранилище, которому принадлежит неймспейс.
+    ///
+    /// Держится живым, пока жива ручка: `Store` при уничтожении
+    /// останавливает writer, и переживший его `Namespace` писал бы в
+    /// никуда, возвращая `Ok` на каждый вызов.
+    _store: Arc<dyn std::any::Any + Send + Sync>,
     id: NsId,
     name: String,
     schema: Schema,
@@ -122,6 +128,7 @@ struct NamespaceInner {
 impl Namespace {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        store: Arc<dyn std::any::Any + Send + Sync>,
         id: NsId,
         name: String,
         schema: Schema,
@@ -135,6 +142,7 @@ impl Namespace {
     ) -> Self {
         Self {
             inner: Arc::new(NamespaceInner {
+                _store: store,
                 id,
                 name,
                 schema,
@@ -538,6 +546,75 @@ mod tests {
     }
 
     #[test]
+    fn overload_loses_only_what_it_reports() {
+        // Под давлением обычный канал вправе терять записи — но ровно
+        // столько, сколько признал потерянными. Расхождение между «принято»
+        // и «записано» означало бы тихую дыру.
+        //
+        // Пропускная способность как таковая здесь не проверяется: она
+        // зависит от загрузки машины и меряется бенчмарками.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        const N: u64 = 50_000;
+        let mut accepted = 0u64;
+        let mut refused = 0u64;
+        for i in 0..N {
+            match ns.log_raw(EventId(1), &[i as u8; 8], None) {
+                Ok(()) => accepted += 1,
+                Err(_) => refused += 1,
+            }
+        }
+        ns.sync().unwrap();
+
+        let stats = store.stats();
+        assert_eq!(accepted + refused, N);
+        assert!(accepted > 0, "хоть что-то обязано пройти");
+        assert!(
+            stats.records_written >= accepted,
+            "записано {} при принятых {accepted} — тихая потеря",
+            stats.records_written
+        );
+        assert_eq!(stats.dropped, refused, "потери учтены ровно те, что были");
+        assert_eq!(stats.io_errors, 0, "ошибок ввода-вывода быть не должно");
+    }
+
+    #[test]
+    fn critical_burst_is_one_group_commit() {
+        // Смысл политики Immediate — не «fdatasync на запись», а «синхронизация
+        // при первой возможности». Всплеск аварийных сообщений должен стоить
+        // единиц обращений к носителю: на eMMC каждый fdatasync это 1–10 мс,
+        // и пятьсот таких обращений превратили бы аварию в секунды записи и
+        // лишний износ флеша.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        const BURST: usize = 500;
+        for i in 0..BURST {
+            while ns.log_raw(EventId(2), &[i as u8], None).is_err() {
+                std::thread::yield_now();
+            }
+        }
+        ns.sync().unwrap();
+
+        let stats = store.stats();
+        assert!(stats.records_written >= BURST as u64);
+        assert!(
+            stats.syncs < BURST as u64 / 4,
+            "всплеск из {BURST} записей стоил {} обращений к носителю — \
+             это не групповая фиксация",
+            stats.syncs
+        );
+        assert!(
+            stats.blocks_written < BURST as u64 / 4,
+            "{BURST} записей уложены в {} блоков — заголовок на запись",
+            stats.blocks_written
+        );
+    }
+
+    #[test]
     fn namespace_cannot_be_opened_twice() {
         let dir = tempfile::tempdir().unwrap();
         let (store, cfg) = open_store(dir.path());
@@ -679,6 +756,86 @@ mod tests {
             "shutdown обязан дописать очередь, а не запечатать поверх неё: \
              записано {written}, принято {accepted}"
         );
+    }
+
+    #[test]
+    fn segment_name_matches_time_of_its_first_record() {
+        // Имя и база сегмента обязаны совпадать со временем ПЕРВОЙ его
+        // записи: на этом стоит отбор сегментов по диапазону при чтении.
+        // Брать время предыдущей записи (у нового канала — ноль) значило бы
+        // молча отдавать читателю сегменты, которых он не просил, и
+        // пропускать те, что нужны.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        // Небольшая занятая пауза, чтобы время старта заведомо было > 0.
+        let mut spin = 0u64;
+        while ns.now().0 < 1_000 && spin < 200_000_000 {
+            spin += 1;
+        }
+        let before = ns.now();
+        ns.log_raw(EventId(1), &[1], None).unwrap();
+        ns.sync().unwrap();
+        let after = ns.now();
+
+        let seg_dir = dir.path().join("orc-radio-0").join("default");
+        let name = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.ends_with(".seg"))
+            .expect("сегмент создан");
+        let parsed = dduroc_format::segment::SegmentName::parse(&name).expect("имя разбирается");
+
+        assert!(
+            parsed.base >= before && parsed.base <= after,
+            "имя сегмента {name} должно нести время первой записи ({before}..{after})"
+        );
+        assert_ne!(parsed.base.0, 0, "нулевая база — признак старой ошибки");
+    }
+
+    #[test]
+    fn namespace_keeps_store_alive() {
+        // Store при уничтожении останавливает writer. Переживший его
+        // Namespace писал бы в никуда, возвращая Ok на каждый вызов —
+        // худший вид потери данных: без единого признака.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        drop(store);
+
+        for i in 0..100 {
+            ns.log_raw(EventId(1), &[i as u8], None)
+                .expect("запись обязана продолжать работать");
+        }
+        ns.sync().expect("синхронизация обязана работать");
+
+        let seg_dir = dir.path().join("orc-radio-0").join("default");
+        let total: u64 = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
+            .count() as u64;
+        assert!(total >= 1, "данные записаны на диск");
+    }
+
+    #[test]
+    fn failed_namespace_open_releases_the_name() {
+        // Пометка «занято» ставится до подъёма; ранний выход обязан её снять,
+        // иначе имя останется недоступным до конца жизни процесса.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+
+        let broken = Schema {
+            version: ProtocolVersion(0), // недопустима
+            ..schema()
+        };
+        assert!(store.namespace("orc-radio-0", broken, &cfg).is_err());
+        // Имя снова свободно.
+        store
+            .namespace("orc-radio-0", schema(), &cfg)
+            .expect("имя обязано освободиться после неудачи");
     }
 
     #[test]

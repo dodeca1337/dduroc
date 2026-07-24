@@ -434,6 +434,23 @@ fn check_unique(kind: &str, items: &[(u16, Ident)]) -> syn::Result<()> {
 }
 
 fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
+    // Дескрипторы укладываются по возрастанию идентификаторов: поиск по
+    // схеме идёт бинарно и выполняется на каждую запись. Порядок в
+    // объявлении при этом остаётся свободным — это забота макроса.
+    let mut input = SchemaInput {
+        name: input.name.clone(),
+        version: input.version,
+        languages: input.languages.clone(),
+        events: input.events.iter().map(clone_event).collect(),
+        metrics: input.metrics.iter().map(clone_metric).collect(),
+        spans: input.spans.iter().map(clone_span).collect(),
+        migrations: input.migrations.iter().map(clone_migration).collect(),
+    };
+    input.events.sort_by_key(|e| e.id);
+    input.metrics.sort_by_key(|m| m.id);
+    input.spans.sort_by_key(|s| s.id);
+    let input = &input;
+
     check_unique(
         "событие",
         &input
@@ -680,6 +697,44 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             };
         }
     })
+}
+
+fn clone_event(e: &EventDef) -> EventDef {
+    EventDef {
+        name: e.name.clone(),
+        id: e.id,
+        level: e.level.clone(),
+        store: e.store.clone(),
+        tags: e.tags.clone(),
+        templates: e.templates.clone(),
+        fields: e.fields.clone(),
+    }
+}
+
+fn clone_metric(m: &MetricDef) -> MetricDef {
+    MetricDef {
+        name: m.name.clone(),
+        id: m.id,
+        vtype: m.vtype.clone(),
+        unit: m.unit.clone(),
+        tags: m.tags.clone(),
+        store: m.store.clone(),
+    }
+}
+
+fn clone_span(s: &SpanDef) -> SpanDef {
+    SpanDef {
+        name: s.name.clone(),
+        id: s.id,
+        store: s.store.clone(),
+    }
+}
+
+fn clone_migration(m: &MigrationDef) -> MigrationDef {
+    MigrationDef {
+        from: m.from,
+        func: m.func.clone(),
+    }
 }
 
 /// Объявить схему неймспейса. См. документацию модуля.

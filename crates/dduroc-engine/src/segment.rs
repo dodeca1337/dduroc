@@ -418,12 +418,19 @@ impl SegmentReader {
                 .ctx_path("чтение трейлера", path)?;
             if let Ok(Some(trailer)) = Trailer::parse(&tail) {
                 let total = trailer.total_len();
+                // Длина из трейлера управляет и размером чтения, и границей
+                // данных, а сам трейлер сверяется только по сигнатуре.
+                // Поэтому footer принимается лишь после проверки CRC: иначе
+                // испорченное поле длины молча отрезало бы часть блоков,
+                // выдав усечённый сегмент за целый.
                 if total <= len - SegmentHeader::SIZE as u64 {
                     let mut buf = vec![0u8; total as usize];
                     file.read_exact_at(&mut buf, len - total)
                         .ctx_path("чтение footer", path)?;
-                    data_end = len - total;
-                    footer_bytes = Some(buf);
+                    if matches!(dduroc_format::Footer::parse(&buf), Ok(Some(_))) {
+                        data_end = len - total;
+                        footer_bytes = Some(buf);
+                    }
                 }
             }
         }
@@ -504,20 +511,35 @@ impl SegmentReader {
         SegmentHeader::SIZE as u64
     }
 
-    /// Итератор по смещениям блоков: из footer'а, если он есть, иначе
-    /// последовательным сканом.
+    /// Смещения блоков: из footer'а, если он есть, иначе последовательным
+    /// сканом.
+    ///
+    /// Повреждение обрывает **скан**, а не всю выборку: уже найденные блоки
+    /// возвращаются. Иначе один битый заголовок в хвосте незапечатанного
+    /// сегмента — обычное следствие обрыва питания — прятал бы от читателя
+    /// весь сегмент целиком.
     pub fn block_offsets(&self) -> Result<Vec<u64>> {
         if let Some(footer) = self.footer() {
             return Ok(footer.blocks.iter().map(|b| b.offset).collect());
         }
+        Ok(self.scan_block_offsets().0)
+    }
+
+    /// То же, но с сообщением о том, где скан оборвался.
+    pub fn scan_block_offsets(&self) -> (Vec<u64>, Option<(u64, String)>) {
         let mut offsets = Vec::new();
         let mut buf = Vec::new();
         let mut offset = Self::first_block_offset();
-        while let Some(next) = self.read_block_at(offset, &mut buf)? {
-            offsets.push(offset);
-            offset = next;
+        loop {
+            match self.read_block_at(offset, &mut buf) {
+                Ok(Some(next)) => {
+                    offsets.push(offset);
+                    offset = next;
+                }
+                Ok(None) => return (offsets, None),
+                Err(e) => return (offsets, Some((offset, e.to_string()))),
+            }
         }
-        Ok(offsets)
     }
 }
 

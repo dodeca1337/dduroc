@@ -198,6 +198,24 @@ impl BlockHeader {
     }
 }
 
+/// Переставить номер блока в уже собранных байтах, пересчитав CRC.
+///
+/// Нужно, когда готовый блок не поместился в текущий сегмент и уезжает в
+/// новый: нумерация блоков начинается в каждом сегменте заново, а пересобирать
+/// тело ради одного поля незачем.
+pub fn restamp_seq(bytes: &mut [u8], seq: u32) -> Result<()> {
+    let Some(mut header) = BlockHeader::parse(bytes)? else {
+        return Err(Error::EmptyBlock);
+    };
+    let body = bytes
+        .get(BlockHeader::SIZE..BlockHeader::SIZE + header.body_len as usize)
+        .ok_or(Error::Truncated)?;
+    header.seq = seq;
+    header.crc = compute_crc(&header, body);
+    bytes[..BlockHeader::SIZE].copy_from_slice(&header.to_bytes());
+    Ok(())
+}
+
 fn compute_crc(header: &BlockHeader, body_on_disk: &[u8]) -> u32 {
     let bytes = header.to_bytes();
     let crc = crc32c::crc32c(&bytes[..28]);
@@ -698,6 +716,20 @@ mod tests {
             BlockHeader::parse(&bytes),
             Err(Error::BadMagic { .. })
         ));
+    }
+
+    #[test]
+    fn restamping_seq_keeps_block_valid() {
+        let mut b = BlockBuilder::new();
+        b.push(Micros(10), &msg(1, &[1, 2, 3])).unwrap();
+        b.push(Micros(20), &msg(2, &[4, 5])).unwrap();
+        let mut out = Vec::new();
+        b.finish(0, Compression::Lz4, &mut out).unwrap();
+
+        restamp_seq(&mut out, 7).unwrap();
+        let block = Block::parse(&out).unwrap().expect("CRC пересчитан");
+        assert_eq!(block.header.seq, 7);
+        assert_eq!(block.records().count(), 2, "содержимое не тронуто");
     }
 
     #[test]
