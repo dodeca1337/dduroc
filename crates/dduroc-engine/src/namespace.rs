@@ -182,14 +182,22 @@ impl Namespace {
         self.inner.clock.now()
     }
 
-    fn channel_of(&self, class: StorageClass) -> ChannelIdx {
-        ChannelIdx(
-            self.inner
-                .classes
-                .iter()
-                .position(|c| *c == class)
-                .unwrap_or(0) as u16,
-        )
+    /// Канал, соответствующий классу хранения.
+    ///
+    /// Список каналов построен по самой схеме, поэтому класс обязан
+    /// найтись. Тихий возврат нулевого канала при промахе означал бы, что
+    /// критическая запись без предупреждения уходит в обычный канал — с
+    /// другой политикой долговечности и другим бюджетом.
+    fn channel_of(&self, class: StorageClass) -> Result<ChannelIdx> {
+        self.inner
+            .classes
+            .iter()
+            .position(|c| *c == class)
+            .map(|i| ChannelIdx(i as u16))
+            .ok_or(Error::BadNamespace {
+                name: self.inner.name.clone(),
+                reason: "класс хранения не объявлен ни одним типом схемы",
+            })
     }
 
     /// Записать событие с уже сериализованным payload'ом.
@@ -220,7 +228,7 @@ impl Namespace {
         };
         let item = Staged {
             ns: self.inner.id,
-            channel: self.channel_of(desc.class),
+            channel: self.channel_of(desc.class)?,
             at: self.now(),
             record: StagedRecord::Message {
                 event,
@@ -251,7 +259,7 @@ impl Namespace {
         };
         let item = Staged {
             ns: self.inner.id,
-            channel: self.channel_of(class),
+            channel: self.channel_of(class)?,
             at: self.now(),
             record: StagedRecord::Text {
                 level,
@@ -276,7 +284,7 @@ impl Namespace {
         Ok(Series {
             ns: self.clone(),
             id,
-            channel: self.channel_of(desc.class),
+            channel: self.channel_of(desc.class)?,
             critical: desc.class == StorageClass::CRITICAL,
             value_type: desc.value_type,
         })
@@ -297,7 +305,7 @@ impl Namespace {
             });
         };
         let span = next_span_id(&self.inner.next_span);
-        let channel = self.channel_of(desc.class);
+        let channel = self.channel_of(desc.class)?;
         let critical = desc.class == StorageClass::CRITICAL;
 
         self.inner.writer.write(
@@ -618,9 +626,16 @@ mod tests {
     fn namespace_cannot_be_opened_twice() {
         let dir = tempfile::tempdir().unwrap();
         let (store, cfg) = open_store(dir.path());
-        let _a = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let a = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
         let err = store.namespace("orc-radio-0", schema(), &cfg).unwrap_err();
         assert!(matches!(err, Error::NamespaceBusy(_)), "получено {err}");
+
+        // Отпущенное имя обязано освободиться: иначе сервис не смог бы
+        // переоткрыть свой неймспейс после перенастройки.
+        drop(a);
+        store
+            .namespace("orc-radio-0", schema(), &cfg)
+            .expect("имя свободно после уничтожения ручки");
     }
 
     #[test]

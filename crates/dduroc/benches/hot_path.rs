@@ -129,6 +129,33 @@ fn bench_format(c: &mut Criterion) {
         b.iter(|| dduroc_format::record::decode(black_box(&buf)).unwrap());
     });
 
+    // Сериализация полей события: единственная часть горячего пути, которую
+    // выполняет прикладной поток до постановки в очередь.
+    g.bench_function("payload/encode_two_fields", |b| {
+        b.iter(|| {
+            let payload: dduroc::Payload = dduroc::postcard::to_extend(
+                &bench::events::Measured {
+                    dbm: black_box(27.5),
+                    ch: black_box(3),
+                },
+                dduroc::Payload::new(),
+            )
+            .unwrap();
+            black_box(payload)
+        });
+    });
+
+    g.bench_function("payload/encode_one_field", |b| {
+        b.iter(|| {
+            let payload: dduroc::Payload = dduroc::postcard::to_extend(
+                &bench::events::Tick { n: black_box(42) },
+                dduroc::Payload::new(),
+            )
+            .unwrap();
+            black_box(payload)
+        });
+    });
+
     g.bench_function("record/encode_sample", |b| {
         let rec = Record::Sample(Sample {
             series: SeriesLocal(3),
@@ -261,6 +288,40 @@ fn bench_write(c: &mut Criterion) {
         });
     });
 
+    // Ненасыщённый режим — то, что видит приложение в реальной работе:
+    // очередь пуста, writer успевает. Пачка заведомо меньше очереди, а
+    // подготовка (не измеряемая) её опустошает.
+    const BURST: usize = 1000;
+    g.throughput(Throughput::Elements(BURST as u64));
+    g.bench_function("burst/unsaturated_1k", |b| {
+        b.iter_batched(
+            || ns.sync().expect("очередь опустошена перед замером"),
+            |()| {
+                for i in 0..BURST {
+                    ns.log(bench::events::Tick { n: i as u32 })
+                        .expect("очередь не должна переполняться");
+                }
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    g.throughput(Throughput::Elements(BURST as u64));
+    g.bench_function("burst/samples_1k", |b| {
+        b.iter_batched(
+            || ns.sync().expect("очередь опустошена перед замером"),
+            |()| {
+                for i in 0..BURST {
+                    series
+                        .sample_f32(20.0 + i as f32)
+                        .expect("очередь свободна");
+                }
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    g.throughput(Throughput::Elements(1));
     g.bench_function("span/open_close", |b| {
         b.iter(|| {
             let span = ns.span(bench::spans::Work).unwrap();

@@ -262,6 +262,10 @@ struct ChannelState {
     /// Сбрасывается вместе со сменой сегмента — определения серий живут
     /// в том же сегменте, что и их сэмплы.
     series_map: HashMap<SeriesId, SeriesLocal>,
+    /// Буфер сериализации блока. Переиспользуется: аллокация и рост на
+    /// каждый flush — лишняя работа на пути, который выполняется тысячи раз
+    /// в секунду.
+    scratch: Vec<u8>,
     /// Максимальное записанное время: время, ушедшее назад, подтягивается
     /// вперёд, чтобы индекс блоков оставался сортированным.
     last_time: Micros,
@@ -281,7 +285,11 @@ impl ChannelState {
         let inventory = Inventory::scan(&dir)?;
         let now = Instant::now();
         Ok(Self {
-            builder: BlockBuilder::with_capacity(config.block_max_bytes.min(64 * 1024)),
+            // Буфер растёт при первой записи: неймспейс, который ничего не
+            // пишет, не должен занимать памяти. При двадцати четырёх тысячах
+            // неймспейсов предварительное выделение по 64 КиБ на канал стоило
+            // бы гигабайты на 32-битной цели.
+            builder: BlockBuilder::new(),
             config,
             dir,
             protocol_version,
@@ -291,6 +299,7 @@ impl ChannelState {
             segment: None,
             footer: FooterBuilder::new(),
             series_map: HashMap::new(),
+            scratch: Vec::new(),
             last_time: Micros(0),
             block_opened: None,
             last_sync: now,
@@ -485,7 +494,10 @@ impl WriterLoop {
         let ns_idx = item.ns.0 as usize;
         let ch_idx = item.channel.0 as usize;
         if ns_idx >= self.namespaces.len() || ch_idx >= self.namespaces[ns_idx].channels.len() {
-            return Ok(()); // неизвестный адрес — молча игнорируем
+            // Адрес не существует — записать некуда. Молчать нельзя: это
+            // ошибка вызывающего, и она обязана быть видна в счётчиках.
+            Counters::bump(&self.counters.dropped);
+            return Ok(());
         }
 
         // Серию нужно разрешить до заимствования канала: справочник лежит
@@ -518,7 +530,11 @@ impl WriterLoop {
 
         let series_local = match series_entry {
             Some((series, Some(entry))) => Some(Self::intern_series(ch, series, &entry, at)?),
-            Some((_, None)) => return Ok(()), // серия не зарегистрирована
+            Some((_, None)) => {
+                // Серии нет в реестре — сэмпл нечем описать.
+                Counters::bump(&self.counters.dropped);
+                return Ok(());
+            }
             None => None,
         };
 
@@ -646,14 +662,25 @@ impl WriterLoop {
             return Ok(());
         }
         let Some(seg) = ch.segment.as_mut() else {
+            // Собранный блок некуда положить: сегмент не открыт. Такого быть
+            // не должно (его открывает `ensure_room`), но потерю всё равно
+            // нужно показать, а не отдать `Ok`.
+            Counters::add(&counters.dropped, u64::from(ch.builder.count()));
+            ch.builder.reset();
             return Ok(());
         };
 
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut ch.scratch);
+        out.clear();
         let last = ch.builder.last().unwrap_or(ch.last_time);
-        let header = ch
-            .builder
-            .finish(seg.next_seq(), ch.config.compression, &mut out)?;
+        let seq = seg.next_seq();
+        let header = match ch.builder.finish(seq, ch.config.compression, &mut out) {
+            Ok(h) => h,
+            Err(e) => {
+                ch.scratch = out;
+                return Err(e.into());
+            }
+        };
 
         // Резерв в `ensure_room` рассчитан по `block_max_bytes`, но одна
         // крупная запись могла перевалить порог: писать за границу
@@ -667,11 +694,18 @@ impl WriterLoop {
             dduroc_format::restamp_seq(&mut out, seg.next_seq())?;
         }
 
-        let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
-        let offset = seg.append_block(&out)?;
+        let result = (|| {
+            let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
+            let offset = seg.append_block(&out)?;
+            Ok::<u64, Error>(offset)
+        })();
+        let written = out.len() as u64;
+        ch.scratch = out;
+
+        let offset = result?;
         ch.footer.add_block(offset, &header, last);
         Counters::bump(&counters.blocks_written);
-        Counters::add(&counters.bytes_written, out.len() as u64);
+        Counters::add(&counters.bytes_written, written);
         Ok(())
     }
 

@@ -218,12 +218,22 @@ impl<'a> Footer<'a> {
 
     /// Индекс блока, который может содержать записи со временем `at`:
     /// последний блок с `base <= at`. `None` — `at` раньше первого блока.
+    /// Индекс блока, который может содержать записи со временем `at`:
+    /// **первый** из блоков с одинаковой базой, не превышающей `at`.
+    ///
+    /// Бинарный поиск на дубликатах отдаёт произвольное совпадение, поэтому
+    /// используется граница разбиения: блоки с равной базой — обычное дело
+    /// (пачка записей одной микросекунды), и начать с середины такой группы
+    /// значило бы потерять её начало.
     pub fn block_for_time(&self, at: Micros) -> Option<usize> {
-        match self.blocks.binary_search_by(|b| b.base.cmp(&at)) {
-            Ok(i) => Some(i),
-            Err(0) => None,
-            Err(i) => Some(i - 1),
+        let first_after = self.blocks.partition_point(|b| b.base <= at);
+        if first_after == 0 {
+            return None;
         }
+        // Отступаем к началу группы блоков с той же базой.
+        let base = self.blocks[first_after - 1].base;
+        let start = self.blocks[..first_after].partition_point(|b| b.base < base);
+        Some(start)
     }
 
     /// Описание серии по её локальному идентификатору.
@@ -532,6 +542,25 @@ mod tests {
             Some(2),
             "после последнего"
         );
+    }
+
+    #[test]
+    fn lookup_returns_start_of_equal_base_group() {
+        // Блоки с одинаковой базой — обычное дело: пачка записей одной
+        // микросекунды. Бинарный поиск на дубликатах отдаёт произвольное
+        // совпадение, и начать с середины группы значило бы потерять её
+        // начало.
+        let mut b = FooterBuilder::new();
+        for (i, base) in [100u64, 500, 500, 500, 900].into_iter().enumerate() {
+            b.add_block(32 + i as u64 * 64, &header(base, 1), Micros(base + 10));
+        }
+        let bytes = b.build();
+        let f = Footer::parse(&bytes).unwrap().unwrap();
+
+        assert_eq!(f.block_for_time(Micros(500)), Some(1), "начало группы");
+        assert_eq!(f.block_for_time(Micros(700)), Some(1), "внутри группы");
+        assert_eq!(f.block_for_time(Micros(900)), Some(4));
+        assert_eq!(f.block_for_time(Micros(50)), None);
     }
 
     #[test]

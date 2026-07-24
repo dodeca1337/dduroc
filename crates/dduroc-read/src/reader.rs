@@ -92,6 +92,16 @@ impl QueryResult {
     }
 }
 
+/// Открытые под запрос курсоры вместе с разрешёнными схемами.
+#[derive(Debug)]
+struct OpenedCursors {
+    cursors: Vec<ChannelCursor>,
+    /// Схема на каждый курсор, в том же порядке.
+    schemas: Vec<Option<Schema>>,
+    /// Каталоги, которые не удалось прочитать.
+    damaged: Vec<Damage>,
+}
+
 /// Сведения о неймспейсе хранилища.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceInfo {
@@ -151,6 +161,11 @@ impl Reader {
 
     /// Перечислить неймспейсы.
     pub fn namespaces(&self) -> Result<Vec<NamespaceInfo>> {
+        self.namespaces_reporting(&mut Vec::new())
+    }
+
+    /// То же, но с накоплением каталогов, которые не удалось прочитать.
+    fn namespaces_reporting(&self, unreadable: &mut Vec<PathBuf>) -> Result<Vec<NamespaceInfo>> {
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(e) => e,
@@ -172,6 +187,13 @@ impl Reader {
                 continue;
             };
             let Some(meta) = read_ns_meta(&path) else {
+                // Каталог без метаданных — не неймспейс (чужая директория в
+                // корне хранилища). Каталог с НЕЧИТАЕМОЙ метой — это
+                // неймспейс, который мы не можем показать, и молчать об этом
+                // нельзя: его данные просто исчезли бы из всех ответов.
+                if path.join(NS_META).exists() {
+                    unreadable.push(path);
+                }
                 continue;
             };
 
@@ -207,8 +229,15 @@ impl Reader {
 
     /// Выполнить запрос.
     pub fn query(&self, q: &Query) -> Result<QueryResult> {
-        let (mut cursors, schemas) = self.open_cursors(q)?;
-        let mut result = QueryResult::default();
+        let OpenedCursors {
+            mut cursors,
+            schemas,
+            damaged,
+        } = self.open_cursors(q)?;
+        let mut result = QueryResult {
+            damaged,
+            ..QueryResult::default()
+        };
         let limit = q.limit.unwrap_or(usize::MAX);
 
         loop {
@@ -258,6 +287,8 @@ impl Reader {
             }
         }
 
+        // Повреждения собираются и при обрезке по лимиту: ответ, из которого
+        // часть данных выпала из-за порчи, не должен выглядеть полным.
         for c in &cursors {
             result.damaged.extend_from_slice(c.damaged());
         }
@@ -269,11 +300,12 @@ impl Reader {
     /// Резолв схемы читает `ns-meta` с диска. Делать это на каждую запись,
     /// как было поначалу, означало бы файловую операцию на запись — именно
     /// это и оказалось главным ограничителем скорости чтения.
-    fn open_cursors(&self, q: &Query) -> Result<(Vec<ChannelCursor>, Vec<Option<Schema>>)> {
+    fn open_cursors(&self, q: &Query) -> Result<OpenedCursors> {
         let mut cursors = Vec::new();
         let mut schemas = Vec::new();
+        let mut unreadable = Vec::new();
 
-        for ns in self.namespaces()? {
+        for ns in self.namespaces_reporting(&mut unreadable)? {
             if !q.namespaces.matches(&ns.name) {
                 continue;
             }
@@ -302,7 +334,20 @@ impl Reader {
                 schemas.push(schema);
             }
         }
-        Ok((cursors, schemas))
+
+        let damaged = unreadable
+            .into_iter()
+            .map(|path| Damage {
+                path,
+                offset: 0,
+                reason: "метаданные неймспейса не читаются".to_owned(),
+            })
+            .collect();
+        Ok(OpenedCursors {
+            cursors,
+            schemas,
+            damaged,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

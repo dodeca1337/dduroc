@@ -319,6 +319,10 @@ impl BlockBuilder {
         let base = self.base.ok_or(Error::EmptyBlock)?;
         let len = self.body.len();
         if len > BlockHeader::MAX_BODY as usize {
+            // Накопитель сбрасывается даже при отказе: иначе переросший
+            // потолок буфер остался бы в нём навсегда, и канал заклинило бы
+            // на этой же ошибке при каждой следующей попытке.
+            self.reset();
             return Err(Error::LimitExceeded {
                 what: "block body",
                 value: len as u64,

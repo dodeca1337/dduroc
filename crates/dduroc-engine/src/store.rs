@@ -224,7 +224,10 @@ impl Store {
         guard.disarm();
 
         Ok(Namespace::new(
-            Arc::clone(self) as Arc<dyn std::any::Any + Send + Sync>,
+            Arc::new(NamespaceLease {
+                store: Arc::clone(self),
+                name: name.to_owned(),
+            }),
             id,
             name.to_owned(),
             schema,
@@ -280,6 +283,27 @@ impl Store {
     /// Завершить работу: дописать, запечатать сегменты, остановить writer.
     pub fn shutdown(&self) {
         self.writer.shutdown();
+    }
+}
+
+/// Держит хранилище живым, пока жива ручка неймспейса, и освобождает имя
+/// при её уничтожении.
+///
+/// Без первого `Store` при уничтожении остановил бы writer, а переживший его
+/// `Namespace` возвращал бы `Ok` в никуда. Без второго имя оставалось бы
+/// занятым до конца жизни процесса, и сервис не смог бы переоткрыть свой
+/// неймспейс после перенастройки.
+#[derive(Debug)]
+struct NamespaceLease {
+    store: Arc<Store>,
+    name: String,
+}
+
+impl Drop for NamespaceLease {
+    fn drop(&mut self) {
+        if let Ok(mut open) = self.store.open.lock() {
+            open.remove(&self.name);
+        }
     }
 }
 
