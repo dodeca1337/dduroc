@@ -1,0 +1,39 @@
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Dodeca Shaven <dodeca@tutamail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dodeca/dduroc"
+rust-version = "1.85"
+
+[workspace]
+resolver = "3"
+members = ["crates/dduroc-format"]
+
+[workspace.dependencies]
+# ── ядро (sync, armv7-friendly) ───────────────────────────────────────────────
+crc32c = "0.6"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+thiserror = "2.0"
+
+# ── serde / payload ───────────────────────────────────────────────────────────
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc"] }
+
+# ── тесты ─────────────────────────────────────────────────────────────────────
+proptest = "1.7"
+
+# ── внутренние ────────────────────────────────────────────────────────────────
+dduroc-format = { path = "crates/dduroc-format" }
+
+[profile.release]
+# Целевая платформа — armv7 с ограниченным флешем: размер бинаря значим.
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true

@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# артефакты фронтенда (dduroc-web)
+node_modules/
+dist/
+
+# локальные данные / дампы хранилища
+*.seg
+/tmp-store/

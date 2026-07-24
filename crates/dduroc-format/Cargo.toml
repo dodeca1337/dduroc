@@ -1,0 +1,16 @@
+[package]
+name = "dduroc-format"
+description = "Байтовый формат хранения dduroc: сегменты, блоки, записи"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crc32c.workspace = true
+lz4_flex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
