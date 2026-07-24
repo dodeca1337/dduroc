@@ -590,7 +590,7 @@ pub fn render(schema: &Schema, event: EventId, payload: &[u8], lang: &str) -> Op
 mod tests {
     use super::*;
     use crate::query::KindFilter;
-    use dduroc_engine::schema::{Language, StorageClass};
+    use dduroc_engine::schema::{EventDesc, Language, MetricDesc, SpanDesc, StorageClass};
     use dduroc_engine::store::{Store, StoreConfig};
     use dduroc_format::{MetricId, ProtocolVersion, SpanKindId, ValueType};
 
