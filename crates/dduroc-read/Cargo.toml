@@ -1,0 +1,18 @@
+[package]
+name = "dduroc-read"
+description = "Чтение хранилища dduroc: выборка, слияние потоков, резолв схемы"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dduroc-engine.workspace = true
+dduroc-format.workspace = true
+thiserror.workspace = true
+postcard.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

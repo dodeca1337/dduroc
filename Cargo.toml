@@ -8,7 +8,7 @@ rust-version = "1.85"
 
 [workspace]
 resolver = "3"
-members = ["crates/dduroc-engine", "crates/dduroc-format"]
+members = ["crates/dduroc-engine", "crates/dduroc-format", "crates/dduroc-read"]
 
 [workspace.dependencies]
 # ── ядро (sync, armv7-friendly) ───────────────────────────────────────────────
@@ -30,6 +30,7 @@ tempfile = "3"
 # ── внутренние ────────────────────────────────────────────────────────────────
 dduroc-format = { path = "crates/dduroc-format" }
 dduroc-engine = { path = "crates/dduroc-engine" }
+dduroc-read = { path = "crates/dduroc-read" }
 
 [profile.release]
 # Целевая платформа — armv7 с ограниченным флешем: размер бинаря значим.
