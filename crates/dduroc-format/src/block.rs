@@ -1,15 +1,27 @@
 //! Блок — единица записи, flush'а и проверки целостности.
 //!
 //! ```text
-//! [BlockHeader 24B] [тело: записи подряд, опционально сжатое целиком]
+//! [BlockHeader 32B] [тело: записи подряд, опционально сжатое целиком]
 //! ```
 //!
 //! Блок соответствует одному батчу writer'а. CRC и сжатие амортизируются на
 //! блок, а не на запись, поэтому запись стоит единицы байт.
 //!
-//! `body_len == 0` — признак конца данных сегмента: файл преаллоцирован
-//! (`fallocate`) и хвост заполнен нулями, так что «нулевой заголовок»
-//! естественно терминирует обход, отличая непрописанный хвост от порчи.
+//! # Три различимых состояния хвоста
+//!
+//! Сегмент преаллоцирован, поэтому непрописанный хвост заполнен нулями.
+//! Заголовок устроен так, чтобы штатный конец данных, потерянный кусок и
+//! порча были **разными** диагнозами, а не одним:
+//!
+//! | состояние | признак |
+//! |---|---|
+//! | конец данных | все 32 байта заголовка нулевые |
+//! | порча | не сошёлся magic, CRC или зарезервированные биты |
+//! | дыра | `seq` не на единицу больше предыдущего |
+//!
+//! Наивный признак «`body_len == 0` ⇒ конец» опасен: одиночный перевёрнутый
+//! бит в поле длины неотличим от конца лога, и уже подтверждённые
+//! `fdatasync`'ом блоки молча исчезли бы без единого сообщения об ошибке.
 
 use crate::error::{Error, Result};
 use crate::ids::Micros;
@@ -42,74 +54,107 @@ impl Compression {
     }
 }
 
+/// Сигнатура заголовка блока.
+pub const BLOCK_MAGIC: [u8; 2] = *b"DB";
+
 /// Заголовок блока.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
-    /// Длина тела на диске (после сжатия). `0` — конец данных сегмента.
+    /// Длина тела на диске (после сжатия).
     pub body_len: u32,
     /// Длина тела до сжатия. Равна `body_len` при [`Compression::None`].
     pub raw_len: u32,
+    /// Порядковый номер блока в сегменте, с нуля. Разрыв нумерации означает
+    /// потерянный блок — состояние, которое иначе неотличимо от порчи.
+    pub seq: u32,
     /// Время первой записи блока.
     pub base: Micros,
     /// Число записей.
     pub count: u16,
     pub compression: Compression,
-    /// CRC32C заголовка (первые 20 байт) и тела **как оно лежит на диске**.
+    /// CRC32C заголовка (первые 28 байт) и тела **как оно лежит на диске**.
     pub crc: u32,
 }
 
 impl BlockHeader {
-    pub const SIZE: usize = 24;
+    pub const SIZE: usize = 32;
 
-    /// Максимальный размер тела блока. Ограничение поля `body_len` (u32),
-    /// на практике движок держит блоки в десятках килобайт.
-    pub const MAX_BODY: u32 = u32::MAX;
+    /// Потолок размера тела блока: 64 МиБ.
+    ///
+    /// Поле вмещает u32, но принимать такие значения с диска нельзя — длина
+    /// управляет размером аллокации при чтении, а файл может быть повреждён
+    /// или получен с чужого устройства. Реальные блоки — десятки килобайт.
+    pub const MAX_BODY: u32 = 64 * 1024 * 1024;
 
     /// Сериализовать заголовок.
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
-        b[0..4].copy_from_slice(&self.body_len.to_le_bytes());
-        b[4..8].copy_from_slice(&self.raw_len.to_le_bytes());
-        b[8..16].copy_from_slice(&self.base.0.to_le_bytes());
-        b[16..18].copy_from_slice(&self.count.to_le_bytes());
-        b[18] = self.compression as u8;
-        b[19] = 0; // резерв
-        b[20..24].copy_from_slice(&self.crc.to_le_bytes());
+        b[0..2].copy_from_slice(&BLOCK_MAGIC);
+        b[2] = self.compression as u8;
+        b[3] = 0; // резерв
+        b[4..8].copy_from_slice(&self.body_len.to_le_bytes());
+        b[8..12].copy_from_slice(&self.raw_len.to_le_bytes());
+        b[12..16].copy_from_slice(&self.seq.to_le_bytes());
+        b[16..24].copy_from_slice(&self.base.0.to_le_bytes());
+        b[24..26].copy_from_slice(&self.count.to_le_bytes());
+        b[26] = 0; // резерв
+        b[27] = 0; // резерв
+        b[28..32].copy_from_slice(&self.crc.to_le_bytes());
         b
     }
 
     /// Разобрать заголовок **без** проверки CRC (тело ещё не прочитано).
     ///
-    /// Возвращает `Ok(None)`, если заголовок нулевой — это непрописанный
-    /// хвост преаллоцированного файла, то есть штатный конец данных.
+    /// `Ok(None)` — заголовок целиком нулевой, то есть непрописанный хвост
+    /// преаллоцированного файла: штатный конец данных. Любое отклонение от
+    /// «все нули» разбирается как настоящий заголовок и обязано пройти
+    /// проверки — иначе битый бит в длине выглядел бы как конец лога.
     pub fn parse(input: &[u8]) -> Result<Option<Self>> {
         let raw: &[u8; Self::SIZE] = input
             .get(..Self::SIZE)
             .and_then(|s| s.try_into().ok())
             .ok_or(Error::Truncated)?;
 
-        let body_len = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        if body_len == 0 {
+        if raw.iter().all(|&b| b == 0) {
             return Ok(None);
         }
 
-        if raw[19] != 0 {
+        let magic: [u8; 2] = [raw[0], raw[1]];
+        if magic != BLOCK_MAGIC {
+            return Err(Error::BadMagic {
+                expected: [BLOCK_MAGIC[0], BLOCK_MAGIC[1], 0, 0],
+                actual: [magic[0], magic[1], 0, 0],
+            });
+        }
+        if raw[3] != 0 || raw[26] != 0 || raw[27] != 0 {
             return Err(Error::ReservedNotZero);
         }
-        let compression = Compression::from_bits(raw[18])?;
-        if raw[18] & !Compression::MASK != 0 {
+        let compression = Compression::from_bits(raw[2])?;
+        if raw[2] & !Compression::MASK != 0 {
             return Err(Error::ReservedNotZero);
+        }
+
+        let body_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        let raw_len = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        // Длины проверяются до того, как по ним что-то выделяется.
+        if body_len == 0 || body_len > Self::MAX_BODY || raw_len > Self::MAX_BODY {
+            return Err(Error::LimitExceeded {
+                what: "block body",
+                value: u64::from(body_len.max(raw_len)),
+                max: u64::from(Self::MAX_BODY),
+            });
         }
 
         Ok(Some(Self {
             body_len,
-            raw_len: u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+            raw_len,
+            seq: u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]),
             base: Micros(u64::from_le_bytes(
-                raw[8..16].try_into().expect("срез 8 байт"),
+                raw[16..24].try_into().expect("срез 8 байт"),
             )),
-            count: u16::from_le_bytes([raw[16], raw[17]]),
+            count: u16::from_le_bytes([raw[24], raw[25]]),
             compression,
-            crc: u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]),
+            crc: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
         }))
     }
 
@@ -155,7 +200,7 @@ impl BlockHeader {
 
 fn compute_crc(header: &BlockHeader, body_on_disk: &[u8]) -> u32 {
     let bytes = header.to_bytes();
-    let crc = crc32c::crc32c(&bytes[..20]);
+    let crc = crc32c::crc32c(&bytes[..28]);
     crc32c::crc32c_append(crc, body_on_disk)
 }
 
@@ -242,15 +287,27 @@ impl BlockBuilder {
     /// Завершить блок: дописать `[заголовок][тело]` в `out` и очистить
     /// накопитель. Возвращает заголовок записанного блока.
     ///
+    /// `seq` — порядковый номер блока в сегменте (с нуля): по разрыву
+    /// нумерации читатель отличает потерянный блок от порчи.
+    ///
     /// Сжатие применяется, только если реально уменьшает тело: на коротких
     /// блоках LZ4 нередко даёт прирост, и хранить раздутое тело незачем.
-    pub fn finish(&mut self, compression: Compression, out: &mut Vec<u8>) -> Result<BlockHeader> {
+    pub fn finish(
+        &mut self,
+        seq: u32,
+        compression: Compression,
+        out: &mut Vec<u8>,
+    ) -> Result<BlockHeader> {
         let base = self.base.ok_or(Error::EmptyBlock)?;
-        let raw_len = u32::try_from(self.body.len()).map_err(|_| Error::LimitExceeded {
-            what: "block body",
-            value: self.body.len() as u64,
-            max: u64::from(BlockHeader::MAX_BODY),
-        })?;
+        let len = self.body.len();
+        if len > BlockHeader::MAX_BODY as usize {
+            return Err(Error::LimitExceeded {
+                what: "block body",
+                value: len as u64,
+                max: u64::from(BlockHeader::MAX_BODY),
+            });
+        }
+        let raw_len = len as u32;
 
         let compressed = match compression {
             Compression::None | Compression::Zstd => None,
@@ -268,6 +325,7 @@ impl BlockBuilder {
         let mut header = BlockHeader {
             body_len: body_on_disk.len() as u32,
             raw_len,
+            seq,
             base,
             count: self.count,
             compression: used,
@@ -387,7 +445,7 @@ mod tests {
         b.push(Micros(9_000), &msg(3, &[])).unwrap();
 
         let mut out = Vec::new();
-        let header = b.finish(Compression::None, &mut out).unwrap();
+        let header = b.finish(0, Compression::None, &mut out).unwrap();
         assert_eq!(header.count, 3);
         assert_eq!(header.base, Micros(1_000));
         assert_eq!(out.len() as u64, header.total_len());
@@ -412,7 +470,7 @@ mod tests {
             b.push(Micros(i * 10), &msg(7, &[0xAA; 16])).unwrap();
         }
         let mut out = Vec::new();
-        let header = b.finish(Compression::Lz4, &mut out).unwrap();
+        let header = b.finish(0, Compression::Lz4, &mut out).unwrap();
         assert_eq!(header.compression, Compression::Lz4);
         assert!(
             header.body_len < header.raw_len,
@@ -432,7 +490,7 @@ mod tests {
             .collect();
         b.push(Micros(0), &msg(1, &noise)).unwrap();
         let mut out = Vec::new();
-        let header = b.finish(Compression::Lz4, &mut out).unwrap();
+        let header = b.finish(0, Compression::Lz4, &mut out).unwrap();
         if header.compression == Compression::None {
             assert_eq!(header.body_len, header.raw_len);
         } else {
@@ -452,7 +510,7 @@ mod tests {
         let mut b = BlockBuilder::new();
         b.push(Micros(0), &msg(1, &[1, 2, 3, 4])).unwrap();
         let mut out = Vec::new();
-        b.finish(Compression::None, &mut out).unwrap();
+        b.finish(0, Compression::None, &mut out).unwrap();
 
         // Порча байта тела.
         let last = out.len() - 1;
@@ -467,7 +525,7 @@ mod tests {
         let mut b = BlockBuilder::new();
         b.push(Micros(0), &msg(1, &[0xEE; 32])).unwrap();
         let mut out = Vec::new();
-        b.finish(Compression::None, &mut out).unwrap();
+        b.finish(0, Compression::None, &mut out).unwrap();
 
         out.truncate(out.len() - 5); // обрыв питания посреди записи блока
         assert_eq!(Block::parse(&out).unwrap_err(), Error::Truncated);
@@ -497,7 +555,7 @@ mod tests {
             .unwrap();
         }
         let mut out = Vec::new();
-        b.finish(Compression::None, &mut out).unwrap();
+        b.finish(0, Compression::None, &mut out).unwrap();
 
         let block = Block::parse(&out).unwrap().unwrap();
         let recs: Vec<_> = block.records().map(|r| r.unwrap()).collect();
@@ -514,7 +572,7 @@ mod tests {
         b.push(Micros(900), &msg(2, &[])).unwrap(); // время «ушло назад»
         b.push(Micros(1_100), &msg(3, &[])).unwrap();
         let mut out = Vec::new();
-        b.finish(Compression::None, &mut out).unwrap();
+        b.finish(0, Compression::None, &mut out).unwrap();
 
         let block = Block::parse(&out).unwrap().unwrap();
         let recs: Vec<_> = block.records().map(|r| r.unwrap()).collect();
@@ -528,7 +586,7 @@ mod tests {
         let mut b = BlockBuilder::new();
         let mut out = Vec::new();
         assert_eq!(
-            b.finish(Compression::None, &mut out),
+            b.finish(0, Compression::None, &mut out),
             Err(Error::EmptyBlock)
         );
         assert!(out.is_empty());
@@ -539,6 +597,7 @@ mod tests {
         let h = BlockHeader {
             body_len: 1234,
             raw_len: 5678,
+            seq: 0,
             base: Micros(0x0102_0304_0506_0708),
             count: 99,
             compression: Compression::Lz4,
@@ -551,21 +610,103 @@ mod tests {
     }
 
     #[test]
-    fn reserved_byte_must_be_zero() {
+    fn reserved_bytes_must_be_zero() {
         let h = BlockHeader {
             body_len: 8,
             raw_len: 8,
+            seq: 0,
             base: Micros(0),
             count: 1,
             compression: Compression::None,
             crc: 0,
         };
-        let mut bytes = h.to_bytes();
-        bytes[19] = 1;
-        assert_eq!(BlockHeader::parse(&bytes), Err(Error::ReservedNotZero));
+        for offset in [3usize, 26, 27] {
+            let mut bytes = h.to_bytes();
+            bytes[offset] = 1;
+            assert_eq!(
+                BlockHeader::parse(&bytes),
+                Err(Error::ReservedNotZero),
+                "резерв на смещении {offset}"
+            );
+        }
 
         let mut bytes = h.to_bytes();
-        bytes[18] = 0b1000_0000; // старшие биты флагов зарезервированы
+        bytes[2] = 0b1000_0000; // старшие биты флагов зарезервированы
         assert_eq!(BlockHeader::parse(&bytes), Err(Error::ReservedNotZero));
+    }
+
+    #[test]
+    fn zero_body_len_is_corruption_not_end_of_data() {
+        // Ключевое отличие от наивного «body_len == 0 ⇒ конец»: одиночный
+        // перевёрнутый бит в длине не имеет права выглядеть как конец лога,
+        // иначе уже подтверждённые fdatasync'ом блоки исчезали бы молча.
+        let h = BlockHeader {
+            body_len: 4096,
+            raw_len: 4096,
+            seq: 12,
+            base: Micros(999),
+            count: 7,
+            compression: Compression::None,
+            crc: 0x1234,
+        };
+        let mut bytes = h.to_bytes();
+        bytes[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let err = BlockHeader::parse(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::LimitExceeded { .. }),
+            "нулевая длина при непустом заголовке — порча, а не конец: {err}"
+        );
+
+        // Терминатором остаётся только полностью нулевой заголовок.
+        assert_eq!(BlockHeader::parse(&[0u8; BlockHeader::SIZE]).unwrap(), None);
+    }
+
+    #[test]
+    fn absurd_lengths_rejected_before_allocation() {
+        let h = BlockHeader {
+            body_len: 16,
+            raw_len: 16,
+            seq: 0,
+            base: Micros(0),
+            count: 1,
+            compression: Compression::Lz4,
+            crc: 0,
+        };
+        // body_len за потолком формата: разбор обязан отказать, не пытаясь
+        // ничего выделить.
+        let mut bytes = h.to_bytes();
+        bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            BlockHeader::parse(&bytes),
+            Err(Error::LimitExceeded { .. })
+        ));
+
+        // raw_len тоже: по нему выделяется буфер распаковки.
+        let mut bytes = h.to_bytes();
+        bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            BlockHeader::parse(&bytes),
+            Err(Error::LimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn foreign_bytes_rejected_by_magic() {
+        let mut bytes = [0xAAu8; BlockHeader::SIZE];
+        bytes[0] = b'X';
+        assert!(matches!(
+            BlockHeader::parse(&bytes),
+            Err(Error::BadMagic { .. })
+        ));
+    }
+
+    #[test]
+    fn seq_is_preserved_for_hole_detection() {
+        let mut b = BlockBuilder::new();
+        b.push(Micros(0), &msg(1, &[1])).unwrap();
+        let mut out = Vec::new();
+        let h = b.finish(42, Compression::None, &mut out).unwrap();
+        assert_eq!(h.seq, 42);
+        assert_eq!(Block::parse(&out).unwrap().unwrap().header.seq, 42);
     }
 }

@@ -25,6 +25,13 @@ pub struct SegmentHeader {
     pub boot: BootCounter,
     /// Время первой записи сегмента (совпадает с именем файла).
     pub base: Micros,
+    /// Идентичность хранилища, в котором создан сегмент.
+    ///
+    /// Без неё файлы, скопированные с другого устройства, бесшовно
+    /// смешались бы с локальными: `boot_counter` у них своя нумерация, и
+    /// чужие события получили бы локальный UTC-якорь, то есть заведомо
+    /// неверное абсолютное время.
+    pub store_id: u64,
 }
 
 /// Сигнатура файла сегмента.
@@ -41,7 +48,7 @@ impl SegmentHeader {
         b[6..8].copy_from_slice(&self.protocol_version.0.to_le_bytes());
         b[8..12].copy_from_slice(&self.boot.0.to_le_bytes());
         b[12..20].copy_from_slice(&self.base.0.to_le_bytes());
-        // 20..28 — резерв, нули
+        b[20..28].copy_from_slice(&self.store_id.to_le_bytes());
         let crc = crc32c::crc32c(&b[..28]);
         b[28..32].copy_from_slice(&crc.to_le_bytes());
         b
@@ -78,7 +85,7 @@ impl SegmentHeader {
                 crate::CONTAINER_VERSION,
             ));
         }
-        if raw[5] != 0 || raw[20..28].iter().any(|&b| b != 0) {
+        if raw[5] != 0 {
             return Err(Error::ReservedNotZero);
         }
 
@@ -90,6 +97,7 @@ impl SegmentHeader {
             base: Micros(u64::from_le_bytes(
                 raw[12..20].try_into().expect("срез 8 байт"),
             )),
+            store_id: u64::from_le_bytes(raw[20..28].try_into().expect("срез 8 байт")),
         })
     }
 
@@ -147,6 +155,7 @@ mod tests {
             protocol_version: ProtocolVersion(3),
             boot: BootCounter(42),
             base: Micros(1_000_000),
+            store_id: 0,
         }
     }
 

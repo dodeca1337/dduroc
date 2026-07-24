@@ -1,0 +1,817 @@
+//! Файл сегмента: создание, дозапись блоков, запечатывание, восстановление.
+//!
+//! # Почему преаллокация
+//!
+//! Файл создаётся сразу на полный размер (`fallocate`). Это даёт три вещи:
+//!
+//! 1. **Дешёвый `fdatasync`**: дозапись блока не меняет размер файла, значит
+//!    не трогает метаданные инода — синхронизировать нужно только данные.
+//! 2. **Честный отказ по месту**: ENOSPC приходит один раз, при создании
+//!    сегмента, а не посреди записи события.
+//! 3. **Терминатор скана**: непрописанный хвост заполнен нулями, а нулевой
+//!    заголовок блока по формату означает «конец данных» — восстановление
+//!    отличает необорванный конец от порчи без дополнительных отметок.
+//!
+//! # Порядок операций при обрыве питания
+//!
+//! - *создание*: fallocate → запись заголовка → fdatasync → fsync каталога.
+//!   Обрыв раньше fsync каталога — файла нет; позже — файл валиден и пуст.
+//! - *дозапись*: pwrite блока → (политика) fdatasync. Обрыв в середине
+//!   блока — CRC не сойдётся, восстановление обрежет хвост.
+//! - *запечатывание*: ftruncate до конца данных → дозапись footer'а →
+//!   fdatasync. Обрыв на любом шаге оставляет сегмент незапечатанным,
+//!   то есть читаемым обычным сканом.
+
+use crate::error::{Error, IoContext, Result};
+use crate::fsutil;
+use dduroc_format::block::BlockHeader;
+use dduroc_format::footer::Trailer;
+use dduroc_format::segment::{SegmentHeader, SegmentName};
+use dduroc_format::{Micros, block};
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
+
+/// Открытый на запись сегмент.
+#[derive(Debug)]
+pub struct SegmentWriter {
+    file: File,
+    path: PathBuf,
+    /// Смещение, куда ляжет следующий блок.
+    end: u64,
+    /// Ёмкость, выделенная при создании.
+    capacity: u64,
+    header: SegmentHeader,
+    /// Номер следующего блока: разрыв нумерации отличает потерянный блок
+    /// от порчи при чтении.
+    next_seq: u32,
+    dirty: bool,
+}
+
+impl SegmentWriter {
+    /// Создать новый сегмент ёмкостью `capacity` байт.
+    pub fn create(dir: &Path, header: SegmentHeader, capacity: u64) -> Result<Self> {
+        let name = SegmentName::new(header.boot, header.base);
+        let path = dir.join(name.to_string());
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            // create_new: сегмент с таким именем уже существовать не может —
+            // иначе мы затёрли бы чужие данные тем же (boot, время) ключом.
+            .create_new(true)
+            .open(&path)
+            .ctx_path("создание сегмента", &path)?;
+
+        let capacity = capacity.max(SegmentHeader::SIZE as u64 + BlockHeader::SIZE as u64);
+        if let Err(e) = grow_to(&file, capacity, &path) {
+            // Файл без места бесполезен и мешает следующей попытке.
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+
+        file.write_all_at(&header.to_bytes(), 0)
+            .ctx_path("запись заголовка", &path)?;
+        fsutil::sync_data(&file, &path)?;
+        fsutil::sync_dir(dir)?;
+
+        Ok(Self {
+            file,
+            path,
+            end: SegmentHeader::SIZE as u64,
+            capacity,
+            header,
+            next_seq: 0,
+            dirty: false,
+        })
+    }
+
+    /// Открыть существующий сегмент для продолжения записи, восстановив
+    /// позицию конца данных.
+    ///
+    /// После восстановления хвост **обнуляется**: `ftruncate` до конца целых
+    /// данных и обратное расширение до ёмкости. Без этого за новым, более
+    /// коротким блоком остались бы байты прежней записи — и следующий скан
+    /// прочитал бы их как блок. В худшем случае уцелевший старый блок сошёлся
+    /// бы по CRC, и в лог вернулись бы записи из уже отброшенного хвоста
+    /// с временами, нарушающими монотонность.
+    pub fn reopen(path: &Path, expect_store: Option<u64>) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .ctx_path("открытие сегмента", path)?;
+        let capacity = file.metadata().ctx_path("stat", path)?.len();
+
+        let scan = Scan::run(&file, capacity, path)?;
+        scan.check_store(expect_store, path)?;
+
+        file.set_len(scan.data_end)
+            .ctx_path("обрезка повреждённого хвоста", path)?;
+        grow_to(&file, capacity, path)?;
+        fsutil::sync_data(&file, path)?;
+
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            end: scan.data_end,
+            capacity,
+            header: scan.header,
+            next_seq: scan.next_seq,
+            dirty: false,
+        })
+    }
+
+    /// Номер, который получит следующий блок.
+    pub fn next_seq(&self) -> u32 {
+        self.next_seq
+    }
+
+    pub fn header(&self) -> SegmentHeader {
+        self.header
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Смещение конца данных (= размер полезной части).
+    pub fn data_end(&self) -> u64 {
+        self.end
+    }
+
+    /// Сколько байт ещё поместится без выхода за преаллоцированную ёмкость.
+    pub fn remaining(&self) -> u64 {
+        self.capacity.saturating_sub(self.end)
+    }
+
+    /// Есть ли незасинхронизированные данные.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Поместится ли блок такого размера.
+    pub fn fits(&self, block_len: u64) -> bool {
+        // Оставляем место под нулевой заголовок-терминатор: без него скан
+        // упёрся бы в конец файла вместо честного признака конца данных.
+        self.remaining() >= block_len + BlockHeader::SIZE as u64
+    }
+
+    /// Дописать готовый блок (заголовок + тело). Возвращает его смещение.
+    ///
+    /// Блок обязан быть собран с номером [`Self::next_seq`].
+    pub fn append_block(&mut self, bytes: &[u8]) -> Result<u64> {
+        let offset = self.end;
+        self.file
+            .write_all_at(bytes, offset)
+            .ctx_path("запись блока", &self.path)?;
+        self.end += bytes.len() as u64;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.dirty = true;
+        Ok(offset)
+    }
+
+    /// `fdatasync`: после возврата данные переживут потерю питания.
+    pub fn sync(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        fsutil::sync_data(&self.file, &self.path)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Запечатать сегмент: обрезать до конца данных и дописать footer.
+    ///
+    /// Footer — оптимизация чтения, поэтому его отсутствие не потеря: обрыв
+    /// на любом шаге оставит сегмент валидным, но незапечатанным.
+    pub fn seal(mut self, footer: &[u8]) -> Result<()> {
+        self.sync()?;
+        self.file
+            .set_len(self.end)
+            .ctx_path("обрезка до конца данных", &self.path)?;
+        self.file
+            .write_all_at(footer, self.end)
+            .ctx_path("запись footer", &self.path)?;
+        fsutil::sync_data(&self.file, &self.path)?;
+        Ok(())
+    }
+
+    /// Обрезать до конца данных без footer'а — для аварийного закрытия.
+    pub fn close_unsealed(mut self) -> Result<()> {
+        self.sync()?;
+        self.file
+            .set_len(self.end)
+            .ctx_path("обрезка до конца данных", &self.path)
+    }
+}
+
+/// Довести файл до размера `capacity`, зарезервировав место на носителе.
+///
+/// Преаллокация — не оптимизация, а способ получить ENOSPC один раз, при
+/// создании сегмента, а не посреди записи критического события.
+fn grow_to(file: &File, capacity: u64, path: &Path) -> Result<()> {
+    match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, capacity) {
+        Ok(()) => Ok(()),
+        // Часть ФС (tmpfs на старых ядрах, некоторые overlay) не умеет
+        // fallocate. Место не резервируется, но формат от этого не страдает:
+        // дотягиваем размер обычным ftruncate — хвост тоже будет нулевым.
+        Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS) => {
+            file.set_len(capacity).ctx_path("ftruncate", path)
+        }
+        Err(rustix::io::Errno::NOSPC) => Err(Error::NoSpace(path.to_owned())),
+        Err(e) => Err(e).ctx_path("fallocate", path),
+    }
+}
+
+/// Что оборвало обход блоков.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanEnd {
+    /// Нулевой заголовок: непрописанный хвост преаллокации. Штатный случай.
+    ZeroTail,
+    /// Данные кончились ровно на границе файла.
+    FileEnd,
+    /// Заголовок или CRC не сошлись — оборванная запись при потере питания
+    /// либо порча носителя.
+    Corrupt,
+    /// Номер блока не на единицу больше предыдущего: часть данных не дошла
+    /// до носителя, хотя последующие дошли (переупорядочивание writeback).
+    SeqGap { expected: u32, found: u32 },
+}
+
+impl ScanEnd {
+    /// Требует ли этот исход отбрасывания хвоста.
+    pub fn is_damage(self) -> bool {
+        matches!(self, ScanEnd::Corrupt | ScanEnd::SeqGap { .. })
+    }
+}
+
+/// Результат восстановления сегмента.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scan {
+    pub header: SegmentHeader,
+    /// Смещение конца последнего целого блока.
+    pub data_end: u64,
+    pub block_count: u32,
+    /// Номер, который должен получить следующий блок.
+    pub next_seq: u32,
+    /// Время первой записи последнего блока (нижняя оценка максимума
+    /// времени сегмента: точное значение требует разбора тела).
+    pub last_base: Micros,
+    /// Чем закончился обход.
+    pub end: ScanEnd,
+}
+
+impl Scan {
+    /// Хвост был повреждён и отброшен.
+    pub fn truncated(&self) -> bool {
+        self.end.is_damage()
+    }
+
+    /// Проверить, что сегмент принадлежит этому хранилищу.
+    ///
+    /// Файлы, скопированные с другого устройства, имеют собственную нумерацию
+    /// `boot_counter` и собственную привязку ко времени: слив их с локальными
+    /// дал бы событиям чужого прибора локальный UTC-якорь, то есть заведомо
+    /// неверное абсолютное время.
+    pub fn check_store(&self, expect: Option<u64>, path: &Path) -> Result<()> {
+        match expect {
+            Some(id) if self.header.store_id != id => Err(Error::ForeignSegment {
+                path: path.to_owned(),
+                expected: id,
+                found: self.header.store_id,
+            }),
+            _ => Ok(()),
+        }
+    }
+    /// Пройти сегмент по заголовкам блоков, найдя конец целых данных.
+    ///
+    /// Блоки читаются по одному в переиспользуемый буфер: сегмент может быть
+    /// сотнями мегабайт, а на armv7 памяти мало — читать файл целиком нельзя.
+    pub fn run(file: &File, file_len: u64, path: &Path) -> Result<Self> {
+        let mut head = [0u8; SegmentHeader::SIZE];
+        file.read_exact_at(&mut head, 0)
+            .ctx_path("чтение заголовка сегмента", path)?;
+        let header = SegmentHeader::parse(&head).map_err(|e| Error::Corrupt {
+            path: path.to_owned(),
+            reason: format!("заголовок сегмента: {e}"),
+        })?;
+
+        let mut offset = SegmentHeader::SIZE as u64;
+        let mut block_count = 0u32;
+        let mut last_base = header.base;
+        let mut buf: Vec<u8> = Vec::new();
+        let end;
+
+        loop {
+            if file_len.saturating_sub(offset) < BlockHeader::SIZE as u64 {
+                end = ScanEnd::FileEnd;
+                break;
+            }
+            let mut hdr = [0u8; BlockHeader::SIZE];
+            if file.read_exact_at(&mut hdr, offset).is_err() {
+                end = ScanEnd::Corrupt;
+                break;
+            }
+            let parsed = match BlockHeader::parse(&hdr) {
+                Ok(Some(h)) => h,
+                // Полностью нулевой заголовок — непрописанный хвост.
+                Ok(None) => {
+                    end = ScanEnd::ZeroTail;
+                    break;
+                }
+                Err(_) => {
+                    end = ScanEnd::Corrupt;
+                    break;
+                }
+            };
+
+            // Разрыв нумерации: предыдущие блоки осели на носитель, а этот —
+            // из другой эпохи записи. Диагноз отличается от порчи, потому что
+            // отличается причина: не битый носитель, а недошедшая запись.
+            if parsed.seq != block_count {
+                end = ScanEnd::SeqGap {
+                    expected: block_count,
+                    found: parsed.seq,
+                };
+                break;
+            }
+
+            let body_len = u64::from(parsed.body_len);
+            let block_end = offset + BlockHeader::SIZE as u64 + body_len;
+            // Длина из повреждённого заголовка может быть любой: прежде чем
+            // выделять буфер, сверяемся с реальным остатком файла.
+            if block_end > file_len {
+                end = ScanEnd::Corrupt;
+                break;
+            }
+
+            buf.clear();
+            buf.resize(body_len as usize, 0);
+            if file
+                .read_exact_at(&mut buf, offset + BlockHeader::SIZE as u64)
+                .is_err()
+            {
+                end = ScanEnd::Corrupt;
+                break;
+            }
+            if parsed.verify(&buf).is_err() {
+                end = ScanEnd::Corrupt;
+                break;
+            }
+
+            block_count += 1;
+            last_base = parsed.base;
+            offset = block_end;
+        }
+
+        Ok(Self {
+            header,
+            data_end: offset,
+            block_count,
+            next_seq: block_count,
+            last_base,
+            end,
+        })
+    }
+
+    /// Прочитать сегмент с диска и восстановить его границы.
+    pub fn of_path(path: &Path) -> Result<Self> {
+        let file = File::open(path).ctx_path("открытие сегмента", path)?;
+        let len = file.metadata().ctx_path("stat", path)?.len();
+        Self::run(&file, len, path)
+    }
+}
+
+/// Сегмент, открытый на чтение.
+#[derive(Debug)]
+pub struct SegmentReader {
+    file: File,
+    path: PathBuf,
+    len: u64,
+    header: SegmentHeader,
+    /// Байты footer'а, если сегмент запечатан.
+    footer_bytes: Option<Vec<u8>>,
+    data_end: u64,
+}
+
+impl SegmentReader {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).ctx_path("открытие сегмента", path)?;
+        let len = file.metadata().ctx_path("stat", path)?.len();
+
+        let mut head = [0u8; SegmentHeader::SIZE];
+        file.read_exact_at(&mut head, 0)
+            .ctx_path("чтение заголовка", path)?;
+        let header = SegmentHeader::parse(&head).map_err(|e| Error::Corrupt {
+            path: path.to_owned(),
+            reason: format!("заголовок сегмента: {e}"),
+        })?;
+
+        // Двухфазное чтение footer'а: сначала трейлер фиксированного размера,
+        // из него — длина, потом сам footer. Так не читается лишнего.
+        let mut footer_bytes = None;
+        let mut data_end = len;
+        if len >= (SegmentHeader::SIZE + Trailer::SIZE) as u64 {
+            let mut tail = [0u8; Trailer::SIZE];
+            file.read_exact_at(&mut tail, len - Trailer::SIZE as u64)
+                .ctx_path("чтение трейлера", path)?;
+            if let Ok(Some(trailer)) = Trailer::parse(&tail) {
+                let total = trailer.total_len();
+                if total <= len - SegmentHeader::SIZE as u64 {
+                    let mut buf = vec![0u8; total as usize];
+                    file.read_exact_at(&mut buf, len - total)
+                        .ctx_path("чтение footer", path)?;
+                    data_end = len - total;
+                    footer_bytes = Some(buf);
+                }
+            }
+        }
+
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            len,
+            header,
+            footer_bytes,
+            data_end,
+        })
+    }
+
+    pub fn header(&self) -> SegmentHeader {
+        self.header
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len <= SegmentHeader::SIZE as u64
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.footer_bytes.is_some()
+    }
+
+    /// Разобранный footer запечатанного сегмента.
+    pub fn footer(&self) -> Option<dduroc_format::Footer<'_>> {
+        let bytes = self.footer_bytes.as_ref()?;
+        dduroc_format::Footer::parse(bytes).ok().flatten()
+    }
+
+    /// Прочитать блок по смещению в `buf`. `Ok(None)` — конец данных.
+    ///
+    /// Возвращает смещение следующего блока.
+    pub fn read_block_at(&self, offset: u64, buf: &mut Vec<u8>) -> Result<Option<u64>> {
+        if offset >= self.data_end || self.data_end - offset < BlockHeader::SIZE as u64 {
+            return Ok(None);
+        }
+        let mut hdr = [0u8; BlockHeader::SIZE];
+        self.file
+            .read_exact_at(&mut hdr, offset)
+            .ctx_path("чтение заголовка блока", &self.path)?;
+        let Some(header) = BlockHeader::parse(&hdr).map_err(|e| Error::Corrupt {
+            path: self.path.clone(),
+            reason: format!("заголовок блока на {offset}: {e}"),
+        })?
+        else {
+            return Ok(None);
+        };
+
+        let total = BlockHeader::SIZE as u64 + u64::from(header.body_len);
+        if offset + total > self.data_end {
+            return Err(Error::Corrupt {
+                path: self.path.clone(),
+                reason: format!("блок на {offset} выходит за конец данных"),
+            });
+        }
+
+        buf.clear();
+        buf.resize(total as usize, 0);
+        self.file
+            .read_exact_at(buf, offset)
+            .ctx_path("чтение блока", &self.path)?;
+        Ok(Some(offset + total))
+    }
+
+    /// Смещение первого блока.
+    pub const fn first_block_offset() -> u64 {
+        SegmentHeader::SIZE as u64
+    }
+
+    /// Итератор по смещениям блоков: из footer'а, если он есть, иначе
+    /// последовательным сканом.
+    pub fn block_offsets(&self) -> Result<Vec<u64>> {
+        if let Some(footer) = self.footer() {
+            return Ok(footer.blocks.iter().map(|b| b.offset).collect());
+        }
+        let mut offsets = Vec::new();
+        let mut buf = Vec::new();
+        let mut offset = Self::first_block_offset();
+        while let Some(next) = self.read_block_at(offset, &mut buf)? {
+            offsets.push(offset);
+            offset = next;
+        }
+        Ok(offsets)
+    }
+}
+
+/// Разобрать блок из сырых байт, прочитанных [`SegmentReader::read_block_at`].
+pub fn parse_block(bytes: &[u8]) -> Result<Option<block::Block<'_>>> {
+    Ok(block::Block::parse(bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dduroc_format::block::{BlockBuilder, Compression};
+    use dduroc_format::record::Message;
+    use dduroc_format::{BootCounter, EventId, ProtocolVersion, Record};
+
+    fn header(base: u64) -> SegmentHeader {
+        SegmentHeader {
+            protocol_version: ProtocolVersion(1),
+            boot: BootCounter(7),
+            base: Micros(base),
+            store_id: 0,
+        }
+    }
+
+    fn block_bytes(seq: u32, base: u64, count: usize) -> (Vec<u8>, BlockHeader) {
+        let mut b = BlockBuilder::new();
+        for i in 0..count {
+            b.push(
+                Micros(base + i as u64 * 100),
+                &Record::Message(Message {
+                    event: EventId(1),
+                    span: None,
+                    payload: &[0xAB; 8],
+                }),
+            )
+            .unwrap();
+        }
+        let mut out = Vec::new();
+        let h = b.finish(seq, Compression::None, &mut out).unwrap();
+        (out, h)
+    }
+
+    /// Записать блок с номером, которого ждёт сегмент.
+    fn append(w: &mut SegmentWriter, base: u64, count: usize) -> u64 {
+        let (bytes, _) = block_bytes(w.next_seq(), base, count);
+        w.append_block(&bytes).unwrap()
+    }
+
+    #[test]
+    fn create_append_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut w = SegmentWriter::create(dir.path(), header(1_000), 64 * 1024).unwrap();
+        assert_eq!(w.data_end(), SegmentHeader::SIZE as u64);
+        let offset = append(&mut w, 1_000, 3);
+        assert_eq!(offset, SegmentHeader::SIZE as u64);
+        w.sync().unwrap();
+        assert!(!w.is_dirty());
+        let end = w.data_end();
+        let path = w.path().to_owned();
+        drop(w);
+
+        // Файл преаллоцирован — размер больше, чем данных.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 * 1024);
+
+        let w2 = SegmentWriter::reopen(&path, None).unwrap();
+        assert_eq!(w2.data_end(), end, "позиция конца данных восстановлена");
+        assert_eq!(w2.header(), header(1_000));
+        assert_eq!(w2.next_seq(), 1, "нумерация блоков продолжается");
+    }
+
+    #[test]
+    fn zero_tail_terminates_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SegmentWriter::create(dir.path(), header(1_000), 32 * 1024).unwrap();
+        append(&mut w, 1_000, 2);
+        append(&mut w, 2_000, 2);
+        w.sync().unwrap();
+        let end = w.data_end();
+        let path = w.path().to_owned();
+        drop(w);
+
+        let scan = Scan::of_path(&path).unwrap();
+        assert_eq!(scan.block_count, 2);
+        assert_eq!(scan.end, ScanEnd::ZeroTail);
+        assert!(!scan.truncated(), "целый хвост не считается повреждённым");
+        assert_eq!(scan.data_end, end);
+    }
+
+    #[test]
+    fn torn_block_is_truncated_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SegmentWriter::create(dir.path(), header(1_000), 32 * 1024).unwrap();
+        append(&mut w, 1_000, 4);
+        let good_end = w.data_end();
+        append(&mut w, 2_000, 4);
+        w.sync().unwrap();
+        let path = w.path().to_owned();
+        drop(w);
+
+        // Имитируем обрыв питания посреди второго блока: портим его хвост.
+        {
+            let f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.write_all_at(&[0xFF; 4], good_end + 34).unwrap();
+        }
+
+        let scan = Scan::of_path(&path).unwrap();
+        assert_eq!(scan.block_count, 1, "уцелел первый блок");
+        assert_eq!(scan.end, ScanEnd::Corrupt, "обрыв распознан как порча");
+        assert_eq!(scan.data_end, good_end, "конец данных — до битого блока");
+
+        // Продолжение записи с восстановленной позиции затирает битый хвост.
+        let mut w = SegmentWriter::reopen(&path, None).unwrap();
+        assert_eq!(w.data_end(), good_end);
+        assert_eq!(w.next_seq(), 1);
+        append(&mut w, 3_000, 4);
+        w.sync().unwrap();
+        let scan = Scan::of_path(&path).unwrap();
+        assert_eq!(scan.block_count, 2);
+        assert!(!scan.truncated());
+    }
+
+    #[test]
+    fn tail_is_zeroed_after_recovery() {
+        // Новый блок короче отброшенного: за ним не должно остаться байт
+        // прежней записи, иначе следующий скан прочитает их как блок —
+        // в худшем случае со сходящимся CRC, вернув в лог выброшенные записи.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SegmentWriter::create(dir.path(), header(0), 32 * 1024).unwrap();
+        append(&mut w, 0, 1);
+        let good_end = w.data_end();
+        append(&mut w, 1_000, 50); // длинный блок, который «не долетит»
+        w.sync().unwrap();
+        let long_end = w.data_end();
+        let path = w.path().to_owned();
+        drop(w);
+
+        // Портим заголовок длинного блока.
+        {
+            let f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.write_all_at(&[0xFF; 8], good_end + 4).unwrap();
+        }
+
+        let mut w = SegmentWriter::reopen(&path, None).unwrap();
+        assert_eq!(w.data_end(), good_end);
+
+        // Проверяем, что область прежнего длинного блока обнулена.
+        let f = File::open(&path).unwrap();
+        let mut probe = vec![0u8; (long_end - good_end) as usize];
+        f.read_exact_at(&mut probe, good_end).unwrap();
+        assert!(
+            probe.iter().all(|&b| b == 0),
+            "хвост после восстановления обязан быть нулевым"
+        );
+
+        append(&mut w, 2_000, 1);
+        w.sync().unwrap();
+        let scan = Scan::of_path(&path).unwrap();
+        assert_eq!(scan.block_count, 2);
+        assert_eq!(scan.end, ScanEnd::ZeroTail, "чистый конец данных");
+    }
+
+    #[test]
+    fn seq_gap_is_distinguished_from_corruption() {
+        // Блоки B1 и B3 осели на носитель, B2 — нет (переупорядочивание
+        // writeback). Это не порча носителя, и диагноз обязан отличаться.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SegmentWriter::create(dir.path(), header(0), 32 * 1024).unwrap();
+        append(&mut w, 0, 1);
+        let end_after_first = w.data_end();
+        let (bytes, _) = block_bytes(5, 1_000, 1); // номер «из будущего»
+        w.append_block(&bytes).unwrap();
+        w.sync().unwrap();
+        let path = w.path().to_owned();
+        drop(w);
+
+        let scan = Scan::of_path(&path).unwrap();
+        assert_eq!(scan.block_count, 1);
+        assert_eq!(
+            scan.end,
+            ScanEnd::SeqGap {
+                expected: 1,
+                found: 5
+            }
+        );
+        assert!(scan.truncated());
+        assert_eq!(scan.data_end, end_after_first);
+    }
+
+    #[test]
+    fn foreign_store_segment_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = header(0);
+        h.store_id = 0xAAAA_BBBB_CCCC_DDDD;
+        let w = SegmentWriter::create(dir.path(), h, 8 * 1024).unwrap();
+        let path = w.path().to_owned();
+        drop(w);
+
+        let err = SegmentWriter::reopen(&path, Some(0x1111_2222_3333_4444)).unwrap_err();
+        assert!(
+            matches!(err, Error::ForeignSegment { .. }),
+            "сегмент чужого хранилища обязан отвергаться: {err}"
+        );
+        // Со своим идентификатором открывается штатно.
+        SegmentWriter::reopen(&path, Some(0xAAAA_BBBB_CCCC_DDDD)).unwrap();
+    }
+
+    #[test]
+    fn garbage_block_length_does_not_allocate_wildly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SegmentWriter::create(dir.path(), header(0), 8 * 1024).unwrap();
+        append(&mut w, 0, 1);
+        w.sync().unwrap();
+        let path = w.path().to_owned();
+        let end = w.data_end();
+        drop(w);
+
+        // body_len = 0xFFFF_FFFF при файле в 8 КиБ.
+        {
+            let f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.write_all_at(&[0xFF, 0xFF, 0xFF, 0xFF], end).unwrap();
+        }
+        let scan = Scan::of_path(&path).unwrap();
+        assert!(scan.truncated());
+        assert_eq!(scan.data_end, end, "мусорная длина не увела скан за файл");
+    }
+
+    #[test]
+    fn seal_writes_footer_and_trims() {
+        use dduroc_format::FooterBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (bytes, bh) = block_bytes(0, 1_000, 3);
+        let mut w = SegmentWriter::create(dir.path(), header(1_000), 64 * 1024).unwrap();
+        let offset = w.append_block(&bytes).unwrap();
+        let path = w.path().to_owned();
+
+        let mut fb = FooterBuilder::new();
+        fb.add_block(offset, &bh, Micros(1_200));
+        fb.add_event(EventId(1));
+        w.seal(&fb.build()).unwrap();
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 64 * 1024, "хвост преаллокации обрезан: {size}");
+
+        let r = SegmentReader::open(&path).unwrap();
+        assert!(r.is_sealed());
+        let footer = r.footer().expect("footer читается");
+        assert_eq!(footer.blocks.len(), 1);
+        assert_eq!(footer.blocks[0].offset, offset);
+        assert_eq!(r.block_offsets().unwrap(), vec![offset]);
+    }
+
+    #[test]
+    fn reader_falls_back_to_scan_without_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = SegmentWriter::create(dir.path(), header(1_000), 16 * 1024).unwrap();
+        let o1 = append(&mut w, 1_000, 2);
+        let o2 = append(&mut w, 2_000, 2);
+        w.sync().unwrap();
+        let path = w.path().to_owned();
+        // Закрываем без footer'а — как после обрыва питания.
+        w.close_unsealed().unwrap();
+
+        let r = SegmentReader::open(&path).unwrap();
+        assert!(!r.is_sealed());
+        assert_eq!(r.block_offsets().unwrap(), vec![o1, o2], "скан нашёл блоки");
+
+        let mut buf = Vec::new();
+        let next = r.read_block_at(o1, &mut buf).unwrap();
+        assert_eq!(next, Some(o2));
+        let block = parse_block(&buf).unwrap().unwrap();
+        assert_eq!(block.records().count(), 2);
+    }
+
+    #[test]
+    fn refuses_to_overwrite_existing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = SegmentWriter::create(dir.path(), header(1_000), 8 * 1024).unwrap();
+        drop(w);
+        // Тот же (boot, время) — существующий файл трогать нельзя.
+        let err = SegmentWriter::create(dir.path(), header(1_000), 8 * 1024);
+        assert!(err.is_err(), "повторное создание обязано провалиться");
+    }
+
+    #[test]
+    fn fits_reserves_room_for_terminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let capacity = SegmentHeader::SIZE as u64 + 200;
+        let w = SegmentWriter::create(dir.path(), header(0), capacity).unwrap();
+        assert!(w.fits(100));
+        assert!(
+            !w.fits(200 - BlockHeader::SIZE as u64 + 1),
+            "место под нулевой терминатор обязано остаться"
+        );
+    }
+}

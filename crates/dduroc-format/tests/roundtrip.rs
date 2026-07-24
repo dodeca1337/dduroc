@@ -269,7 +269,7 @@ proptest! {
 
         let compression = if compress { Compression::Lz4 } else { Compression::None };
         let mut out = Vec::new();
-        let header = builder.finish(compression, &mut out).unwrap();
+        let header = builder.finish(0, compression, &mut out).unwrap();
         prop_assert_eq!(header.count as usize, n);
         prop_assert_eq!(out.len() as u64, header.total_len());
 
@@ -304,7 +304,7 @@ proptest! {
             payload: &payload,
         })).unwrap();
         let mut out = Vec::new();
-        builder.finish(Compression::None, &mut out).unwrap();
+        builder.finish(0, Compression::None, &mut out).unwrap();
 
         let i = idx.index(out.len());
         out[i] ^= xor;
@@ -336,6 +336,7 @@ proptest! {
             protocol_version: ProtocolVersion(protocol),
             boot: BootCounter(boot),
             base: Micros(base),
+            store_id: 0,
         };
         let bytes = h.to_bytes();
         prop_assert_eq!(SegmentHeader::parse(&bytes)?, h);
@@ -380,6 +381,7 @@ proptest! {
             let header = BlockHeader {
                 body_len: 16,
                 raw_len: 16,
+                seq: 0,
                 base: Micros(base),
                 count: *count,
                 compression: Compression::None,
@@ -447,6 +449,7 @@ proptest! {
             let header = BlockHeader {
                 body_len: 8,
                 raw_len: 8,
+                seq: 0,
                 base: Micros(base),
                 count: 1,
                 compression: Compression::None,

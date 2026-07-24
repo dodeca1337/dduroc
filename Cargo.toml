@@ -8,13 +8,16 @@ rust-version = "1.85"
 
 [workspace]
 resolver = "3"
-members = ["crates/dduroc-format"]
+members = ["crates/dduroc-engine", "crates/dduroc-format"]
 
 [workspace.dependencies]
 # ── ядро (sync, armv7-friendly) ───────────────────────────────────────────────
 crc32c = "0.6"
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 thiserror = "2.0"
+rustix = { version = "1.1", features = ["fs", "time", "process"] }
+crossbeam-channel = "0.5"
+smallvec = { version = "1", features = ["union"] }
 
 # ── serde / payload ───────────────────────────────────────────────────────────
 serde = { version = "1.0", features = ["derive"] }
@@ -22,9 +25,11 @@ postcard = { version = "1.1", features = ["alloc"] }
 
 # ── тесты ─────────────────────────────────────────────────────────────────────
 proptest = "1.7"
+tempfile = "3"
 
 # ── внутренние ────────────────────────────────────────────────────────────────
 dduroc-format = { path = "crates/dduroc-format" }
+dduroc-engine = { path = "crates/dduroc-engine" }
 
 [profile.release]
 # Целевая платформа — armv7 с ограниченным флешем: размер бинаря значим.

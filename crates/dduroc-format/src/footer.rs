@@ -145,7 +145,12 @@ impl<'a> Footer<'a> {
 
         // Индекс блоков: дельты смещений от конца заголовка сегмента и
         // дельты времени от предыдущего блока.
-        let mut blocks = Vec::with_capacity(trailer.block_count as usize);
+        //
+        // Ёмкость НИКОГДА не выделяется по счётчику из файла: CRC32C — не
+        // подпись, его пересчитывает кто угодно, а `block_count` в трейлере
+        // напрямую управлял бы размером аллокации. Потолок — сколько записей
+        // физически помещается в секции (минимум 3 байта на запись).
+        let mut blocks = Vec::with_capacity(bounded(trailer.block_count, sections.len(), 3));
         let mut offset = SegmentHeader::SIZE as u64;
         let mut base = 0u64;
         for _ in 0..trailer.block_count {
@@ -159,18 +164,18 @@ impl<'a> Footer<'a> {
             });
         }
 
-        let events = read_id_set(&mut c, "event_id")?
+        let events = read_id_set(&mut c, "event_id", sections.len())?
             .into_iter()
             .map(|v| EventId(v as u16))
             .collect();
-        let metrics = read_id_set(&mut c, "metric_id")?
+        let metrics = read_id_set(&mut c, "metric_id", sections.len())?
             .into_iter()
             .map(|v| MetricId(v as u16))
             .collect();
 
         // Таблица серий.
         let n = c.varint_u32("series count")?;
-        let mut series = Vec::with_capacity(n as usize);
+        let mut series = Vec::with_capacity(bounded(n, sections.len(), 4));
         for _ in 0..n {
             let metric = MetricId(c.varint_u16("metric_id")?);
             let value_type = ValueType::from_u8(c.u8()?)?;
@@ -187,6 +192,17 @@ impl<'a> Footer<'a> {
                     count,
                     bytes: &sections[tags_start..c.pos()],
                 },
+            });
+        }
+
+        // Секции обязаны быть разобраны без остатка: длина в трейлере
+        // согласована с CRC, поэтому лишние байты означают не запас, а
+        // несоответствие содержимого заявленной структуре.
+        if c.pos() != sections.len() {
+            return Err(Error::LimitExceeded {
+                what: "footer sections",
+                value: c.pos() as u64,
+                max: sections.len() as u64,
             });
         }
 
@@ -225,9 +241,19 @@ impl<'a> Footer<'a> {
     }
 }
 
-fn read_id_set(c: &mut Cursor<'_>, what: &'static str) -> Result<Vec<u64>> {
+/// Безопасная стартовая ёмкость: не больше, чем физически влезло бы в
+/// `available` байт при `min_entry` байтах на элемент.
+///
+/// Разбор всё равно упрётся в конец секций и вернёт ошибку, но выделять
+/// гигабайты по счётчику из недоверенного файла нельзя: на armv7 это паника
+/// «capacity overflow», на 64-битном вьюере — OOM-killer.
+fn bounded(count: u32, available: usize, min_entry: usize) -> usize {
+    (count as usize).min(available / min_entry.max(1))
+}
+
+fn read_id_set(c: &mut Cursor<'_>, what: &'static str, available: usize) -> Result<Vec<u64>> {
     let n = c.varint_u32(what)?;
-    let mut out = Vec::with_capacity(n as usize);
+    let mut out = Vec::with_capacity(bounded(n, available, 1));
     let mut prev = 0u64;
     for i in 0..n {
         let delta = c.varint()?;
@@ -278,14 +304,27 @@ impl FooterBuilder {
     }
 
     /// Зарегистрировать записанный блок.
+    ///
+    /// Индекс обязан оставаться неубывающим по времени: по нему делается
+    /// бинарный поиск, а `build` кодирует дельты. Блок с базой раньше
+    /// предыдущей (переупорядочивание записей между потоками) не отбрасывается
+    /// — его база подтягивается к предыдущей, чтобы индекс остался
+    /// сортированным, а фактический минимум учитывается в `min` отдельно.
     pub fn add_block(&mut self, offset: u64, header: &BlockHeader, last: Micros) {
+        let prev = self.blocks.last().map_or(0, |b| b.base.0);
         self.blocks.push(BlockIndexEntry {
             offset,
-            base: header.base,
+            base: Micros(header.base.0.max(prev)),
             count: header.count,
         });
-        self.min.get_or_insert(header.base);
-        self.max = Micros(self.max.0.max(last.0));
+        // Минимум и максимум — по фактическим значениям, а не по первому и
+        // последнему блоку: иначе отбор сегментов по диапазону времени молча
+        // выбрасывал бы сегмент, содержащий искомые записи.
+        self.min = Some(match self.min {
+            Some(m) => Micros(m.0.min(header.base.0)),
+            None => header.base,
+        });
+        self.max = Micros(self.max.0.max(last.0).max(header.base.0));
     }
 
     pub fn add_event(&mut self, id: EventId) {
@@ -401,6 +440,7 @@ mod tests {
         BlockHeader {
             body_len: 10,
             raw_len: 10,
+            seq: 0,
             base: Micros(base),
             count,
             compression: Compression::None,
@@ -503,6 +543,117 @@ mod tests {
         assert!(
             !f.touches(&[EventId(2), EventId(299)], &[MetricId(7)]),
             "затронутых типов нет — сегмент не переписываем"
+        );
+    }
+
+    /// Собрать footer с произвольным трейлером и корректным CRC —
+    /// имитация файла, подготовленного злонамеренно или испорченного.
+    fn forge(sections: Vec<u8>, mut trailer: Trailer) -> Vec<u8> {
+        trailer.footer_len = sections.len() as u32;
+        let mut tb = Vec::new();
+        trailer.write(&mut tb);
+        trailer.crc = crc32c::crc32c_append(crc32c::crc32c(&sections), &tb[..24]);
+        let mut bytes = sections;
+        trailer.write(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn absurd_counts_do_not_allocate() {
+        // CRC32C — не подпись: кто угодно пересчитает его после правки
+        // счётчиков. Разбор обязан устоять, а не выделять гигабайты по
+        // числу из файла (на armv7 это паника «capacity overflow»,
+        // на 64-битном вьюере — OOM-killer).
+        let bytes = forge(
+            Vec::new(),
+            Trailer {
+                footer_len: 0,
+                block_count: u32::MAX,
+                min: Micros(0),
+                max: Micros(0),
+                crc: 0,
+            },
+        );
+        let err = Footer::parse(&bytes).unwrap_err();
+        assert!(
+            err.is_torn_tail(),
+            "ожидалась ошибка разбора, получено {err}"
+        );
+
+        // То же для множеств идентификаторов и таблицы серий.
+        // Число блоков берётся из трейлера, поэтому секции начинаются сразу
+        // с множества событий.
+        let empty_trailer = Trailer {
+            footer_len: 0,
+            block_count: 0,
+            min: Micros(0),
+            max: Micros(0),
+            crc: 0,
+        };
+
+        let mut sections = Vec::new();
+        varint::write_u64(&mut sections, u64::from(u32::MAX)); // «событий» — 4 млрд
+        assert!(Footer::parse(&forge(sections, empty_trailer)).is_err());
+
+        let mut sections = Vec::new();
+        varint::write_u64(&mut sections, 0); // событий нет
+        varint::write_u64(&mut sections, 0); // метрик нет
+        varint::write_u64(&mut sections, u64::from(u32::MAX)); // «серий» — 4 млрд
+        assert!(Footer::parse(&forge(sections, empty_trailer)).is_err());
+    }
+
+    #[test]
+    fn trailing_garbage_in_footer_rejected() {
+        // Лишние байты после разобранных секций означают, что footer описан
+        // не тем, чем кажется: длина секций из трейлера согласована с CRC,
+        // поэтому расхождение — признак подделки или порчи, а не запаса.
+        let mut sections = Vec::new();
+        varint::write_u64(&mut sections, 0); // событий нет
+        varint::write_u64(&mut sections, 0); // метрик нет
+        varint::write_u64(&mut sections, 0); // серий нет
+        sections.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        let bytes = forge(
+            sections,
+            Trailer {
+                footer_len: 0,
+                block_count: 0,
+                min: Micros(0),
+                max: Micros(0),
+                crc: 0,
+            },
+        );
+        assert!(
+            Footer::parse(&bytes).is_err(),
+            "хвост в секциях footer'а обязан отвергаться"
+        );
+    }
+
+    #[test]
+    fn index_stays_sorted_and_bounds_are_exact() {
+        // Записи могут прийти к writer'у переупорядоченными между потоками:
+        // индекс обязан остаться неубывающим (по нему идёт бинарный поиск),
+        // а min/max — отражать фактические границы, иначе отбор сегментов
+        // по диапазону молча выбросил бы сегмент с нужными записями.
+        let mut b = FooterBuilder::new();
+        b.add_block(32, &header(5_000, 1), Micros(5_100));
+        b.add_block(100, &header(1_000, 1), Micros(1_100)); // «из прошлого»
+        b.add_block(200, &header(9_000, 1), Micros(9_100));
+
+        let bytes = b.build();
+        let f = Footer::parse(&bytes).unwrap().unwrap();
+
+        let bases: Vec<u64> = f.blocks.iter().map(|e| e.base.0).collect();
+        assert!(
+            bases.windows(2).all(|w| w[0] <= w[1]),
+            "индекс обязан быть неубывающим: {bases:?}"
+        );
+        assert_eq!(f.min, Micros(1_000), "min — фактический минимум");
+        assert_eq!(f.max, Micros(9_100));
+        // Смещения не искажены подтягиванием времени.
+        assert_eq!(
+            f.blocks.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            vec![32, 100, 200]
         );
     }
 

@@ -1,0 +1,21 @@
+[package]
+name = "dduroc-engine"
+description = "Движок хранилища dduroc: неймспейсы, каналы, writer, ротация, миграции"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dduroc-format.workspace = true
+crossbeam-channel.workspace = true
+postcard.workspace = true
+rustix.workspace = true
+serde.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
