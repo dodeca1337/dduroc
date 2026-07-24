@@ -90,7 +90,7 @@ pub use dduroc_engine::schema::{
     DecodeError, EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MigratedRecord,
     Migration, OwnedRecord, Schema, SpanDesc, StorageClass,
 };
-pub use dduroc_engine::staged::OwnedValue;
+pub use dduroc_engine::staged::{OwnedValue, Payload};
 pub use dduroc_engine::stats::Stats;
 pub use dduroc_engine::store::{Store, StoreConfig};
 pub use dduroc_engine::{Clock, Error, Result};
@@ -128,13 +128,11 @@ pub trait NamespaceExt {
 
 impl NamespaceExt for Namespace {
     fn log<E: Event>(&self, event: E) -> Result<()> {
-        let payload = encode(&event)?;
-        self.log_raw(E::ID, &payload, None)
+        self.log_payload(E::ID, encode(&event)?, None)
     }
 
     fn log_in<E: Event>(&self, span: &SpanGuard, event: E) -> Result<()> {
-        let payload = encode(&event)?;
-        self.log_raw(E::ID, &payload, Some(span.id()))
+        self.log_payload(E::ID, encode(&event)?, Some(span.id()))
     }
 }
 
@@ -146,17 +144,19 @@ pub trait SpanExt {
 
 impl SpanExt for SpanGuard {
     fn log<E: Event>(&self, event: E) -> Result<()> {
-        let payload = encode(&event)?;
-        self.log_raw(E::ID, &payload)
+        self.log_payload(E::ID, encode(&event)?)
     }
 }
 
-/// Сериализовать поля события.
+/// Сериализовать поля события прямо в буфер записи.
 ///
-/// Буфер берётся с запасом под типичное событие; переполнение приводит к
-/// одной аллокации, а не к потере записи.
-fn encode<E: Event>(event: &E) -> Result<Vec<u8>> {
-    postcard::to_allocvec(event).map_err(|_| Error::BadNamespace {
+/// Именно сюда упирается стоимость логирования, поэтому промежуточного
+/// `Vec` нет: postcard пишет в тот самый буфер, который уйдёт в очередь.
+/// При типичном размере полей он остаётся inline, и обращений к куче на
+/// событие не происходит вовсе.
+#[inline]
+fn encode<E: Event>(event: &E) -> Result<Payload> {
+    postcard::to_extend(event, Payload::new()).map_err(|_| Error::BadNamespace {
         name: String::new(),
         reason: "поля события не сериализуются",
     })

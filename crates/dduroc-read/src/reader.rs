@@ -5,7 +5,7 @@ use crate::error::{ReadError, Result};
 use crate::query::{Order, Query};
 use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
-use dduroc_engine::schema::{EventDesc, MetricDesc, Schema, SpanDesc};
+use dduroc_engine::schema::Schema;
 use dduroc_format::{EventId, Level, Micros, SeriesLocal, SpanId};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,8 +52,8 @@ pub enum EntryKind {
 /// Запись ответа.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
-    pub namespace: String,
-    pub channel: String,
+    pub namespace: std::sync::Arc<str>,
+    pub channel: std::sync::Arc<str>,
     /// Относительное время от старта запуска.
     pub at: Micros,
     pub boot: u32,
@@ -207,7 +207,7 @@ impl Reader {
 
     /// Выполнить запрос.
     pub fn query(&self, q: &Query) -> Result<QueryResult> {
-        let mut cursors = self.open_cursors(q)?;
+        let (mut cursors, schemas) = self.open_cursors(q)?;
         let mut result = QueryResult::default();
         // Определения серий: сегментно-локальные номера действительны в
         // пределах своего сегмента, поэтому таблица ведётся на курсор.
@@ -247,7 +247,7 @@ impl Reader {
                 tags,
             } = &raw.record
             {
-                let desc = self.metric_desc(&cursors[idx].namespace, *metric);
+                let desc = schemas[idx].as_ref().and_then(|s| s.metric(*metric));
                 series[idx].insert(
                     *local,
                     SeriesInfo {
@@ -269,9 +269,16 @@ impl Reader {
                 continue;
             }
 
-            let ns_name = cursors[idx].namespace.clone();
-            let ch_name = cursors[idx].channel.clone();
-            let Some(entry) = self.build_entry(&ns_name, &ch_name, &raw, &series[idx], q) else {
+            let ns_name = std::sync::Arc::clone(&cursors[idx].namespace);
+            let ch_name = std::sync::Arc::clone(&cursors[idx].channel);
+            let Some(entry) = self.build_entry(
+                ns_name,
+                ch_name,
+                schemas[idx].as_ref(),
+                &raw,
+                &series[idx],
+                q,
+            ) else {
                 continue;
             };
 
@@ -288,20 +295,30 @@ impl Reader {
         Ok(result)
     }
 
-    fn open_cursors(&self, q: &Query) -> Result<Vec<ChannelCursor>> {
+    /// Открыть курсоры и разрешить схему **один раз на неймспейс**.
+    ///
+    /// Резолв схемы читает `ns-meta` с диска. Делать это на каждую запись,
+    /// как было поначалу, означало бы файловую операцию на запись — именно
+    /// это и оказалось главным ограничителем скорости чтения.
+    fn open_cursors(&self, q: &Query) -> Result<(Vec<ChannelCursor>, Vec<Option<Schema>>)> {
         let mut cursors = Vec::new();
-        let scope = crate::cursor::ChannelScope {
-            from: q.from,
-            to: q.to,
-            boot: q.boot,
-            reverse: q.order == Order::Newest,
-            expect_store: self.store_id,
-        };
+        let mut schemas = Vec::new();
 
         for ns in self.namespaces()? {
             if !q.namespaces.matches(&ns.name) {
                 continue;
             }
+            let schema = self.schemas.get(&ns.schema_name).copied();
+            let ns_name: std::sync::Arc<str> = std::sync::Arc::from(ns.name.as_str());
+            let scope = crate::cursor::ChannelScope {
+                from: q.from,
+                to: q.to,
+                boot: q.boot,
+                reverse: q.order == Order::Newest,
+                expect_store: self.store_id,
+                prefilter: Some(build_prefilter(q, schema)),
+            };
+
             for channel in &ns.channels {
                 if !q.channels.is_empty() && !q.channels.contains(channel) {
                     continue;
@@ -309,37 +326,22 @@ impl Reader {
                 let dir = self.root.join(&ns.name).join(channel);
                 cursors.push(ChannelCursor::open(
                     &dir,
-                    ns.name.clone(),
-                    channel.clone(),
+                    std::sync::Arc::clone(&ns_name),
+                    std::sync::Arc::from(channel.as_str()),
                     &scope,
                 )?);
+                schemas.push(schema);
             }
         }
-        Ok(cursors)
+        Ok((cursors, schemas))
     }
 
-    /// Схема неймспейса — по имени схемы из его метаданных.
-    fn schema_of(&self, ns: &str) -> Option<&Schema> {
-        let meta = read_ns_meta(&self.root.join(ns))?;
-        self.schemas.get(&meta.schema_name)
-    }
-
-    fn event_desc(&self, ns: &str, id: EventId) -> Option<&'static EventDesc> {
-        self.schema_of(ns)?.event(id)
-    }
-
-    fn metric_desc(&self, ns: &str, id: dduroc_format::MetricId) -> Option<&'static MetricDesc> {
-        self.schema_of(ns)?.metric(id)
-    }
-
-    fn span_desc(&self, ns: &str, id: dduroc_format::SpanKindId) -> Option<&'static SpanDesc> {
-        self.schema_of(ns)?.span(id)
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn build_entry(
         &self,
-        ns: &str,
-        channel: &str,
+        ns: std::sync::Arc<str>,
+        channel: std::sync::Arc<str>,
+        schema: Option<&Schema>,
         raw: &crate::cursor::RawEntry,
         series: &HashMap<SeriesLocal, SeriesInfo>,
         q: &Query,
@@ -354,7 +356,7 @@ impl Reader {
                 if !kinds.messages {
                     return None;
                 }
-                let desc = self.event_desc(ns, *event);
+                let desc = schema.and_then(|s| s.event(*event));
                 // Уровень и тэги — статические свойства типа, поэтому фильтр
                 // применяется здесь, без чтения payload'а.
                 if let Some(min) = q.filter.min_level {
@@ -430,7 +432,7 @@ impl Reader {
                 (
                     EntryKind::SpanStart {
                         span: *span,
-                        kind_name: self.span_desc(ns, *kind).map(|d| d.name),
+                        kind_name: schema.and_then(|s| s.span(*kind)).map(|d| d.name),
                         parent: *parent,
                     },
                     Some(*span),
@@ -477,8 +479,8 @@ impl Reader {
         }
 
         Some(Entry {
-            namespace: ns.to_owned(),
-            channel: channel.to_owned(),
+            namespace: ns,
+            channel,
             at: raw.at,
             boot: raw.boot,
             utc_ms: self.epochs.to_utc_ms(raw.boot, raw.at.0),
@@ -494,6 +496,61 @@ struct SeriesInfo {
     name: Option<&'static str>,
     unit: Option<&'static str>,
     tags: Vec<(String, String)>,
+}
+
+/// Собрать предикат отбора, применяемый до материализации записи.
+///
+/// Уровни и тэги — статические свойства типов, поэтому запрос вроде
+/// «только ошибки» решается по схеме, без чтения payload'а; отброшенная
+/// запись не стоит ни аллокации, ни копирования.
+fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilter {
+    let kinds = q.filter.kinds;
+    let min_level = q.filter.min_level;
+    let events = q.filter.events.clone();
+    let event_names = q.filter.event_names.clone();
+    let any_tags = q.filter.any_tags.clone();
+
+    std::sync::Arc::new(move |record: &dduroc_format::Record<'_>| match record {
+        dduroc_format::Record::Message(m) => {
+            if !kinds.messages {
+                return false;
+            }
+            if let Some(want) = &events
+                && !want.contains(&m.event)
+            {
+                return false;
+            }
+            let desc = schema.and_then(|s| s.event(m.event));
+            if let Some(min) = min_level {
+                match desc.map(|d| d.level) {
+                    Some(l) if l >= min => {}
+                    // Уровень неизвестен — запись не прячем: это событие
+                    // типа, удалённого из схемы, и скрыть его от того, кто
+                    // ищет проблему, нельзя.
+                    None => {}
+                    _ => return false,
+                }
+            }
+            if !any_tags.is_empty() {
+                let tags = desc.map(|d| d.tags).unwrap_or(&[]);
+                if !any_tags.iter().any(|want| tags.iter().any(|t| t == want)) {
+                    return false;
+                }
+            }
+            if !event_names.is_empty() {
+                let name = desc.map(|d| d.name).unwrap_or("");
+                if !event_names.iter().any(|n| n == name) {
+                    return false;
+                }
+            }
+            true
+        }
+        dduroc_format::Record::Text(t) => kinds.text && min_level.is_none_or(|min| t.level >= min),
+        dduroc_format::Record::SpanStart(_) | dduroc_format::Record::SpanEnd { .. } => kinds.spans,
+        dduroc_format::Record::Sample(_) => kinds.samples,
+        dduroc_format::Record::SeriesDef(_) => true,
+        dduroc_format::Record::Ext { .. } => true,
+    })
 }
 
 fn read_ns_meta(dir: &Path) -> Option<NsMeta> {
@@ -790,7 +847,7 @@ mod tests {
         );
         // В ответе присутствуют оба неймспейса вперемешку.
         let namespaces: std::collections::HashSet<_> =
-            all.entries.iter().map(|e| e.namespace.as_str()).collect();
+            all.entries.iter().map(|e| &*e.namespace).collect();
         assert!(namespaces.len() >= 2);
     }
 
@@ -905,7 +962,7 @@ mod tests {
             result
                 .entries
                 .iter()
-                .any(|e| e.namespace == "orc-radio-1" || e.namespace == "apt-modem-0"),
+                .any(|e| &*e.namespace == "orc-radio-1" || &*e.namespace == "apt-modem-0"),
             "порча одного сегмента не должна прятать остальные"
         );
     }

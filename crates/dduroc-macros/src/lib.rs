@@ -234,7 +234,7 @@ fn parse_event(input: ParseStream, languages: &[Ident]) -> syn::Result<EventDef>
             store = Some(content.parse::<Ident>()?);
         } else if key_str == "tags" {
             tags = parse_ident_list(&content)?;
-        } else if languages.iter().any(|l| *l == key) {
+        } else if languages.contains(&key) {
             if templates.iter().any(|(l, _)| *l == key) {
                 return Err(syn::Error::new(
                     key.span(),
@@ -642,8 +642,8 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
     let mod_name = &input.name;
 
     Ok(quote! {
+        #[allow(non_snake_case, non_upper_case_globals, clippy::all, unused_imports)]
         pub mod #mod_name {
-            #![allow(clippy::all, unused_imports)]
 
             /// Типы событий этой схемы.
             pub mod events {

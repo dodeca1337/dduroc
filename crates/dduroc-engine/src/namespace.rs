@@ -10,7 +10,8 @@ use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::schema::{Schema, StorageClass};
 use crate::staged::{
-    ChannelIdx, NsId, OwnedValue, Payload, SeriesEntry, SeriesId, Staged, StagedRecord,
+    ChannelIdx, DropCounters, NsId, OwnedValue, Payload, SeriesEntry, SeriesId, Staged,
+    StagedRecord,
 };
 use crate::store::next_span_id;
 use crate::writer::{SeriesRegistry, Writer};
@@ -113,6 +114,7 @@ struct NamespaceInner {
     writer: Arc<Writer>,
     clock: Clock,
     series: Arc<RwLock<Vec<SeriesEntry>>>,
+    drops: Arc<DropCounters>,
     next_span: Arc<AtomicU32>,
     meta: NsMeta,
 }
@@ -127,6 +129,7 @@ impl Namespace {
         writer: Arc<Writer>,
         clock: Clock,
         series: Arc<RwLock<Vec<SeriesEntry>>>,
+        drops: Arc<DropCounters>,
         next_span: Arc<AtomicU32>,
         meta: NsMeta,
     ) -> Self {
@@ -139,6 +142,7 @@ impl Namespace {
                 writer,
                 clock,
                 series,
+                drops,
                 next_span,
                 meta,
             }),
@@ -186,6 +190,20 @@ impl Namespace {
     /// мёртв): у обычного канала она случается при отставании диска, у
     /// критического — только по таймауту ожидания.
     pub fn log_raw(&self, event: EventId, payload: &[u8], span: Option<SpanId>) -> Result<()> {
+        self.log_payload(event, Payload::from_slice(payload), span)
+    }
+
+    /// То же, но payload уже собран в буфере записи.
+    ///
+    /// Основной путь для типизированного API: сериализация идёт прямо в этот
+    /// буфер, поэтому на событие не приходится ни одной лишней аллокации и
+    /// копии — при типичном размере полей буфер остаётся inline.
+    pub fn log_payload(
+        &self,
+        event: EventId,
+        payload: Payload,
+        span: Option<SpanId>,
+    ) -> Result<()> {
         let Some(desc) = self.inner.schema.event(event) else {
             return Err(Error::BadNamespace {
                 name: self.inner.name.clone(),
@@ -199,12 +217,14 @@ impl Namespace {
             record: StagedRecord::Message {
                 event,
                 span,
-                payload: Payload::from_slice(payload),
+                payload,
             },
         };
-        self.inner
-            .writer
-            .write(item, desc.class == StorageClass::CRITICAL)
+        self.inner.writer.write(
+            item,
+            desc.class == StorageClass::CRITICAL,
+            &self.inner.drops,
+        )
     }
 
     /// Записать свободный текст без схемы: мост из `tracing`, panic-handler.
@@ -232,7 +252,7 @@ impl Namespace {
                 text: text.into(),
             },
         };
-        self.inner.writer.write(item, critical)
+        self.inner.writer.write(item, critical, &self.inner.drops)
     }
 
     /// Открыть серию телеметрии: `(метрика, тэги)` интернируются один раз,
@@ -280,6 +300,7 @@ impl Namespace {
                 record: StagedRecord::SpanStart { span, kind, parent },
             },
             critical,
+            &self.inner.drops,
         )?;
 
         Ok(SpanGuard {
@@ -336,7 +357,10 @@ impl Series {
                 value,
             },
         };
-        self.ns.inner.writer.write(item, self.critical)
+        self.ns
+            .inner
+            .writer
+            .write(item, self.critical, &self.ns.inner.drops)
     }
 
     /// Скалярный отсчёт с плавающей точкой — самый частый случай.
@@ -370,6 +394,11 @@ impl SpanGuard {
         self.ns.log_raw(event, payload, Some(self.span))
     }
 
+    /// То же, но payload уже собран в буфере записи.
+    pub fn log_payload(&self, event: EventId, payload: Payload) -> Result<()> {
+        self.ns.log_payload(event, payload, Some(self.span))
+    }
+
     /// Закрыть явно, увидев ошибку записи. Обычно не нужно: закрытие
     /// происходит при уничтожении.
     pub fn close(mut self) -> Result<()> {
@@ -386,6 +415,7 @@ impl SpanGuard {
                 record: StagedRecord::SpanEnd { span: self.span },
             },
             self.critical,
+            &self.ns.inner.drops,
         )
     }
 }
@@ -591,6 +621,64 @@ mod tests {
         // 50 сэмплов + 1 SeriesDef + 2 SpanStart + 1 событие + 2 SpanEnd
         assert!(stats.records_written >= 55, "получено {stats:?}");
         assert!(stats.is_clean());
+    }
+
+    #[test]
+    fn sync_waits_for_everything_already_enqueued() {
+        // Управляющие команды идут отдельной очередью и без явного
+        // вычерпывания обгоняли бы записи в полёте: sync отчитывался бы
+        // об успехе, не записав их, а shutdown запечатывал бы сегменты
+        // поверх недописанного. Проверяем на потоке, заведомо обгоняющем
+        // writer.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        const N: usize = 20_000;
+        let mut accepted = 0u64;
+        for i in 0..N {
+            // Ретраи, чтобы отделить потери очереди (штатное поведение
+            // обычного канала) от потерь при синхронизации.
+            while ns.log_raw(EventId(1), &[i as u8; 4], None).is_err() {
+                std::thread::yield_now();
+            }
+            accepted += 1;
+        }
+        ns.sync().unwrap();
+
+        let stats = store.stats();
+        // Записей может оказаться БОЛЬШЕ принятых: неудачные попытки
+        // try_send оставляют в потоке отметку о потере. Меньше — нельзя.
+        assert!(
+            stats.records_written >= accepted,
+            "sync обязан дождаться всех принятых записей, а не только успевших: \
+             записано {}, принято {accepted}",
+            stats.records_written
+        );
+    }
+
+    #[test]
+    fn shutdown_persists_everything_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        const N: usize = 20_000;
+        let mut accepted = 0u64;
+        for i in 0..N {
+            while ns.log_raw(EventId(1), &[i as u8; 4], None).is_err() {
+                std::thread::yield_now();
+            }
+            accepted += 1;
+        }
+        store.shutdown();
+
+        let written = store.stats().records_written;
+        assert!(
+            written >= accepted,
+            "shutdown обязан дописать очередь, а не запечатать поверх неё: \
+             записано {written}, принято {accepted}"
+        );
     }
 
     #[test]

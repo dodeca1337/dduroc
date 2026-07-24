@@ -219,10 +219,35 @@ mod tests {
 
     #[test]
     fn kind_presets() {
-        assert!(KindFilter::LOGS.messages && KindFilter::LOGS.text);
-        assert!(!KindFilter::LOGS.samples);
-        assert!(KindFilter::TELEMETRY.samples && !KindFilter::TELEMETRY.messages);
-        assert!(KindFilter::SPANS.spans && !KindFilter::SPANS.text);
+        // Значения константные, поэтому сравниваем структуры целиком:
+        // так проверка не вырождается в тавтологию для компилятора.
+        assert_eq!(
+            KindFilter::LOGS,
+            KindFilter {
+                messages: true,
+                spans: false,
+                samples: false,
+                text: true
+            }
+        );
+        assert_eq!(
+            KindFilter::TELEMETRY,
+            KindFilter {
+                messages: false,
+                spans: false,
+                samples: true,
+                text: false
+            }
+        );
+        assert_eq!(
+            KindFilter::SPANS,
+            KindFilter {
+                messages: false,
+                spans: true,
+                samples: false,
+                text: false
+            }
+        );
         assert_eq!(
             KindFilter::default(),
             KindFilter {

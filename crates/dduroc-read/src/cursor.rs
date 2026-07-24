@@ -15,6 +15,15 @@ use dduroc_engine::segment::{SegmentReader, parse_block};
 use dduroc_format::segment::SegmentName;
 use dduroc_format::{Micros, Record};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Предикат отбора, применяемый **до** материализации записи.
+///
+/// Владеющая копия записи стоит аллокации payload'а, поэтому запрос вроде
+/// «только ошибки» не должен её платить за каждую из сотен тысяч
+/// отфильтрованных записей. Определения серий пропускаются всегда: без них
+/// не восстановить идентичность сэмплов.
+pub type Prefilter = Arc<dyn Fn(&Record<'_>) -> bool + Send + Sync>;
 
 /// Одна прочитанная запись с восстановленным абсолютным временем.
 #[derive(Debug, Clone)]
@@ -134,7 +143,6 @@ fn own(record: &Record<'_>) -> OwnedRecord {
 }
 
 /// Курсор по записям одного сегмента.
-#[derive(Debug)]
 pub struct SegmentCursor {
     reader: SegmentReader,
     path: PathBuf,
@@ -148,6 +156,8 @@ pub struct SegmentCursor {
     pos: usize,
     /// Обратный порядок.
     reverse: bool,
+    /// Отбор до материализации.
+    prefilter: Option<Prefilter>,
     /// Блоки, которые не удалось прочитать.
     damaged: Vec<Damage>,
 }
@@ -161,7 +171,12 @@ pub struct Damage {
 }
 
 impl SegmentCursor {
-    pub fn open(path: &Path, reverse: bool, expect_store: Option<u64>) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        reverse: bool,
+        expect_store: Option<u64>,
+        prefilter: Option<Prefilter>,
+    ) -> Result<Self> {
         let reader = SegmentReader::open(path).map_err(ReadError::Engine)?;
         if let Some(id) = expect_store
             && reader.header().store_id != id
@@ -184,6 +199,7 @@ impl SegmentCursor {
             buffered: Vec::new(),
             pos: 0,
             reverse,
+            prefilter,
             damaged: Vec::new(),
         })
     }
@@ -285,11 +301,21 @@ impl SegmentCursor {
             let mut broken = None;
             for item in block.records() {
                 match item {
-                    Ok((at, record)) => self.buffered.push(RawEntry {
-                        at,
-                        boot,
-                        record: own(&record),
-                    }),
+                    Ok((at, record)) => {
+                        // Отбор до владеющей копии: отброшенная запись не
+                        // должна стоить аллокации своего payload'а.
+                        let keep = match &self.prefilter {
+                            Some(f) => matches!(record, Record::SeriesDef(_)) || f(&record),
+                            None => true,
+                        };
+                        if keep {
+                            self.buffered.push(RawEntry {
+                                at,
+                                boot,
+                                record: own(&record),
+                            });
+                        }
+                    }
                     Err(e) => {
                         broken = Some(e.to_string());
                         break;
@@ -315,7 +341,6 @@ impl SegmentCursor {
 }
 
 /// Курсор по сегментам одного канала.
-#[derive(Debug)]
 pub struct ChannelCursor {
     dir: PathBuf,
     /// Имена сегментов в порядке обхода.
@@ -325,37 +350,42 @@ pub struct ChannelCursor {
     reverse: bool,
     from: Option<Micros>,
     expect_store: Option<u64>,
+    prefilter: Option<Prefilter>,
     damaged: Vec<Damage>,
     /// Неймспейс и канал — для маркировки выдаваемых записей.
-    pub namespace: String,
-    pub channel: String,
+    ///
+    /// `Arc<str>`, а не `String`: имя копируется в каждую выдаваемую запись,
+    /// и на сотне тысяч записей это была бы сотня тысяч аллокаций.
+    pub namespace: Arc<str>,
+    pub channel: Arc<str>,
 }
 
 /// Параметры открытия канала.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ChannelScope {
     pub from: Option<Micros>,
     pub to: Option<Micros>,
     pub boot: Option<u32>,
     pub reverse: bool,
     pub expect_store: Option<u64>,
+    pub prefilter: Option<Prefilter>,
 }
 
 impl ChannelCursor {
     /// Открыть канал, отобрав сегменты по диапазону времени.
     pub fn open(
         dir: &Path,
-        namespace: String,
-        channel: String,
+        namespace: Arc<str>,
+        channel: Arc<str>,
         scope: &ChannelScope,
     ) -> Result<Self> {
-        let ChannelScope {
-            from,
-            to,
-            boot,
-            reverse,
-            expect_store,
-        } = *scope;
+        let (from, to, boot, reverse, expect_store) = (
+            scope.from,
+            scope.to,
+            scope.boot,
+            scope.reverse,
+            scope.expect_store,
+        );
         let inventory = dduroc_engine::rotation::Inventory::scan(dir).map_err(ReadError::Engine)?;
         let all: Vec<SegmentName> = inventory.iter().map(|e| e.name).collect();
 
@@ -397,6 +427,7 @@ impl ChannelCursor {
             reverse,
             from,
             expect_store,
+            prefilter: scope.prefilter.clone(),
             damaged: Vec::new(),
             namespace,
             channel,
@@ -454,7 +485,12 @@ impl ChannelCursor {
             let name = self.segments[self.next];
             self.next += 1;
             let path = self.dir.join(name.to_string());
-            match SegmentCursor::open(&path, self.reverse, self.expect_store) {
+            match SegmentCursor::open(
+                &path,
+                self.reverse,
+                self.expect_store,
+                self.prefilter.clone(),
+            ) {
                 Ok(mut c) => {
                     if let Some(from) = self.from {
                         c.seek_from(from);
@@ -474,5 +510,42 @@ impl ChannelCursor {
             }
         }
         false
+    }
+}
+
+impl std::fmt::Debug for ChannelScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelScope")
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("boot", &self.boot)
+            .field("reverse", &self.reverse)
+            .field("expect_store", &self.expect_store)
+            .field("prefilter", &self.prefilter.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SegmentCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentCursor")
+            .field("path", &self.path)
+            .field("blocks", &self.offsets.len())
+            .field("next_block", &self.next_block)
+            .field("reverse", &self.reverse)
+            .field("damaged", &self.damaged.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ChannelCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelCursor")
+            .field("namespace", &self.namespace)
+            .field("channel", &self.channel)
+            .field("segments", &self.segments.len())
+            .field("next", &self.next)
+            .field("damaged", &self.damaged.len())
+            .finish()
     }
 }

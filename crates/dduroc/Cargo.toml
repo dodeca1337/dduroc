@@ -16,5 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 dduroc-read.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "hot_path"
+harness = false

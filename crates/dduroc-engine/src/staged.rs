@@ -163,6 +163,47 @@ impl StagedRecord {
     }
 }
 
+/// Счётчики потерь по каналам неймспейса.
+///
+/// Учёт потерь лежит **на горячем пути ровно тогда, когда система под
+/// давлением** — в худший из возможных моментов. Поэтому это массив атомиков,
+/// индексируемый номером канала, а не разделяемая таблица под мьютексом:
+/// последняя добавляла бы к каждой потерянной записи захват блокировки и
+/// работу с хеш-таблицей.
+#[derive(Debug)]
+pub struct DropCounters {
+    per_channel: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl DropCounters {
+    pub fn new(channels: usize) -> Self {
+        Self {
+            per_channel: (0..channels)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    /// Отметить потерю в канале.
+    #[inline]
+    pub fn record(&self, channel: ChannelIdx) {
+        if let Some(c) = self.per_channel.get(channel.0 as usize) {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Забрать накопленное, обнулив счётчик.
+    pub fn take(&self, channel: ChannelIdx) -> u64 {
+        self.per_channel
+            .get(channel.0 as usize)
+            .map_or(0, |c| c.swap(0, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn channels(&self) -> usize {
+        self.per_channel.len()
+    }
+}
+
 /// Определение серии в реестре неймспейса.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeriesEntry {

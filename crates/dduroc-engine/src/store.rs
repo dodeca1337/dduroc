@@ -7,7 +7,7 @@ use crate::error::{Error, IoContext, Result};
 use crate::fsutil;
 use crate::namespace::{Namespace, NsMeta};
 use crate::schema::{Schema, StorageClass};
-use crate::staged::{NsId, SeriesEntry};
+use crate::staged::{DropCounters, NsId, SeriesEntry};
 use crate::stats::{Counters, Stats};
 use crate::writer::{NsSetup, SeriesRegistry, Writer};
 use serde::{Deserialize, Serialize};
@@ -189,6 +189,7 @@ impl Store {
         }
 
         let series: Arc<std::sync::RwLock<Vec<SeriesEntry>>> = SeriesRegistry::new_shared();
+        let drops = Arc::new(DropCounters::new(channel_configs.len()));
         let boot = {
             let epochs = self.epochs.lock().map_err(|_| Error::ShuttingDown)?;
             dduroc_format::BootCounter(epochs.current_run().boot_counter)
@@ -202,6 +203,7 @@ impl Store {
             boot,
             channels: channel_configs,
             series: Arc::clone(&series),
+            drops: Arc::clone(&drops),
         })?;
 
         self.open
@@ -217,6 +219,7 @@ impl Store {
             Arc::clone(&self.writer),
             self.clock.clone(),
             series,
+            drops,
             Arc::clone(&self.next_span),
             meta,
         ))

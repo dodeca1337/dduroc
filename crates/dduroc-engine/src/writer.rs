@@ -31,7 +31,7 @@ use crate::channel::{ChannelConfig, Durability};
 use crate::error::{Error, Result};
 use crate::rotation::{Inventory, SegmentEntry};
 use crate::segment::SegmentWriter;
-use crate::staged::{ChannelIdx, NsId, SeriesEntry, SeriesId, Staged, StagedRecord};
+use crate::staged::{ChannelIdx, DropCounters, NsId, SeriesEntry, SeriesId, Staged, StagedRecord};
 use crate::stats::Counters;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use dduroc_format::block::{BlockBuilder, BlockHeader};
@@ -63,8 +63,13 @@ const DIAG_TARGET: &str = "dduroc";
 // Команды
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Управляющая команда. Идёт по той же очереди, что и записи соответствующего
-/// приоритета, поэтому не может обогнать данные, находящиеся в полёте.
+/// Управляющая команда.
+///
+/// Команды идут отдельной очередью, поэтому сами по себе **обгоняют** данные,
+/// находящиеся в полёте. Чтобы `sync` не отчитался об успехе, пока часть
+/// записей ещё лежит в очереди, а `shutdown` не запечатал сегменты поверх
+/// недописанного, обе команды сперва вычерпывают очереди данных досуха
+/// (см. [`WriterLoop::drain_pending`]).
 #[derive(Debug)]
 enum Control {
     /// Зарегистрировать неймспейс.
@@ -85,6 +90,7 @@ pub struct NsSetup {
     pub boot: BootCounter,
     pub channels: Vec<ChannelConfig>,
     pub series: Arc<RwLock<Vec<SeriesEntry>>>,
+    pub drops: Arc<DropCounters>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -97,8 +103,6 @@ pub struct Writer {
     normal: Sender<Staged>,
     critical: Sender<Staged>,
     control: Sender<Control>,
-    /// Потери, о которых ещё не сделана отметка в потоке.
-    pending_drops: Arc<Mutex<HashMap<(NsId, ChannelIdx), u64>>>,
     counters: Arc<Counters>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -109,12 +113,10 @@ impl Writer {
         let (normal_tx, normal_rx) = crossbeam_channel::bounded(NORMAL_QUEUE);
         let (critical_tx, critical_rx) = crossbeam_channel::bounded(CRITICAL_QUEUE);
         let (control_tx, control_rx) = crossbeam_channel::bounded(64);
-        let pending_drops = Arc::new(Mutex::new(HashMap::new()));
 
         let loop_state = WriterLoop {
             namespaces: Vec::new(),
             counters: Arc::clone(&counters),
-            pending_drops: Arc::clone(&pending_drops),
             batch: Vec::new(),
         };
 
@@ -130,7 +132,6 @@ impl Writer {
             normal: normal_tx,
             critical: critical_tx,
             control: control_tx,
-            pending_drops,
             counters,
             handle: Mutex::new(Some(handle)),
         }))
@@ -148,31 +149,31 @@ impl Writer {
     /// Поставить запись в очередь.
     ///
     /// `critical` выбирает поведение при переполнении: ожидание вместо потери.
-    pub fn write(&self, item: Staged, critical: bool) -> Result<()> {
+    /// `drops` — счётчики канала: потеря должна быть отмечена там, где
+    /// образовалась дыра.
+    #[inline]
+    pub fn write(&self, item: Staged, critical: bool, drops: &DropCounters) -> Result<()> {
         if critical {
-            self.write_critical(item)
+            self.write_critical(item, drops)
         } else {
-            self.write_normal(item)
+            self.write_normal(item, drops)
         }
     }
 
-    fn write_normal(&self, item: Staged) -> Result<()> {
+    #[inline]
+    fn write_normal(&self, item: Staged, drops: &DropCounters) -> Result<()> {
         match self.normal.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(item)) => {
-                // Потеря учитывается адресно: отметка о ней должна попасть в
-                // тот же канал, где образовалась дыра.
                 Counters::bump(&self.counters.dropped);
-                if let Ok(mut map) = self.pending_drops.lock() {
-                    *map.entry((item.ns, item.channel)).or_insert(0) += 1;
-                }
+                drops.record(item.channel);
                 Err(Error::QueueFull)
             }
             Err(TrySendError::Disconnected(_)) => Err(Error::WriterDead),
         }
     }
 
-    fn write_critical(&self, item: Staged) -> Result<()> {
+    fn write_critical(&self, item: Staged, drops: &DropCounters) -> Result<()> {
         match self.critical.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(item)) => {
@@ -183,9 +184,7 @@ impl Writer {
                     Ok(()) => Ok(()),
                     Err(crossbeam_channel::SendTimeoutError::Timeout(item)) => {
                         Counters::bump(&self.counters.dropped);
-                        if let Ok(mut map) = self.pending_drops.lock() {
-                            *map.entry((item.ns, item.channel)).or_insert(0) += 1;
-                        }
+                        drops.record(item.channel);
                         Err(Error::QueueFull)
                     }
                     Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
@@ -303,6 +302,7 @@ struct NsState {
     boot: BootCounter,
     channels: Vec<ChannelState>,
     series: Arc<RwLock<Vec<SeriesEntry>>>,
+    drops: Arc<DropCounters>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -312,7 +312,6 @@ struct NsState {
 struct WriterLoop {
     namespaces: Vec<NsState>,
     counters: Arc<Counters>,
-    pending_drops: Arc<Mutex<HashMap<(NsId, ChannelIdx), u64>>>,
     /// Переиспользуемый буфер батча.
     batch: Vec<Staged>,
 }
@@ -334,7 +333,7 @@ impl WriterLoop {
                 self.apply_batch();
             }
 
-            match self.poll_control(&control) {
+            match self.poll_control(&control, &normal, &critical) {
                 ControlOutcome::Continue => {}
                 ControlOutcome::Stop => break,
             }
@@ -342,14 +341,23 @@ impl WriterLoop {
             if got == 0 {
                 // Ждём либо новую запись, либо ближайший дедлайн.
                 let timeout = self.next_deadline().unwrap_or(Duration::from_millis(250));
+                let mut stop = false;
                 crossbeam_channel::select! {
                     recv(critical) -> item => if let Ok(item) = item { self.batch.push(item); self.apply_batch(); },
                     recv(normal) -> item => if let Ok(item) = item { self.batch.push(item); self.apply_batch(); },
                     recv(control) -> cmd => match cmd {
-                        Ok(cmd) => if matches!(self.handle_control(cmd), ControlOutcome::Stop) { break },
-                        Err(_) => break,
+                        Ok(cmd) => {
+                            stop = matches!(
+                                self.handle_control(cmd, &normal, &critical),
+                                ControlOutcome::Stop
+                            );
+                        }
+                        Err(_) => stop = true,
                     },
                     default(timeout) => {}
+                }
+                if stop {
+                    break;
                 }
             }
 
@@ -357,6 +365,23 @@ impl WriterLoop {
         }
 
         self.finish();
+    }
+
+    /// Вычерпать обе очереди данных досуха.
+    ///
+    /// Вызывается перед `sync` и `shutdown`: команды идут отдельной очередью
+    /// и без этого обгоняли бы записи, уже стоящие в очереди данных. Тогда
+    /// `sync` отчитывался бы об успехе, не записав их, а `shutdown` запечатывал
+    /// сегменты поверх недописанного — записи исчезали бы, хотя `log()`
+    /// вернул `Ok`.
+    fn drain_pending(&mut self, normal: &Receiver<Staged>, critical: &Receiver<Staged>) {
+        loop {
+            let got = self.drain(critical) + self.drain(normal);
+            if got == 0 {
+                break;
+            }
+            self.apply_batch();
+        }
     }
 
     /// Забрать из очереди сколько получится, не превышая лимит.
@@ -693,22 +718,23 @@ impl WriterLoop {
     /// Дыра, о которой нигде не сказано, неотличима от тишины — ровно тот
     /// дефект прототипа, ради которого здесь ведётся учёт.
     fn emit_drop_notices(&mut self) {
-        let drops: Vec<((NsId, ChannelIdx), u64)> = {
-            let Ok(mut map) = self.pending_drops.lock() else {
-                return;
-            };
-            if map.is_empty() {
-                return;
+        let mut notices: Vec<(NsId, ChannelIdx, u64, Micros)> = Vec::new();
+        for (ns_idx, ns) in self.namespaces.iter().enumerate() {
+            for ch_idx in 0..ns.channels.len() {
+                let channel = ChannelIdx(ch_idx as u16);
+                let count = ns.drops.take(channel);
+                if count > 0 {
+                    notices.push((
+                        NsId(ns_idx as u32),
+                        channel,
+                        count,
+                        ns.channels[ch_idx].last_time,
+                    ));
+                }
             }
-            map.drain().collect()
-        };
+        }
 
-        for ((ns, channel), count) in drops {
-            let at = self
-                .namespaces
-                .get(ns.0 as usize)
-                .and_then(|n| n.channels.get(channel.0 as usize))
-                .map_or(Micros(0), |c| c.last_time);
+        for (ns, channel, count, at) in notices {
             let item = Staged {
                 ns,
                 channel,
@@ -727,26 +753,43 @@ impl WriterLoop {
         }
     }
 
-    fn poll_control(&mut self, control: &Receiver<Control>) -> ControlOutcome {
+    fn poll_control(
+        &mut self,
+        control: &Receiver<Control>,
+        normal: &Receiver<Staged>,
+        critical: &Receiver<Staged>,
+    ) -> ControlOutcome {
         while let Ok(cmd) = control.try_recv() {
-            if matches!(self.handle_control(cmd), ControlOutcome::Stop) {
+            if matches!(
+                self.handle_control(cmd, normal, critical),
+                ControlOutcome::Stop
+            ) {
                 return ControlOutcome::Stop;
             }
         }
         ControlOutcome::Continue
     }
 
-    fn handle_control(&mut self, cmd: Control) -> ControlOutcome {
+    fn handle_control(
+        &mut self,
+        cmd: Control,
+        normal: &Receiver<Staged>,
+        critical: &Receiver<Staged>,
+    ) -> ControlOutcome {
         match cmd {
             Control::Register(setup, reply) => {
                 let _ = reply.send(self.register(*setup));
                 ControlOutcome::Continue
             }
             Control::Sync(ns, reply) => {
+                // Сначала записи, потом отчёт: иначе `sync` подтвердил бы
+                // сохранность того, что ещё стоит в очереди.
+                self.drain_pending(normal, critical);
                 let _ = reply.send(self.sync_all(ns));
                 ControlOutcome::Continue
             }
             Control::Shutdown(reply) => {
+                self.drain_pending(normal, critical);
                 self.finish();
                 let _ = reply.send(());
                 ControlOutcome::Stop
@@ -768,6 +811,7 @@ impl WriterLoop {
             boot: setup.boot,
             channels,
             series: setup.series,
+            drops: setup.drops,
         });
         Ok(id)
     }
