@@ -31,17 +31,14 @@ use crate::channel::{ChannelConfig, Durability};
 use crate::error::{Error, Result};
 use crate::rotation::{Inventory, SegmentEntry};
 use crate::segment::SegmentWriter;
-use crate::staged::{ChannelIdx, DropCounters, NsId, SeriesEntry, SeriesId, Staged, StagedRecord};
+use crate::staged::{ChannelIdx, DropCounters, NsId, Staged, StagedRecord};
 use crate::stats::Counters;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use dduroc_format::block::{BlockBuilder, BlockHeader};
 use dduroc_format::segment::{SegmentHeader, SegmentName};
-use dduroc_format::{
-    BootCounter, FooterBuilder, Level, MetricId, Micros, ProtocolVersion, SeriesLocal,
-};
-use std::collections::HashMap;
+use dduroc_format::{BootCounter, FooterBuilder, Level, Micros, ProtocolVersion};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Ёмкости очередей.
@@ -134,7 +131,6 @@ pub struct NsSetup {
     pub store_id: u64,
     pub boot: BootCounter,
     pub channels: Vec<ChannelConfig>,
-    pub series: Arc<RwLock<Vec<SeriesEntry>>>,
     pub drops: Arc<DropCounters>,
 }
 
@@ -333,10 +329,6 @@ struct ChannelState {
     segment: Option<SegmentWriter>,
     builder: BlockBuilder,
     footer: FooterBuilder,
-    /// Соответствие серий реестра сегментно-локальным номерам.
-    /// Сбрасывается вместе со сменой сегмента — определения серий живут
-    /// в том же сегменте, что и их сэмплы.
-    series_map: HashMap<SeriesId, SeriesLocal>,
     /// Буфер сериализации блока. Переиспользуется: аллокация и рост на
     /// каждый flush — лишняя работа на пути, который выполняется тысячи раз
     /// в секунду.
@@ -373,7 +365,6 @@ impl ChannelState {
             inventory,
             segment: None,
             footer: FooterBuilder::new(),
-            series_map: HashMap::new(),
             scratch: Vec::new(),
             last_time: Micros(0),
             block_opened: None,
@@ -407,7 +398,6 @@ struct NsState {
     #[allow(dead_code)]
     name: String,
     channels: Vec<ChannelState>,
-    series: Arc<RwLock<Vec<SeriesEntry>>>,
     drops: Arc<DropCounters>,
 }
 
@@ -584,17 +574,6 @@ impl WriterLoop {
             return Ok(());
         }
 
-        // Серию нужно разрешить до заимствования канала: справочник лежит
-        // в неймспейсе, а канал берётся изменяемой ссылкой.
-        let series_entry = match &item.record {
-            StagedRecord::Sample { series, .. } => {
-                let ns = &self.namespaces[ns_idx];
-                let guard = ns.series.read().map_err(|_| Error::WriterDead)?;
-                Some((*series, guard.get(series.0 as usize).cloned()))
-            }
-            _ => None,
-        };
-
         let ch = &mut self.namespaces[ns_idx].channels[ch_idx];
 
         // Монотонность внутри канала: время из прошлого подтягивается вперёд.
@@ -604,31 +583,21 @@ impl WriterLoop {
         let at = Micros(item.at.0.max(ch.last_time.0));
         ch.last_time = at;
 
-        // Блок открывается против конкретного сегмента: решать, куда он
-        // ляжет, в момент выталкивания нельзя — определения серий уже
-        // посчитаны против текущего сегмента и уехали бы в чужой.
         if ch.builder.is_empty() {
             Self::ensure_room(ch, at, &self.counters)?;
             ch.block_opened = Some(Instant::now());
         }
 
-        let series_local = match series_entry {
-            Some((series, Some(entry))) => Some(Self::intern_series(ch, series, &entry, at)?),
-            Some((_, None)) => {
-                // Серии нет в реестре — сэмпл нечем описать.
-                Counters::bump(&self.counters.dropped);
-                return Ok(());
-            }
-            None => None,
-        };
-
-        let Some(record) = item.record.as_record(series_local) else {
-            return Ok(());
-        };
-        ch.builder.push(at, &record)?;
+        ch.builder.push(at, &item.record.as_record())?;
         Counters::bump(&self.counters.records_written);
-        if let Some(id) = item.event_id() {
+        // Множества типов в footer'е: миграция по ним решает, переписывать ли
+        // сегмент, а читатель — что в сегменте вообще есть.
+        let (event, metric) = item.footer_ids();
+        if let Some(id) = event {
             ch.footer.add_event(id);
+        }
+        if let Some(id) = metric {
+            ch.footer.add_metric(id);
         }
         ch.dirty_since_sync = true;
         if !self.active.contains(&(ns_idx, ch_idx)) {
@@ -639,31 +608,6 @@ impl WriterLoop {
             Self::flush_block(ch, &self.counters)?;
         }
         Ok(())
-    }
-
-    /// Выдать серии сегментно-локальный номер, при необходимости записав
-    /// её определение в текущий блок.
-    fn intern_series(
-        ch: &mut ChannelState,
-        series: SeriesId,
-        entry: &SeriesEntry,
-        at: Micros,
-    ) -> Result<SeriesLocal> {
-        if let Some(local) = ch.series_map.get(&series) {
-            return Ok(*local);
-        }
-        let local = SeriesLocal(ch.series_map.len() as u32);
-        let tags = entry.tag_refs();
-        let def = dduroc_format::Record::SeriesDef(dduroc_format::SeriesDef {
-            series: local,
-            metric: entry.metric,
-            value_type: entry.value_type,
-            tags: dduroc_format::Tags::Slice(&tags),
-        });
-        ch.builder.push(at, &def)?;
-        ch.footer.add_series(entry.metric, entry.value_type, &tags);
-        ch.series_map.insert(series, local);
-        Ok(local)
     }
 
     /// Убедиться, что в активном сегменте хватит места на целый блок.
@@ -701,7 +645,6 @@ impl WriterLoop {
                         size: ch.config.segment_bytes,
                     });
                     ch.segment = Some(seg);
-                    ch.series_map.clear();
                     ch.footer.reset();
                     Counters::bump(&counters.segments_created);
                     // Новый сегмент занял место — освобождаем старые.
@@ -819,7 +762,6 @@ impl WriterLoop {
         // это учесть, иначе ротация считала бы преаллокацию вечной.
         ch.inventory.update_size(name, data_end + footer_len);
         ch.footer.reset();
-        ch.series_map.clear();
         ch.dirty_since_sync = false;
         Counters::bump(&counters.segments_sealed);
         Ok(())
@@ -1003,7 +945,6 @@ impl WriterLoop {
         self.namespaces.push(NsState {
             name: setup.name,
             channels,
-            series: setup.series,
             drops: setup.drops,
         });
         Ok(id)
@@ -1057,114 +998,50 @@ enum ControlOutcome {
     Stop,
 }
 
-/// Операции над реестром серий неймспейса.
-///
-/// Реестр — просто разделяемый вектор: серия регистрируется один раз при
-/// открытии, дальше сэмпл ссылается на неё номером.
-#[derive(Debug)]
-pub struct SeriesRegistry;
-
-impl SeriesRegistry {
-    /// Создать пустой реестр.
-    pub fn new_shared() -> Arc<RwLock<Vec<SeriesEntry>>> {
-        Arc::new(RwLock::new(Vec::new()))
-    }
-
-    /// Найти или создать серию. Идентификаторы выдаются по порядку и не
-    /// переиспользуются.
-    pub fn intern(
-        registry: &RwLock<Vec<SeriesEntry>>,
-        metric: MetricId,
-        value_type: dduroc_format::ValueType,
-        tags: &[(&str, &str)],
-    ) -> SeriesId {
-        let matches = |e: &SeriesEntry| {
-            e.metric == metric
-                && e.tags.len() == tags.len()
-                && e.tags
-                    .iter()
-                    .zip(tags)
-                    .all(|((k, v), (tk, tv))| k == tk && v == tv)
-        };
-
-        if let Ok(guard) = registry.read()
-            && let Some(pos) = guard.iter().position(matches)
-        {
-            return SeriesId(pos as u32);
-        }
-
-        let mut guard = match registry.write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // Повторная проверка: между освобождением read и взятием write
-        // серию мог зарегистрировать другой поток.
-        if let Some(pos) = guard.iter().position(matches) {
-            return SeriesId(pos as u32);
-        }
-        guard.push(SeriesEntry {
-            metric,
-            value_type,
-            tags: tags
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect(),
-        });
-        SeriesId((guard.len() - 1) as u32)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dduroc_format::ValueType;
+    use crate::staged::{OwnedValue, StagedRecord as SR};
+    use dduroc_format::MetricId;
 
     #[test]
-    fn series_registry_dedups_and_is_namespace_local() {
-        let reg = SeriesRegistry::new_shared();
-        let a = SeriesRegistry::intern(&reg, MetricId(1), ValueType::F32, &[("sensor", "pa")]);
-        let b = SeriesRegistry::intern(&reg, MetricId(1), ValueType::F32, &[("sensor", "pa")]);
-        assert_eq!(a, b, "та же серия — тот же идентификатор");
+    fn queue_sizes_never_degenerate_to_rendezvous() {
+        // Нулевая ёмкость превратила бы постановку в очередь в рандеву с
+        // writer'ом: обычный канал перестал бы отличаться от критического, а
+        // прикладной поток стал бы ждать диск на каждой записи.
+        let q = QueueSizes {
+            normal: 0,
+            critical: 0,
+        }
+        .sanitized();
+        assert_eq!(q.normal, 1);
+        assert_eq!(q.critical, 1);
 
-        let c = SeriesRegistry::intern(&reg, MetricId(1), ValueType::F32, &[("sensor", "lna")]);
-        assert_ne!(a, c, "другие тэги — другая серия");
-        let d = SeriesRegistry::intern(&reg, MetricId(2), ValueType::F32, &[("sensor", "pa")]);
-        assert_ne!(a, d, "другая метрика — другая серия");
-
-        // Реестр другого неймспейса нумеруется независимо: общий на процесс
-        // склеил бы серии разных экземпляров сервиса.
-        let other = SeriesRegistry::new_shared();
-        let e = SeriesRegistry::intern(&other, MetricId(9), ValueType::F64, &[]);
-        assert_eq!(e, SeriesId(0));
+        let d = QueueSizes::default();
+        assert_eq!(d.sanitized(), d, "разумные значения не искажаются");
     }
 
     #[test]
-    fn series_registry_is_thread_safe() {
-        let reg = SeriesRegistry::new_shared();
-        let mut handles = Vec::new();
-        for t in 0..4 {
-            let reg = Arc::clone(&reg);
-            handles.push(std::thread::spawn(move || {
-                let mut ids = Vec::new();
-                for i in 0..50u16 {
-                    let tag = format!("s{}", i % 10);
-                    ids.push(SeriesRegistry::intern(
-                        &reg,
-                        MetricId(i % 5),
-                        ValueType::F32,
-                        &[("sensor", tag.as_str())],
-                    ));
-                }
-                let _ = t;
-                ids
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        // 5 метрик × 10 тэгов, но пары (метрика, тэг) повторяются циклами
-        // по 10: уникальных комбинаций ровно 10.
-        let count = reg.read().unwrap().len();
-        assert_eq!(count, 10, "дубликаты не создаются при гонке");
+    fn footer_ids_split_events_from_metrics() {
+        // Множества типов в footer'е ведутся раздельно: миграция спрашивает
+        // про события и метрики по отдельности.
+        let sample = Staged {
+            ns: NsId(0),
+            channel: ChannelIdx(0),
+            at: Micros(0),
+            record: SR::Sample {
+                metric: MetricId(4),
+                value: OwnedValue::F32(1.0),
+            },
+        };
+        assert_eq!(sample.footer_ids(), (None, Some(MetricId(4))));
+
+        let span = Staged {
+            record: SR::SpanEnd {
+                span: dduroc_format::SpanId(1),
+            },
+            ..sample
+        };
+        assert_eq!(span.footer_ids(), (None, None), "спан не тип данных");
     }
 }

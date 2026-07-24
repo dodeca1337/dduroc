@@ -33,7 +33,21 @@
 //!     }
 //!
 //!     metrics {
-//!         Temp = 0x01 { vtype: f32, unit: "°C", tags: [sensor] },
+//!         // Непрерывная величина с пределами: вне `warn` — тревога,
+//!         // вне `critical` — авария. Верхняя граница включительная,
+//!         // поэтому `..=`.
+//!         TempPa = 0x01 { vtype: f32, unit: "°C", tags: [thermal],
+//!                         warn: ..=70.0, critical: ..=85.0 },
+//!         // Второй датчик — отдельная метрика, а не размерность первой:
+//!         // рантайм-тэгов нет, и различающий признак не занимает места
+//!         // в каждом отсчёте.
+//!         TempLna = 0x02 { vtype: f32, unit: "°C", tags: [thermal] },
+//!         // Конечный автомат как временной ряд. Коды явные: позиционная
+//!         // нумерация сдвинулась бы при вставке состояния в середину.
+//!         LinkState = 0x03 {
+//!             states: [Los = 0: critical, Sync = 1: warn, Lock = 2],
+//!             tags: [rf],
+//!         },
 //!     }
 //!
 //!     spans {
@@ -52,8 +66,22 @@
 //!
 //! ns.log(radio::events::PowerSet { dbm: 27.5 })?;
 //!
-//! let temp = ns.series(radio::metrics::Temp, &[("sensor", "pa")])?;
+//! let temp = ns.series(radio::metrics::TempPa)?;
 //! temp.sample_f32(36.6)?;
+//!
+//! // Состояние: на диск уходит код, имя и важность берутся из схемы.
+//! let link = ns.series(radio::metrics::LinkState)?;
+//! link.sample_state(radio::metrics::LinkState::Lock)?;
+//!
+//! // Пределы, известные только в рантайме (модель железа определена
+//! // внешней системой). На диск не пишутся.
+//! ns.set_limits(
+//!     radio::metrics::TempPa,
+//!     Some(MetricLimits::numeric(Thresholds {
+//!         warn: dduroc::Range { min: None, max: Some(60.0) },
+//!         critical: dduroc::Range { min: None, max: Some(75.0) },
+//!     })),
+//! )?;
 //!
 //! {
 //!     let cal = ns.span(radio::spans::Calibration)?;
@@ -85,10 +113,12 @@ pub use serde_json;
 
 pub use dduroc_engine::channel::{ChannelConfig, Durability};
 pub use dduroc_engine::epochs::SyncSource;
-pub use dduroc_engine::namespace::{Namespace, Series, SpanGuard};
+pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, StateStatus};
+pub use dduroc_engine::namespace::{MetricState, Namespace, Series, SpanGuard};
 pub use dduroc_engine::schema::{
-    DecodeError, EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MigratedRecord,
-    Migration, OwnedRecord, Schema, SpanDesc, StorageClass,
+    DecodeError, EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MetricKind,
+    MigratedRecord, Migration, OwnedRecord, Range, Schema, Severity, SpanDesc, StateDesc,
+    StorageClass, Thresholds,
 };
 pub use dduroc_engine::staged::{OwnedValue, Payload};
 pub use dduroc_engine::stats::Stats;
@@ -102,7 +132,8 @@ pub use dduroc_format::{
 /// Всё, что нужно для записи: типы и трейты одной строкой.
 pub mod prelude {
     pub use crate::{
-        Event, Level, NamespaceExt, OwnedValue, SpanExt, Store, StoreConfig, SyncSource,
+        Event, Level, MetricLimits, MetricState, NamespaceExt, OwnedValue, Severity, SpanExt,
+        Store, StoreConfig, SyncSource, Thresholds,
     };
 }
 
@@ -196,8 +227,17 @@ mod tests {
         }
 
         metrics {
-            Temp = 0x01 { vtype: f32, unit: "°C", tags: [sensor] },
+            Temp = 0x01 { vtype: f32, unit: "°C", tags: [thermal],
+                          warn: ..=70.0, critical: ..=85.0 },
             Spectrum = 0x02 { vtype: blob, store: telemetry },
+            LinkState = 0x03 {
+                states: [Los = 0: critical, Sync = 1: warn, Lock = 2],
+                tags: [rf],
+            },
+            Locked = 0x04 {
+                vtype: bool,
+                states: [Unlocked = 0: critical, Locked = 1],
+            },
         }
 
         spans {
@@ -212,7 +252,7 @@ mod tests {
         assert_eq!(testing::SCHEMA.name, "testing");
         assert_eq!(testing::SCHEMA.version, ProtocolVersion(1));
         assert_eq!(testing::SCHEMA.events.len(), 3);
-        assert_eq!(testing::SCHEMA.metrics.len(), 2);
+        assert_eq!(testing::SCHEMA.metrics.len(), 4);
         assert_eq!(testing::SCHEMA.spans.len(), 2);
     }
 
@@ -298,9 +338,7 @@ mod tests {
             ns.log(testing::events::Overheat { t: 91.0, sensor: 1 })
                 .unwrap();
 
-            let temp = ns
-                .series(testing::metrics::Temp, &[("sensor", "pa")])
-                .unwrap();
+            let temp = ns.series(testing::metrics::Temp).unwrap();
             temp.sample_f32(36.6).unwrap();
 
             {
@@ -343,6 +381,133 @@ mod tests {
         // Событие внутри спана привязано к нему.
         let in_span = result.entries.iter().filter(|e| e.span.is_some()).count();
         assert_eq!(in_span, 1);
+    }
+
+    #[test]
+    fn macro_generates_typed_states_and_limits() {
+        // Проверка того, что даёт макрос: константа метрики и Rust-тип
+        // состояний с одним именем (у значений и типов разные пространства
+        // имён), подписи и важность в схеме, пределы из диапазонов.
+        testing::SCHEMA.validate().expect("схема корректна");
+
+        let link = testing::SCHEMA.metric(MetricId(3)).unwrap();
+        assert_eq!(link.kind, MetricKind::State);
+        assert_eq!(link.value_type, ValueType::U64, "код состояния — целое");
+        assert_eq!(link.tags, &["rf"]);
+        assert_eq!(link.states.len(), 3);
+        assert_eq!(link.state(0).unwrap().name, "Los");
+        assert_eq!(link.state(0).unwrap().severity, Severity::Critical);
+        assert_eq!(link.state(1).unwrap().severity, Severity::Warn);
+        assert_eq!(link.state(2).unwrap().severity, Severity::Normal);
+
+        // Одно имя, два пространства имён: значение и тип.
+        let id: MetricId = testing::metrics::LinkState;
+        assert_eq!(id, MetricId(3));
+        assert_eq!(
+            <testing::metrics::LinkState as MetricState>::metric(),
+            MetricId(3)
+        );
+        assert_eq!(testing::metrics::LinkState::Lock.code(), 2);
+        assert_eq!(testing::metrics::LinkState::Los.name(), "Los");
+
+        // bool как два состояния.
+        let locked = testing::SCHEMA.metric(MetricId(4)).unwrap();
+        assert_eq!(locked.value_type, ValueType::Bool);
+        assert_eq!(locked.kind, MetricKind::State);
+        assert_eq!(locked.state(0).unwrap().severity, Severity::Critical);
+
+        // Пределы из диапазонов: верхняя граница включительная.
+        let temp = testing::SCHEMA.metric(MetricId(1)).unwrap();
+        assert_eq!(temp.thresholds.warn.max, Some(70.0));
+        assert_eq!(temp.thresholds.warn.min, None);
+        assert_eq!(temp.thresholds.critical.max, Some(85.0));
+        assert_eq!(
+            temp.severity_of(&dduroc_format::Value::F32(70.0)),
+            Severity::Normal
+        );
+        assert_eq!(
+            temp.severity_of(&dduroc_format::Value::F32(71.0)),
+            Severity::Warn
+        );
+        assert_eq!(
+            temp.severity_of(&dduroc_format::Value::F32(90.0)),
+            Severity::Critical
+        );
+
+        // Метрика без пределов и без состояний.
+        let spec = testing::SCHEMA.metric(MetricId(2)).unwrap();
+        assert!(spec.thresholds.is_unset());
+        assert!(spec.states.is_empty());
+        assert_eq!(spec.kind, MetricKind::Gauge);
+    }
+
+    #[test]
+    fn states_roundtrip_through_disk_as_bare_codes() {
+        use dduroc_read::{EntryKind, KindFilter, Order, Query, Reader};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+        {
+            let store = Store::open(config.clone()).unwrap();
+            let ns = store
+                .namespace("orc-radio-0", testing::SCHEMA, &config)
+                .unwrap();
+
+            let link = ns.series(testing::metrics::LinkState).unwrap();
+            for st in [
+                testing::metrics::LinkState::Los,
+                testing::metrics::LinkState::Sync,
+                testing::metrics::LinkState::Lock,
+            ] {
+                link.sample_state(st).unwrap();
+            }
+            let locked = ns.series(testing::metrics::Locked).unwrap();
+            locked
+                .sample_state(testing::metrics::Locked::Locked)
+                .unwrap();
+
+            ns.sync().unwrap();
+            assert!(store.stats().is_clean(), "{:?}", store.stats());
+            assert_eq!(
+                store.stats().records_written,
+                4,
+                "ни одной служебной записи: идентичность ряда — сама метрика"
+            );
+            store.shutdown();
+        }
+
+        let reader = Reader::open(dir.path(), &[testing::SCHEMA]).unwrap();
+        let result = reader
+            .query(
+                &Query::new()
+                    .order(Order::Oldest)
+                    .kinds(KindFilter::TELEMETRY),
+            )
+            .unwrap();
+        assert!(result.is_complete());
+
+        let seen: Vec<(&str, Severity)> = result
+            .entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EntryKind::Sample {
+                    state: Some(name),
+                    severity: Some(sev),
+                    ..
+                } => Some((*name, *sev)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("Los", Severity::Critical),
+                ("Sync", Severity::Warn),
+                ("Lock", Severity::Normal),
+                ("Locked", Severity::Normal),
+            ],
+            "подписи и важность восстановлены по схеме — на диске их не было"
+        );
     }
 
     #[test]

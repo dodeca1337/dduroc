@@ -105,6 +105,129 @@ impl EventDesc {
     }
 }
 
+/// Насколько значение метрики требует внимания.
+///
+/// Вычисляется при чтении по пределам, на диск не пишется: пределы —
+/// настраиваемое свойство установки, а не свойство измерения. Одна и та же
+/// температура нормальна для одного усилителя и аварийна для другого.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
+pub enum Severity {
+    #[default]
+    Normal,
+    Warn,
+    Critical,
+}
+
+impl Severity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Severity::Normal => "normal",
+            Severity::Warn => "warn",
+            Severity::Critical => "critical",
+        }
+    }
+
+    pub const fn is_normal(self) -> bool {
+        matches!(self, Severity::Normal)
+    }
+}
+
+/// Как величина ведёт себя между отсчётами — подсказка тому, кто её рисует.
+///
+/// Соединять точки прямой можно только у непрерывной величины. Состояние
+/// между отсчётами **не меняется**: линия через промежуточные значения
+/// показала бы состояния, которых не было. Разница не косметическая, поэтому
+/// вид объявляется в схеме, а не угадывается по типу значения.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub enum MetricKind {
+    /// Непрерывная величина: температура, мощность. Интерполируется.
+    #[default]
+    Gauge,
+    /// Дискретное состояние: держится ступенькой до следующего отсчёта.
+    State,
+    /// Монотонно растущий счётчик: осмысленна производная, не значение.
+    Counter,
+}
+
+/// Одно состояние метрики-перечисления.
+///
+/// Код пишется на диск как обычное целое, имя и важность остаются в схеме —
+/// ровно как уровень и шаблон у сообщения. Коды задаются **явно**: позиционная
+/// нумерация сдвинулась бы при вставке состояния в середину списка, и старые
+/// сегменты стали бы читаться неверно без единого признака ошибки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateDesc {
+    pub code: u64,
+    pub name: &'static str,
+    /// Важность самого факта нахождения в этом состоянии.
+    pub severity: Severity,
+}
+
+/// Диапазон допустимых значений; `None` — граница не задана.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Range {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+impl Range {
+    pub const NONE: Self = Self {
+        min: None,
+        max: None,
+    };
+
+    pub const fn is_unset(&self) -> bool {
+        self.min.is_none() && self.max.is_none()
+    }
+
+    /// Лежит ли значение внутри (границы включительно).
+    ///
+    /// NaN не внутри никакого диапазона: сравнения с ним ложны, и это
+    /// правильный ответ — неизвестное значение не «нормально».
+    pub fn contains(&self, v: f64) -> bool {
+        if v.is_nan() {
+            return false;
+        }
+        self.min.is_none_or(|m| v >= m) && self.max.is_none_or(|m| v <= m)
+    }
+}
+
+/// Пределы числовой метрики: диапазоны, **вне** которых значение требует
+/// внимания.
+///
+/// `critical` обязан включать `warn`: сначала величина выходит из нормы, потом
+/// из допустимого. Обратное означало бы, что значение критично, но не тревожно.
+/// Проверяется в [`Schema::validate`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Thresholds {
+    /// Вне этого диапазона — [`Severity::Warn`].
+    pub warn: Range,
+    /// Вне этого — [`Severity::Critical`].
+    pub critical: Range,
+}
+
+impl Thresholds {
+    pub const NONE: Self = Self {
+        warn: Range::NONE,
+        critical: Range::NONE,
+    };
+
+    pub const fn is_unset(&self) -> bool {
+        self.warn.is_unset() && self.critical.is_unset()
+    }
+
+    /// Важность числового значения. Более тяжёлый диагноз побеждает.
+    pub fn severity_of(&self, v: f64) -> Severity {
+        if !self.critical.is_unset() && !self.critical.contains(v) {
+            return Severity::Critical;
+        }
+        if !self.warn.is_unset() && !self.warn.contains(v) {
+            return Severity::Warn;
+        }
+        Severity::Normal
+    }
+}
+
 /// Тип метрики телеметрии.
 #[derive(Debug, Clone, Copy)]
 pub struct MetricDesc {
@@ -114,8 +237,52 @@ pub struct MetricDesc {
     pub class: StorageClass,
     /// Единица измерения для UI (`"°C"`, `"dBm"`).
     pub unit: &'static str,
-    /// Разрешённые ключи тэгов серии.
-    pub tag_keys: &'static [&'static str],
+    /// Статические тэги-категории — как у [`EventDesc::tags`]. Живут в схеме,
+    /// места на диске не занимают.
+    ///
+    /// Рантайм-размерностей у метрики нет: идентичность ряда равна метрике.
+    /// Четыре датчика температуры — это четыре метрики схемы, а не одна с
+    /// тэгом, иначе тэг пришлось бы писать в каждый отсчёт.
+    pub tags: &'static [&'static str],
+    /// Как величина ведёт себя между отсчётами.
+    pub kind: MetricKind,
+    /// Подписи кодов состояний. Пусто — метрика не перечисление.
+    pub states: &'static [StateDesc],
+    /// Пределы по умолчанию. Установка вправе переопределить их в рантайме
+    /// (см. `Namespace::set_limits`) — например узнав модель железа.
+    pub thresholds: Thresholds,
+}
+
+impl MetricDesc {
+    /// Подпись состояния по коду. `None` — код не объявлен либо метрика не
+    /// перечисление.
+    pub fn state(&self, code: u64) -> Option<&'static StateDesc> {
+        self.states.iter().find(|s| s.code == code)
+    }
+
+    /// Важность значения по пределам **из схемы**.
+    ///
+    /// Для перечислений и `bool` берётся важность состояния: их значения не
+    /// упорядочены, и «выше порога» к ним неприменимо. Незнакомый код — не
+    /// повод для тревоги сам по себе, но и не норма: у него нет подписи, и
+    /// решать, что он значит, читателю нечем.
+    pub fn severity_of(&self, value: &dduroc_format::Value<'_>) -> Severity {
+        use dduroc_format::Value;
+        if !self.states.is_empty() {
+            let code = match value {
+                Value::U64(v) => Some(*v),
+                Value::I64(v) if *v >= 0 => Some(*v as u64),
+                Value::Bool(b) => Some(u64::from(*b)),
+                _ => None,
+            };
+            return code
+                .and_then(|c| self.state(c))
+                .map_or(Severity::Normal, |s| s.severity);
+        }
+        value
+            .as_f64()
+            .map_or(Severity::Normal, |v| self.thresholds.severity_of(v))
+    }
 }
 
 /// Вид спана.
@@ -239,6 +406,20 @@ pub enum SchemaError {
         kind: &'static str,
         name: &'static str,
     },
+
+    #[error("схема {schema:?}: метрика {metric:?} объявляет код состояния {code} дважды")]
+    DuplicateStateCode {
+        schema: &'static str,
+        metric: &'static str,
+        code: u64,
+    },
+
+    #[error("схема {schema:?}: метрика {metric:?}: {reason}")]
+    BadMetric {
+        schema: &'static str,
+        metric: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl Schema {
@@ -308,6 +489,10 @@ impl Schema {
             }
         }
 
+        for m in self.metrics {
+            self.check_metric(m)?;
+        }
+
         // Цепочка миграций обязана быть непрерывной: 1→2→…→version. Пропуск
         // означает, что данные старой версии молча остались бы неверно
         // истолкованными.
@@ -331,6 +516,93 @@ impl Schema {
         Ok(())
     }
 
+    /// Проверить осмысленность метрики.
+    ///
+    /// Бессмысленную метрику нельзя объявить: ошибка ловится на старте
+    /// процесса, а не через месяц работы на графике, который никто не может
+    /// прочесть.
+    fn check_metric(&self, m: &MetricDesc) -> Result<(), SchemaError> {
+        let bad = |reason| SchemaError::BadMetric {
+            schema: self.name,
+            metric: m.name,
+            reason,
+        };
+
+        // Перечисление и вид State — одно и то же свойство, объявленное
+        // дважды. Расхождение означает, что одно из двух написано по ошибке,
+        // а какое — знает только автор схемы.
+        match (m.states.is_empty(), m.kind) {
+            (true, MetricKind::State) => {
+                return Err(bad(
+                    "вид State без объявленных состояний: подписывать нечем",
+                ));
+            }
+            (false, k) if k != MetricKind::State => {
+                return Err(bad(
+                    "состояния объявлены, но вид не State — график нарисовали бы \
+                     прямой через значения, которых не было",
+                ));
+            }
+            _ => {}
+        }
+
+        if !m.states.is_empty() {
+            // Код состояния — целое на диске, поэтому дробный или блобовый
+            // тип значения к перечислению неприменим.
+            if !matches!(
+                m.value_type,
+                ValueType::U64 | ValueType::I64 | ValueType::Bool
+            ) {
+                return Err(bad(
+                    "состояния допустимы только у целочисленной или булевой \
+                     метрики: код состояния хранится целым",
+                ));
+            }
+            if !m.thresholds.is_unset() {
+                return Err(bad(
+                    "числовые пределы у перечисления: его значения не упорядочены, \
+                     важность задаётся на состояние",
+                ));
+            }
+            for (i, s) in m.states.iter().enumerate() {
+                if m.states[..i].iter().any(|p| p.code == s.code) {
+                    return Err(SchemaError::DuplicateStateCode {
+                        schema: self.name,
+                        metric: m.name,
+                        code: s.code,
+                    });
+                }
+                if s.name.is_empty() {
+                    return Err(bad("состояние без имени"));
+                }
+                if m.value_type == ValueType::Bool && s.code > 1 {
+                    return Err(bad("у булевой метрики допустимы только коды 0 и 1"));
+                }
+            }
+        }
+
+        for (r, what) in [
+            (m.thresholds.warn, "тревожный"),
+            (m.thresholds.critical, "критический"),
+        ] {
+            if matches!((r.min, r.max), (Some(lo), Some(hi)) if lo > hi) {
+                let _ = what;
+                return Err(bad("диапазон задан вывернутым: min больше max"));
+            }
+            if r.min.is_some_and(f64::is_nan) || r.max.is_some_and(f64::is_nan) {
+                return Err(bad("граница диапазона — NaN: сравнения с ним всегда ложны"));
+            }
+        }
+        crate::limits::check_nesting(m.name, &m.thresholds).map_err(|_| {
+            bad(
+                "критический диапазон обязан включать тревожный: иначе значение \
+                 оказалось бы критическим, не будучи тревожным",
+            )
+        })?;
+
+        Ok(())
+    }
+
     /// Найти тип сообщения по идентификатору.
     ///
     /// Вызывается на **каждую** записываемую и читаемую запись, поэтому
@@ -346,9 +618,22 @@ impl Schema {
     }
 
     pub fn metric(&self, id: MetricId) -> Option<&'static MetricDesc> {
+        self.metric_index(id).map(|(_, d)| d)
+    }
+
+    /// Метрика вместе с её позицией в [`Schema::metrics`].
+    ///
+    /// Позиция — устойчивый ключ для того, что хранится параллельно схеме и
+    /// не пишется на диск: рантайм-пределов (см. [`crate::limits`]).
+    pub fn metric_index(&self, id: MetricId) -> Option<(usize, &'static MetricDesc)> {
         match self.metrics.binary_search_by_key(&id.0, |m| m.id.0) {
-            Ok(i) => Some(&self.metrics[i]),
-            Err(_) => self.metrics.iter().find(|m| m.id == id),
+            Ok(i) => Some((i, &self.metrics[i])),
+            // Схема не отсортирована (не прошла validate) — честно ищем.
+            Err(_) => self
+                .metrics
+                .iter()
+                .position(|m| m.id == id)
+                .map(|i| (i, &self.metrics[i])),
         }
     }
 
@@ -599,6 +884,325 @@ mod tests {
         }
         .validate()
         .expect("непрерывная цепочка");
+    }
+
+    /// Схема с одной метрикой — для проверок осмысленности метрик.
+    fn with_metric(metrics: &'static [MetricDesc]) -> Schema {
+        static EVENTS: &[EventDesc] = &[];
+        Schema {
+            metrics,
+            ..schema(EVENTS, 1)
+        }
+    }
+
+    const fn metric(
+        value_type: ValueType,
+        kind: MetricKind,
+        states: &'static [StateDesc],
+        thresholds: Thresholds,
+    ) -> MetricDesc {
+        MetricDesc {
+            id: MetricId(1),
+            name: "m",
+            value_type,
+            class: StorageClass::TELEMETRY,
+            unit: "",
+            tags: &[],
+            kind,
+            states,
+            thresholds,
+        }
+    }
+
+    const fn range(min: Option<f64>, max: Option<f64>) -> Range {
+        Range { min, max }
+    }
+
+    #[test]
+    fn valid_state_metric_passes() {
+        static STATES: &[StateDesc] = &[
+            StateDesc {
+                code: 0,
+                name: "Los",
+                severity: Severity::Critical,
+            },
+            StateDesc {
+                code: 2,
+                name: "Lock",
+                severity: Severity::Normal,
+            },
+        ];
+        static M: &[MetricDesc] = &[metric(
+            ValueType::U64,
+            MetricKind::State,
+            STATES,
+            Thresholds::NONE,
+        )];
+        with_metric(M).validate().expect("перечисление корректно");
+
+        let desc = with_metric(M).metric(MetricId(1)).unwrap();
+        assert_eq!(desc.state(0).unwrap().name, "Los");
+        assert_eq!(desc.state(2).unwrap().severity, Severity::Normal);
+        assert!(desc.state(1).is_none(), "код 1 не объявлен — и подписи нет");
+        // Пропуски в нумерации законны: коды явные, а не позиционные.
+        assert_eq!(
+            desc.severity_of(&dduroc_format::Value::U64(2)),
+            Severity::Normal
+        );
+    }
+
+    #[test]
+    fn state_and_kind_must_agree() {
+        static STATES: &[StateDesc] = &[StateDesc {
+            code: 0,
+            name: "A",
+            severity: Severity::Normal,
+        }];
+
+        // Вид State без состояний: подписывать нечем.
+        static NO_STATES: &[MetricDesc] = &[metric(
+            ValueType::U64,
+            MetricKind::State,
+            &[],
+            Thresholds::NONE,
+        )];
+        assert!(matches!(
+            with_metric(NO_STATES).validate(),
+            Err(SchemaError::BadMetric { .. })
+        ));
+
+        // Состояния при виде Gauge: график нарисовали бы прямой через
+        // значения, которых не было.
+        static WRONG_KIND: &[MetricDesc] = &[metric(
+            ValueType::U64,
+            MetricKind::Gauge,
+            STATES,
+            Thresholds::NONE,
+        )];
+        assert!(matches!(
+            with_metric(WRONG_KIND).validate(),
+            Err(SchemaError::BadMetric { .. })
+        ));
+    }
+
+    #[test]
+    fn states_require_an_integral_value_type() {
+        static STATES: &[StateDesc] = &[StateDesc {
+            code: 0,
+            name: "A",
+            severity: Severity::Normal,
+        }];
+        for vt in [ValueType::F32, ValueType::F64, ValueType::Blob] {
+            let leaked: &'static [MetricDesc] = Box::leak(Box::new([metric(
+                vt,
+                MetricKind::State,
+                STATES,
+                Thresholds::NONE,
+            )]));
+            assert!(
+                matches!(
+                    with_metric(leaked).validate(),
+                    Err(SchemaError::BadMetric { .. })
+                ),
+                "тип {vt:?} не может нести код состояния"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_and_nameless_states_rejected() {
+        static DUP: &[StateDesc] = &[
+            StateDesc {
+                code: 5,
+                name: "A",
+                severity: Severity::Normal,
+            },
+            StateDesc {
+                code: 5,
+                name: "B",
+                severity: Severity::Warn,
+            },
+        ];
+        static M: &[MetricDesc] = &[metric(
+            ValueType::U64,
+            MetricKind::State,
+            DUP,
+            Thresholds::NONE,
+        )];
+        assert!(matches!(
+            with_metric(M).validate(),
+            Err(SchemaError::DuplicateStateCode { code: 5, .. })
+        ));
+
+        static NAMELESS: &[StateDesc] = &[StateDesc {
+            code: 0,
+            name: "",
+            severity: Severity::Normal,
+        }];
+        static N: &[MetricDesc] = &[metric(
+            ValueType::U64,
+            MetricKind::State,
+            NAMELESS,
+            Thresholds::NONE,
+        )];
+        assert!(matches!(
+            with_metric(N).validate(),
+            Err(SchemaError::BadMetric { .. })
+        ));
+    }
+
+    #[test]
+    fn bool_states_are_limited_to_zero_and_one() {
+        static BAD: &[StateDesc] = &[StateDesc {
+            code: 7,
+            name: "Weird",
+            severity: Severity::Normal,
+        }];
+        static M: &[MetricDesc] = &[metric(
+            ValueType::Bool,
+            MetricKind::State,
+            BAD,
+            Thresholds::NONE,
+        )];
+        assert!(matches!(
+            with_metric(M).validate(),
+            Err(SchemaError::BadMetric { .. })
+        ));
+
+        static OK: &[StateDesc] = &[
+            StateDesc {
+                code: 0,
+                name: "Unlocked",
+                severity: Severity::Critical,
+            },
+            StateDesc {
+                code: 1,
+                name: "Locked",
+                severity: Severity::Normal,
+            },
+        ];
+        static G: &[MetricDesc] = &[metric(
+            ValueType::Bool,
+            MetricKind::State,
+            OK,
+            Thresholds::NONE,
+        )];
+        with_metric(G).validate().expect("bool как два состояния");
+        // Важность булева значения берётся из состояния.
+        let d = with_metric(G).metric(MetricId(1)).unwrap();
+        assert_eq!(
+            d.severity_of(&dduroc_format::Value::Bool(false)),
+            Severity::Critical
+        );
+        assert_eq!(
+            d.severity_of(&dduroc_format::Value::Bool(true)),
+            Severity::Normal
+        );
+    }
+
+    #[test]
+    fn thresholds_must_be_sane() {
+        // Вывернутый диапазон.
+        static INVERTED: &[MetricDesc] = &[metric(
+            ValueType::F32,
+            MetricKind::Gauge,
+            &[],
+            Thresholds {
+                warn: range(Some(10.0), Some(1.0)),
+                critical: Range::NONE,
+            },
+        )];
+        assert!(matches!(
+            with_metric(INVERTED).validate(),
+            Err(SchemaError::BadMetric { .. })
+        ));
+
+        // Критический не включает тревожный.
+        static NOT_NESTED: &[MetricDesc] = &[metric(
+            ValueType::F32,
+            MetricKind::Gauge,
+            &[],
+            Thresholds {
+                warn: range(None, Some(80.0)),
+                critical: range(None, Some(50.0)),
+            },
+        )];
+        assert!(matches!(
+            with_metric(NOT_NESTED).validate(),
+            Err(SchemaError::BadMetric { .. })
+        ));
+
+        // NaN как граница: сравнения с ним всегда ложны, значит предел
+        // молча не работал бы.
+        static NAN: &[MetricDesc] = &[metric(
+            ValueType::F32,
+            MetricKind::Gauge,
+            &[],
+            Thresholds {
+                warn: range(None, Some(f64::NAN)),
+                critical: Range::NONE,
+            },
+        )];
+        assert!(matches!(
+            with_metric(NAN).validate(),
+            Err(SchemaError::BadMetric { .. })
+        ));
+
+        // Пределы у перечисления.
+        static STATES: &[StateDesc] = &[StateDesc {
+            code: 0,
+            name: "A",
+            severity: Severity::Normal,
+        }];
+        static BOTH: &[MetricDesc] = &[metric(
+            ValueType::U64,
+            MetricKind::State,
+            STATES,
+            Thresholds {
+                warn: range(Some(0.0), Some(1.0)),
+                critical: Range::NONE,
+            },
+        )];
+        assert!(matches!(
+            with_metric(BOTH).validate(),
+            Err(SchemaError::BadMetric { .. })
+        ));
+
+        // Односторонние границы и полностью открытый диапазон законны.
+        static OPEN: &[MetricDesc] = &[metric(
+            ValueType::F32,
+            MetricKind::Gauge,
+            &[],
+            Thresholds {
+                warn: range(None, Some(70.0)),
+                critical: range(Some(-273.15), None),
+            },
+        )];
+        with_metric(OPEN).validate().expect("открытые границы");
+    }
+
+    #[test]
+    fn metric_index_is_stable_key_for_runtime_state() {
+        // Позиция метрики — ключ для того, что хранится параллельно схеме и
+        // на диск не идёт (пределы). Она обязана совпадать с порядком в
+        // массиве, иначе пределы применились бы к чужой метрике.
+        static M: &[MetricDesc] = &[
+            MetricDesc {
+                id: MetricId(1),
+                ..metric(ValueType::F32, MetricKind::Gauge, &[], Thresholds::NONE)
+            },
+            MetricDesc {
+                id: MetricId(9),
+                name: "second",
+                ..metric(ValueType::U64, MetricKind::Counter, &[], Thresholds::NONE)
+            },
+        ];
+        let s = with_metric(M);
+        s.validate().unwrap();
+        assert_eq!(s.metric_index(MetricId(1)).unwrap().0, 0);
+        assert_eq!(s.metric_index(MetricId(9)).unwrap().0, 1);
+        assert_eq!(s.metric_index(MetricId(9)).unwrap().1.name, "second");
+        assert!(s.metric_index(MetricId(5)).is_none());
     }
 
     #[test]

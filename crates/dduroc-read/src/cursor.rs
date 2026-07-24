@@ -31,21 +31,6 @@ pub struct RawEntry {
     pub at: Micros,
     pub boot: u32,
     pub record: OwnedRecord,
-    /// Идентичность серии у сэмплов, разрешённая **внутри сегмента**.
-    ///
-    /// Номер серии сегментно-локален и переиспользуется с нуля в каждом
-    /// сегменте, поэтому восстанавливать идентичность на уровне канала
-    /// нельзя: сэмпл напряжения из нового сегмента унаследовал бы
-    /// определение температуры из предыдущего.
-    pub series: Option<SeriesDefinition>,
-}
-
-/// Идентичность серии телеметрии.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SeriesDefinition {
-    pub metric: dduroc_format::MetricId,
-    pub value_type: dduroc_format::ValueType,
-    pub tags: Vec<(String, String)>,
 }
 
 /// Владеющая копия записи: курсор переиспользует буфер блока, поэтому
@@ -66,14 +51,8 @@ pub enum OwnedRecord {
         span: dduroc_format::SpanId,
     },
     Sample {
-        series: dduroc_format::SeriesLocal,
-        value: OwnedSampleValue,
-    },
-    SeriesDef {
-        series: dduroc_format::SeriesLocal,
         metric: dduroc_format::MetricId,
-        value_type: dduroc_format::ValueType,
-        tags: Vec<(String, String)>,
+        value: OwnedSampleValue,
     },
     Text {
         level: dduroc_format::Level,
@@ -124,7 +103,7 @@ fn own(record: &Record<'_>) -> OwnedRecord {
         },
         Record::SpanEnd { span } => OwnedRecord::SpanEnd { span: *span },
         Record::Sample(s) => OwnedRecord::Sample {
-            series: s.series,
+            metric: s.metric,
             value: match s.value {
                 dduroc_format::Value::F32(v) => OwnedSampleValue::F32(v),
                 dduroc_format::Value::F64(v) => OwnedSampleValue::F64(v),
@@ -133,17 +112,6 @@ fn own(record: &Record<'_>) -> OwnedRecord {
                 dduroc_format::Value::Bool(v) => OwnedSampleValue::Bool(v),
                 dduroc_format::Value::Blob(b) => OwnedSampleValue::Blob(b.to_vec()),
             },
-        },
-        Record::SeriesDef(d) => OwnedRecord::SeriesDef {
-            series: d.series,
-            metric: d.metric,
-            value_type: d.value_type,
-            tags: d
-                .tags
-                .iter()
-                .filter_map(|r| r.ok())
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
         },
         Record::Text(t) => OwnedRecord::Text {
             level: t.level,
@@ -157,45 +125,13 @@ fn own(record: &Record<'_>) -> OwnedRecord {
     }
 }
 
-/// Запомнить определение серии в таблице сегмента.
-fn remember_series(table: &mut Vec<Option<SeriesDefinition>>, def: &dduroc_format::SeriesDef<'_>) {
-    let idx = def.series.0 as usize;
-    // Номер серии приходит из файла: расширяем таблицу только в разумных
-    // пределах, иначе повреждённая запись задала бы размер аллокации.
-    const MAX_SERIES: usize = 64 * 1024;
-    if idx >= MAX_SERIES {
-        return;
-    }
-    if idx >= table.len() {
-        table.resize(idx + 1, None);
-    }
-    table[idx] = Some(SeriesDefinition {
-        metric: def.metric,
-        value_type: def.value_type,
-        tags: def
-            .tags
-            .iter()
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect(),
-    });
-}
-
-/// Пройти незапечатанный сегмент, попутно собрав определения серий.
+/// Пройти незапечатанный сегмент по заголовкам блоков.
 ///
-/// Смещения блоков и таблица серий добываются из одних и тех же прочитанных
-/// байт. Раздельные проходы означали бы чтение сегмента целиком дважды — а
-/// сегмент бывает в сотни мегабайт, и второй проход стоил бы столько же,
-/// сколько сам запрос.
-///
-/// `want_series` включает разбор тел. Без него достаточно заголовков: при
-/// прямом обходе определение серии встречается в потоке раньше своих сэмплов
-/// и наполняет таблицу по ходу дела.
-fn scan_with_series(
-    reader: &SegmentReader,
-    series: &mut Vec<Option<SeriesDefinition>>,
-    want_series: bool,
-) -> (Vec<u64>, Option<(u64, String)>) {
+/// Тела не разбираются вовсе: идентичность ряда лежит в самом сэмпле, и
+/// восстанавливать её больше нечем и незачем. Раньше здесь был второй проход
+/// по всему сегменту — он собирал определения серий, которые при обратном
+/// обходе оказывались позади своих сэмплов.
+fn scan_offsets(reader: &SegmentReader) -> (Vec<u64>, Option<(u64, String)>) {
     let mut offsets = Vec::new();
     let mut buf = Vec::new();
     let mut offset = SegmentReader::first_block_offset();
@@ -203,13 +139,6 @@ fn scan_with_series(
         match reader.read_block_at(offset, &mut buf) {
             Ok(Some(next)) => {
                 offsets.push(offset);
-                if want_series && let Ok(Some(block)) = parse_block(&buf) {
-                    for item in block.records() {
-                        if let Ok((_, Record::SeriesDef(def))) = item {
-                            remember_series(series, &def);
-                        }
-                    }
-                }
                 offset = next;
             }
             Ok(None) => return (offsets, None),
@@ -234,13 +163,6 @@ pub struct SegmentCursor {
     reverse: bool,
     /// Отбор до материализации.
     prefilter: Option<Prefilter>,
-    /// Таблица серий сегмента: индекс — сегментно-локальный номер.
-    ///
-    /// У запечатанного сегмента берётся из footer'а, куда она продублирована
-    /// ровно для этого: определение серии пишется в тело один раз, и при
-    /// чтении с середины, в обратном порядке или после битого блока его
-    /// в потоке уже не встретить.
-    series: Vec<Option<SeriesDefinition>>,
     /// Блоки, которые не удалось прочитать.
     damaged: Vec<Damage>,
 }
@@ -271,41 +193,18 @@ impl SegmentCursor {
             });
         }
         let mut damaged = Vec::new();
-        let mut series: Vec<Option<SeriesDefinition>> = Vec::new();
-        // Запечатанный сегмент отдаёт и то, и другое из footer'а — ради этого
-        // таблица серий там и продублирована: определение серии пишется в тело
-        // один раз, и при чтении с середины, в обратном порядке или после
-        // битого блока его в потоке уже не встретить.
+        // Запечатанный сегмент отдаёт смещения блоков из footer'а; иначе —
+        // скан заголовков. Обрыв скана — обычное следствие потери питания:
+        // уже найденные блоки остаются в выборке, о месте обрыва сообщается
+        // явно.
+        //
+        // Обратный обход больше не требует предварительного прохода: раньше
+        // сэмпл ссылался на локальный номер серии, определение которого лежало
+        // в потоке ПЕРЕД ним, то есть при чтении с конца — уже позади.
         let mut offsets: Vec<u64> = match reader.footer() {
-            Some(footer) => {
-                series = footer
-                    .series
-                    .iter()
-                    .map(|s| {
-                        Some(SeriesDefinition {
-                            metric: s.metric,
-                            value_type: s.value_type,
-                            tags: s
-                                .tags
-                                .iter()
-                                .filter_map(|r| r.ok())
-                                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                .collect(),
-                        })
-                    })
-                    .collect();
-                footer.blocks.iter().map(|b| b.offset).collect()
-            }
+            Some(footer) => footer.blocks.iter().map(|b| b.offset).collect(),
             None => {
-                // Незапечатанный сегмент сканируется; обрыв скана — обычное
-                // следствие потери питания. Уже найденные блоки остаются в
-                // выборке, а о месте обрыва сообщается явно.
-                //
-                // Тела разбираются только при обратном обходе: там определения
-                // серий оказываются позади своих сэмплов, и собрать их нужно
-                // заранее. У сегмента без телеметрии проход всё равно ничего
-                // не найдёт, зато читает он ровно то, что и так читает скан.
-                let (offsets, stopped) = scan_with_series(&reader, &mut series, reverse);
+                let (offsets, stopped) = scan_offsets(&reader);
                 if let Some((offset, reason)) = stopped {
                     damaged.push(Damage {
                         path: path.to_owned(),
@@ -329,7 +228,6 @@ impl SegmentCursor {
             pos: 0,
             reverse,
             prefilter,
-            series,
             damaged,
         })
     }
@@ -353,6 +251,23 @@ impl SegmentCursor {
     /// Пропущенные фрагменты, накопленные к этому моменту.
     pub fn damaged(&self) -> &[Damage] {
         &self.damaged
+    }
+
+    /// Есть ли в сегменте хоть одна из указанных метрик.
+    ///
+    /// `None` — сегмент не запечатан, множества метрик нет, и ответить, не
+    /// читая блоки, нельзя. Ради этого вопроса множество и лежит в footer'е:
+    /// поиск последнего состояния перед окном иначе читал бы историю целиком.
+    pub fn contains_any_metric(
+        &self,
+        wanted: &std::collections::HashSet<dduroc_format::MetricId>,
+    ) -> Option<bool> {
+        let footer = self.reader.footer()?;
+        Some(
+            wanted
+                .iter()
+                .any(|m| footer.metrics.binary_search(m).is_ok()),
+        )
     }
 
     /// Заглянуть в следующую запись, не потребляя её.
@@ -432,12 +347,9 @@ impl SegmentCursor {
             for item in block.records() {
                 match item {
                     Ok((at, record)) => {
-                        // Определение серии — служебная запись: она наполняет
-                        // таблицу сегмента и наружу не выдаётся.
-                        if let Record::SeriesDef(def) = &record {
-                            remember_series(&mut self.series, def);
-                            continue;
-                        }
+                        // Служебных записей в блоке больше нет: всё, что
+                        // прочитано, выдаётся наружу как есть.
+                        //
                         // Отбор до владеющей копии: отброшенная запись не
                         // должна стоить аллокации своего payload'а.
                         if let Some(f) = &self.prefilter
@@ -445,17 +357,10 @@ impl SegmentCursor {
                         {
                             continue;
                         }
-                        let series = match &record {
-                            Record::Sample(s) => {
-                                self.series.get(s.series.0 as usize).and_then(|d| d.clone())
-                            }
-                            _ => None,
-                        };
                         self.buffered.push(RawEntry {
                             at,
                             boot,
                             record: own(&record),
-                            series,
                         });
                     }
                     Err(e) => {
@@ -493,6 +398,7 @@ pub struct ChannelCursor {
     from: Option<Micros>,
     expect_store: Option<u64>,
     prefilter: Option<Prefilter>,
+    require_metrics: Option<Arc<std::collections::HashSet<dduroc_format::MetricId>>>,
     damaged: Vec<Damage>,
     /// Неймспейс и канал — для маркировки выдаваемых записей.
     ///
@@ -511,6 +417,14 @@ pub struct ChannelScope {
     pub reverse: bool,
     pub expect_store: Option<u64>,
     pub prefilter: Option<Prefilter>,
+    /// Сколько сегментов максимум просмотреть (в порядке обхода).
+    ///
+    /// Нужно поиску «что было до окна»: без границы он мог бы уйти в историю
+    /// на всю глубину хранения, читая мегабайты ради одного значения.
+    pub max_segments: Option<usize>,
+    /// Пропускать запечатанные сегменты, в которых нет ни одной из этих
+    /// метрик. Проверка идёт по множеству из footer'а, без чтения блоков.
+    pub require_metrics: Option<Arc<std::collections::HashSet<dduroc_format::MetricId>>>,
 }
 
 /// Отобрать сегменты, которые могут содержать записи из диапазона.
@@ -580,6 +494,12 @@ impl ChannelCursor {
         if reverse {
             segments.reverse();
         }
+        // Граница просмотра применяется ПОСЛЕ разворота: смысл её — «столько
+        // сегментов от начала обхода», а обход у обратного порядка идёт от
+        // свежих к старым.
+        if let Some(k) = scope.max_segments {
+            segments.truncate(k);
+        }
 
         Ok(Self {
             dir: dir.to_owned(),
@@ -590,6 +510,7 @@ impl ChannelCursor {
             from,
             expect_store,
             prefilter: scope.prefilter.clone(),
+            require_metrics: scope.require_metrics.clone(),
             damaged: Vec::new(),
             namespace,
             channel,
@@ -654,6 +575,14 @@ impl ChannelCursor {
                 self.prefilter.clone(),
             ) {
                 Ok(mut c) => {
+                    // Сегмент, в котором заведомо нет нужных метрик, не
+                    // читается вовсе: множество идентификаторов лежит в
+                    // footer'е, и ответ получается без единого чтения блока.
+                    if let Some(wanted) = &self.require_metrics
+                        && c.contains_any_metric(wanted) == Some(false)
+                    {
+                        continue;
+                    }
                     if let Some(from) = self.from {
                         c.seek_from(from);
                     }

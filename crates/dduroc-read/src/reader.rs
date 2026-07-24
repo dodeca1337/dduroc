@@ -2,13 +2,33 @@
 
 use crate::cursor::{ChannelCursor, Damage, OwnedRecord, OwnedSampleValue};
 use crate::error::{ReadError, Result};
-use crate::query::{Order, Query};
+use crate::query::{Filter, KindFilter, Order, Query};
 use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
-use dduroc_engine::schema::Schema;
-use dduroc_format::{EventId, Level, Micros, SpanId};
+use dduroc_engine::schema::{MetricKind, Schema, Severity};
+use dduroc_format::{EventId, Level, MetricId, Micros, SpanId, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Сколько сегментов назад искать состояние на левый край окна.
+///
+/// Граница нужна, чтобы поиск не уходил в историю на всю глубину хранения:
+/// ряд, не менявшийся месяц, обошёлся бы чтением месяца данных ради одного
+/// значения. Два сегмента — это десятки мегабайт истории при типичном
+/// размере, чего хватает состоянию, которое пишут при каждом изменении.
+const SEED_SEGMENTS: usize = 2;
+
+/// Одолжить владеющее значение как значение формата — для вычисления важности.
+fn as_format_value(v: &OwnedSampleValue) -> Value<'_> {
+    match v {
+        OwnedSampleValue::F32(x) => Value::F32(*x),
+        OwnedSampleValue::F64(x) => Value::F64(*x),
+        OwnedSampleValue::I64(x) => Value::I64(*x),
+        OwnedSampleValue::U64(x) => Value::U64(*x),
+        OwnedSampleValue::Bool(x) => Value::Bool(*x),
+        OwnedSampleValue::Blob(b) => Value::Blob(b),
+    }
+}
 
 /// Разновидность записи в ответе.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,11 +56,30 @@ pub enum EntryKind {
     SpanEnd {
         span: SpanId,
     },
-    /// Отсчёт телеметрии с восстановленной идентичностью серии.
+    /// Отсчёт телеметрии.
+    ///
+    /// Из записи приходят только метрика и значение; всё, что нужно для
+    /// показа, резолвится по схеме и на диске места не занимает. Поля
+    /// `Option`, потому что схема может быть неизвестна этому билду — тогда
+    /// остаются идентификатор и число, и это честнее, чем выдумать имя.
     Sample {
+        metric: MetricId,
         metric_name: Option<&'static str>,
         unit: Option<&'static str>,
-        tags: Vec<(String, String)>,
+        /// Статические тэги-категории метрики.
+        tags: &'static [&'static str],
+        /// Как величину рисовать: состояние держится ступенькой, непрерывная
+        /// величина интерполируется. Прямая через значения, которых не было,
+        /// это не косметика, а ложь на графике.
+        kind: Option<MetricKind>,
+        /// Подпись состояния, если метрика — перечисление и код объявлен.
+        state: Option<&'static str>,
+        /// Важность значения по пределам **из схемы**.
+        ///
+        /// Рантайм-переопределения читателю недоступны by design: он может
+        /// читать дамп с чужого прибора, где действовали другие настройки, а
+        /// в сам дамп пределы не пишутся (см. `dduroc_engine::limits`).
+        severity: Option<Severity>,
         value: OwnedSampleValue,
     },
     /// Нераспознанное расширение формата.
@@ -79,6 +118,13 @@ impl Entry {
 #[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     pub entries: Vec<Entry>,
+    /// Состояния на левый край окна: последний отсчёт каждого
+    /// ряда-состояния **до** `from` (см. [`Query::seed_states`]).
+    ///
+    /// Лежат отдельно от `entries` намеренно: их время вне запрошенного
+    /// диапазона, и подмешивать их к остальным значило бы нарушить обещание
+    /// «всё в ответе внутри окна».
+    pub seeds: Vec<Entry>,
     /// Фрагменты, которые не удалось прочитать. Пустой список — ответ полон.
     pub damaged: Vec<Damage>,
     /// Ответ обрезан по `limit`.
@@ -292,7 +338,100 @@ impl Reader {
         for c in &cursors {
             result.damaged.extend_from_slice(c.damaged());
         }
+
+        if q.seed_states && q.from.is_some() {
+            result.seeds = self.collect_state_seeds(q, &mut result.damaged)?;
+        }
         Ok(result)
+    }
+
+    /// Найти последний отсчёт каждого ряда-состояния до начала окна.
+    ///
+    /// Ищется обратным обходом от `from` назад, и он **ограничен**
+    /// [`SEED_SEGMENTS`] сегментами: ряд, не менявшийся очень долго, останется
+    /// без затравки, и это честнее, чем читать всю историю ради одного
+    /// значения. Приложению, которому важна полная картина, стоит писать
+    /// состояние ещё и при старте — тогда затравка всегда рядом.
+    ///
+    /// Сегменты, в которых нужных метрик нет вовсе, отбрасываются по множеству
+    /// идентификаторов из footer'а, без чтения блоков.
+    fn collect_state_seeds(&self, q: &Query, damaged: &mut Vec<Damage>) -> Result<Vec<Entry>> {
+        let Some(from) = q.from else {
+            return Ok(Vec::new());
+        };
+
+        // Ряды-состояния собираются по схемам, а не по данным: их немного, и
+        // знать их заранее дешевле, чем выяснять чтением.
+        let wanted: std::collections::HashSet<MetricId> = self
+            .schemas
+            .values()
+            .flat_map(|s| s.metrics.iter())
+            .filter(|m| m.kind == MetricKind::State)
+            .map(|m| m.id)
+            .collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted = std::sync::Arc::new(wanted);
+
+        // Окно ищем строго ДО `from`, порядок — от свежих к старым, чтобы
+        // первым встреченным отсчётом ряда оказался последний по времени.
+        let probe = Query {
+            from: None,
+            to: Some(Micros(from.0.saturating_sub(1))),
+            order: Order::Newest,
+            limit: None,
+            seed_states: false,
+            filter: Filter {
+                kinds: KindFilter::TELEMETRY,
+                ..q.filter.clone()
+            },
+            ..q.clone()
+        };
+
+        let OpenedCursors {
+            mut cursors,
+            schemas,
+            damaged: open_damaged,
+        } = self.open_cursors_with(&probe, |scope| {
+            scope.max_segments = Some(SEED_SEGMENTS);
+            scope.require_metrics = Some(std::sync::Arc::clone(&wanted));
+        })?;
+        damaged.extend(open_damaged);
+
+        // Первое встреченное значение ряда и есть последнее по времени.
+        let mut seen: std::collections::HashSet<(usize, MetricId)> =
+            std::collections::HashSet::new();
+        let mut out: Vec<Entry> = Vec::new();
+
+        for (idx, cursor) in cursors.iter_mut().enumerate() {
+            while let Some(raw) = cursor.next_entry() {
+                if raw.at >= from {
+                    continue;
+                }
+                let OwnedRecord::Sample { metric, .. } = &raw.record else {
+                    continue;
+                };
+                if !wanted.contains(metric) || !seen.insert((idx, *metric)) {
+                    continue;
+                }
+                let ns = std::sync::Arc::clone(&cursor.namespace);
+                let ch = std::sync::Arc::clone(&cursor.channel);
+                if let Some(entry) = self.build_entry(ns, ch, schemas[idx].as_ref(), &raw, &probe) {
+                    out.push(entry);
+                }
+                // Все ряды этого канала найдены — дальше читать нечего.
+                if wanted.iter().all(|m| seen.contains(&(idx, *m))) {
+                    break;
+                }
+            }
+        }
+        for c in &cursors {
+            damaged.extend_from_slice(c.damaged());
+        }
+
+        out.sort_by_key(|e| (e.boot, e.at.0));
+        Ok(out)
     }
 
     /// Открыть курсоры и разрешить схему **один раз на неймспейс**.
@@ -301,6 +440,16 @@ impl Reader {
     /// как было поначалу, означало бы файловую операцию на запись — именно
     /// это и оказалось главным ограничителем скорости чтения.
     fn open_cursors(&self, q: &Query) -> Result<OpenedCursors> {
+        self.open_cursors_with(q, |_| {})
+    }
+
+    /// То же с правкой параметров открытия — для поиска затравок, где нужны
+    /// граница просмотра и отсечение сегментов по метрикам.
+    fn open_cursors_with(
+        &self,
+        q: &Query,
+        adjust: impl Fn(&mut crate::cursor::ChannelScope),
+    ) -> Result<OpenedCursors> {
         let mut cursors = Vec::new();
         let mut schemas = Vec::new();
         let mut unreadable = Vec::new();
@@ -311,14 +460,17 @@ impl Reader {
             }
             let schema = self.schemas.get(&ns.schema_name).copied();
             let ns_name: std::sync::Arc<str> = std::sync::Arc::from(ns.name.as_str());
-            let scope = crate::cursor::ChannelScope {
+            let mut scope = crate::cursor::ChannelScope {
                 from: q.from,
                 to: q.to,
                 boot: q.boot,
                 reverse: q.order == Order::Newest,
                 expect_store: self.store_id,
                 prefilter: Some(build_prefilter(q, schema)),
+                max_segments: None,
+                require_metrics: None,
             };
+            adjust(&mut scope);
 
             for channel in &ns.channels {
                 if !q.channels.is_empty() && !q.channels.contains(channel) {
@@ -457,26 +609,30 @@ impl Reader {
                 }
                 (EntryKind::SpanEnd { span: *span }, Some(*span))
             }
-            OwnedRecord::Sample { value, .. } => {
+            OwnedRecord::Sample { metric, value } => {
                 if !kinds.samples {
                     return None;
                 }
-                // Идентичность серии разрешена курсором внутри сегмента:
-                // сегментно-локальные номера переиспользуются, и связывать
-                // их на уровне канала значило бы подменить одну метрику другой.
-                let desc = raw
-                    .series
-                    .as_ref()
-                    .and_then(|d| schema.and_then(|s| s.metric(d.metric)));
+                // Идентичность ряда лежит в самой записи: метрика и есть ряд.
+                // Всё остальное — имя, единица, подпись состояния, важность,
+                // поведение между отсчётами — резолвится по схеме и на диске
+                // места не занимает.
+                let desc = schema.and_then(|s| s.metric(*metric));
+                let code = match value {
+                    OwnedSampleValue::U64(v) => Some(*v),
+                    OwnedSampleValue::I64(v) if *v >= 0 => Some(*v as u64),
+                    OwnedSampleValue::Bool(b) => Some(u64::from(*b)),
+                    _ => None,
+                };
                 (
                     EntryKind::Sample {
+                        metric: *metric,
                         metric_name: desc.map(|d| d.name),
                         unit: desc.map(|d| d.unit),
-                        tags: raw
-                            .series
-                            .as_ref()
-                            .map(|d| d.tags.clone())
-                            .unwrap_or_default(),
+                        tags: desc.map_or(&[][..], |d| d.tags),
+                        kind: desc.map(|d| d.kind),
+                        state: desc.zip(code).and_then(|(d, c)| d.state(c)).map(|s| s.name),
+                        severity: desc.map(|d| d.severity_of(&as_format_value(value))),
                         value: value.clone(),
                     },
                     None,
@@ -488,7 +644,6 @@ impl Reader {
                 },
                 None,
             ),
-            OwnedRecord::SeriesDef { .. } => return None,
         };
 
         if let Some(want) = &q.filter.spans {
@@ -560,7 +715,6 @@ fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilte
         dduroc_format::Record::Text(t) => kinds.text && min_level.is_none_or(|min| t.level >= min),
         dduroc_format::Record::SpanStart(_) | dduroc_format::Record::SpanEnd { .. } => kinds.spans,
         dduroc_format::Record::Sample(_) => kinds.samples,
-        dduroc_format::Record::SeriesDef(_) => true,
         dduroc_format::Record::Ext { .. } => true,
     })
 }
@@ -629,14 +783,51 @@ mod tests {
             decoders: None,
         },
     ];
-    static METRICS: &[MetricDesc] = &[MetricDesc {
-        id: MetricId(1),
-        name: "temp",
-        value_type: ValueType::F32,
-        class: StorageClass::DEFAULT,
-        unit: "°C",
-        tag_keys: &["sensor"],
-    }];
+    static LINK_STATES: &[dduroc_engine::schema::StateDesc] = &[
+        dduroc_engine::schema::StateDesc {
+            code: 0,
+            name: "Los",
+            severity: Severity::Critical,
+        },
+        dduroc_engine::schema::StateDesc {
+            code: 1,
+            name: "Lock",
+            severity: Severity::Normal,
+        },
+    ];
+    static METRICS: &[MetricDesc] = &[
+        MetricDesc {
+            id: MetricId(1),
+            name: "temp",
+            value_type: ValueType::F32,
+            class: StorageClass::DEFAULT,
+            unit: "°C",
+            tags: &["thermal"],
+            kind: MetricKind::Gauge,
+            states: &[],
+            thresholds: dduroc_engine::schema::Thresholds {
+                warn: dduroc_engine::schema::Range {
+                    min: None,
+                    max: Some(25.0),
+                },
+                critical: dduroc_engine::schema::Range {
+                    min: None,
+                    max: Some(28.0),
+                },
+            },
+        },
+        MetricDesc {
+            id: MetricId(2),
+            name: "link",
+            value_type: ValueType::U64,
+            class: StorageClass::DEFAULT,
+            unit: "",
+            tags: &["rf"],
+            kind: MetricKind::State,
+            states: LINK_STATES,
+            thresholds: dduroc_engine::schema::Thresholds::NONE,
+        },
+    ];
     static SPANS: &[SpanDesc] = &[SpanDesc {
         id: SpanKindId(1),
         name: "Calibration",
@@ -668,7 +859,7 @@ mod tests {
             }
             ns.log_raw(EventId(2), &[0xFF], None).unwrap();
 
-            let temp = ns.series(MetricId(1), &[("sensor", "pa")]).unwrap();
+            let temp = ns.series(MetricId(1)).unwrap();
             for i in 0..10 {
                 temp.sample_f32(20.0 + i as f32).unwrap();
             }
@@ -745,14 +936,22 @@ mod tests {
             .expect("сэмпл найден");
         match &sample.kind {
             EntryKind::Sample {
+                metric,
                 metric_name,
                 unit,
                 tags,
+                kind,
+                state,
+                severity,
                 value,
             } => {
+                assert_eq!(*metric, MetricId(1), "идентификатор пришёл из записи");
                 assert_eq!(*metric_name, Some("temp"));
                 assert_eq!(*unit, Some("°C"));
-                assert_eq!(tags, &[("sensor".to_owned(), "pa".to_owned())]);
+                assert_eq!(tags, &["thermal"]);
+                assert_eq!(*kind, Some(MetricKind::Gauge));
+                assert_eq!(*state, None, "не перечисление — подписи нет");
+                assert!(severity.is_some(), "важность посчитана по схеме");
                 assert!(value.as_f64().unwrap() >= 20.0);
             }
             other => panic!("ожидался сэмпл: {other:?}"),
@@ -844,12 +1043,112 @@ mod tests {
                     } => {
                         assert_eq!(*metric_name, Some("temp"), "порядок {order:?}");
                         assert_eq!(*unit, Some("°C"));
-                        assert_eq!(tags, &[("sensor".to_owned(), "pa".to_owned())]);
+                        assert_eq!(tags, &["thermal"]);
                     }
                     other => panic!("ожидался сэмпл: {other:?}"),
                 }
             }
         }
+    }
+
+    #[test]
+    fn sparse_state_series_gets_seeded_at_the_window_edge() {
+        // Состояния пишут по изменению. Окно, внутри которого состояние не
+        // менялось, не содержит ни одного отсчёта — и полоса на графике
+        // оказалась бы пустой, хотя состояние было известно всё это время.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+        let store = Store::open(cfg.clone()).unwrap();
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        // Переход в Lock — единственный отсчёт состояния, рано.
+        let link = ns.series(MetricId(2)).unwrap();
+        link.sample(dduroc_engine::staged::OwnedValue::U64(1))
+            .unwrap();
+        let after_state = ns.now();
+
+        // Дальше идёт только температура: окно будет без состояний.
+        let temp = ns.series(MetricId(1)).unwrap();
+        for i in 0..20 {
+            temp.sample_f32(20.0 + i as f32).unwrap();
+        }
+        ns.sync().unwrap();
+        store.shutdown();
+        drop(store);
+
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let window = Query {
+            from: Some(Micros(after_state.0 + 1)),
+            order: Order::Oldest,
+            filter: crate::Filter {
+                kinds: KindFilter::TELEMETRY,
+                ..Default::default()
+            },
+            ..Query::new()
+        };
+
+        // Без затравки состояния в ответе нет вовсе.
+        let plain = reader.query(&window).unwrap();
+        assert!(plain.seeds.is_empty());
+        assert!(
+            !plain
+                .entries
+                .iter()
+                .any(|e| matches!(&e.kind, EntryKind::Sample { state: Some(_), .. })),
+            "в окне действительно нет ни одного состояния"
+        );
+
+        // С затравкой — приходит последний отсчёт до окна, отдельно.
+        let seeded = reader
+            .query(&Query {
+                seed_states: true,
+                ..window
+            })
+            .unwrap();
+        assert_eq!(seeded.seeds.len(), 1, "по одному на ряд-состояние");
+        let seed = &seeded.seeds[0];
+        assert!(
+            seed.at <= after_state,
+            "затравка обязана лежать ДО окна: {} vs {}",
+            seed.at,
+            after_state
+        );
+        match &seed.kind {
+            EntryKind::Sample {
+                metric,
+                state,
+                kind,
+                severity,
+                ..
+            } => {
+                assert_eq!(*metric, MetricId(2));
+                assert_eq!(*state, Some("Lock"), "подпись состояния из схемы");
+                assert_eq!(*kind, Some(MetricKind::State));
+                assert_eq!(*severity, Some(Severity::Normal));
+            }
+            other => panic!("ожидался сэмпл состояния: {other:?}"),
+        }
+        // Окно от затравки не изменилось.
+        assert_eq!(seeded.entries.len(), plain.entries.len());
+    }
+
+    #[test]
+    fn state_seed_is_absent_when_there_is_nothing_before_the_window() {
+        // Запрос от начала времён: до окна ничего нет, и выдумывать затравку
+        // неоткуда.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let r = reader
+            .query(&Query {
+                from: Some(Micros(0)),
+                seed_states: true,
+                order: Order::Oldest,
+                ..Query::new()
+            })
+            .unwrap();
+        assert!(r.seeds.is_empty());
+        assert!(r.is_complete());
     }
 
     #[test]
@@ -861,7 +1160,7 @@ mod tests {
         let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
         let store = Store::open(cfg.clone()).unwrap();
         let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
-        let temp = ns.series(MetricId(1), &[("sensor", "pa")]).unwrap();
+        let temp = ns.series(MetricId(1)).unwrap();
         for i in 0..10 {
             temp.sample_f32(20.0 + i as f32).unwrap();
         }

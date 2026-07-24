@@ -49,6 +49,15 @@ pub enum Error {
     #[error("нет шага миграции {from} → {to} для схемы {schema:?}")]
     MissingMigration { schema: String, from: u16, to: u16 },
 
+    #[error("метрика {id} не объявлена в схеме")]
+    UnknownMetric { id: u16 },
+
+    #[error("недопустимые пределы метрики {metric:?}: {reason}")]
+    BadLimits {
+        metric: &'static str,
+        reason: &'static str,
+    },
+
     #[error("повреждён {path}: {reason}")]
     Corrupt { path: PathBuf, reason: String },
 

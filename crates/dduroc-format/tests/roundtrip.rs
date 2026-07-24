@@ -9,11 +9,11 @@
 
 use dduroc_format::block::{Block, BlockBuilder, BlockHeader, Compression};
 use dduroc_format::footer::{Footer, FooterBuilder, Trailer};
-use dduroc_format::record::{self, Message, Record, Sample, SeriesDef, SpanStart, Tags, Text};
+use dduroc_format::record::{self, Message, Record, Sample, SpanStart, Text};
 use dduroc_format::segment::{SegmentHeader, SegmentName};
 use dduroc_format::{
-    BootCounter, EventId, Level, MetricId, Micros, ProtocolVersion, SeriesLocal, SpanId,
-    SpanKindId, Value, ValueType, varint,
+    BootCounter, EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId, Value,
+    varint,
 };
 use proptest::prelude::*;
 
@@ -58,14 +58,8 @@ enum OwnedRecord {
     SpanEnd {
         span: u32,
     },
-    SeriesDef {
-        series: u32,
-        metric: u16,
-        vtype: u8,
-        tags: Vec<(String, String)>,
-    },
     Sample {
-        series: u32,
+        metric: u16,
         value: Value<'static>,
     },
     Text {
@@ -80,7 +74,7 @@ enum OwnedRecord {
 }
 
 impl OwnedRecord {
-    fn as_record<'a>(&'a self, tags: &'a [(&'a str, &'a str)]) -> Record<'a> {
+    fn as_record(&self) -> Record<'_> {
         match self {
             OwnedRecord::Message {
                 event,
@@ -99,19 +93,8 @@ impl OwnedRecord {
             OwnedRecord::SpanEnd { span } => Record::SpanEnd {
                 span: SpanId(*span),
             },
-            OwnedRecord::SeriesDef {
-                series,
-                metric,
-                vtype,
-                ..
-            } => Record::SeriesDef(SeriesDef {
-                series: SeriesLocal(*series),
+            OwnedRecord::Sample { metric, value } => Record::Sample(Sample {
                 metric: MetricId(*metric),
-                value_type: ValueType::from_u8(*vtype).unwrap(),
-                tags: Tags::Slice(tags),
-            }),
-            OwnedRecord::Sample { series, value } => Record::Sample(Sample {
-                series: SeriesLocal(*series),
                 value: *value,
             }),
             OwnedRecord::Text {
@@ -126,15 +109,6 @@ impl OwnedRecord {
                 text,
             }),
             OwnedRecord::Ext { bytes } => Record::Ext { bytes },
-        }
-    }
-
-    fn tag_refs(&self) -> Vec<(&str, &str)> {
-        match self {
-            OwnedRecord::SeriesDef { tags, .. } => {
-                tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
-            }
-            _ => Vec::new(),
         }
     }
 }
@@ -154,20 +128,8 @@ fn any_record() -> impl Strategy<Value = OwnedRecord> {
         (1u32..u32::MAX, any::<u16>(), any_span())
             .prop_map(|(span, kind, parent)| { OwnedRecord::SpanStart { span, kind, parent } }),
         (1u32..u32::MAX).prop_map(|span| OwnedRecord::SpanEnd { span }),
-        (
-            any::<u32>(),
-            any::<u16>(),
-            0u8..6,
-            prop::collection::vec((".{0,12}", ".{0,12}"), 0..4)
-        )
-            .prop_map(|(series, metric, vtype, tags)| OwnedRecord::SeriesDef {
-                series,
-                metric,
-                vtype,
-                tags
-            }),
-        (any::<u32>(), any_value())
-            .prop_map(|(series, value)| OwnedRecord::Sample { series, value }),
+        (any::<u16>(), any_value())
+            .prop_map(|(metric, value)| OwnedRecord::Sample { metric, value }),
         (0u8..6, any_span(), ".{0,20}", ".{0,40}").prop_map(|(level, span, target, text)| {
             OwnedRecord::Text {
                 level,
@@ -184,7 +146,7 @@ fn any_record() -> impl Strategy<Value = OwnedRecord> {
 fn records_eq(a: &Record<'_>, b: &Record<'_>) -> bool {
     match (a, b) {
         (Record::Sample(x), Record::Sample(y)) => {
-            x.series == y.series
+            x.metric == y.metric
                 && match (x.value, y.value) {
                     (Value::F32(p), Value::F32(q)) => p.to_bits() == q.to_bits(),
                     (Value::F64(p), Value::F64(q)) => p.to_bits() == q.to_bits(),
@@ -221,8 +183,7 @@ proptest! {
 
     #[test]
     fn record_roundtrips(owned in any_record(), dt in any::<u64>()) {
-        let tags = owned.tag_refs();
-        let rec = owned.as_record(&tags);
+        let rec = owned.as_record();
 
         let mut buf = Vec::new();
         let written = record::encode(&rec, dt, &mut buf).unwrap();
@@ -260,11 +221,8 @@ proptest! {
         times.sort_unstable(); // writer подаёт записи в порядке времени
 
         let mut builder = BlockBuilder::new();
-        let tag_store: Vec<Vec<(&str, &str)>> =
-            records[..n].iter().map(|r| r.tag_refs()).collect();
         for (i, owned) in records[..n].iter().enumerate() {
-            let rec = owned.as_record(&tag_store[i]);
-            builder.push(Micros(times[i]), &rec).unwrap();
+            builder.push(Micros(times[i]), &owned.as_record()).unwrap();
         }
 
         let compression = if compress { Compression::Lz4 } else { Compression::None };
@@ -278,8 +236,7 @@ proptest! {
         prop_assert_eq!(decoded.len(), n);
         for (i, (at, rec)) in decoded.iter().enumerate() {
             prop_assert_eq!(at.0, times[i], "время записи {} восстановлено неверно", i);
-            let expected = records[i].as_record(&tag_store[i]);
-            prop_assert!(records_eq(rec, &expected));
+            prop_assert!(records_eq(rec, &records[i].as_record()));
         }
     }
 
@@ -370,7 +327,7 @@ proptest! {
     fn footer_roundtrips(
         blocks in prop::collection::vec((0u64..1_000_000, 0u16..1000), 0..20),
         events in prop::collection::vec(any::<u16>(), 0..30),
-        series in prop::collection::vec((any::<u16>(), 0u8..6), 0..10),
+        metrics in prop::collection::vec(any::<u16>(), 0..30),
     ) {
         let mut builder = FooterBuilder::new();
         let mut offset = SegmentHeader::SIZE as u64;
@@ -394,12 +351,8 @@ proptest! {
         for e in &events {
             builder.add_event(EventId(*e));
         }
-        for (metric, vtype) in &series {
-            builder.add_series(
-                MetricId(*metric),
-                ValueType::from_u8(*vtype).unwrap(),
-                &[("k", "v")],
-            );
+        for m in &metrics {
+            builder.add_metric(MetricId(*m));
         }
 
         let bytes = builder.build();
@@ -414,18 +367,16 @@ proptest! {
             prop_assert_eq!(got.count, *count);
         }
 
-        // Множество событий — отсортированное и без дублей.
-        let mut expected_events: Vec<u16> = events.clone();
-        expected_events.sort_unstable();
-        expected_events.dedup();
-        let got_events: Vec<u16> = footer.events.iter().map(|e| e.0).collect();
-        prop_assert_eq!(got_events, expected_events);
-
-        prop_assert_eq!(footer.series.len(), series.len());
-        for (i, (metric, vtype)) in series.iter().enumerate() {
-            let info = footer.series(SeriesLocal(i as u32)).unwrap();
-            prop_assert_eq!(info.metric.0, *metric);
-            prop_assert_eq!(info.value_type as u8, *vtype);
+        // Множества — отсортированные и без дублей: по ним идёт бинарный
+        // поиск и в миграции, и при вопросе «какая телеметрия здесь есть».
+        for (declared, got) in [
+            (&events, footer.events.iter().map(|e| e.0).collect::<Vec<u16>>()),
+            (&metrics, footer.metrics.iter().map(|m| m.0).collect::<Vec<u16>>()),
+        ] {
+            let mut expected: Vec<u16> = declared.clone();
+            expected.sort_unstable();
+            expected.dedup();
+            prop_assert_eq!(got, expected);
         }
     }
 

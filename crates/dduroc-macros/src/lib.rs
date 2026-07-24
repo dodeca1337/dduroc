@@ -72,10 +72,25 @@ struct EventDef {
 struct MetricDef {
     name: Ident,
     id: u16,
-    vtype: Ident,
+    /// `None` — тип выводится: у перечисления это `u64`.
+    vtype: Option<Ident>,
     unit: LitStr,
     tags: Vec<Ident>,
     store: Option<Ident>,
+    kind: Option<Ident>,
+    states: Vec<StateDef>,
+    /// Диапазоны допустимых значений: вне них — соответствующая важность.
+    warn: Option<syn::ExprRange>,
+    critical: Option<syn::ExprRange>,
+}
+
+/// Одно состояние метрики-перечисления: `Los = 0: critical`.
+#[derive(Clone)]
+struct StateDef {
+    name: Ident,
+    code: u64,
+    /// `None` — состояние нормальное.
+    severity: Option<Ident>,
 }
 
 struct SpanDef {
@@ -292,6 +307,46 @@ fn parse_event(input: ParseStream, languages: &[Ident]) -> syn::Result<EventDef>
     })
 }
 
+/// Разобрать список состояний: `[Los = 0: critical, Sync = 1: warn, Lock = 2]`.
+///
+/// Коды **обязательно** явные: позиционная нумерация сдвинулась бы при вставке
+/// состояния в середину списка, и уже записанные сегменты стали бы читаться
+/// неверно, без единого признака ошибки.
+fn parse_states(input: ParseStream) -> syn::Result<Vec<StateDef>> {
+    let content;
+    bracketed!(content in input);
+    let mut out = Vec::new();
+    while !content.is_empty() {
+        let name: Ident = content.parse()?;
+        content.parse::<Token![=]>().map_err(|_| {
+            syn::Error::new(
+                name.span(),
+                format!(
+                    "у состояния `{name}` не задан код: пишите `{name} = 0`. \
+                     Код обязан быть явным — позиционная нумерация сдвинулась бы \
+                     при вставке состояния в середину списка"
+                ),
+            )
+        })?;
+        let lit: LitInt = content.parse()?;
+        let code = lit.base10_parse::<u64>()?;
+        // Важность необязательна: без неё состояние считается нормальным.
+        let severity = if content.peek(Token![:]) {
+            content.parse::<Token![:]>()?;
+            Some(content.parse::<Ident>()?)
+        } else {
+            None
+        };
+        out.push(StateDef {
+            name,
+            code,
+            severity,
+        });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(out)
+}
+
 fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     let name: Ident = input.parse()?;
     let id = parse_id(input)?;
@@ -302,6 +357,10 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     let mut unit = None;
     let mut tags = Vec::new();
     let mut store = None;
+    let mut kind = None;
+    let mut states = Vec::new();
+    let mut warn = None;
+    let mut critical = None;
 
     while !content.is_empty() {
         let key: Ident = content.parse()?;
@@ -311,19 +370,36 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
             "unit" => unit = Some(content.parse::<LitStr>()?),
             "tags" => tags = parse_ident_list(&content)?,
             "store" => store = Some(content.parse::<Ident>()?),
+            "kind" => kind = Some(content.parse::<Ident>()?),
+            "states" => states = parse_states(&content)?,
+            "warn" => warn = Some(content.parse::<syn::ExprRange>()?),
+            "critical" => critical = Some(content.parse::<syn::ExprRange>()?),
             other => {
                 return Err(syn::Error::new(
                     key.span(),
-                    format!("у метрики неизвестный ключ `{other}`"),
+                    format!(
+                        "у метрики неизвестный ключ `{other}`: ожидались vtype, unit, \
+                         tags, store, kind, states, warn, critical"
+                    ),
                 ));
             }
         }
         let _ = content.parse::<Token![,]>();
     }
 
-    let vtype = vtype.ok_or_else(|| {
-        syn::Error::new(name.span(), format!("у метрики `{name}` не задан `vtype:`"))
-    })?;
+    // Тип перечисления выводится: код состояния — целое.
+    if vtype.is_none() && !states.is_empty() {
+        vtype = Some(Ident::new("u64", name.span()));
+    }
+    if vtype.is_none() {
+        return Err(syn::Error::new(
+            name.span(),
+            format!(
+                "у метрики `{name}` не задан `vtype:` (у перечисления он выводится \
+                 из `states:`)"
+            ),
+        ));
+    }
     let unit = unit.unwrap_or_else(|| LitStr::new("", name.span()));
 
     Ok(MetricDef {
@@ -333,6 +409,10 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         unit,
         tags,
         store,
+        kind,
+        states,
+        warn,
+        critical,
     })
 }
 
@@ -415,6 +495,114 @@ fn vtype_path(vtype: &Ident) -> syn::Result<TokenStream2> {
             ));
         }
     })
+}
+
+fn severity_path(severity: Option<&Ident>) -> syn::Result<TokenStream2> {
+    let Some(s) = severity else {
+        return Ok(quote!(::dduroc::Severity::Normal));
+    };
+    Ok(match s.to_string().as_str() {
+        "normal" => quote!(::dduroc::Severity::Normal),
+        "warn" => quote!(::dduroc::Severity::Warn),
+        "critical" => quote!(::dduroc::Severity::Critical),
+        other => {
+            return Err(syn::Error::new(
+                s.span(),
+                format!("неизвестная важность `{other}`: ожидались normal/warn/critical"),
+            ));
+        }
+    })
+}
+
+fn metric_kind_path(kind: Option<&Ident>, has_states: bool) -> syn::Result<TokenStream2> {
+    let Some(k) = kind else {
+        // Перечисление держится ступенькой по определению; всё остальное по
+        // умолчанию непрерывно.
+        return Ok(if has_states {
+            quote!(::dduroc::MetricKind::State)
+        } else {
+            quote!(::dduroc::MetricKind::Gauge)
+        });
+    };
+    let name = k.to_string();
+    if has_states && name != "state" {
+        return Err(syn::Error::new(
+            k.span(),
+            format!(
+                "метрика объявляет `states:`, значит её вид — state, а не `{name}`: \
+                 непрерывной величиной график соединил бы состояния прямой, \
+                 показав значения, которых не было"
+            ),
+        ));
+    }
+    Ok(match name.as_str() {
+        "gauge" => quote!(::dduroc::MetricKind::Gauge),
+        "state" => quote!(::dduroc::MetricKind::State),
+        "counter" => quote!(::dduroc::MetricKind::Counter),
+        other => {
+            return Err(syn::Error::new(
+                k.span(),
+                format!("неизвестный вид метрики `{other}`: ожидались gauge/state/counter"),
+            ));
+        }
+    })
+}
+
+/// Числовое значение границы диапазона: литерал, возможно со знаком минус.
+fn bound_value(expr: &syn::Expr) -> syn::Result<f64> {
+    use syn::{Expr, Lit, UnOp};
+    match expr {
+        Expr::Lit(l) => match &l.lit {
+            Lit::Float(f) => f.base10_parse::<f64>(),
+            Lit::Int(i) => i.base10_parse::<f64>(),
+            other => Err(syn::Error::new_spanned(
+                other,
+                "граница диапазона обязана быть числом",
+            )),
+        },
+        Expr::Unary(u) if matches!(u.op, UnOp::Neg(_)) => Ok(-bound_value(&u.expr)?),
+        Expr::Group(g) => bound_value(&g.expr),
+        Expr::Paren(p) => bound_value(&p.expr),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "граница диапазона обязана быть числовым литералом",
+        )),
+    }
+}
+
+/// Собрать [`dduroc::Range`] из диапазона Rust.
+///
+/// Верхняя граница требует `..=`: она **включительная**, и позволить писать
+/// `..70.0` значило бы тихо переопределить смысл общеизвестного синтаксиса.
+fn range_tokens(range: Option<&syn::ExprRange>) -> syn::Result<TokenStream2> {
+    let Some(r) = range else {
+        return Ok(quote!(::dduroc::Range {
+            min: None,
+            max: None
+        }));
+    };
+    let min = match &r.start {
+        Some(e) => {
+            let v = bound_value(e)?;
+            quote!(Some(#v))
+        }
+        None => quote!(None),
+    };
+    let max = match &r.end {
+        Some(e) => {
+            if matches!(r.limits, syn::RangeLimits::HalfOpen(_)) {
+                return Err(syn::Error::new_spanned(
+                    r,
+                    "верхняя граница предела включительная — пишите `..=`: \
+                     значение, равное границе, ещё нормально",
+                ));
+            }
+            let v = bound_value(e)?;
+            quote!(Some(#v))
+        }
+        None => quote!(None),
+    };
+    Ok(quote!(::dduroc::Range { min: #min, max: #max }))
 }
 
 /// Проверить уникальность идентификаторов.
@@ -594,18 +782,92 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
     // ── метрики ──────────────────────────────────────────────────────────
     let mut metric_consts = Vec::new();
     let mut metric_descs = Vec::new();
+    let mut state_statics = Vec::new();
     for m in &input.metrics {
         let name = &m.name;
         let name_str = name.to_string();
         let id = m.id;
-        let vtype = vtype_path(&m.vtype)?;
+        let vtype_ident = m.vtype.as_ref().expect("vtype проверен при разборе");
+        let vtype = vtype_path(vtype_ident)?;
         let class = class_path(m.store.as_ref())?;
         let unit = &m.unit;
         let tags: Vec<String> = m.tags.iter().map(|t| t.to_string()).collect();
+        let kind = metric_kind_path(m.kind.as_ref(), !m.states.is_empty())?;
+        let warn = range_tokens(m.warn.as_ref())?;
+        let critical = range_tokens(m.critical.as_ref())?;
 
         metric_consts.push(quote! {
             pub const #name: ::dduroc::MetricId = ::dduroc::MetricId(#id);
         });
+
+        // Статика подписей состояний: имена и важность живут в схеме, на диск
+        // уходит только код.
+        let states_ref = if m.states.is_empty() {
+            quote!(&[])
+        } else {
+            let states_static = quote::format_ident!("STATES_{}", name_str.to_uppercase());
+            let entries: Vec<TokenStream2> = m
+                .states
+                .iter()
+                .map(|s| {
+                    let code = s.code;
+                    let sname = s.name.to_string();
+                    let sev = severity_path(s.severity.as_ref())?;
+                    Ok(quote! {
+                        ::dduroc::StateDesc { code: #code, name: #sname, severity: #sev }
+                    })
+                })
+                .collect::<syn::Result<_>>()?;
+            state_statics.push(quote! {
+                static #states_static: &[::dduroc::StateDesc] = &[#(#entries),*];
+            });
+
+            // Rust-тип перечисления, чтобы на месте вызова стояло
+            // `metrics::LinkState::Lock`, а не голое число. Константа с тем же
+            // именем не конфликтует: у значений и типов разные пространства имён.
+            let variants: Vec<TokenStream2> = m
+                .states
+                .iter()
+                .map(|s| {
+                    let v = &s.name;
+                    let code = s.code;
+                    quote!(#v = #code)
+                })
+                .collect();
+            let name_arms: Vec<TokenStream2> = m
+                .states
+                .iter()
+                .map(|s| {
+                    let v = &s.name;
+                    let sname = s.name.to_string();
+                    quote!(Self::#v => #sname)
+                })
+                .collect();
+            metric_consts.push(quote! {
+                #[doc = concat!("Состояния метрики `", #name_str, "`.")]
+                #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+                #[repr(u64)]
+                pub enum #name {
+                    #(#variants),*
+                }
+
+                impl ::dduroc::MetricState for #name {
+                    fn metric() -> ::dduroc::MetricId {
+                        ::dduroc::MetricId(#id)
+                    }
+                    fn code(self) -> u64 {
+                        self as u64
+                    }
+                    fn name(self) -> &'static str {
+                        match self {
+                            #(#name_arms),*
+                        }
+                    }
+                }
+            });
+            quote!(#states_static)
+        };
+
         metric_descs.push(quote! {
             ::dduroc::MetricDesc {
                 id: ::dduroc::MetricId(#id),
@@ -613,7 +875,10 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 value_type: #vtype,
                 class: #class,
                 unit: #unit,
-                tag_keys: &[#(#tags),*],
+                tags: &[#(#tags),*],
+                kind: #kind,
+                states: #states_ref,
+                thresholds: ::dduroc::Thresholds { warn: #warn, critical: #critical },
             }
         });
     }
@@ -678,6 +943,8 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 #(#span_consts)*
             }
 
+            #(#state_statics)*
+
             static EVENTS: &[::dduroc::EventDesc] = &[#(#event_descs),*];
             static METRICS: &[::dduroc::MetricDesc] = &[#(#metric_descs),*];
             static SPANS: &[::dduroc::SpanDesc] = &[#(#span_descs),*];
@@ -719,6 +986,10 @@ fn clone_metric(m: &MetricDef) -> MetricDef {
         unit: m.unit.clone(),
         tags: m.tags.clone(),
         store: m.store.clone(),
+        kind: m.kind.clone(),
+        states: m.states.clone(),
+        warn: m.warn.clone(),
+        critical: m.critical.clone(),
     }
 }
 

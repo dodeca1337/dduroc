@@ -201,15 +201,25 @@ mod tests {
 
     #[test]
     fn rejects_other_container_version() {
-        let mut bytes = header().to_bytes();
-        bytes[4] = 2;
-        // CRC пересчитан — имитируем честно записанный сегмент версии 2.
-        let crc = crc32c::crc32c(&bytes[..28]);
-        bytes[28..32].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(
-            SegmentHeader::parse(&bytes),
-            Err(Error::UnsupportedContainerVersion(2, 1))
-        );
+        // Версия 1 — предыдущая раскладка, где сэмпл ссылался на локальный
+        // номер серии, а связывала его с метрикой отдельная запись. Прочитать
+        // такой сегмент этим билдом нельзя, и «попробовать разобрать» тоже
+        // нельзя: байты сошлись бы по CRC и дали бы чужие метрики.
+        for other in [1u8, 3, 255] {
+            let mut bytes = header().to_bytes();
+            bytes[4] = other;
+            // CRC пересчитан — имитируем честно записанный сегмент той версии.
+            let crc = crc32c::crc32c(&bytes[..28]);
+            bytes[28..32].copy_from_slice(&crc.to_le_bytes());
+            assert_eq!(
+                SegmentHeader::parse(&bytes),
+                Err(Error::UnsupportedContainerVersion(
+                    other,
+                    crate::CONTAINER_VERSION
+                )),
+                "версия контейнера {other}"
+            );
+        }
     }
 
     #[test]

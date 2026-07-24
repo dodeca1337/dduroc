@@ -13,7 +13,7 @@
 
 use crate::cursor::{Cursor, write_str};
 use crate::error::{Error, Result};
-use crate::ids::{EventId, MetricId, SeriesLocal, SpanId, SpanKindId};
+use crate::ids::{EventId, MetricId, SpanId, SpanKindId};
 use crate::level::Level;
 use crate::value::{Value, ValueType};
 use crate::varint;
@@ -23,7 +23,11 @@ pub mod kind {
     pub const MESSAGE: u8 = 0x0;
     pub const SPAN_START: u8 = 0x1;
     pub const SPAN_END: u8 = 0x2;
-    pub const SERIES_DEF: u8 = 0x3;
+    /// Занят в контейнере версии 1 записью `SeriesDef`, определявшей серию
+    /// как `(метрика, рантайм-тэги)`. Рантайм-тэгов больше нет, идентичность
+    /// серии равна метрике, и сэмпл несёт `metric_id` напрямую. Код не
+    /// переиспользуется: цена — ничего, а спутать разбор версий нельзя.
+    pub const RETIRED_SERIES_DEF: u8 = 0x3;
     pub const SAMPLE: u8 = 0x4;
     pub const TEXT: u8 = 0x5;
     /// Расширение: `len varint` + байты. Единственный способ добавить
@@ -36,104 +40,6 @@ pub mod kind {
 const FLAG_SPAN: u8 = 0b0001;
 /// Маска типа значения в флагах записи `Sample`.
 const SAMPLE_VTYPE_MASK: u8 = 0b0111;
-
-// ════════════════════════════════════════════════════════════════════════════
-// Тэги серий
-// ════════════════════════════════════════════════════════════════════════════
-
-/// Тэги серии телеметрии — часть её идентичности (`sensor="pa"`).
-///
-/// Два представления с общим API: [`Tags::Slice`] при записи, [`Tags::Raw`]
-/// при чтении (заимствует байты блока, не аллоцирует — важно на armv7).
-#[derive(Debug, Clone, Copy)]
-pub enum Tags<'a> {
-    Slice(&'a [(&'a str, &'a str)]),
-    Raw { count: u32, bytes: &'a [u8] },
-}
-
-impl<'a> Tags<'a> {
-    pub const EMPTY: Tags<'static> = Tags::Slice(&[]);
-
-    pub fn len(&self) -> u32 {
-        match self {
-            Tags::Slice(s) => s.len() as u32,
-            Tags::Raw { count, .. } => *count,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Итератор пар `(ключ, значение)`. Для [`Tags::Raw`] элементы
-    /// декодируются лениво, поэтому возможна ошибка формата.
-    pub fn iter(&self) -> TagIter<'a> {
-        TagIter(match *self {
-            Tags::Slice(s) => TagIterInner::Slice(s.iter()),
-            Tags::Raw { count, bytes } => TagIterInner::Raw {
-                remaining: count,
-                cursor: Cursor::new(bytes),
-            },
-        })
-    }
-
-    fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
-        varint::write_u64(out, u64::from(self.len()));
-        for pair in self.iter() {
-            let (k, v) = pair?;
-            write_str(out, k);
-            write_str(out, v);
-        }
-        Ok(())
-    }
-}
-
-/// Итератор тэгов. Для сырого представления возвращает `Result`, так как
-/// разбор идёт по ходу.
-#[derive(Debug)]
-pub struct TagIter<'a>(TagIterInner<'a>);
-
-#[derive(Debug)]
-enum TagIterInner<'a> {
-    Slice(core::slice::Iter<'a, (&'a str, &'a str)>),
-    Raw { remaining: u32, cursor: Cursor<'a> },
-}
-
-impl<'a> Iterator for TagIter<'a> {
-    type Item = Result<(&'a str, &'a str)>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.0 {
-            TagIterInner::Slice(it) => it.next().map(|&(k, v)| Ok((k, v))),
-            TagIterInner::Raw { remaining, cursor } => {
-                if *remaining == 0 {
-                    return None;
-                }
-                *remaining -= 1;
-                let pair = (|| {
-                    let k = cursor.str("tag_key")?;
-                    let v = cursor.str("tag_value")?;
-                    Ok((k, v))
-                })();
-                Some(pair)
-            }
-        }
-    }
-}
-
-impl PartialEq for Tags<'_> {
-    /// Сравнение логическое (по парам), а не по представлению: `Slice` и
-    /// `Raw` с одинаковым содержимым равны — на это опираются roundtrip-тесты.
-    fn eq(&self, other: &Self) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
-        self.iter().zip(other.iter()).all(|(a, b)| match (a, b) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        })
-    }
-}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Записи
@@ -160,21 +66,17 @@ pub struct SpanStart {
     pub parent: Option<SpanId>,
 }
 
-/// Определение серии телеметрии: интернирование `(метрика, тэги)` в
-/// сегментно-локальный `SeriesLocal`. Пишется при первом сэмпле серии
-/// в сегменте и дублируется в footer'е.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SeriesDef<'a> {
-    pub series: SeriesLocal,
-    pub metric: MetricId,
-    pub value_type: ValueType,
-    pub tags: Tags<'a>,
-}
-
 /// Отсчёт телеметрии.
+///
+/// Идентичность ряда — это метрика, и ничего кроме: рантайм-размерностей в
+/// системе нет, а имя, единица, подписи состояний и пределы — статика схемы.
+/// Поэтому сэмпл несёт `metric_id` напрямую, без промежуточного
+/// интернирования и без записи-определения серии: одна varint-величина
+/// вместо целого механизма, который к тому же приходилось восстанавливать
+/// при чтении с середины и в обратном порядке.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample<'a> {
-    pub series: SeriesLocal,
+    pub metric: MetricId,
     pub value: Value<'a>,
 }
 
@@ -197,7 +99,6 @@ pub enum Record<'a> {
     SpanEnd {
         span: SpanId,
     },
-    SeriesDef(SeriesDef<'a>),
     Sample(Sample<'a>),
     Text(Text<'a>),
     /// Нераспознанное расширение: сохранено целиком, пропускается по длине.
@@ -221,7 +122,6 @@ impl Record<'_> {
             Record::Message(_) => kind::MESSAGE,
             Record::SpanStart(_) => kind::SPAN_START,
             Record::SpanEnd { .. } => kind::SPAN_END,
-            Record::SeriesDef(_) => kind::SERIES_DEF,
             Record::Sample(_) => kind::SAMPLE,
             Record::Text(_) => kind::TEXT,
             Record::Ext { .. } => kind::EXT,
@@ -270,14 +170,8 @@ pub fn encode(record: &Record<'_>, dt: u64, out: &mut Vec<u8>) -> Result<usize> 
         Record::SpanEnd { span } => {
             varint::write_u64(out, u64::from(span.0));
         }
-        Record::SeriesDef(d) => {
-            varint::write_u64(out, u64::from(d.series.0));
-            varint::write_u64(out, u64::from(d.metric.0));
-            out.push(d.value_type as u8);
-            d.tags.encode(out)?;
-        }
         Record::Sample(s) => {
-            varint::write_u64(out, u64::from(s.series.0));
+            varint::write_u64(out, u64::from(s.metric.0));
             s.value.encode(out);
         }
         Record::Text(t) => {
@@ -333,37 +227,17 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
                 span: read_span(&mut c)?,
             }
         }
-        kind::SERIES_DEF => {
-            reject_flags(flags)?;
-            let series = SeriesLocal(c.varint_u32("series_local")?);
-            let metric = MetricId(c.varint_u16("metric_id")?);
-            let value_type = ValueType::from_u8(c.u8()?)?;
-            let count = c.varint_u32("n_tags")?;
-            // Границы каждого тэга проверяются при ленивом разборе; здесь
-            // нужно лишь потребить их байты, чтобы найти конец записи.
-            let tags_start = c.pos();
-            for _ in 0..count {
-                let _ = c.str("tag_key")?;
-                let _ = c.str("tag_value")?;
-            }
-            let bytes = &input[tags_start..c.pos()];
-            Record::SeriesDef(SeriesDef {
-                series,
-                metric,
-                value_type,
-                tags: Tags::Raw { count, bytes },
-            })
-        }
         kind::SAMPLE => {
-            // Тип значения дублирован во флагах: без него сэмпл нельзя
-            // пропустить, не зная его серию.
+            // Тип значения дублирован во флагах: без него длину значения
+            // взять негде — у сэмпла, в отличие от сообщения и расширения,
+            // нет префикса длины.
             let ty = ValueType::from_u8(flags & SAMPLE_VTYPE_MASK)?;
             if flags & !SAMPLE_VTYPE_MASK != 0 {
                 return Err(Error::ReservedNotZero);
             }
-            let series = SeriesLocal(c.varint_u32("series_local")?);
+            let metric = MetricId(c.varint_u16("metric_id")?);
             Record::Sample(Sample {
-                series,
+                metric,
                 value: c.value(ty)?,
             })
         }
@@ -385,6 +259,12 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
             Record::Ext {
                 bytes: c.take(len)?,
             }
+        }
+        // Отличимый диагноз для кода, занятого прежней версией: «неизвестный
+        // тип» отправил бы искать порчу носителя там, где на самом деле
+        // читается сегмент версии 1.
+        kind::RETIRED_SERIES_DEF => {
+            return Err(Error::RetiredRecordKind(kind::RETIRED_SERIES_DEF));
         }
         other => return Err(Error::UnknownRecordKind(other)),
     };
@@ -505,25 +385,70 @@ mod tests {
 
     #[test]
     fn sample_sizes() {
-        // f32: 1 + 1 + 1 + 4 = 7 байт.
+        // f32: kind+flags(1) + dt(1) + metric_id(1) + значение(4) = 7 байт.
         let size = roundtrip(
             Record::Sample(Sample {
-                series: SeriesLocal(0),
+                metric: MetricId(1),
                 value: Value::F32(36.6),
             }),
             0,
         );
         assert_eq!(size, 7, "сэмпл f32 — 7 байт");
 
-        // Малое u64: 1 + 1 + 1 + 1 = 4 байта.
+        // Малое u64: 1 + 1 + 1 + 1 = 4 байта. Столько же занимает и код
+        // состояния метрики-перечисления: на диске это обычный u64.
         let size = roundtrip(
             Record::Sample(Sample {
-                series: SeriesLocal(3),
+                metric: MetricId(3),
                 value: Value::U64(42),
             }),
             0,
         );
         assert_eq!(size, 4, "сэмпл малого u64 — 4 байта");
+    }
+
+    #[test]
+    fn dropping_series_interning_did_not_cost_bytes() {
+        // Раньше сэмпл ссылался на сегментно-локальный номер серии, который
+        // нумеровался с нуля, и отдельная запись SeriesDef связывала его с
+        // метрикой. Теперь метрика лежит в самом сэмпле. Размер обязан
+        // остаться прежним для метрик, укладывающихся в один байт varint,
+        // то есть для всех id меньше 128 — а бюджет схемы это 150 метрик.
+        for id in [0u16, 1, 42, 127] {
+            let size = roundtrip(
+                Record::Sample(Sample {
+                    metric: MetricId(id),
+                    value: Value::F32(1.0),
+                }),
+                0,
+            );
+            assert_eq!(size, 7, "metric_id {id} обязан стоить один байт");
+        }
+        // Только id от 128 стоит второй байт — и это плата за исчезновение
+        // записи-определения серии, которая стоила десятки байт на сегмент.
+        let size = roundtrip(
+            Record::Sample(Sample {
+                metric: MetricId(128),
+                value: Value::F32(1.0),
+            }),
+            0,
+        );
+        assert_eq!(size, 8);
+    }
+
+    #[test]
+    fn retired_series_def_kind_is_not_decodable() {
+        // Код 0x3 занимала запись SeriesDef контейнера версии 1. Он не
+        // переиспользуется, и встретить его можно только в файле чужой
+        // версии — читатель обязан честно отказаться, а не разобрать
+        // байты как что-то другое.
+        let mut buf = vec![kind::RETIRED_SERIES_DEF << 4];
+        varint::write_u64(&mut buf, 0);
+        assert_eq!(
+            decode(&buf),
+            Err(Error::RetiredRecordKind(kind::RETIRED_SERIES_DEF)),
+            "диагноз обязан указывать на версию формата, а не на порчу"
+        );
     }
 
     #[test]
@@ -554,26 +479,15 @@ mod tests {
         );
         roundtrip(Record::SpanEnd { span: SpanId(9) }, 1_000_000);
         roundtrip(
-            Record::SeriesDef(SeriesDef {
-                series: SeriesLocal(0),
+            Record::Sample(Sample {
                 metric: MetricId(1),
-                value_type: ValueType::F32,
-                tags: Tags::Slice(&[("sensor", "pa"), ("канал", "3")]),
-            }),
-            0,
-        );
-        roundtrip(
-            Record::SeriesDef(SeriesDef {
-                series: SeriesLocal(1),
-                metric: MetricId(2),
-                value_type: ValueType::Blob,
-                tags: Tags::EMPTY,
+                value: Value::F32(36.6),
             }),
             0,
         );
         roundtrip(
             Record::Sample(Sample {
-                series: SeriesLocal(1),
+                metric: MetricId(u16::MAX),
                 value: Value::Blob(&[1, 2, 3]),
             }),
             5,
@@ -600,29 +514,30 @@ mod tests {
     }
 
     #[test]
-    fn tags_decoded_lazily_and_compare_logically() {
-        let tags: &[(&str, &str)] = &[("a", "1"), ("b", "2")];
+    fn sample_carries_no_dimensions_beyond_the_metric() {
+        // Проверка ключевого свойства модели: на диске у сэмпла нет ничего,
+        // кроме времени, метрики и значения. Любая размерность, которую
+        // захотелось бы добавить в рантайме, обязана стать отдельной
+        // метрикой схемы — иначе она начнёт занимать место в каждом отсчёте.
         let mut buf = Vec::new();
         encode(
-            &Record::SeriesDef(SeriesDef {
-                series: SeriesLocal(0),
-                metric: MetricId(0),
-                value_type: ValueType::I64,
-                tags: Tags::Slice(tags),
+            &Record::Sample(Sample {
+                metric: MetricId(0x2a),
+                value: Value::U64(2),
             }),
             0,
             &mut buf,
         )
         .unwrap();
-
-        let (framed, _) = decode(&buf).unwrap();
-        let Record::SeriesDef(def) = framed.record else {
-            panic!("ожидался SeriesDef");
-        };
-        assert_eq!(def.tags.len(), 2);
-        let pairs: Vec<_> = def.tags.iter().map(|r| r.unwrap()).collect();
-        assert_eq!(pairs, tags);
-        assert_eq!(def.tags, Tags::Slice(tags), "Raw == Slice по содержимому");
+        assert_eq!(
+            buf,
+            vec![
+                (kind::SAMPLE << 4) | ValueType::U64 as u8,
+                0,    // dt
+                0x2a, // metric_id
+                2,    // значение
+            ]
+        );
     }
 
     #[test]
@@ -720,7 +635,7 @@ mod tests {
         );
         assert_eq!(
             Record::Sample(Sample {
-                series: SeriesLocal(0),
+                metric: MetricId(0),
                 value: Value::Bool(true)
             })
             .span(),

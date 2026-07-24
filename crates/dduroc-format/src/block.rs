@@ -470,7 +470,7 @@ impl<'a> Iterator for BlockRecords<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{EventId, SeriesLocal};
+    use crate::ids::{EventId, MetricId};
     use crate::record::{Message, Sample};
     use crate::value::Value;
 
@@ -579,21 +579,12 @@ mod tests {
     #[test]
     fn mixed_records_and_time_reconstruction() {
         let mut b = BlockBuilder::new();
-        b.push(
-            Micros(500),
-            &Record::SeriesDef(crate::record::SeriesDef {
-                series: SeriesLocal(0),
-                metric: crate::ids::MetricId(1),
-                value_type: crate::value::ValueType::F32,
-                tags: crate::record::Tags::Slice(&[("sensor", "pa")]),
-            }),
-        )
-        .unwrap();
+        b.push(Micros(500), &msg(9, &[1])).unwrap();
         for i in 0..10u64 {
             b.push(
                 Micros(1_000 + i * 250),
                 &Record::Sample(Sample {
-                    series: SeriesLocal(0),
+                    metric: MetricId(1),
                     value: Value::F32(20.0 + i as f32),
                 }),
             )

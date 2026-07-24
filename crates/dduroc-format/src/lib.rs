@@ -8,9 +8,9 @@
 //! # Структура
 //!
 //! ```text
-//! <root>/<namespace>/<channel>/<boot:08x>-<micros:012x>.seg
+//! <root>/<namespace>/<channel>/<boot:08x>-<micros:016x>.seg
 //!   [SegmentHeader 32B] [Block]* [Footer]?
-//!        Block = [BlockHeader 24B] [тело: записи, опц. сжатое]
+//!        Block = [BlockHeader 32B] [тело: записи, опц. сжатое]
 //! ```
 //!
 //! Неймспейс и канал в байтах не кодируются — они имплицитны из пути файла.
@@ -47,15 +47,22 @@ pub mod varint;
 pub use block::{Block, BlockBuilder, BlockHeader, Compression, restamp_seq};
 pub use error::{Error, Result};
 pub use footer::{Footer, FooterBuilder, Trailer};
-pub use ids::{
-    BootCounter, EventId, MetricId, Micros, ProtocolVersion, SeriesLocal, SpanId, SpanKindId,
-};
+pub use ids::{BootCounter, EventId, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId};
 pub use level::Level;
-pub use record::{Framed, Message, Record, Sample, SeriesDef, SpanStart, Tags, Text};
+pub use record::{Framed, Message, Record, Sample, SpanStart, Text};
 pub use segment::{SegmentHeader, SegmentName};
 pub use value::{Value, ValueType};
 
 /// Версия контейнера — байтового формата как такового. Не путать с версией
 /// протокола схемы ([`ProtocolVersion`]), которая принадлежит приложению и
 /// меняется его миграциями.
-pub const CONTAINER_VERSION: u8 = 1;
+///
+/// | версия | что изменилось |
+/// |---|---|
+/// | 1 | первая раскладка: сэмпл ссылался на сегментно-локальный номер серии, отдельная запись `SeriesDef` связывала его с метрикой и рантайм-тэгами, таблица серий дублировалась в footer'е |
+/// | 2 | рантайм-тэгов нет: идентичность ряда равна метрике, сэмпл несёт `metric_id`, запись `SeriesDef` и таблица серий удалены |
+///
+/// Читатель принимает **только** текущую версию: несовпадение — внятная
+/// ошибка [`Error::UnsupportedContainerVersion`], а не попытка угадать
+/// раскладку. Файл прежней версии остаётся читаемым прежним билдом.
+pub const CONTAINER_VERSION: u8 = 2;

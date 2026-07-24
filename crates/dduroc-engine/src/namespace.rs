@@ -8,19 +8,17 @@
 
 use crate::error::{Error, Result};
 use crate::fsutil;
-use crate::schema::{Schema, StorageClass};
-use crate::staged::{
-    ChannelIdx, DropCounters, NsId, OwnedValue, Payload, SeriesEntry, SeriesId, Staged,
-    StagedRecord,
-};
+use crate::limits::{EffectiveLimits, LimitsRegistry, MetricLimits};
+use crate::schema::{MetricKind, Schema, Severity, StorageClass};
+use crate::staged::{ChannelIdx, DropCounters, NsId, OwnedValue, Payload, Staged, StagedRecord};
 use crate::store::next_span_id;
-use crate::writer::{SeriesRegistry, Writer};
+use crate::writer::Writer;
 use crate::{Clock, schema};
 use dduroc_format::{EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, RwLock};
 
 /// Имя файла метаданных неймспейса.
 pub const NS_META: &str = "ns-meta";
@@ -119,10 +117,12 @@ struct NamespaceInner {
     classes: Vec<StorageClass>,
     writer: Arc<Writer>,
     clock: Clock,
-    series: Arc<RwLock<Vec<SeriesEntry>>>,
     drops: Arc<DropCounters>,
     next_span: Arc<AtomicU32>,
     meta: NsMeta,
+    /// Пределы значений: дефолты схемы плюс то, что выставила установка.
+    /// Живут в памяти и **не пишутся на диск** — см. [`crate::limits`].
+    limits: LimitsRegistry,
 }
 
 impl Namespace {
@@ -135,11 +135,11 @@ impl Namespace {
         classes: Vec<StorageClass>,
         writer: Arc<Writer>,
         clock: Clock,
-        series: Arc<RwLock<Vec<SeriesEntry>>>,
         drops: Arc<DropCounters>,
         next_span: Arc<AtomicU32>,
         meta: NsMeta,
     ) -> Self {
+        let limits = LimitsRegistry::new(schema.metrics.len());
         Self {
             inner: Arc::new(NamespaceInner {
                 _store: store,
@@ -149,10 +149,10 @@ impl Namespace {
                 classes,
                 writer,
                 clock,
-                series,
                 drops,
                 next_span,
                 meta,
+                limits,
             }),
         }
     }
@@ -271,23 +271,64 @@ impl Namespace {
         self.inner.writer.write(item, critical, &self.inner.drops)
     }
 
-    /// Открыть серию телеметрии: `(метрика, тэги)` интернируются один раз,
-    /// дальше сэмпл стоит один вызов без поиска.
-    pub fn series(&self, metric: MetricId, tags: &[(&str, &str)]) -> Result<Series> {
+    /// Открыть ряд телеметрии.
+    ///
+    /// Ряд — это метрика, и ничего кроме: рантайм-размерностей нет. Ручка
+    /// разрешает дескриптор один раз, дальше отсчёт стоит один вызов без
+    /// всякого поиска. Четыре датчика температуры — четыре метрики схемы:
+    /// иначе различающий их признак пришлось бы писать в каждый отсчёт.
+    pub fn series(&self, metric: MetricId) -> Result<Series> {
         let Some(desc) = self.inner.schema.metric(metric) else {
             return Err(Error::BadNamespace {
                 name: self.inner.name.clone(),
                 reason: "метрика не объявлена в схеме",
             });
         };
-        let id = SeriesRegistry::intern(&self.inner.series, metric, desc.value_type, tags);
         Ok(Series {
             ns: self.clone(),
-            id,
+            metric,
             channel: self.channel_of(desc.class)?,
             critical: desc.class == StorageClass::CRITICAL,
             value_type: desc.value_type,
+            desc,
         })
+    }
+
+    /// Выставить пределы значений метрики поверх схемных.
+    ///
+    /// Для случая, когда границы известны только в рантайме: внешняя система
+    /// определила модель железа и знает, что для этого усилителя нормально.
+    /// `None` снимает переопределение, возвращая объявленное в схеме.
+    ///
+    /// **На диск не пишется.** Пределы — свойство установки, а не измерения;
+    /// подробнее в [`crate::limits`].
+    pub fn set_limits(&self, metric: MetricId, limits: Option<MetricLimits>) -> Result<()> {
+        self.inner
+            .limits
+            .set(&self.inner.schema, metric, limits)
+            .map_err(|e| match e {
+                Error::UnknownMetric { .. } => Error::BadNamespace {
+                    name: self.inner.name.clone(),
+                    reason: "метрика не объявлена в схеме",
+                },
+                other => other,
+            })
+    }
+
+    /// Действующие пределы метрики: схема плюс переопределения.
+    pub fn limits(&self, metric: MetricId) -> Result<EffectiveLimits> {
+        self.inner.limits.effective(&self.inner.schema, metric)
+    }
+
+    /// Насколько значение требует внимания по действующим пределам.
+    ///
+    /// Сама запись пределов не касается: движок не решает за приложение, что
+    /// делать с выходом за границы, и не порождает событий сам. Метод — для
+    /// того, кто хочет проверить значение (и, например, записать событие).
+    pub fn severity_of(&self, metric: MetricId, value: &OwnedValue) -> Severity {
+        self.inner
+            .limits
+            .severity_of(&self.inner.schema, metric, &value.as_value())
     }
 
     /// Начать спан. Возвращает страж: конец записывается при его уничтожении,
@@ -334,23 +375,49 @@ impl Namespace {
     }
 }
 
-/// Открытая серия телеметрии.
+/// Состояние метрики-перечисления, порождённое макросом схемы.
+///
+/// Реализуется сгенерированным типом, чтобы на месте вызова стоял
+/// `link.sample_state(metrics::LinkState::Lock)`, а не голое число: код
+/// состояния на диске — обычное целое, и спутать его с кодом другой метрики
+/// иначе ничто не мешает.
+pub trait MetricState: Copy {
+    /// Метрика, которой принадлежит это перечисление.
+    fn metric() -> MetricId;
+    /// Код, попадающий на диск.
+    fn code(self) -> u64;
+    /// Имя состояния из схемы.
+    fn name(self) -> &'static str;
+}
+
+/// Открытый ряд телеметрии.
+///
+/// Идентичность ряда — метрика. Дескриптор разрешён при открытии, поэтому
+/// отсчёт не делает ни поиска по схеме, ни обращения к какому-либо реестру.
 #[derive(Debug, Clone)]
 pub struct Series {
     ns: Namespace,
-    id: SeriesId,
+    metric: MetricId,
     channel: ChannelIdx,
     critical: bool,
+    /// Копия объявленного типа значения. Дескриптор весит полторы сотни байт
+    /// и лежит в `.rodata`; сверка на каждом отсчёте не должна за ним ходить.
     value_type: dduroc_format::ValueType,
+    desc: &'static crate::schema::MetricDesc,
 }
 
 impl Series {
-    pub fn id(&self) -> SeriesId {
-        self.id
+    pub fn metric(&self) -> MetricId {
+        self.metric
     }
 
     pub fn value_type(&self) -> dduroc_format::ValueType {
         self.value_type
+    }
+
+    /// Как величина ведёт себя между отсчётами.
+    pub fn kind(&self) -> MetricKind {
+        self.desc.kind
     }
 
     /// Записать отсчёт.
@@ -369,7 +436,7 @@ impl Series {
             channel: self.channel,
             at: self.ns.now(),
             record: StagedRecord::Sample {
-                series: self.id,
+                metric: self.metric,
                 value,
             },
         };
@@ -382,6 +449,34 @@ impl Series {
     /// Скалярный отсчёт с плавающей точкой — самый частый случай.
     pub fn sample_f32(&self, v: f32) -> Result<()> {
         self.sample(OwnedValue::F32(v))
+    }
+
+    /// Записать состояние метрики-перечисления.
+    ///
+    /// На диск уходит код состояния — обычное целое в один байт для кодов
+    /// меньше 128. Имя и важность остаются в схеме, как шаблон у сообщения.
+    ///
+    /// Перечисление обязано принадлежать этой метрике: коды у разных метрик
+    /// свои, и записать чужой код значило бы получить график состояний,
+    /// подписанный чужими именами.
+    pub fn sample_state<S: MetricState>(&self, state: S) -> Result<()> {
+        if S::metric() != self.metric {
+            return Err(Error::BadNamespace {
+                name: self.ns.inner.name.clone(),
+                reason: "состояние принадлежит другой метрике",
+            });
+        }
+        let code = state.code();
+        match self.value_type {
+            dduroc_format::ValueType::Bool => self.sample(OwnedValue::Bool(code != 0)),
+            dduroc_format::ValueType::I64 => self.sample(OwnedValue::I64(code as i64)),
+            _ => self.sample(OwnedValue::U64(code)),
+        }
+    }
+
+    /// Важность значения по действующим пределам.
+    pub fn severity_of(&self, value: &OwnedValue) -> Severity {
+        self.ns.severity_of(self.metric, value)
     }
 }
 
@@ -493,14 +588,76 @@ mod tests {
             decoders: None,
         },
     ];
-    static METRICS: &[MetricDesc] = &[MetricDesc {
-        id: MetricId(1),
-        name: "temp",
-        value_type: ValueType::F32,
-        class: StorageClass::DEFAULT,
-        unit: "°C",
-        tag_keys: &["sensor"],
-    }];
+    static LINK_STATES: &[crate::schema::StateDesc] = &[
+        crate::schema::StateDesc {
+            code: 0,
+            name: "Los",
+            severity: Severity::Critical,
+        },
+        crate::schema::StateDesc {
+            code: 1,
+            name: "Sync",
+            severity: Severity::Warn,
+        },
+        crate::schema::StateDesc {
+            code: 2,
+            name: "Lock",
+            severity: Severity::Normal,
+        },
+    ];
+    static METRICS: &[MetricDesc] = &[
+        MetricDesc {
+            id: MetricId(1),
+            name: "temp",
+            value_type: ValueType::F32,
+            class: StorageClass::DEFAULT,
+            unit: "°C",
+            tags: &["thermal"],
+            kind: MetricKind::Gauge,
+            states: &[],
+            thresholds: crate::schema::Thresholds {
+                warn: crate::schema::Range {
+                    min: None,
+                    max: Some(70.0),
+                },
+                critical: crate::schema::Range {
+                    min: None,
+                    max: Some(85.0),
+                },
+            },
+        },
+        MetricDesc {
+            id: MetricId(2),
+            name: "link",
+            value_type: ValueType::U64,
+            class: StorageClass::DEFAULT,
+            unit: "",
+            tags: &["rf"],
+            kind: MetricKind::State,
+            states: LINK_STATES,
+            thresholds: crate::schema::Thresholds::NONE,
+        },
+    ];
+
+    /// Состояние канала — то, что для настоящей схемы породил бы макрос.
+    #[derive(Debug, Clone, Copy)]
+    enum LinkState {
+        Los = 0,
+        Sync = 1,
+        Lock = 2,
+    }
+
+    impl MetricState for LinkState {
+        fn metric() -> MetricId {
+            MetricId(2)
+        }
+        fn code(self) -> u64 {
+            self as u64
+        }
+        fn name(self) -> &'static str {
+            LINK_STATES[self as usize].name
+        }
+    }
     static SPANS: &[SpanDesc] = &[SpanDesc {
         id: SpanKindId(1),
         name: "Calibration",
@@ -710,7 +867,7 @@ mod tests {
         let (store, cfg) = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
 
-        let temp = ns.series(MetricId(1), &[("sensor", "pa")]).unwrap();
+        let temp = ns.series(MetricId(1)).unwrap();
         for i in 0..50 {
             temp.sample_f32(20.0 + i as f32).unwrap();
         }
@@ -869,13 +1026,182 @@ mod tests {
     }
 
     #[test]
+    fn enum_states_are_written_as_plain_integers() {
+        // Смысл модели: состояние на диске — обычное целое, всё остальное
+        // (имя, важность) живёт в схеме и места не занимает.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        let link = ns.series(MetricId(2)).unwrap();
+        assert_eq!(link.kind(), MetricKind::State);
+        for st in [LinkState::Los, LinkState::Sync, LinkState::Lock] {
+            link.sample_state(st).unwrap();
+        }
+        ns.sync().unwrap();
+
+        let stats = store.stats();
+        assert_eq!(stats.records_written, 3, "ни одной служебной записи");
+        assert!(stats.is_clean(), "{stats:?}");
+
+        // Три отсчёта: каждый — заголовок, дельта времени, метрика, код.
+        assert!(
+            stats.bytes_written < 32 + 3 * 8,
+            "три состояния заняли {} байт вместе с заголовком блока",
+            stats.bytes_written
+        );
+    }
+
+    #[test]
+    fn sealed_segment_lists_its_metrics_in_the_footer() {
+        // По этому множеству миграция решает, переписывать ли сегмент, а
+        // читатель — есть ли смысл его открывать. Пустое множество означало бы,
+        // что миграция молча пропустит всю историю телеметрии, а поиск
+        // состояния перед окном отбросит сегмент, в котором оно есть.
+        // Регрессия была бы совершенно тихой — отсюда тест.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        ns.series(MetricId(1)).unwrap().sample_f32(36.6).unwrap();
+        ns.series(MetricId(2))
+            .unwrap()
+            .sample_state(LinkState::Lock)
+            .unwrap();
+        ns.log_raw(EventId(1), &[1], None).unwrap();
+        store.shutdown();
+
+        let seg_dir = dir.path().join("orc-radio-0").join("default");
+        let path = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "seg"))
+            .expect("сегмент создан");
+
+        let reader = crate::segment::SegmentReader::open(&path).unwrap();
+        assert!(reader.is_sealed(), "shutdown запечатывает сегмент");
+        let footer = reader.footer().expect("footer читается");
+        assert_eq!(
+            footer.metrics,
+            vec![MetricId(1), MetricId(2)],
+            "обе метрики обязаны быть перечислены"
+        );
+        assert_eq!(footer.events, vec![EventId(1)]);
+        assert!(
+            footer.touches(&[], &[MetricId(2)]),
+            "миграция обязана увидеть, что сегмент затронут"
+        );
+        assert!(!footer.touches(&[], &[MetricId(9)]));
+    }
+
+    #[test]
+    fn state_of_a_foreign_metric_is_refused() {
+        // Коды состояний у разных метрик свои. Записать чужой код значило бы
+        // получить график, подписанный чужими именами.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        let temp = ns.series(MetricId(1)).unwrap();
+        let err = temp.sample_state(LinkState::Lock).unwrap_err();
+        assert!(matches!(err, Error::BadNamespace { .. }), "получено {err}");
+    }
+
+    #[test]
+    fn limits_default_from_schema_and_override_at_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+
+        // Дефолты схемы.
+        let sev = |v: f32| ns.severity_of(MetricId(1), &OwnedValue::F32(v));
+        assert_eq!(sev(36.6), Severity::Normal);
+        assert_eq!(sev(75.0), Severity::Warn);
+        assert_eq!(sev(90.0), Severity::Critical);
+
+        // Внешняя система определила модель усилителя и сузила пределы.
+        ns.set_limits(
+            MetricId(1),
+            Some(MetricLimits::numeric(crate::schema::Thresholds {
+                warn: crate::schema::Range {
+                    min: None,
+                    max: Some(40.0),
+                },
+                critical: crate::schema::Range {
+                    min: None,
+                    max: Some(50.0),
+                },
+            })),
+        )
+        .unwrap();
+        assert_eq!(sev(45.0), Severity::Warn, "схема сказала бы Normal");
+        let eff = ns.limits(MetricId(1)).unwrap();
+        assert!(eff.overridden);
+        assert_eq!(eff.unit, "°C");
+        assert_eq!(eff.kind, MetricKind::Gauge);
+
+        // Состояния: важность приходит из состояния, а не из диапазонов.
+        let link = ns.limits(MetricId(2)).unwrap();
+        assert_eq!(link.kind, MetricKind::State);
+        assert_eq!(link.states.len(), 3);
+        assert_eq!(link.states[0].name, "Los");
+        assert_eq!(link.states[0].severity, Severity::Critical);
+        assert_eq!(
+            ns.severity_of(MetricId(2), &OwnedValue::U64(0)),
+            Severity::Critical
+        );
+
+        // Пределы не попадают в поток записей.
+        ns.sync().unwrap();
+        assert_eq!(
+            store.stats().records_written,
+            0,
+            "пределы — настройка, а не данные: писать их некуда"
+        );
+        assert!(ns.set_limits(MetricId(99), None).is_err());
+    }
+
+    #[test]
+    fn limits_are_per_namespace_not_per_process() {
+        // У каждого экземпляра своё железо: общие на процесс пределы были бы
+        // неверны для всех сразу.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, cfg) = open_store(dir.path());
+        let a = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let b = store.namespace("orc-radio-1", schema(), &cfg).unwrap();
+
+        a.set_limits(
+            MetricId(1),
+            Some(MetricLimits::numeric(crate::schema::Thresholds {
+                warn: crate::schema::Range {
+                    min: None,
+                    max: Some(10.0),
+                },
+                critical: crate::schema::Range::NONE,
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(
+            a.severity_of(MetricId(1), &OwnedValue::F32(20.0)),
+            Severity::Warn
+        );
+        assert_eq!(
+            b.severity_of(MetricId(1), &OwnedValue::F32(20.0)),
+            Severity::Normal,
+            "сосед сохранил свои пределы"
+        );
+    }
+
+    #[test]
     fn unknown_ids_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (store, cfg) = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
 
         assert!(ns.log_raw(EventId(99), &[], None).is_err());
-        assert!(ns.series(MetricId(99), &[]).is_err());
+        assert!(ns.series(MetricId(99)).is_err());
         assert!(ns.span(SpanKindId(99)).is_err());
     }
 }

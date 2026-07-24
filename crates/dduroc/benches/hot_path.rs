@@ -14,7 +14,7 @@ use dduroc::prelude::*;
 use dduroc::{ChannelConfig, Durability, StorageClass};
 use dduroc_format::block::{BlockBuilder, Compression};
 use dduroc_format::record::{Message, Sample};
-use dduroc_format::{EventId, Micros, Record, SeriesLocal, Value, varint};
+use dduroc_format::{EventId, MetricId, Micros, Record, Value, varint};
 use std::hint::black_box;
 use std::path::PathBuf;
 
@@ -44,7 +44,7 @@ dduroc::schema! {
     }
 
     metrics {
-        Temp = 0x01 { vtype: f32, unit: "°C", tags: [sensor] },
+        Temp = 0x01 { vtype: f32, unit: "°C", tags: [thermal] },
     }
 
     spans {
@@ -158,7 +158,7 @@ fn bench_format(c: &mut Criterion) {
 
     g.bench_function("record/encode_sample", |b| {
         let rec = Record::Sample(Sample {
-            series: SeriesLocal(3),
+            metric: MetricId(3),
             value: Value::F32(36.6),
         });
         let mut buf = Vec::with_capacity(32);
@@ -245,9 +245,7 @@ fn bench_write(c: &mut Criterion) {
     let ns = store
         .namespace("bench-0", bench::SCHEMA, &config)
         .expect("неймспейс");
-    let series = ns
-        .series(bench::metrics::Temp, &[("sensor", "pa")])
-        .expect("серия");
+    let series = ns.series(bench::metrics::Temp).expect("серия");
 
     let mut g = c.benchmark_group("write");
     g.throughput(Throughput::Elements(1));
@@ -361,6 +359,33 @@ fn bench_throughput(c: &mut Criterion) {
                     ns.log(bench::events::Tick { n: i as u32 }).ok();
                 }
                 ns.sync().unwrap();
+                store.shutdown();
+                let _ = std::fs::remove_dir_all(&root);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    // Телеметрия отдельно: это самая частая запись, и мерить её надо там же,
+    // где меряется всё остальное — в сквозном режиме. Числа группы `write`
+    // для неё обманчивы: они зависят от состязания прикладного потока с
+    // writer'ом за буфер очереди, и ускорение writer'а выглядит там
+    // замедлением.
+    g.bench_function("end_to_end/10k_samples", |b| {
+        b.iter_batched(
+            || {
+                let root = bench_root();
+                let config = store_config(&root);
+                let store = Store::open(config.clone()).unwrap();
+                let ns = store.namespace("bench-0", bench::SCHEMA, &config).unwrap();
+                let series = ns.series(bench::metrics::Temp).unwrap();
+                (root, store, series)
+            },
+            |(root, store, series)| {
+                for i in 0..BATCH {
+                    series.sample_f32(20.0 + i as f32).ok();
+                }
+                store.sync().unwrap();
                 store.shutdown();
                 let _ = std::fs::remove_dir_all(&root);
             },

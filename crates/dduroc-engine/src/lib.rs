@@ -22,6 +22,7 @@ pub mod clock;
 pub mod epochs;
 mod error;
 mod fsutil;
+pub mod limits;
 pub mod namespace;
 pub mod rotation;
 pub mod schema;
@@ -35,9 +36,13 @@ pub use channel::{ChannelConfig, Durability};
 pub use clock::Clock;
 pub use epochs::{EpochStore, Epochs, SyncSource};
 pub use error::{Error, Result};
+pub use limits::{EffectiveLimits, MetricLimits, StateStatus};
 pub use namespace::{Namespace, Series, SpanGuard};
 pub use rotation::Inventory;
-pub use schema::{EventDesc, Language, MetricDesc, Schema, SpanDesc, StorageClass};
+pub use schema::{
+    EventDesc, Language, MetricDesc, MetricKind, Range, Schema, Severity, SpanDesc, StateDesc,
+    StorageClass, Thresholds,
+};
 pub use segment::{Scan, SegmentReader, SegmentWriter};
 pub use staged::{NsId, Staged, StagedRecord};
 pub use stats::Stats;

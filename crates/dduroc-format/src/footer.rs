@@ -1,28 +1,29 @@
-//! Footer запечатанного сегмента: индекс блоков, множества встреченных типов
-//! и таблица серий.
+//! Footer запечатанного сегмента: индекс блоков и множества встреченных типов.
 //!
 //! ```text
-//! [индекс блоков] [event_id'ы] [metric_id'ы] [таблица серий] [Trailer 32B]
+//! [индекс блоков] [event_id'ы] [metric_id'ы] [Trailer 32B]
 //! ```
 //!
 //! Footer — **оптимизация, а не необходимость**: он позволяет найти блок по
-//! времени без чтения тел и понять, какие серии есть в сегменте, не сканируя
+//! времени без чтения тел и понять, какие типы есть в сегменте, не сканируя
 //! его. Если footer повреждён или отсутствует (сегмент активен либо оборвано
 //! питание при seal'е), читатель деградирует к последовательному обходу
 //! заголовков блоков — данные не теряются.
 //!
 //! Множества типов нужны миграции: сегмент, не содержащий затронутых
 //! `event_id`/`metric_id`, переписывать не нужно — экономия ресурса флеша.
+//! Множество метрик заодно отвечает на вопрос «какая телеметрия есть в этом
+//! сегменте» — ради него таблица серий и существовала, пока идентичность ряда
+//! была парой `(метрика, рантайм-тэги)`. Тэгов больше нет, идентичность равна
+//! метрике, и множества идентификаторов достаточно.
 //!
 //! Признак запечатанности — сигнатура в последних четырёх байтах файла.
 
 use crate::block::BlockHeader;
-use crate::cursor::{Cursor, write_str};
+use crate::cursor::Cursor;
 use crate::error::{Error, Result};
-use crate::ids::{EventId, MetricId, Micros, SeriesLocal};
-use crate::record::Tags;
+use crate::ids::{EventId, MetricId, Micros};
 use crate::segment::SegmentHeader;
-use crate::value::ValueType;
 use crate::varint;
 
 /// Сигнатура в последних 4 байтах запечатанного сегмента.
@@ -36,14 +37,6 @@ pub struct BlockIndexEntry {
     /// Время первой записи блока.
     pub base: Micros,
     pub count: u16,
-}
-
-/// Серия сегмента (позиция в таблице = [`SeriesLocal`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SeriesInfo<'a> {
-    pub metric: MetricId,
-    pub value_type: ValueType,
-    pub tags: Tags<'a>,
 }
 
 /// Хвостовой блок footer'а фиксированного размера.
@@ -101,23 +94,25 @@ impl Trailer {
 
 /// Разобранный footer.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Footer<'a> {
+pub struct Footer {
     pub blocks: Vec<BlockIndexEntry>,
     /// Типы сообщений, встречающиеся в сегменте (возрастающий порядок).
     pub events: Vec<EventId>,
     /// Метрики, встречающиеся в сегменте (возрастающий порядок).
+    ///
+    /// Отвечает и на вопрос миграции «затронут ли сегмент», и на вопрос
+    /// читателя «какая телеметрия здесь есть»: идентичность ряда равна
+    /// метрике, поэтому перечислить метрики значит перечислить ряды.
     pub metrics: Vec<MetricId>,
-    /// Таблица серий: индекс = [`SeriesLocal`].
-    pub series: Vec<SeriesInfo<'a>>,
     pub min: Micros,
     pub max: Micros,
 }
 
-impl<'a> Footer<'a> {
+impl Footer {
     /// Разобрать footer из хвоста файла. `bytes` обязан **заканчиваться**
     /// последним байтом файла и содержать footer целиком
     /// (длина известна из [`Trailer::parse`]).
-    pub fn parse(bytes: &'a [u8]) -> Result<Option<Self>> {
+    pub fn parse(bytes: &[u8]) -> Result<Option<Self>> {
         let Some(trailer) = Trailer::parse(bytes)? else {
             return Ok(None);
         };
@@ -173,28 +168,6 @@ impl<'a> Footer<'a> {
             .map(|v| MetricId(v as u16))
             .collect();
 
-        // Таблица серий.
-        let n = c.varint_u32("series count")?;
-        let mut series = Vec::with_capacity(bounded(n, sections.len(), 4));
-        for _ in 0..n {
-            let metric = MetricId(c.varint_u16("metric_id")?);
-            let value_type = ValueType::from_u8(c.u8()?)?;
-            let count = c.varint_u32("n_tags")?;
-            let tags_start = c.pos();
-            for _ in 0..count {
-                let _ = c.str("tag_key")?;
-                let _ = c.str("tag_value")?;
-            }
-            series.push(SeriesInfo {
-                metric,
-                value_type,
-                tags: Tags::Raw {
-                    count,
-                    bytes: &sections[tags_start..c.pos()],
-                },
-            });
-        }
-
         // Секции обязаны быть разобраны без остатка: длина в трейлере
         // согласована с CRC, поэтому лишние байты означают не запас, а
         // несоответствие содержимого заявленной структуре.
@@ -210,7 +183,6 @@ impl<'a> Footer<'a> {
             blocks,
             events,
             metrics,
-            series,
             min: trailer.min,
             max: trailer.max,
         }))
@@ -234,11 +206,6 @@ impl<'a> Footer<'a> {
         let base = self.blocks[first_after - 1].base;
         let start = self.blocks[..first_after].partition_point(|b| b.base < base);
         Some(start)
-    }
-
-    /// Описание серии по её локальному идентификатору.
-    pub fn series(&self, id: SeriesLocal) -> Option<&SeriesInfo<'a>> {
-        self.series.get(id.0 as usize)
     }
 
     /// Пересекается ли сегмент с указанными типами — критерий для миграции:
@@ -291,21 +258,52 @@ fn read_id_set(c: &mut Cursor<'_>, what: &'static str, available: usize) -> Resu
 
 /// Накопитель footer'а: движок кормит его по мере записи блоков, а при seal'е
 /// получает готовые байты.
+/// Отсортированное множество идентификаторов на плоском векторе.
+///
+/// Не `BTreeSet`, потому что `insert` вызывается **на каждую запись**: у
+/// сообщения — его тип, у отсчёта — его метрика. Типов в схеме сотни, то есть
+/// множество крошечное, и на таком размере непрерывная память с бинарным
+/// поиском заметно быстрее дерева с его разыменованиями. Плюс дешёвая защёлка
+/// на последнее добавленное: подряд идущие записи одного типа — обычное дело.
+#[derive(Debug, Default)]
+struct IdSet {
+    ids: Vec<u16>,
+    last: Option<u16>,
+}
+
+impl IdSet {
+    #[inline]
+    fn insert(&mut self, id: u16) {
+        if self.last == Some(id) {
+            return;
+        }
+        self.last = Some(id);
+        if let Err(pos) = self.ids.binary_search(&id) {
+            self.ids.insert(pos, id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.ids.clear();
+        self.last = None;
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u16> + '_ {
+        self.ids.iter().copied()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FooterBuilder {
     blocks: Vec<BlockIndexEntry>,
-    events: std::collections::BTreeSet<u16>,
-    metrics: std::collections::BTreeSet<u16>,
-    series: Vec<OwnedSeries>,
+    events: IdSet,
+    metrics: IdSet,
     min: Option<Micros>,
     max: Micros,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct OwnedSeries {
-    metric: MetricId,
-    value_type: ValueType,
-    tags: Vec<(String, String)>,
 }
 
 impl FooterBuilder {
@@ -337,33 +335,20 @@ impl FooterBuilder {
         self.max = Micros(self.max.0.max(last.0).max(header.base.0));
     }
 
+    /// Отметить встреченный тип сообщения. Вызывается на каждую запись.
+    #[inline]
     pub fn add_event(&mut self, id: EventId) {
         self.events.insert(id.0);
     }
 
+    /// Отметить встреченную метрику. Вызывается на каждый отсчёт.
+    ///
+    /// Множество отвечает и миграции («затронут ли сегмент»), и читателю
+    /// («какая телеметрия здесь есть»). Пустым оно быть не должно ни в одном
+    /// сегменте с телеметрией — иначе миграция молча пропустила бы историю.
+    #[inline]
     pub fn add_metric(&mut self, id: MetricId) {
         self.metrics.insert(id.0);
-    }
-
-    /// Зарегистрировать серию. Порядок вызовов задаёт [`SeriesLocal`],
-    /// поэтому он обязан совпадать с порядком `SeriesDef` в блоках.
-    pub fn add_series(
-        &mut self,
-        metric: MetricId,
-        value_type: ValueType,
-        tags: &[(&str, &str)],
-    ) -> SeriesLocal {
-        self.metrics.insert(metric.0);
-        let id = SeriesLocal(self.series.len() as u32);
-        self.series.push(OwnedSeries {
-            metric,
-            value_type,
-            tags: tags
-                .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                .collect(),
-        });
-        id
     }
 
     pub fn block_count(&self) -> usize {
@@ -391,17 +376,6 @@ impl FooterBuilder {
         write_id_set(&mut sections, &self.events);
         write_id_set(&mut sections, &self.metrics);
 
-        varint::write_u64(&mut sections, self.series.len() as u64);
-        for s in &self.series {
-            varint::write_u64(&mut sections, u64::from(s.metric.0));
-            sections.push(s.value_type as u8);
-            varint::write_u64(&mut sections, s.tags.len() as u64);
-            for (k, v) in &s.tags {
-                write_str(&mut sections, k);
-                write_str(&mut sections, v);
-            }
-        }
-
         let mut trailer = Trailer {
             footer_len: sections.len() as u32,
             block_count: self.blocks.len() as u32,
@@ -426,16 +400,15 @@ impl FooterBuilder {
         self.blocks.clear();
         self.events.clear();
         self.metrics.clear();
-        self.series.clear();
         self.min = None;
         self.max = Micros(0);
     }
 }
 
-fn write_id_set(out: &mut Vec<u8>, set: &std::collections::BTreeSet<u16>) {
+fn write_id_set(out: &mut Vec<u8>, set: &IdSet) {
     varint::write_u64(out, set.len() as u64);
     let mut prev = 0u64;
-    for &id in set {
+    for id in set.iter() {
         varint::write_u64(out, u64::from(id) - prev);
         prev = u64::from(id);
     }
@@ -466,8 +439,9 @@ mod tests {
         b.add_event(EventId(1));
         b.add_event(EventId(300));
         b.add_event(EventId(1)); // дубли схлопываются
-        b.add_series(MetricId(5), ValueType::F32, &[("sensor", "pa")]);
-        b.add_series(MetricId(6), ValueType::Blob, &[]);
+        b.add_metric(MetricId(5));
+        b.add_metric(MetricId(6));
+        b.add_metric(MetricId(5)); // дубли схлопываются
         b
     }
 
@@ -487,14 +461,22 @@ mod tests {
         assert_eq!(footer.metrics, vec![MetricId(5), MetricId(6)]);
         assert_eq!(footer.min, Micros(1_000));
         assert_eq!(footer.max, Micros(9_100));
+    }
 
-        assert_eq!(footer.series.len(), 2);
-        let s0 = footer.series(SeriesLocal(0)).unwrap();
-        assert_eq!(s0.metric, MetricId(5));
-        assert_eq!(s0.value_type, ValueType::F32);
-        assert_eq!(s0.tags, Tags::Slice(&[("sensor", "pa")]));
-        assert_eq!(footer.series(SeriesLocal(1)).unwrap().tags.len(), 0);
-        assert!(footer.series(SeriesLocal(2)).is_none());
+    #[test]
+    fn metric_set_answers_what_telemetry_is_here() {
+        // Ради этого вопроса и существовала таблица серий, пока идентичность
+        // ряда была парой «метрика + рантайм-тэги». Тэгов нет, идентичность
+        // равна метрике, и множества идентификаторов достаточно — притом оно
+        // уже было в footer'е ради миграций.
+        let bytes = sample_builder().build();
+        let f = Footer::parse(&bytes).unwrap().unwrap();
+        assert_eq!(f.metrics, vec![MetricId(5), MetricId(6)]);
+        assert!(f.metrics.binary_search(&MetricId(5)).is_ok());
+        assert!(
+            f.metrics.binary_search(&MetricId(7)).is_err(),
+            "чего нет в сегменте — того нет и во множестве"
+        );
     }
 
     #[test]
@@ -609,7 +591,7 @@ mod tests {
             "ожидалась ошибка разбора, получено {err}"
         );
 
-        // То же для множеств идентификаторов и таблицы серий.
+        // То же для множеств идентификаторов.
         // Число блоков берётся из трейлера, поэтому секции начинаются сразу
         // с множества событий.
         let empty_trailer = Trailer {
@@ -626,8 +608,7 @@ mod tests {
 
         let mut sections = Vec::new();
         varint::write_u64(&mut sections, 0); // событий нет
-        varint::write_u64(&mut sections, 0); // метрик нет
-        varint::write_u64(&mut sections, u64::from(u32::MAX)); // «серий» — 4 млрд
+        varint::write_u64(&mut sections, u64::from(u32::MAX)); // «метрик» — 4 млрд
         assert!(Footer::parse(&forge(sections, empty_trailer)).is_err());
     }
 
@@ -639,7 +620,6 @@ mod tests {
         let mut sections = Vec::new();
         varint::write_u64(&mut sections, 0); // событий нет
         varint::write_u64(&mut sections, 0); // метрик нет
-        varint::write_u64(&mut sections, 0); // серий нет
         sections.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
 
         let bytes = forge(
@@ -694,7 +674,7 @@ mod tests {
         let f = Footer::parse(&bytes).unwrap().unwrap();
         assert!(f.blocks.is_empty());
         assert!(f.events.is_empty());
-        assert!(f.series.is_empty());
+        assert!(f.metrics.is_empty());
     }
 
     #[test]
@@ -706,7 +686,6 @@ mod tests {
         varint::write_u64(&mut sections, 5);
         varint::write_u64(&mut sections, 0); // дубль
         varint::write_u64(&mut sections, 0); // метрик нет
-        varint::write_u64(&mut sections, 0); // серий нет
 
         let mut trailer = Trailer {
             footer_len: sections.len() as u32,

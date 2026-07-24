@@ -7,9 +7,9 @@ use crate::error::{Error, IoContext, Result};
 use crate::fsutil;
 use crate::namespace::{Namespace, NsMeta};
 use crate::schema::{Schema, StorageClass};
-use crate::staged::{DropCounters, NsId, SeriesEntry};
+use crate::staged::{DropCounters, NsId};
 use crate::stats::{Counters, Stats};
-use crate::writer::{NsSetup, QueueSizes, SeriesRegistry, Writer};
+use crate::writer::{NsSetup, QueueSizes, Writer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -95,6 +95,10 @@ impl StoreConfig {
 pub struct Store {
     root: PathBuf,
     meta: StoreMeta,
+    /// Версия контейнера, с которой поднято хранилище, если она была старее
+    /// текущей. Приложению стоит записать это в журнал: часть накопленной
+    /// истории этим билдом не читается.
+    upgraded_from: Option<u8>,
     clock: Clock,
     epochs: Mutex<EpochStore>,
     writer: Arc<Writer>,
@@ -121,7 +125,7 @@ impl Store {
         let lock = acquire_lock(&config.root)?;
         fsutil::sweep_tmp(&config.root)?;
 
-        let meta = load_or_create_meta(&config.root)?;
+        let (meta, upgraded_from) = load_or_create_meta(&config.root)?;
 
         // База часов и запись в epochs.bin берут одно и то же значение
         // BOOTTIME: расхождение между ними уехало бы в конверсию в UTC.
@@ -135,6 +139,7 @@ impl Store {
         Ok(Arc::new(Self {
             root: config.root.clone(),
             meta,
+            upgraded_from,
             clock,
             epochs: Mutex::new(epochs),
             writer,
@@ -151,6 +156,15 @@ impl Store {
 
     pub fn meta(&self) -> StoreMeta {
         self.meta
+    }
+
+    /// Прежняя версия контейнера, если хранилище было поднято со старой.
+    ///
+    /// `Some(v)` означает: сегменты версии `v` в каталоге есть, но этим билдом
+    /// они не читаются и уйдут при ротации. Стоит записать это событие —
+    /// молчаливая потеря доступа к истории хуже, чем явная.
+    pub fn upgraded_from(&self) -> Option<u8> {
+        self.upgraded_from
     }
 
     pub fn clock(&self) -> &Clock {
@@ -213,7 +227,6 @@ impl Store {
             c.validate()?;
         }
 
-        let series: Arc<std::sync::RwLock<Vec<SeriesEntry>>> = SeriesRegistry::new_shared();
         let drops = Arc::new(DropCounters::new(channel_configs.len()));
         let boot = dduroc_format::BootCounter(self.boot_counter());
 
@@ -224,7 +237,6 @@ impl Store {
             store_id: self.meta.store_id,
             boot,
             channels: channel_configs,
-            series: Arc::clone(&series),
             drops: Arc::clone(&drops),
         })?;
 
@@ -244,7 +256,6 @@ impl Store {
             classes,
             Arc::clone(&self.writer),
             self.clock.clone(),
-            series,
             drops,
             Arc::clone(&self.next_span),
             meta,
@@ -399,32 +410,58 @@ fn acquire_lock(root: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn load_or_create_meta(root: &Path) -> Result<StoreMeta> {
+/// Прочитать или создать метаданные хранилища.
+///
+/// Хранилище, записанное **прежней** версией контейнера, поднимается: файл
+/// метаданных переписывается на текущую версию, `store_id` сохраняется, а
+/// старые сегменты остаются лежать до ротации.
+///
+/// Отказаться было бы хуже всего: обновление прошивки означало бы, что
+/// `Store::open` не удался и прибор перестал логировать вовсе — ровно в тот
+/// момент, когда журнал нужнее всего. Данные прежней версии при этом не
+/// подменяются и не выдаются за свои: заголовок каждого сегмента несёт версию
+/// контейнера, и читатель сообщает о них как о непрочитанном фрагменте, а не
+/// разбирает их наугад.
+///
+/// Версия **из будущего** по-прежнему ошибка: раскладку, которой этот билд не
+/// знает, угадывать нечем.
+fn load_or_create_meta(root: &Path) -> Result<(StoreMeta, Option<u8>)> {
     let path = root.join(STORE_META);
+    let current = dduroc_format::CONTAINER_VERSION;
+
     if let Some(bytes) = fsutil::read_optional(&path)? {
         let meta: StoreMeta = postcard::from_bytes(&bytes).map_err(|_| Error::Corrupt {
             path: path.clone(),
             reason: "метаданные хранилища не разбираются".to_owned(),
         })?;
-        if meta.container_version != dduroc_format::CONTAINER_VERSION {
+        if meta.container_version > current {
             return Err(Error::Corrupt {
                 path,
                 reason: format!(
-                    "версия контейнера {} не поддерживается (ожидалась {})",
-                    meta.container_version,
-                    dduroc_format::CONTAINER_VERSION
+                    "версия контейнера {} новее поддерживаемой ({}): раскладку из \
+                     будущего этот билд разобрать не может",
+                    meta.container_version, current
                 ),
             });
         }
-        return Ok(meta);
+        if meta.container_version < current {
+            let from = meta.container_version;
+            let upgraded = StoreMeta {
+                container_version: current,
+                store_id: meta.store_id,
+            };
+            fsutil::write_atomic(&path, &postcard::to_allocvec(&upgraded)?)?;
+            return Ok((upgraded, Some(from)));
+        }
+        return Ok((meta, None));
     }
 
     let meta = StoreMeta {
-        container_version: dduroc_format::CONTAINER_VERSION,
+        container_version: current,
         store_id: fresh_store_id(),
     };
     fsutil::write_atomic(&path, &postcard::to_allocvec(&meta)?)?;
-    Ok(meta)
+    Ok((meta, None))
 }
 
 /// Идентификатор хранилища.
@@ -513,6 +550,74 @@ mod tests {
         first.shutdown();
         drop(first);
         Store::open(StoreConfig::new(dir.path())).expect("корень освободился");
+    }
+
+    #[test]
+    fn older_container_version_is_upgraded_not_fatal() {
+        // Отказ открыть хранилище означал бы, что обновление прошивки лишает
+        // прибор журнала — ровно в тот момент, когда он нужнее всего.
+        // Поднимаемся, сохранив идентичность хранилища, и сообщаем о том, что
+        // часть истории этим билдом не читается.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig::new(dir.path());
+
+        let first = Store::open(cfg.clone()).unwrap();
+        let store_id = first.meta().store_id;
+        assert_eq!(first.upgraded_from(), None, "новое хранилище не «поднято»");
+        first.shutdown();
+        drop(first);
+
+        // Подделываем прежнюю версию контейнера.
+        let path = dir.path().join(STORE_META);
+        let old = StoreMeta {
+            container_version: 1,
+            store_id,
+        };
+        std::fs::write(&path, postcard::to_allocvec(&old).unwrap()).unwrap();
+
+        let upgraded = Store::open(cfg.clone()).unwrap();
+        assert_eq!(upgraded.upgraded_from(), Some(1), "подъём объявлен");
+        assert_eq!(
+            upgraded.meta().store_id,
+            store_id,
+            "идентичность хранилища обязана сохраниться: иначе свои же сегменты \
+             стали бы чужими"
+        );
+        assert_eq!(
+            upgraded.meta().container_version,
+            dduroc_format::CONTAINER_VERSION
+        );
+        upgraded.shutdown();
+        drop(upgraded);
+
+        // Повторное открытие уже не считается подъёмом.
+        let again = Store::open(cfg).unwrap();
+        assert_eq!(again.upgraded_from(), None);
+    }
+
+    #[test]
+    fn future_container_version_is_refused() {
+        // Раскладку из будущего угадывать нечем: тут отказ — единственный
+        // честный ответ.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig::new(dir.path());
+        let s = Store::open(cfg.clone()).unwrap();
+        let store_id = s.meta().store_id;
+        s.shutdown();
+        drop(s);
+
+        let future = StoreMeta {
+            container_version: dduroc_format::CONTAINER_VERSION + 1,
+            store_id,
+        };
+        std::fs::write(
+            dir.path().join(STORE_META),
+            postcard::to_allocvec(&future).unwrap(),
+        )
+        .unwrap();
+
+        let err = Store::open(cfg).unwrap_err();
+        assert!(matches!(err, Error::Corrupt { .. }), "получено {err}");
     }
 
     #[test]

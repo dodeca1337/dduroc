@@ -466,7 +466,7 @@ impl SegmentReader {
     }
 
     /// Разобранный footer запечатанного сегмента.
-    pub fn footer(&self) -> Option<dduroc_format::Footer<'_>> {
+    pub fn footer(&self) -> Option<dduroc_format::Footer> {
         let bytes = self.footer_bytes.as_ref()?;
         dduroc_format::Footer::parse(bytes).ok().flatten()
     }

@@ -25,14 +25,6 @@ pub struct NsId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChannelIdx(pub u16);
 
-/// Идентификатор серии в реестре **неймспейса**.
-///
-/// Ключ обязательно включает неймспейс: общий на процесс реестр склеил бы
-/// серию `temp{sensor=pa}` разных экземпляров сервиса в одну, и `SeriesDef`
-/// был бы записан только в сегмент того неймспейса, который обратился первым.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SeriesId(pub u32);
-
 /// Значение сэмпла во владеющей форме.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OwnedValue {
@@ -85,7 +77,7 @@ pub enum StagedRecord {
         span: SpanId,
     },
     Sample {
-        series: SeriesId,
+        metric: MetricId,
         value: OwnedValue,
     },
     Text {
@@ -109,10 +101,15 @@ pub struct Staged {
 
 impl Staged {
     /// Идентификатор типа для учёта в footer'е.
-    pub fn event_id(&self) -> Option<EventId> {
+    ///
+    /// Множества встреченных типов нужны миграции (сегмент без затронутых
+    /// типов не переписывается) и читателю — узнать, что вообще есть в
+    /// сегменте, не читая блоки.
+    pub fn footer_ids(&self) -> (Option<EventId>, Option<MetricId>) {
         match self.record {
-            StagedRecord::Message { event, .. } => Some(event),
-            _ => None,
+            StagedRecord::Message { event, .. } => (Some(event), None),
+            StagedRecord::Sample { metric, .. } => (None, Some(metric)),
+            _ => (None, None),
         }
     }
 }
@@ -120,13 +117,10 @@ impl Staged {
 impl StagedRecord {
     /// Одолжить как [`Record`] формата.
     ///
-    /// `Sample` требует внешнего разрешения серии: её сегментно-локальный
-    /// номер известен только writer'у, поэтому он передаётся аргументом.
-    pub fn as_record(
-        &self,
-        series_local: Option<dduroc_format::SeriesLocal>,
-    ) -> Option<Record<'_>> {
-        Some(match self {
+    /// Разрешать нечего: сэмпл несёт метрику, а метрика — это и есть
+    /// идентичность ряда.
+    pub fn as_record(&self) -> Record<'_> {
+        match self {
             StagedRecord::Message {
                 event,
                 span,
@@ -144,8 +138,8 @@ impl StagedRecord {
                 })
             }
             StagedRecord::SpanEnd { span } => Record::SpanEnd { span: *span },
-            StagedRecord::Sample { value, .. } => Record::Sample(dduroc_format::Sample {
-                series: series_local?,
+            StagedRecord::Sample { metric, value } => Record::Sample(dduroc_format::Sample {
+                metric: *metric,
                 value: value.as_value(),
             }),
             StagedRecord::Text {
@@ -159,7 +153,7 @@ impl StagedRecord {
                 target,
                 text,
             }),
-        })
+        }
     }
 }
 
@@ -204,24 +198,6 @@ impl DropCounters {
     }
 }
 
-/// Определение серии в реестре неймспейса.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SeriesEntry {
-    pub metric: MetricId,
-    pub value_type: ValueType,
-    pub tags: Vec<(String, String)>,
-}
-
-impl SeriesEntry {
-    /// Тэги в виде срезов — для передачи в кодек формата.
-    pub fn tag_refs(&self) -> Vec<(&str, &str)> {
-        self.tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,16 +228,32 @@ mod tests {
     }
 
     #[test]
-    fn sample_needs_resolved_series() {
+    fn sample_needs_nothing_resolved() {
+        // Метрика — это и есть идентичность ряда, поэтому запись собирается
+        // без обращения к какому-либо реестру. Раньше здесь требовался
+        // сегментно-локальный номер серии, известный только writer'у.
         let rec = StagedRecord::Sample {
-            series: SeriesId(0),
+            metric: MetricId(7),
             value: OwnedValue::F32(1.0),
         };
-        assert!(
-            rec.as_record(None).is_none(),
-            "без разрешённого номера серии запись собрать нельзя"
+        match rec.as_record() {
+            Record::Sample(s) => {
+                assert_eq!(s.metric, MetricId(7));
+                assert_eq!(s.value, Value::F32(1.0));
+            }
+            other => panic!("ожидался сэмпл: {other:?}"),
+        }
+        assert_eq!(
+            Staged {
+                ns: NsId(0),
+                channel: ChannelIdx(0),
+                at: Micros(0),
+                record: rec,
+            }
+            .footer_ids(),
+            (None, Some(MetricId(7))),
+            "метрика обязана попасть в множество footer'а"
         );
-        assert!(rec.as_record(Some(dduroc_format::SeriesLocal(3))).is_some());
     }
 
     #[test]
@@ -271,7 +263,7 @@ mod tests {
             span: None,
             payload: smallvec::smallvec![9, 8, 7],
         };
-        match rec.as_record(None).unwrap() {
+        match rec.as_record() {
             Record::Message(m) => assert_eq!(m.payload, &[9, 8, 7]),
             other => panic!("ожидалось сообщение: {other:?}"),
         }
