@@ -20,6 +20,30 @@ pub enum Error {
     #[error("недопустимое имя неймспейса {name:?}: {reason}")]
     BadNamespace { name: String, reason: &'static str },
 
+    #[error("схема {name:?} не проходит проверку: {reason}")]
+    BadSchema { name: String, reason: String },
+
+    #[error(
+        "событие {event} не объявлено в схеме {schema:?}: id из чужой схемы означал бы \
+         чужой декодер при чтении"
+    )]
+    UnknownEvent { schema: &'static str, event: u16 },
+
+    #[error("вид спана {kind} не объявлен в схеме {schema:?}")]
+    UnknownSpanKind { schema: &'static str, kind: u16 },
+
+    #[error("поля события {event:?} не сериализуются")]
+    EncodeFailed { event: &'static str },
+
+    #[error(
+        "класс хранения {class:?} не объявлен ни одним типом схемы {schema:?}: \
+         канала под него нет"
+    )]
+    ClassNotDeclared {
+        schema: &'static str,
+        class: &'static str,
+    },
+
     #[error("недопустимое имя канала {name:?}: {reason}")]
     BadChannel { name: String, reason: &'static str },
 
@@ -51,6 +75,16 @@ pub enum Error {
 
     #[error("метрика {id} не объявлена в схеме")]
     UnknownMetric { id: u16 },
+
+    #[error(
+        "метрика {metric} объявлена как {declared:?}, а значение — {got:?}: \
+         тип отсчёта — свойство метрики, а не отдельной записи"
+    )]
+    ValueTypeMismatch {
+        metric: u16,
+        declared: dduroc_format::ValueType,
+        got: dduroc_format::ValueType,
+    },
 
     #[error("недопустимые пределы метрики {metric:?}: {reason}")]
     BadLimits {
@@ -133,6 +167,36 @@ impl<T> IoContext<T> for std::result::Result<T, rustix::io::Errno> {
 }
 
 impl Error {
+    /// Означает ли ошибка, что **запись потеряна**.
+    ///
+    /// Главный вопрос вызывающего на пути записи, и он не должен требовать
+    /// разбора всего перечисления: потеря — это состояние носителя (очередь не
+    /// успевает, writer мёртв, хранилище останавливается), а не ошибка вызова.
+    /// Нарушение контракта (id из чужой схемы) — наоборот, дефект кода, и
+    /// реагировать на него надо иначе: не повтором, а исправлением.
+    pub fn loses_record(&self) -> bool {
+        matches!(
+            self,
+            Error::QueueFull | Error::WriterDead | Error::ShuttingDown
+        )
+    }
+
+    /// Ошибка вызова: объявленное в схеме и переданное не совпали.
+    ///
+    /// Такое не лечится повтором и не зависит от нагрузки — это дефект сборки
+    /// (обычно тип из одной схемы передан в неймспейс другой).
+    pub fn breaks_contract(&self) -> bool {
+        matches!(
+            self,
+            Error::UnknownEvent { .. }
+                | Error::UnknownMetric { .. }
+                | Error::UnknownSpanKind { .. }
+                | Error::ValueTypeMismatch { .. }
+                | Error::ClassNotDeclared { .. }
+                | Error::EncodeFailed { .. }
+        )
+    }
+
     /// Закончилось место на устройстве — для этого случая политика особая:
     /// движок обязан продолжать ротацию и не терять критические данные молча.
     pub fn is_no_space(&self) -> bool {
@@ -147,4 +211,52 @@ impl Error {
 const fn libc_enospc() -> i32 {
     // ENOSPC одинаков на всех Linux-ABI (включая armv7).
     28
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_records_are_distinguishable_from_caller_bugs() {
+        // Ради этого разделения предикаты и существуют: на потерю прикладной
+        // код реагирует счётчиком и деградацией, на нарушение контракта —
+        // исправлением сборки. Перепутать их значит либо молча терпеть баг,
+        // либо поднимать тревогу из-за занятого диска.
+        for lost in [Error::QueueFull, Error::WriterDead, Error::ShuttingDown] {
+            assert!(lost.loses_record(), "{lost}");
+            assert!(!lost.breaks_contract(), "{lost}");
+        }
+
+        let bugs = [
+            Error::UnknownEvent {
+                schema: "radio",
+                event: 7,
+            },
+            Error::UnknownMetric { id: 7 },
+            Error::UnknownSpanKind {
+                schema: "radio",
+                kind: 7,
+            },
+            Error::ValueTypeMismatch {
+                metric: 1,
+                declared: dduroc_format::ValueType::F32,
+                got: dduroc_format::ValueType::U64,
+            },
+            Error::ClassNotDeclared {
+                schema: "radio",
+                class: "critical",
+            },
+            Error::EncodeFailed { event: "PowerSet" },
+        ];
+        for bug in bugs {
+            assert!(bug.breaks_contract(), "{bug}");
+            assert!(!bug.loses_record(), "{bug}");
+        }
+
+        // Отказ носителя — ни то, ни другое: запись могла и дойти.
+        let io = Error::NoSpace(PathBuf::from("/data"));
+        assert!(!io.loses_record());
+        assert!(!io.breaks_contract());
+    }
 }

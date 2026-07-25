@@ -380,38 +380,65 @@ dduroc::schema! {
 // main:
 let store = Store::open(StoreConfig::new("/data/logs"))?; // epochs, boot-регистрация
 
-// подъём неймспейса экземпляром сервиса (прогоняет миграции при необходимости):
-let ns = store.namespace("orc-radio-0", radio::SCHEMA, NsConfig::group("orc"))?;
+// подъём неймспейса экземпляром сервиса (политики каналов — из настроек
+// хранилища; прогоняет миграции при необходимости):
+let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
 
-// сообщения:
+// сообщения — ничего не возвращают: логирование не влияет на управление,
+// потери учтены в store.stats() и объявлены в самом потоке:
 ns.log(radio::events::PowerSet { dbm: 27.5 });
 
-// телеметрия — handle серии интернирует (metric, tags):
-let temp = ns.series(radio::metrics::Temp).tag("sensor", "pa").open();
+// телеметрия: тип отсчёта приходит из константы метрики (Metric<f32>),
+// поэтому `sample(36u64)` — ошибка компиляции, а не отказ в рантайме:
+let temp = ns.series(radio::metrics::Temp)?;
 temp.sample(36.6);
 
+// состояние — тот же sample; чужое перечисление не пройдёт проверку типов:
+ns.series(radio::metrics::LinkState)?.sample(radio::metrics::LinkState::Lock);
+
 // спаны — guard, SpanEnd на drop (и при отмене future):
-let cal = ns.span(radio::spans::Calibration).start();      // корневой
-let sub = cal.child(radio::spans::PowerRamp).start();      // дочерний
+let cal = ns.span(radio::spans::Calibration);              // корневой
+let sub = cal.child(radio::spans::PowerRamp);              // дочерний
 ns.log_in(&sub, radio::events::PowerSet { dbm: 30.0 });    // привязка к спану
-// sub.id() : SpanRef — Copy, передаётся другим сервисам для кросс-ns привязки
+// sub.id() : SpanId — Copy, передаётся другим сервисам для кросс-ns привязки
+
+// кому нужен вердикт на месте вызова — парный try_*:
+if let Err(e) = ns.try_log(radio::events::Overheat { t: 91.0 }) {
+    if e.loses_record() { /* диск отстаёт */ } else { /* дефект сборки */ }
+}
+```
+
+Границы значений, известные только в рантайме (внешняя система определила
+модель железа) — теми же range-выражениями, что и в схеме; на диск не пишутся:
+
+```rust
+ns.set_thresholds(radio::metrics::Temp, ..=60.0, ..=75.0)?;
+ns.clear_limits(radio::metrics::Temp)?;   // снова действует схема
 ```
 
 Чтение (тот же API на устройстве и в вьюере):
 
 ```rust
 let reader = Reader::open(path, &[radio::SCHEMA])?;
-let result = reader.query(
-    &Query::new()
-        .group("orc-")                       // все экземпляры оркестратора
-        .since(Utc::now() - TimeDelta::hours(2))  // или .since(BootTime)
-        .min_level(Level::Warn)
-        .order(Order::Newest)
-        .limit(500),
-)?;
+let q = Query::new()
+    .group("orc-")                            // все экземпляры оркестратора
+    .since(Utc::now() - TimeDelta::hours(2))   // или .since(BootTime)
+    .min_level(Level::Warn)
+    .order(Order::Newest)
+    .limit(500);
+
+let result = reader.query(&q)?;
 // result.entries       — слитый по времени поток Message | Span | Sample | Text
 // result.damaged       — что не прочиталось; пусто → ответ полон
 // result.unanchored    — запуски, выпавшие из настенного окна: якоря нет
+println!("{:?}", reader.render(&result.entries[0], "ru"));  // текст по схеме записи
+
+// то же лениво: память ограничена одним блоком на канал, а не размером ответа.
+// Единственный способ читать много: ответ без `limit` на 200 ГБ в память не
+// поместится.
+for entry in reader.stream(&q)? {
+    if done() { break; }                        // обход можно прервать
+}
 ```
 
 Границы окна — один тип, `Timestamp`: либо `BootTime` (запуск + µs от его
@@ -436,3 +463,9 @@ series / namespaces / storageStats`, cursor-пагинация (base64 пози�
   отдельный тип блока для высокочастотных серий.
 - Поведение при переполнении очереди writer'а для критического канала
   (backpressure vs drop).
+- **Курсор пагинации для веб-слоя.** `stream` позволяет читать лениво и
+  прерывать обход, но продолжить его в следующем HTTP-запросе нечем:
+  возобновление «с последней записи» неточно, потому что часы монотонны, но не
+  строго возрастают — в одну микросекунду попадает несколько записей, и
+  граница `since(last.at)` либо повторит их, либо потеряет. Нужен токен вида
+  (момент, порядковый номер внутри момента); пока не спроектирован.

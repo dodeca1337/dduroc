@@ -60,38 +60,43 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use dduroc::prelude::*;
 //!
-//! let config = dduroc::StoreConfig::new("/data/logs").with_budget(20 << 30);
-//! let store = dduroc::Store::open(config.clone())?;
-//!
-//! // Экземпляр микросервиса поднимает свой неймспейс.
-//! let ns = store.namespace("orc-radio-0", radio::SCHEMA, &config)?;
-//!
-//! ns.log(radio::events::PowerSet { dbm: 27.5 })?;
-//!
-//! let temp = ns.series(radio::metrics::TempPa)?;
-//! temp.sample_f32(36.6)?;
-//!
-//! // Состояние: на диск уходит код, имя и важность берутся из схемы.
-//! let link = ns.series(radio::metrics::LinkState)?;
-//! link.sample_state(radio::metrics::LinkState::Lock)?;
-//!
-//! // Пределы, известные только в рантайме (модель железа определена
-//! // внешней системой). На диск не пишутся.
-//! ns.set_limits(
-//!     radio::metrics::TempPa,
-//!     Some(MetricLimits::numeric(Thresholds {
-//!         warn: dduroc::Range { min: None, max: Some(60.0) },
-//!         alarm: dduroc::Range { min: None, max: Some(75.0) },
-//!     })),
+//! let store = dduroc::Store::open(
+//!     dduroc::StoreConfig::new("/data/logs").with_budget(20 << 30),
 //! )?;
 //!
+//! // Экземпляр микросервиса поднимает свой неймспейс.
+//! let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
+//!
+//! // Запись ничего не возвращает: логирование не влияет на управление.
+//! // Потери учтены в `store.stats()` и объявлены в самом потоке.
+//! ns.log(radio::events::PowerSet { dbm: 27.5 });
+//!
+//! // Тип отсчёта — из константы метрики: `Metric<f32>` не примет целое.
+//! let temp = ns.series(radio::metrics::TempPa)?;
+//! temp.sample(36.6);
+//!
+//! // Состояние — то же `sample`: на диск уходит код, имя и важность
+//! // берутся из схемы. Состояние чужой метрики не пройдёт проверку типов.
+//! let link = ns.series(radio::metrics::LinkState)?;
+//! link.sample(radio::metrics::LinkState::Lock);
+//!
+//! // Границы, известные только в рантайме (модель железа определена
+//! // внешней системой) — теми же range-выражениями, что и в схеме.
+//! // На диск не пишутся.
+//! ns.set_thresholds(radio::metrics::TempPa, ..=60.0, ..=75.0)?;
+//!
 //! {
-//!     let cal = ns.span(radio::spans::Calibration)?;
-//!     cal.log(radio::events::PowerSet { dbm: 30.0 })?;
+//!     let cal = ns.span(radio::spans::Calibration);
+//!     cal.log(radio::events::PowerSet { dbm: 30.0 });
 //! } // конец спана записывается здесь
 //!
 //! // Пришёл GPS: якорь ретроактивен, UTC получают и записи выше.
 //! store.record_sync(Utc::now(), SyncSource::Gps)?;
+//!
+//! // Кому нужен вердикт на месте вызова — парный `try_*`.
+//! if let Err(e) = ns.try_log(radio::events::Overheat { t: 91.0 }) {
+//!     assert!(e.loses_record() || e.breaks_contract());
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -111,6 +116,13 @@ pub use dduroc_macros::schema;
 /// заставлять пользователя добавлять зависимость ради одного вызова.
 pub use chrono;
 
+/// Чтение хранилища: тот же слой на устройстве и в офлайн-вьюере.
+///
+/// Отдельной зависимости не нужно — за одним исключением: прошивке, которая
+/// только пишет, чтение можно выключить (`default-features = false`).
+#[cfg(feature = "read")]
+pub use dduroc_read as read;
+
 // Реэкспорты для кода, генерируемого макросом: пользователю не нужно
 // добавлять serde и postcard в свои зависимости.
 #[doc(hidden)]
@@ -123,7 +135,8 @@ pub use serde_json;
 pub use dduroc_engine::channel::{ChannelConfig, Durability};
 pub use dduroc_engine::epochs::SyncSource;
 pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, StateStatus};
-pub use dduroc_engine::namespace::{MetricState, Namespace, Series, SpanGuard};
+pub use dduroc_engine::metric::{Blob, Metric, MetricState, MetricValue, Untyped};
+pub use dduroc_engine::namespace::{Namespace, Series, SpanGuard};
 pub use dduroc_engine::schema::{
     DecodeError, EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MetricKind,
     MigratedRecord, Migration, OwnedRecord, Range, Schema, Severity, SpanDesc, StateDesc,
@@ -164,33 +177,83 @@ pub trait Event: serde::Serialize {
 }
 
 /// Расширение [`Namespace`] типизированной записью.
+///
+/// Записывающие методы **ничего не возвращают**: логирование не должно влиять
+/// на управление в прикладном коде, а сделать с отказом на месте вызова нечего
+/// — повтор при отстающем диске только усугубляет. Потери учтены в
+/// [`Stats::dropped`] и объявлены в самом потоке записей; кому нужен ответ на
+/// месте, у каждого метода есть парный `try_*`.
 pub trait NamespaceExt {
     /// Записать событие: поля сериализуются в компактный бинарный вид.
-    fn log<E: Event>(&self, event: E) -> Result<()>;
+    fn log<E: Event>(&self, event: E);
 
     /// Записать событие, привязав его к спану.
-    fn log_in<E: Event>(&self, span: &SpanGuard, event: E) -> Result<()>;
+    fn log_in<E: Event>(&self, span: &SpanGuard, event: E);
+
+    /// То же с ответом об исходе. `Err` различается двумя предикатами:
+    /// [`Error::loses_record`] — запись не дошла до носителя,
+    /// [`Error::breaks_contract`] — событие не из этой схемы.
+    fn try_log<E: Event>(&self, event: E) -> Result<()>;
+
+    /// То же для события в спане.
+    fn try_log_in<E: Event>(&self, span: &SpanGuard, event: E) -> Result<()>;
 }
 
 impl NamespaceExt for Namespace {
-    fn log<E: Event>(&self, event: E) -> Result<()> {
-        self.log_payload(E::ID, encode(&event)?, None)
+    #[inline]
+    fn log<E: Event>(&self, event: E) {
+        self.report_here(self.try_log(event));
     }
 
-    fn log_in<E: Event>(&self, span: &SpanGuard, event: E) -> Result<()> {
-        self.log_payload(E::ID, encode(&event)?, Some(span.id()))
+    #[inline]
+    fn log_in<E: Event>(&self, span: &SpanGuard, event: E) {
+        self.report_here(self.try_log_in(span, event));
+    }
+
+    #[inline]
+    fn try_log<E: Event>(&self, event: E) -> Result<()> {
+        self.try_log_payload(E::ID, encode(&event)?, None)
+    }
+
+    #[inline]
+    fn try_log_in<E: Event>(&self, span: &SpanGuard, event: E) -> Result<()> {
+        self.try_log_payload(E::ID, encode(&event)?, Some(span.id()))
     }
 }
 
 /// Расширение [`SpanGuard`] типизированной записью.
 pub trait SpanExt {
     /// Записать событие внутри спана.
-    fn log<E: Event>(&self, event: E) -> Result<()>;
+    fn log<E: Event>(&self, event: E);
+
+    /// То же с ответом об исходе.
+    fn try_log<E: Event>(&self, event: E) -> Result<()>;
 }
 
 impl SpanExt for SpanGuard {
-    fn log<E: Event>(&self, event: E) -> Result<()> {
-        self.log_payload(E::ID, encode(&event)?)
+    #[inline]
+    fn log<E: Event>(&self, event: E) {
+        let outcome = self.try_log(event);
+        self.namespace().report_here(outcome);
+    }
+
+    #[inline]
+    fn try_log<E: Event>(&self, event: E) -> Result<()> {
+        self.try_log_payload(E::ID, encode(&event)?)
+    }
+}
+
+/// Учесть отказ сериализации там же, где движок учитывает свои.
+trait ReportHere {
+    fn report_here(&self, outcome: Result<()>);
+}
+
+impl ReportHere for Namespace {
+    #[inline]
+    fn report_here(&self, outcome: Result<()>) {
+        if let Err(e) = outcome {
+            self.note_failure(e);
+        }
     }
 }
 
@@ -202,10 +265,7 @@ impl SpanExt for SpanGuard {
 /// событие не происходит вовсе.
 #[inline]
 fn encode<E: Event>(event: &E) -> Result<Payload> {
-    postcard::to_extend(event, Payload::new()).map_err(|_| Error::BadNamespace {
-        name: String::new(),
-        reason: "поля события не сериализуются",
-    })
+    postcard::to_extend(event, Payload::new()).map_err(|_| Error::EncodeFailed { event: E::NAME })
 }
 
 #[cfg(test)]
@@ -344,20 +404,17 @@ mod tests {
         let config = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
         {
             let store = Store::open(config.clone()).unwrap();
-            let ns = store
-                .namespace("orc-radio-0", testing::SCHEMA, &config)
-                .unwrap();
+            let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
 
-            ns.log(testing::events::PowerSet { dbm: 27.5 }).unwrap();
-            ns.log(testing::events::Overheat { t: 91.0, sensor: 1 })
-                .unwrap();
+            ns.log(testing::events::PowerSet { dbm: 27.5 });
+            ns.log(testing::events::Overheat { t: 91.0, sensor: 1 });
 
             let temp = ns.series(testing::metrics::Temp).unwrap();
-            temp.sample_f32(36.6).unwrap();
+            temp.sample(36.6);
 
             {
-                let cal = ns.span(testing::spans::Calibration).unwrap();
-                cal.log(testing::events::PowerSet { dbm: 30.0 }).unwrap();
+                let cal = ns.span(testing::spans::Calibration);
+                cal.log(testing::events::PowerSet { dbm: 30.0 });
             }
 
             ns.sync().unwrap();
@@ -414,8 +471,9 @@ mod tests {
         assert_eq!(link.state(1).unwrap().severity, Severity::Warn);
         assert_eq!(link.state(2).unwrap().severity, Severity::Normal);
 
-        // Одно имя, два пространства имён: значение и тип.
-        let id: MetricId = testing::metrics::LinkState;
+        // Одно имя, два пространства имён: константа метрики и тип её
+        // состояний.
+        let id: MetricId = testing::metrics::LinkState.into();
         assert_eq!(id, MetricId(3));
         assert_eq!(
             <testing::metrics::LinkState as MetricState>::metric(),
@@ -463,9 +521,7 @@ mod tests {
         let config = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
         {
             let store = Store::open(config.clone()).unwrap();
-            let ns = store
-                .namespace("orc-radio-0", testing::SCHEMA, &config)
-                .unwrap();
+            let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
 
             let link = ns.series(testing::metrics::LinkState).unwrap();
             for st in [
@@ -473,12 +529,10 @@ mod tests {
                 testing::metrics::LinkState::Sync,
                 testing::metrics::LinkState::Lock,
             ] {
-                link.sample_state(st).unwrap();
+                link.sample(st);
             }
             let locked = ns.series(testing::metrics::Locked).unwrap();
-            locked
-                .sample_state(testing::metrics::Locked::Locked)
-                .unwrap();
+            locked.sample(testing::metrics::Locked::Locked);
 
             ns.sync().unwrap();
             assert!(store.stats().is_clean(), "{:?}", store.stats());
@@ -546,13 +600,12 @@ mod tests {
             });
         let refused = {
             let store = Store::open(config.clone()).unwrap();
-            let ns = store
-                .namespace("orc-radio-0", testing::SCHEMA, &config)
-                .unwrap();
+            let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
 
             let mut refused = 0u64;
             for _ in 0..20_000 {
-                if ns.log(testing::events::PowerSet { dbm: 27.5 }).is_err() {
+                if let Err(e) = ns.try_log(testing::events::PowerSet { dbm: 27.5 }) {
+                    assert!(e.loses_record(), "потеря, а не дефект вызова: {e}");
                     refused += 1;
                 }
             }

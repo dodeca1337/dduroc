@@ -23,6 +23,7 @@ pub mod epochs;
 mod error;
 mod fsutil;
 pub mod limits;
+pub mod metric;
 pub mod namespace;
 pub mod rotation;
 pub mod schema;

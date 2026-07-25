@@ -9,8 +9,10 @@
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::limits::{EffectiveLimits, LimitsRegistry, MetricLimits};
-use crate::schema::{MetricKind, Schema, Severity, StorageClass};
+use crate::metric::{Metric, MetricValue, Untyped};
+use crate::schema::{MetricDesc, MetricKind, Schema, Severity, StorageClass, Thresholds};
 use crate::staged::{ChannelIdx, DropCounters, NsId, OwnedValue, Payload, Staged, StagedRecord};
+use crate::stats::Counters;
 use crate::store::next_span_id;
 use crate::writer::Writer;
 use crate::{Clock, schema};
@@ -125,6 +127,12 @@ struct NamespaceInner {
     /// Пределы значений: дефолты схемы плюс то, что выставила установка.
     /// Живут в памяти и **не пишутся на диск** — см. [`crate::limits`].
     limits: LimitsRegistry,
+    /// Какие нарушения контракта уже объявлены в потоке — по биту на вид.
+    ///
+    /// Объявлять каждое значило бы залить журнал: нарушение контракта не
+    /// случайность, оно повторяется на каждом витке цикла. Одного раза
+    /// достаточно, чтобы дефект нашли; дальше растёт только счётчик.
+    announced: std::sync::atomic::AtomicU8,
 }
 
 impl Namespace {
@@ -155,6 +163,7 @@ impl Namespace {
                 next_span,
                 meta,
                 limits,
+                announced: std::sync::atomic::AtomicU8::new(0),
             }),
         }
     }
@@ -209,36 +218,84 @@ impl Namespace {
             .iter()
             .position(|c| *c == class)
             .map(|i| ChannelIdx(i as u16))
-            .ok_or(Error::BadNamespace {
-                name: self.inner.name.clone(),
-                reason: "класс хранения не объявлен ни одним типом схемы",
+            .ok_or(Error::ClassNotDeclared {
+                schema: self.inner.schema.name,
+                class: class.as_str(),
             })
     }
 
-    /// Записать событие с уже сериализованным payload'ом.
+    /// Учесть исход записи, о котором вызывающему не сообщают.
     ///
-    /// Ошибка означает именно потерю записи (очередь переполнена, writer
-    /// мёртв): у обычного канала она случается при отставании диска, у
-    /// критического — только по таймауту ожидания.
-    pub fn log_raw(&self, event: EventId, payload: &[u8], span: Option<SpanId>) -> Result<()> {
-        self.log_payload(event, Payload::from_slice(payload), span)
+    /// Путь записи ничего не возвращает — прикладной код всё равно не может
+    /// сделать с отказом ничего осмысленного, — но исход не исчезает:
+    ///
+    /// - **потеря** (очередь не успевает, writer мёртв) уже учтена счётчиком
+    ///   writer'а и объявляется отметкой в самом потоке;
+    /// - **нарушение контракта** (id из чужой схемы) — дефект сборки: он
+    ///   считается отдельно и один раз объявляется записью в журнал, чтобы его
+    ///   нашли, а не искали причину тишины.
+    fn report(&self, outcome: Result<()>) {
+        let Err(e) = outcome else { return };
+        if e.loses_record() {
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        Counters::bump(&self.inner.writer.counters().rejected);
+        let bit = contract_bit(&e);
+        if self.inner.announced.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            // Само объявление идёт обычным путём и может быть потеряно под
+            // нагрузкой; повторять его незачем — счётчик остаётся.
+            let _ = self.try_log_text(Level::Error, Arc::from("dduroc"), e.to_string(), None);
+        }
     }
 
-    /// То же, но payload уже собран в буфере записи.
+    /// Учесть отказ, случившийся слоем выше — при сериализации полей события
+    /// или в мосте из `tracing`.
     ///
-    /// Основной путь для типизированного API: сериализация идёт прямо в этот
-    /// буфер, поэтому на событие не приходится ни одной лишней аллокации и
-    /// копии — при типичном размере полей буфер остаётся inline.
-    pub fn log_payload(
+    /// Нужно, чтобы такой отказ попал в те же счётчики и то же однократное
+    /// объявление, что и отказы самого движка: иначе типизированный слой поверх
+    /// ручки терял бы записи тише, чем она сама.
+    pub fn note_failure(&self, e: Error) {
+        self.report(Err(e));
+    }
+
+    /// Записать событие с уже сериализованным payload'ом.
+    pub fn log_raw(&self, event: EventId, payload: &[u8], span: Option<SpanId>) {
+        self.report(self.try_log_raw(event, payload, span));
+    }
+
+    /// То же с ответом об исходе — см. [`Namespace::try_log_payload`].
+    pub fn try_log_raw(&self, event: EventId, payload: &[u8], span: Option<SpanId>) -> Result<()> {
+        self.try_log_payload(event, Payload::from_slice(payload), span)
+    }
+
+    /// Записать событие; payload уже собран в буфере записи.
+    ///
+    /// Ничего не возвращает намеренно: логирование не должно влиять на
+    /// управление в прикладном коде, а сделать с отказом на месте вызова
+    /// нечего — повтор при отстающем диске только усугубляет. Что именно
+    /// случилось, видно в [`crate::stats::Stats`] и в самом потоке записей;
+    /// кому нужен ответ на месте — [`Namespace::try_log_payload`].
+    pub fn log_payload(&self, event: EventId, payload: Payload, span: Option<SpanId>) {
+        self.report(self.try_log_payload(event, payload, span));
+    }
+
+    /// Записать событие и сказать, чем это кончилось.
+    ///
+    /// `Err` бывает двух родов, и различать их важнее, чем текст:
+    /// [`Error::loses_record`] — запись не дошла до носителя (диск отстаёт),
+    /// [`Error::breaks_contract`] — событие не из этой схемы, то есть дефект
+    /// сборки.
+    pub fn try_log_payload(
         &self,
         event: EventId,
         payload: Payload,
         span: Option<SpanId>,
     ) -> Result<()> {
         let Some(desc) = self.inner.schema.event(event) else {
-            return Err(Error::BadNamespace {
-                name: self.inner.name.clone(),
-                reason: "событие не объявлено в схеме",
+            return Err(Error::UnknownEvent {
+                schema: self.inner.schema.name,
+                event: event.0,
             });
         };
         let item = Staged {
@@ -260,6 +317,17 @@ impl Namespace {
 
     /// Записать свободный текст без схемы: мост из `tracing`, panic-handler.
     pub fn log_text(
+        &self,
+        level: Level,
+        target: Arc<str>,
+        text: impl Into<Box<str>>,
+        span: Option<SpanId>,
+    ) {
+        self.report(self.try_log_text(level, target, text, span));
+    }
+
+    /// То же с ответом об исходе.
+    pub fn try_log_text(
         &self,
         level: Level,
         target: Arc<str>,
@@ -292,13 +360,32 @@ impl Namespace {
     /// разрешает дескриптор один раз, дальше отсчёт стоит один вызов без
     /// всякого поиска. Четыре датчика температуры — четыре метрики схемы:
     /// иначе различающий их признак пришлось бы писать в каждый отсчёт.
-    pub fn series(&self, metric: MetricId) -> Result<Series> {
-        let Some(desc) = self.inner.schema.metric(metric) else {
-            return Err(Error::BadNamespace {
-                name: self.inner.name.clone(),
-                reason: "метрика не объявлена в схеме",
-            });
-        };
+    ///
+    /// Тип значения приходит из константы метрики, поэтому `sample` принимает
+    /// только объявленное — см. [`crate::metric`]. Открытие возвращает
+    /// `Result`, потому что метрика может быть из чужой схемы; это один вызов
+    /// на ряд, а не на отсчёт.
+    pub fn series<M>(&self, metric: Metric<M>) -> Result<Series<M>> {
+        let id: MetricId = metric.into();
+        let desc = self.metric_desc(id)?;
+        Ok(Series {
+            ns: self.clone(),
+            metric: id,
+            channel: self.channel_of(desc.class)?,
+            critical: desc.class == StorageClass::CRITICAL,
+            value_type: desc.value_type,
+            desc,
+            _value: std::marker::PhantomData,
+        })
+    }
+
+    /// Открыть ряд по идентификатору, известному только в рантайме.
+    ///
+    /// Тип значения на этапе компиляции неизвестен, поэтому такой ряд
+    /// принимает лишь [`Series::sample_raw`], который сверяет тип со схемой.
+    /// Нужно веб-слою и миграциям — прикладному коду нужен [`Namespace::series`].
+    pub fn series_untyped(&self, metric: MetricId) -> Result<Series<Untyped>> {
+        let desc = self.metric_desc(metric)?;
         Ok(Series {
             ns: self.clone(),
             metric,
@@ -306,33 +393,59 @@ impl Namespace {
             critical: desc.class == StorageClass::CRITICAL,
             value_type: desc.value_type,
             desc,
+            _value: std::marker::PhantomData,
         })
     }
 
-    /// Выставить пределы значений метрики поверх схемных.
+    fn metric_desc(&self, metric: MetricId) -> Result<&'static MetricDesc> {
+        self.inner
+            .schema
+            .metric(metric)
+            .ok_or(Error::UnknownMetric { id: metric.0 })
+    }
+
+    /// Выставить границы значений поверх схемных.
     ///
-    /// Для случая, когда границы известны только в рантайме: внешняя система
+    /// Для случая, когда они известны только в рантайме: внешняя система
     /// определила модель железа и знает, что для этого усилителя нормально.
-    /// `None` снимает переопределение, возвращая объявленное в схеме.
+    /// Диапазоны записываются так же, как в схеме, — обычными range-выражениями:
     ///
-    /// **На диск не пишется.** Пределы — свойство установки, а не измерения;
+    /// ```text
+    /// ns.set_thresholds(metrics::TempPa, ..=60.0, ..=75.0)?;   // сверху
+    /// ns.set_thresholds(metrics::Vswr, 1.0..=1.5, 1.0..=2.0)?; // с двух сторон
+    /// ```
+    ///
+    /// **На диск не пишется.** Границы — свойство установки, а не измерения;
     /// подробнее в [`crate::limits`].
-    pub fn set_limits(&self, metric: MetricId, limits: Option<MetricLimits>) -> Result<()> {
+    pub fn set_thresholds(
+        &self,
+        metric: impl Into<MetricId>,
+        warn: impl std::ops::RangeBounds<f64>,
+        alarm: impl std::ops::RangeBounds<f64>,
+    ) -> Result<()> {
+        self.set_limits(metric, MetricLimits::numeric(Thresholds::new(warn, alarm)))
+    }
+
+    /// Выставить переопределение целиком: границы, важность состояний или и то
+    /// и другое.
+    pub fn set_limits(&self, metric: impl Into<MetricId>, limits: MetricLimits) -> Result<()> {
         self.inner
             .limits
-            .set(&self.inner.schema, metric, limits)
-            .map_err(|e| match e {
-                Error::UnknownMetric { .. } => Error::BadNamespace {
-                    name: self.inner.name.clone(),
-                    reason: "метрика не объявлена в схеме",
-                },
-                other => other,
-            })
+            .set(&self.inner.schema, metric.into(), Some(limits))
+    }
+
+    /// Снять переопределение: снова действует объявленное в схеме.
+    pub fn clear_limits(&self, metric: impl Into<MetricId>) -> Result<()> {
+        self.inner
+            .limits
+            .set(&self.inner.schema, metric.into(), None)
     }
 
     /// Действующие пределы метрики: схема плюс переопределения.
-    pub fn limits(&self, metric: MetricId) -> Result<EffectiveLimits> {
-        self.inner.limits.effective(&self.inner.schema, metric)
+    pub fn limits(&self, metric: impl Into<MetricId>) -> Result<EffectiveLimits> {
+        self.inner
+            .limits
+            .effective(&self.inner.schema, metric.into())
     }
 
     /// Насколько значение требует внимания по действующим пределам.
@@ -340,31 +453,50 @@ impl Namespace {
     /// Сама запись пределов не касается: движок не решает за приложение, что
     /// делать с выходом за границы, и не порождает событий сам. Метод — для
     /// того, кто хочет проверить значение (и, например, записать событие).
-    pub fn severity_of(&self, metric: MetricId, value: &OwnedValue) -> Severity {
+    pub fn severity_of(&self, metric: impl Into<MetricId>, value: &OwnedValue) -> Severity {
         self.inner
             .limits
-            .severity_of(&self.inner.schema, metric, &value.as_value())
+            .severity_of(&self.inner.schema, metric.into(), &value.as_value())
     }
 
     /// Начать спан. Возвращает страж: конец записывается при его уничтожении,
     /// в том числе при развёртке стека — незакрытый спан неотличим от краха.
-    pub fn span(&self, kind: SpanKindId) -> Result<SpanGuard> {
+    ///
+    /// Страж выдаётся всегда, даже если начало спана не удалось записать:
+    /// иначе прикладной код получал бы `?` на месте, где вложенность важнее
+    /// самой записи, а читатель и так обязан уметь показать спан без начала —
+    /// именно так выглядит спан, оборванный крахом процесса.
+    pub fn span(&self, kind: SpanKindId) -> SpanGuard {
         self.span_with_parent(kind, None)
     }
 
     /// Начать спан с явным родителем.
-    pub fn span_with_parent(&self, kind: SpanKindId, parent: Option<SpanId>) -> Result<SpanGuard> {
-        let Some(desc) = self.inner.schema.span(kind) else {
-            return Err(Error::BadNamespace {
-                name: self.inner.name.clone(),
-                reason: "вид спана не объявлен в схеме",
-            });
-        };
+    pub fn span_with_parent(&self, kind: SpanKindId, parent: Option<SpanId>) -> SpanGuard {
         let span = next_span_id(&self.inner.next_span);
-        let channel = self.channel_of(desc.class)?;
-        let critical = desc.class == StorageClass::CRITICAL;
+        // Вид спана не из этой схемы — не повод не открывать спан: класс
+        // хранения берём обычный, о нарушении контракта сообщаем как обычно.
+        let class = self
+            .inner
+            .schema
+            .span(kind)
+            .map_or(StorageClass::DEFAULT, |d| d.class);
+        let channel = match self.channel_of(class) {
+            Ok(c) => c,
+            Err(e) => {
+                self.report(Err(e));
+                ChannelIdx(0)
+            }
+        };
+        let critical = class == StorageClass::CRITICAL;
 
-        self.inner.writer.write(
+        if self.inner.schema.span(kind).is_none() {
+            self.report(Err(Error::UnknownSpanKind {
+                schema: self.inner.schema.name,
+                kind: kind.0,
+            }));
+        }
+
+        self.report(self.inner.writer.write(
             Staged {
                 ns: self.inner.id,
                 channel,
@@ -373,15 +505,15 @@ impl Namespace {
             },
             critical,
             &self.inner.drops,
-        )?;
+        ));
 
-        Ok(SpanGuard {
+        SpanGuard {
             ns: self.clone(),
             span,
             channel,
             critical,
             closed: false,
-        })
+        }
     }
 
     /// Дождаться, пока накопленное окажется на носителе.
@@ -390,27 +522,15 @@ impl Namespace {
     }
 }
 
-/// Состояние метрики-перечисления, порождённое макросом схемы.
-///
-/// Реализуется сгенерированным типом, чтобы на месте вызова стоял
-/// `link.sample_state(metrics::LinkState::Lock)`, а не голое число: код
-/// состояния на диске — обычное целое, и спутать его с кодом другой метрики
-/// иначе ничто не мешает.
-pub trait MetricState: Copy {
-    /// Метрика, которой принадлежит это перечисление.
-    fn metric() -> MetricId;
-    /// Код, попадающий на диск.
-    fn code(self) -> u64;
-    /// Имя состояния из схемы.
-    fn name(self) -> &'static str;
-}
-
 /// Открытый ряд телеметрии.
 ///
 /// Идентичность ряда — метрика. Дескриптор разрешён при открытии, поэтому
 /// отсчёт не делает ни поиска по схеме, ни обращения к какому-либо реестру.
+///
+/// Параметр `M` — маркер типа значения из константы метрики; он и определяет,
+/// что примет [`Series::sample`].
 #[derive(Debug, Clone)]
-pub struct Series {
+pub struct Series<M> {
     ns: Namespace,
     metric: MetricId,
     channel: ChannelIdx,
@@ -419,9 +539,10 @@ pub struct Series {
     /// и лежит в `.rodata`; сверка на каждом отсчёте не должна за ним ходить.
     value_type: dduroc_format::ValueType,
     desc: &'static crate::schema::MetricDesc,
+    _value: std::marker::PhantomData<fn() -> M>,
 }
 
-impl Series {
+impl<M> Series<M> {
     pub fn metric(&self) -> MetricId {
         self.metric
     }
@@ -435,15 +556,26 @@ impl Series {
         self.desc.kind
     }
 
-    /// Записать отсчёт.
+    /// Имя метрики из схемы.
+    pub fn name(&self) -> &'static str {
+        self.desc.name
+    }
+
+    /// Записать отсчёт с уже собранным значением.
     ///
-    /// Тип значения обязан совпасть с объявленным у метрики: расхождение —
-    /// ошибка схемы, а не данных, и молча писать «как получилось» нельзя.
-    pub fn sample(&self, value: OwnedValue) -> Result<()> {
+    /// Путь для случая, когда тип известен лишь в рантайме. Прикладному коду
+    /// нужен [`Series::sample`]: там тип сверяет компилятор.
+    pub fn sample_raw(&self, value: OwnedValue) {
+        self.ns.report(self.try_sample_raw(value));
+    }
+
+    /// То же с ответом об исходе.
+    pub fn try_sample_raw(&self, value: OwnedValue) -> Result<()> {
         if value.value_type() != self.value_type {
-            return Err(Error::BadNamespace {
-                name: self.ns.inner.name.clone(),
-                reason: "тип значения не совпадает с объявленным у метрики",
+            return Err(Error::ValueTypeMismatch {
+                metric: self.metric.0,
+                declared: self.value_type,
+                got: value.value_type(),
             });
         }
         let item = Staged {
@@ -461,37 +593,42 @@ impl Series {
             .write(item, self.critical, &self.ns.inner.drops)
     }
 
-    /// Скалярный отсчёт с плавающей точкой — самый частый случай.
-    pub fn sample_f32(&self, v: f32) -> Result<()> {
-        self.sample(OwnedValue::F32(v))
-    }
-
-    /// Записать состояние метрики-перечисления.
-    ///
-    /// На диск уходит код состояния — обычное целое в один байт для кодов
-    /// меньше 128. Имя и важность остаются в схеме, как шаблон у сообщения.
-    ///
-    /// Перечисление обязано принадлежать этой метрике: коды у разных метрик
-    /// свои, и записать чужой код значило бы получить график состояний,
-    /// подписанный чужими именами.
-    pub fn sample_state<S: MetricState>(&self, state: S) -> Result<()> {
-        if S::metric() != self.metric {
-            return Err(Error::BadNamespace {
-                name: self.ns.inner.name.clone(),
-                reason: "состояние принадлежит другой метрике",
-            });
-        }
-        let code = state.code();
-        match self.value_type {
-            dduroc_format::ValueType::Bool => self.sample(OwnedValue::Bool(code != 0)),
-            dduroc_format::ValueType::I64 => self.sample(OwnedValue::I64(code as i64)),
-            _ => self.sample(OwnedValue::U64(code)),
-        }
-    }
-
     /// Важность значения по действующим пределам.
     pub fn severity_of(&self, value: &OwnedValue) -> Severity {
         self.ns.severity_of(self.metric, value)
+    }
+}
+
+impl<M> Series<M> {
+    /// Записать отсчёт.
+    ///
+    /// Принимает только то, что объявлено у метрики: `Series<f32>` — `f32`,
+    /// `Series<LinkState>` — состояния этой метрики и ничьи другие. Ничего не
+    /// возвращает по той же причине, что и запись событий (см.
+    /// [`Namespace::log_payload`]); кому нужен ответ — [`Series::try_sample`].
+    #[inline]
+    pub fn sample<V: MetricValue<M>>(&self, value: V) {
+        self.ns.report(self.try_sample(value));
+    }
+
+    /// То же с ответом об исходе.
+    #[inline]
+    pub fn try_sample<V: MetricValue<M>>(&self, value: V) -> Result<()> {
+        self.try_sample_raw(self.coerce(value.into_owned()))
+    }
+
+    /// Привести значение к объявленному представлению.
+    ///
+    /// Нужно ровно для перечислений: код состояния приходит целым, а метрика
+    /// может быть объявлена как `bool` (два состояния) или `i64`. Остальные
+    /// значения проходят как есть — их тип уже совпадает по построению.
+    #[inline]
+    fn coerce(&self, value: OwnedValue) -> OwnedValue {
+        match (self.value_type, &value) {
+            (dduroc_format::ValueType::Bool, OwnedValue::U64(code)) => OwnedValue::Bool(*code != 0),
+            (dduroc_format::ValueType::I64, OwnedValue::U64(code)) => OwnedValue::I64(*code as i64),
+            _ => value,
+        }
     }
 }
 
@@ -510,19 +647,29 @@ impl SpanGuard {
         self.span
     }
 
+    /// Неймспейс, которому принадлежит спан — нужен слою поверх ручки.
+    pub fn namespace(&self) -> &Namespace {
+        &self.ns
+    }
+
     /// Вложенный спан: родителем становится этот.
-    pub fn child(&self, kind: SpanKindId) -> Result<SpanGuard> {
+    pub fn child(&self, kind: SpanKindId) -> SpanGuard {
         self.ns.span_with_parent(kind, Some(self.span))
     }
 
     /// Записать событие, привязанное к этому спану.
-    pub fn log_raw(&self, event: EventId, payload: &[u8]) -> Result<()> {
-        self.ns.log_raw(event, payload, Some(self.span))
+    pub fn log_raw(&self, event: EventId, payload: &[u8]) {
+        self.ns.log_raw(event, payload, Some(self.span));
     }
 
     /// То же, но payload уже собран в буфере записи.
-    pub fn log_payload(&self, event: EventId, payload: Payload) -> Result<()> {
-        self.ns.log_payload(event, payload, Some(self.span))
+    pub fn log_payload(&self, event: EventId, payload: Payload) {
+        self.ns.log_payload(event, payload, Some(self.span));
+    }
+
+    /// То же с ответом об исходе.
+    pub fn try_log_payload(&self, event: EventId, payload: Payload) -> Result<()> {
+        self.ns.try_log_payload(event, payload, Some(self.span))
     }
 
     /// Закрыть явно, увидев ошибку записи. Обычно не нужно: закрытие
@@ -572,6 +719,21 @@ impl Drop for SpanGuard {
 
 /// Уровни и классы — реэкспорт для потребителей ручки.
 pub use schema::StorageClass as Class;
+
+/// Бит вида нарушения контракта: объявляется по одному разу на вид.
+fn contract_bit(e: &Error) -> u8 {
+    match e {
+        Error::UnknownEvent { .. } => 1 << 0,
+        Error::UnknownMetric { .. } => 1 << 1,
+        Error::UnknownSpanKind { .. } => 1 << 2,
+        Error::ValueTypeMismatch { .. } => 1 << 3,
+        Error::ClassNotDeclared { .. } => 1 << 4,
+        Error::EncodeFailed { .. } => 1 << 5,
+        // Прочее (например, отказ носителя) — тоже один раз, но своим битом:
+        // залить журнал повторами оно способно ровно так же.
+        _ => 1 << 7,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -654,12 +816,25 @@ mod tests {
         },
     ];
 
+    use crate::metric::{Metric, MetricState, MetricValue};
+
+    /// Типизированные константы метрик — то, что для настоящей схемы порождает
+    /// макрос: тип значения приходит вместе с идентификатором.
+    const TEMP: Metric<f32> = Metric::new(MetricId(1));
+    const LINK: Metric<LinkState> = Metric::new(MetricId(2));
+
     /// Состояние канала — то, что для настоящей схемы породил бы макрос.
     #[derive(Debug, Clone, Copy)]
     enum LinkState {
         Los = 0,
         Sync = 1,
         Lock = 2,
+    }
+
+    impl MetricValue<LinkState> for LinkState {
+        fn into_owned(self) -> OwnedValue {
+            OwnedValue::U64(self as u64)
+        }
     }
 
     impl MetricState for LinkState {
@@ -691,19 +866,18 @@ mod tests {
         }
     }
 
-    fn open_store(dir: &Path) -> (Arc<Store>, StoreConfig) {
-        let cfg = StoreConfig::new(dir).with_budget(8 * 1024 * 1024);
-        (Store::open(cfg.clone()).unwrap(), cfg)
+    fn open_store(dir: &Path) -> Arc<Store> {
+        Store::open(StoreConfig::new(dir).with_budget(8 * 1024 * 1024)).unwrap()
     }
 
     #[test]
     fn writes_land_on_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         for i in 0..100 {
-            ns.log_raw(EventId(1), &[i as u8; 4], None).unwrap();
+            ns.log_raw(EventId(1), &[i as u8; 4], None);
         }
         ns.sync().unwrap();
 
@@ -725,10 +899,10 @@ mod tests {
     #[test]
     fn critical_events_are_synced_immediately() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        ns.log_raw(EventId(2), &[1, 2, 3], None).unwrap();
+        ns.log_raw(EventId(2), &[1, 2, 3], None);
         // Ждём, пока writer обработает: sync — барьер по той же очереди.
         ns.sync().unwrap();
         assert!(
@@ -749,14 +923,14 @@ mod tests {
         // Пропускная способность как таковая здесь не проверяется: она
         // зависит от загрузки машины и меряется бенчмарками.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         const N: u64 = 50_000;
         let mut accepted = 0u64;
         let mut refused = 0u64;
         for i in 0..N {
-            match ns.log_raw(EventId(1), &[i as u8; 8], None) {
+            match ns.try_log_raw(EventId(1), &[i as u8; 8], None) {
                 Ok(()) => accepted += 1,
                 Err(_) => refused += 1,
             }
@@ -783,12 +957,12 @@ mod tests {
         // и пятьсот таких обращений превратили бы аварию в секунды записи и
         // лишний износ флеша.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         const BURST: usize = 500;
         for i in 0..BURST {
-            while ns.log_raw(EventId(2), &[i as u8], None).is_err() {
+            while ns.try_log_raw(EventId(2), &[i as u8], None).is_err() {
                 std::thread::yield_now();
             }
         }
@@ -812,33 +986,33 @@ mod tests {
     #[test]
     fn namespace_cannot_be_opened_twice() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let a = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
-        let err = store.namespace("orc-radio-0", schema(), &cfg).unwrap_err();
+        let store = open_store(dir.path());
+        let a = store.namespace("orc-radio-0", schema()).unwrap();
+        let err = store.namespace("orc-radio-0", schema()).unwrap_err();
         assert!(matches!(err, Error::NamespaceBusy(_)), "получено {err}");
 
         // Отпущенное имя обязано освободиться: иначе сервис не смог бы
         // переоткрыть свой неймспейс после перенастройки.
         drop(a);
         store
-            .namespace("orc-radio-0", schema(), &cfg)
+            .namespace("orc-radio-0", schema())
             .expect("имя свободно после уничтожения ручки");
     }
 
     #[test]
     fn foreign_schema_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        drop(store.namespace("orc-radio-0", schema(), &cfg).unwrap());
+        let store = open_store(dir.path());
+        drop(store.namespace("orc-radio-0", schema()).unwrap());
         store.shutdown();
         drop(store);
 
-        let (store2, cfg) = open_store(dir.path());
+        let store2 = open_store(dir.path());
         let other = Schema {
             name: "другая-схема",
             ..schema()
         };
-        let err = store2.namespace("orc-radio-0", other, &cfg).unwrap_err();
+        let err = store2.namespace("orc-radio-0", other).unwrap_err();
         assert!(
             matches!(err, Error::SchemaMismatch { .. }),
             "получено {err}"
@@ -856,8 +1030,8 @@ mod tests {
         };
         std::fs::write(ns_dir.join(NS_META), postcard::to_allocvec(&meta).unwrap()).unwrap();
 
-        let (store, cfg) = open_store(dir.path());
-        let err = store.namespace("orc-radio-0", schema(), &cfg).unwrap_err();
+        let store = open_store(dir.path());
+        let err = store.namespace("orc-radio-0", schema()).unwrap_err();
         assert!(
             matches!(err, Error::ProtocolFromFuture { stored: 99, .. }),
             "получено {err}"
@@ -867,10 +1041,10 @@ mod tests {
     #[test]
     fn bad_namespace_names_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
+        let store = open_store(dir.path());
         for bad in ["../escape", "a/b", "", ".hidden"] {
             assert!(
-                store.namespace(bad, schema(), &cfg).is_err(),
+                store.namespace(bad, schema()).is_err(),
                 "{bad:?} обязано отвергаться"
             );
         }
@@ -879,20 +1053,25 @@ mod tests {
     #[test]
     fn telemetry_series_and_spans() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        let temp = ns.series(MetricId(1)).unwrap();
+        let temp = ns.series(TEMP).unwrap();
         for i in 0..50 {
-            temp.sample_f32(20.0 + i as f32).unwrap();
+            temp.sample(20.0 + i as f32);
         }
-        // Тип значения обязан совпасть с объявленным.
-        assert!(temp.sample(OwnedValue::U64(1)).is_err());
+        // Динамический путь сверяет тип со схемой сам: у типизированного
+        // `sample` такое значение просто не собралось бы.
+        let dyn_temp = ns.series_untyped(MetricId(1)).unwrap();
+        let e = dyn_temp
+            .try_sample_raw(OwnedValue::U64(1))
+            .expect_err("тип значения обязан совпасть с объявленным");
+        assert!(e.breaks_contract(), "это дефект вызова, а не потеря: {e}");
 
         {
-            let cal = ns.span(SpanKindId(1)).unwrap();
-            cal.log_raw(EventId(1), &[7]).unwrap();
-            let _child = cal.child(SpanKindId(1)).unwrap();
+            let cal = ns.span(SpanKindId(1));
+            cal.log_raw(EventId(1), &[7]);
+            let _child = cal.child(SpanKindId(1));
         } // оба спана закрываются здесь
 
         ns.sync().unwrap();
@@ -910,15 +1089,15 @@ mod tests {
         // поверх недописанного. Проверяем на потоке, заведомо обгоняющем
         // writer.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         const N: usize = 20_000;
         let mut accepted = 0u64;
         for i in 0..N {
             // Ретраи, чтобы отделить потери очереди (штатное поведение
             // обычного канала) от потерь при синхронизации.
-            while ns.log_raw(EventId(1), &[i as u8; 4], None).is_err() {
+            while ns.try_log_raw(EventId(1), &[i as u8; 4], None).is_err() {
                 std::thread::yield_now();
             }
             accepted += 1;
@@ -939,13 +1118,13 @@ mod tests {
     #[test]
     fn shutdown_persists_everything_accepted() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         const N: usize = 20_000;
         let mut accepted = 0u64;
         for i in 0..N {
-            while ns.log_raw(EventId(1), &[i as u8; 4], None).is_err() {
+            while ns.try_log_raw(EventId(1), &[i as u8; 4], None).is_err() {
                 std::thread::yield_now();
             }
             accepted += 1;
@@ -968,8 +1147,8 @@ mod tests {
         // молча отдавать читателю сегменты, которых он не просил, и
         // пропускать те, что нужны.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         // Небольшая занятая пауза, чтобы время старта заведомо было > 0.
         let mut spin = 0u64;
@@ -977,7 +1156,7 @@ mod tests {
             spin += 1;
         }
         let before = ns.now();
-        ns.log_raw(EventId(1), &[1], None).unwrap();
+        ns.log_raw(EventId(1), &[1], None);
         ns.sync().unwrap();
         let after = ns.now();
 
@@ -1003,12 +1182,12 @@ mod tests {
         // Namespace писал бы в никуда, возвращая Ok на каждый вызов —
         // худший вид потери данных: без единого признака.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
         drop(store);
 
         for i in 0..100 {
-            ns.log_raw(EventId(1), &[i as u8], None)
+            ns.try_log_raw(EventId(1), &[i as u8], None)
                 .expect("запись обязана продолжать работать");
         }
         ns.sync().expect("синхронизация обязана работать");
@@ -1027,16 +1206,16 @@ mod tests {
         // Пометка «занято» ставится до подъёма; ранний выход обязан её снять,
         // иначе имя останется недоступным до конца жизни процесса.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
+        let store = open_store(dir.path());
 
         let broken = Schema {
             version: ProtocolVersion(0), // недопустима
             ..schema()
         };
-        assert!(store.namespace("orc-radio-0", broken, &cfg).is_err());
+        assert!(store.namespace("orc-radio-0", broken).is_err());
         // Имя снова свободно.
         store
-            .namespace("orc-radio-0", schema(), &cfg)
+            .namespace("orc-radio-0", schema())
             .expect("имя обязано освободиться после неудачи");
     }
 
@@ -1045,13 +1224,13 @@ mod tests {
         // Смысл модели: состояние на диске — обычное целое, всё остальное
         // (имя, важность) живёт в схеме и места не занимает.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        let link = ns.series(MetricId(2)).unwrap();
+        let link = ns.series(LINK).unwrap();
         assert_eq!(link.kind(), MetricKind::State);
         for st in [LinkState::Los, LinkState::Sync, LinkState::Lock] {
-            link.sample_state(st).unwrap();
+            link.sample(st);
         }
         ns.sync().unwrap();
 
@@ -1075,15 +1254,12 @@ mod tests {
         // состояния перед окном отбросит сегмент, в котором оно есть.
         // Регрессия была бы совершенно тихой — отсюда тест.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        ns.series(MetricId(1)).unwrap().sample_f32(36.6).unwrap();
-        ns.series(MetricId(2))
-            .unwrap()
-            .sample_state(LinkState::Lock)
-            .unwrap();
-        ns.log_raw(EventId(1), &[1], None).unwrap();
+        ns.series(TEMP).unwrap().sample(36.6);
+        ns.series(LINK).unwrap().sample(LinkState::Lock);
+        ns.log_raw(EventId(1), &[1], None);
         store.shutdown();
 
         let seg_dir = dir.path().join("orc-radio-0").join("default");
@@ -1114,20 +1290,30 @@ mod tests {
     fn state_of_a_foreign_metric_is_refused() {
         // Коды состояний у разных метрик свои. Записать чужой код значило бы
         // получить график, подписанный чужими именами.
+        //
+        // На типизированном пути это **ошибка компиляции**: `Series<f32>` не
+        // примет `LinkState`, и проверять тут нечего. Проверяется динамический
+        // путь — единственный оставшийся способ подсунуть чужое значение.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        let temp = ns.series(MetricId(1)).unwrap();
-        let err = temp.sample_state(LinkState::Lock).unwrap_err();
-        assert!(matches!(err, Error::BadNamespace { .. }), "получено {err}");
+        let temp = ns.series_untyped(MetricId(1)).unwrap();
+        let err = temp
+            .try_sample_raw(OwnedValue::U64(LinkState::Lock as u64))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ValueTypeMismatch { .. }),
+            "получено {err}"
+        );
+        assert!(err.breaks_contract());
     }
 
     #[test]
     fn limits_default_from_schema_and_override_at_runtime() {
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         // Дефолты схемы.
         let sev = |v: f32| ns.severity_of(MetricId(1), &OwnedValue::F32(v));
@@ -1135,21 +1321,9 @@ mod tests {
         assert_eq!(sev(75.0), Severity::Warn);
         assert_eq!(sev(90.0), Severity::Alarm);
 
-        // Внешняя система определила модель усилителя и сузила пределы.
-        ns.set_limits(
-            MetricId(1),
-            Some(MetricLimits::numeric(crate::schema::Thresholds {
-                warn: crate::schema::Range {
-                    min: None,
-                    max: Some(40.0),
-                },
-                alarm: crate::schema::Range {
-                    min: None,
-                    max: Some(50.0),
-                },
-            })),
-        )
-        .unwrap();
+        // Внешняя система определила модель усилителя и сузила пределы —
+        // теми же range-выражениями, что и в схеме.
+        ns.set_thresholds(TEMP, ..=40.0, ..=50.0).unwrap();
         assert_eq!(sev(45.0), Severity::Warn, "схема сказала бы Normal");
         let eff = ns.limits(MetricId(1)).unwrap();
         assert!(eff.overridden);
@@ -1174,7 +1348,14 @@ mod tests {
             0,
             "пределы — настройка, а не данные: писать их некуда"
         );
-        assert!(ns.set_limits(MetricId(99), None).is_err());
+        // Снятие переопределения возвращает объявленное в схеме.
+        ns.clear_limits(TEMP).unwrap();
+        assert_eq!(sev(45.0), Severity::Normal);
+        assert!(!ns.limits(TEMP).unwrap().overridden);
+
+        // Метрика не из этой схемы — дефект вызова, а не потеря.
+        let e = ns.clear_limits(MetricId(99)).unwrap_err();
+        assert!(e.breaks_contract(), "{e}");
     }
 
     #[test]
@@ -1182,21 +1363,11 @@ mod tests {
         // У каждого экземпляра своё железо: общие на процесс пределы были бы
         // неверны для всех сразу.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let a = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
-        let b = store.namespace("orc-radio-1", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let a = store.namespace("orc-radio-0", schema()).unwrap();
+        let b = store.namespace("orc-radio-1", schema()).unwrap();
 
-        a.set_limits(
-            MetricId(1),
-            Some(MetricLimits::numeric(crate::schema::Thresholds {
-                warn: crate::schema::Range {
-                    min: None,
-                    max: Some(10.0),
-                },
-                alarm: crate::schema::Range::NONE,
-            })),
-        )
-        .unwrap();
+        a.set_thresholds(TEMP, ..=10.0, ..).unwrap();
 
         assert_eq!(
             a.severity_of(MetricId(1), &OwnedValue::F32(20.0)),
@@ -1210,13 +1381,38 @@ mod tests {
     }
 
     #[test]
-    fn unknown_ids_are_refused() {
+    fn unknown_ids_are_counted_and_announced_once() {
+        // Id из чужой схемы — дефект сборки. Путь записи ничего не
+        // возвращает, поэтому такой вызов не должен пропадать бесследно: он
+        // учитывается отдельным счётчиком и **один раз** объявляется записью в
+        // журнал. Объявлять каждый значило бы залить журнал — нарушение
+        // контракта повторяется на каждом витке цикла.
         let dir = tempfile::tempdir().unwrap();
-        let (store, cfg) = open_store(dir.path());
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        assert!(ns.log_raw(EventId(99), &[], None).is_err());
-        assert!(ns.series(MetricId(99)).is_err());
-        assert!(ns.span(SpanKindId(99)).is_err());
+        let e = ns.try_log_raw(EventId(99), &[], None).unwrap_err();
+        assert!(e.breaks_contract(), "{e}");
+        assert!(ns.series_untyped(MetricId(99)).is_err());
+
+        for _ in 0..100 {
+            ns.log_raw(EventId(99), &[], None);
+        }
+        ns.sync().unwrap();
+
+        let stats = store.stats();
+        assert_eq!(stats.rejected, 100, "каждый отказ учтён");
+        assert_eq!(stats.dropped, 0, "это не потеря из-за диска");
+        assert!(!stats.is_clean(), "дефект обязан быть виден");
+        assert_eq!(
+            stats.records_written, 1,
+            "объявление одно на все сто вызовов: получено {}",
+            stats.records_written
+        );
+
+        // Вид спана из чужой схемы: страж выдаётся всё равно, иначе
+        // вложенность прикладного кода зависела бы от схемы.
+        let span = ns.span(SpanKindId(99));
+        assert!(span.id().0 > 0);
     }
 }

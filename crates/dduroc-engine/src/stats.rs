@@ -20,6 +20,11 @@ pub struct Counters {
     pub segments_rotated: AtomicU64,
     /// Записи, отброшенные из-за переполнения очереди обычного канала.
     pub dropped: AtomicU64,
+    /// Записи, отвергнутые как нарушающие контракт схемы: id из чужой схемы,
+    /// значение не того типа. Дефект сборки, а не следствие нагрузки, поэтому
+    /// счётчик отдельный — смешать его с потерями значило бы спрятать баг за
+    /// «диск не успевает».
+    pub rejected: AtomicU64,
     /// Сколько раз запись в критический канал ждала места в очереди.
     pub backpressure_waits: AtomicU64,
     /// Ошибки ввода-вывода в writer'е.
@@ -50,6 +55,7 @@ impl Counters {
             segments_sealed: g(&self.segments_sealed),
             segments_rotated: g(&self.segments_rotated),
             dropped: g(&self.dropped),
+            rejected: g(&self.rejected),
             backpressure_waits: g(&self.backpressure_waits),
             io_errors: g(&self.io_errors),
             recovered_tails: g(&self.recovered_tails),
@@ -68,15 +74,18 @@ pub struct Stats {
     pub segments_sealed: u64,
     pub segments_rotated: u64,
     pub dropped: u64,
+    /// Отвергнутые как нарушающие контракт схемы — см. одноимённое поле
+    /// [`Counters`].
+    pub rejected: u64,
     pub backpressure_waits: u64,
     pub io_errors: u64,
     pub recovered_tails: u64,
 }
 
 impl Stats {
-    /// Всё ли благополучно: ничего не потеряно и не сломалось.
+    /// Всё ли благополучно: ничего не потеряно, не отвергнуто и не сломалось.
     pub fn is_clean(&self) -> bool {
-        self.dropped == 0 && self.io_errors == 0
+        self.dropped == 0 && self.rejected == 0 && self.io_errors == 0
     }
 }
 
@@ -96,5 +105,14 @@ mod tests {
         assert_eq!(s.dropped, 1);
         assert!(!s.is_clean(), "потери обязаны быть видны");
         assert!(Stats::default().is_clean());
+
+        // Нарушение контракта учитывается отдельно от потерь: причины разные,
+        // и реакция на них разная.
+        let c = Counters::default();
+        Counters::bump(&c.rejected);
+        let s = c.snapshot();
+        assert_eq!(s.dropped, 0);
+        assert_eq!(s.rejected, 1);
+        assert!(!s.is_clean(), "отвергнутая запись обязана быть видна");
     }
 }

@@ -15,6 +15,7 @@ use dduroc_format::BootTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -101,6 +102,9 @@ pub struct Store {
     /// текущей. Приложению стоит записать это в журнал: часть накопленной
     /// истории этим билдом не читается.
     upgraded_from: Option<u8>,
+    /// Настройки, с которыми хранилище открыто: неймспейсы берут политики
+    /// каналов отсюда, а не из повторно переданного экземпляра.
+    config: StoreConfig,
     clock: Clock,
     epochs: Mutex<EpochStore>,
     writer: Arc<Writer>,
@@ -145,6 +149,7 @@ impl Store {
             root: config.root.clone(),
             meta,
             upgraded_from,
+            config,
             clock,
             epochs: Mutex::new(epochs),
             writer,
@@ -181,19 +186,23 @@ impl Store {
     }
 
     /// Поднять неймспейс с указанной схемой.
-    pub fn namespace(
-        self: &Arc<Self>,
-        name: &str,
-        schema: Schema,
-        config: &StoreConfig,
-    ) -> Result<Namespace> {
+    ///
+    /// Настройки каналов берутся из тех, с которыми открыто хранилище: раньше
+    /// их приходилось передавать вторым экземпляром (`Store::open(config.clone())`
+    /// плюс `namespace(.., &config)`), и ничто не мешало передать сюда другие —
+    /// каналы получили бы бюджет, о котором хранилище не знает.
+    pub fn namespace(self: &Arc<Self>, name: &str, schema: Schema) -> Result<Namespace> {
         validate_component(name).map_err(|reason| Error::BadNamespace {
             name: name.to_owned(),
             reason,
         })?;
-        schema.validate().map_err(|e| Error::BadNamespace {
-            name: name.to_owned(),
-            reason: Box::leak(e.to_string().into_boxed_str()),
+        // Причина — обычная строка. Раньше здесь стоял `Box::leak`, потому что
+        // `reason` был `&'static str`: каждая неудачная попытка подъёма
+        // неймспейса навсегда оставляла в памяти свой текст, а на устройстве
+        // такую попытку повторяют в цикле переподключения.
+        schema.validate().map_err(|e| Error::BadSchema {
+            name: schema.name.to_owned(),
+            reason: e.to_string(),
         })?;
 
         // Занятость помечается под той же блокировкой, что и проверка:
@@ -227,7 +236,7 @@ impl Store {
 
         let classes = schema.classes();
         let channel_configs: Vec<ChannelConfig> =
-            classes.iter().map(|c| config.config_for(*c)).collect();
+            classes.iter().map(|c| self.config.config_for(*c)).collect();
         for c in &channel_configs {
             c.validate()?;
         }
@@ -396,6 +405,7 @@ fn acquire_lock(root: &Path) -> Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(fsutil::FILE_MODE)
         .open(&path)
         .ctx_path("открытие файла блокировки", &path)?;
 

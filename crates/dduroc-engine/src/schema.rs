@@ -200,6 +200,26 @@ impl Range {
     }
 }
 
+impl<R: std::ops::RangeBounds<f64>> From<R> for Range {
+    /// Диапазон из обычного range-выражения: `..=70.0`, `1.0..=1.5`, `10.0..`.
+    ///
+    /// Границы диапазона метрики включительные — за ними уже не норма, — а
+    /// `Excluded` у `f64` не выразить без произвольного эпсилона, поэтому
+    /// исключающая граница трактуется как включающая. В схеме макрос требует
+    /// `..=` явно; здесь этого не потребовать, зато можно не соврать молча.
+    fn from(r: R) -> Self {
+        use std::ops::Bound;
+        let bound = |b: Bound<&f64>| match b {
+            Bound::Unbounded => None,
+            Bound::Included(v) | Bound::Excluded(v) => Some(*v),
+        };
+        Self {
+            min: bound(r.start_bound()),
+            max: bound(r.end_bound()),
+        }
+    }
+}
+
 /// Пределы числовой метрики: диапазоны, **вне** которых значение требует
 /// внимания.
 ///
@@ -219,6 +239,22 @@ impl Thresholds {
         warn: Range::NONE,
         alarm: Range::NONE,
     };
+
+    /// Пределы из двух range-выражений — так же, как в объявлении схемы:
+    ///
+    /// ```text
+    /// Thresholds::new(..=70.0, ..=85.0)        // только сверху
+    /// Thresholds::new(1.0..=1.5, 1.0..=2.0)    // с двух сторон
+    /// ```
+    pub fn new(
+        warn: impl std::ops::RangeBounds<f64>,
+        alarm: impl std::ops::RangeBounds<f64>,
+    ) -> Self {
+        Self {
+            warn: warn.into(),
+            alarm: alarm.into(),
+        }
+    }
 
     pub const fn is_unset(&self) -> bool {
         self.warn.is_unset() && self.alarm.is_unset()

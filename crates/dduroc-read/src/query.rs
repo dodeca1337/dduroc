@@ -17,7 +17,7 @@
 //! сообщается явно ([`Resolution::unanchored`]), а не молча.
 
 use dduroc_engine::epochs::{Epochs, RunOffset};
-use dduroc_format::{BootCounter, BootTime, EventId, Level, Micros};
+use dduroc_format::{BootCounter, BootTime, EventId, Level, Micros, SpanId};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Момент времени в границах запроса.
@@ -231,7 +231,7 @@ pub struct Filter {
     /// Имена событий — резолвятся по схеме.
     pub event_names: Vec<String>,
     /// Только записи, привязанные к этим спанам.
-    pub spans: Option<HashSet<u32>>,
+    pub spans: Option<HashSet<SpanId>>,
     /// Какие разновидности записей нужны.
     pub kinds: KindFilter,
 }

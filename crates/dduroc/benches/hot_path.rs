@@ -243,7 +243,7 @@ fn bench_write(c: &mut Criterion) {
     let config = store_config(&root);
     let store = Store::open(config.clone()).expect("хранилище");
     let ns = store
-        .namespace("bench-0", bench::SCHEMA, &config)
+        .namespace("bench-0", bench::SCHEMA)
         .expect("неймспейс");
     let series = ns.series(bench::metrics::Temp).expect("серия");
 
@@ -260,7 +260,7 @@ fn bench_write(c: &mut Criterion) {
         let mut n = 0u32;
         b.iter(|| {
             n = n.wrapping_add(1);
-            ns.log(bench::events::Tick { n: black_box(n) }).ok();
+            ns.log(bench::events::Tick { n: black_box(n) });
         });
     });
 
@@ -269,20 +269,19 @@ fn bench_write(c: &mut Criterion) {
             ns.log(bench::events::Measured {
                 dbm: black_box(27.5),
                 ch: black_box(3),
-            })
-            .ok();
+            });
         });
     });
 
     g.bench_function("sample/f32", |b| {
         b.iter(|| {
-            series.sample_f32(black_box(36.6)).ok();
+            series.sample(black_box(36.6));
         });
     });
 
     g.bench_function("log/critical", |b| {
         b.iter(|| {
-            ns.log(bench::events::Alarm { code: black_box(7) }).ok();
+            ns.log(bench::events::Alarm { code: black_box(7) });
         });
     });
 
@@ -296,7 +295,7 @@ fn bench_write(c: &mut Criterion) {
             || ns.sync().expect("очередь опустошена перед замером"),
             |()| {
                 for i in 0..BURST {
-                    ns.log(bench::events::Tick { n: i as u32 })
+                    ns.try_log(bench::events::Tick { n: i as u32 })
                         .expect("очередь не должна переполняться");
                 }
             },
@@ -311,7 +310,7 @@ fn bench_write(c: &mut Criterion) {
             |()| {
                 for i in 0..BURST {
                     series
-                        .sample_f32(20.0 + i as f32)
+                        .try_sample(20.0 + i as f32)
                         .expect("очередь свободна");
                 }
             },
@@ -324,11 +323,10 @@ fn bench_write(c: &mut Criterion) {
         b.iter(|| {
             // Режим здесь насыщенный, как и у остальных замеров группы:
             // отказ переполненной очереди штатен и входит в измеряемую смесь.
-            // `unwrap` превращал бы её в падение замера, стоило производителю
-            // стать чуть быстрее writer'а.
-            if let Ok(span) = ns.span(bench::spans::Work) {
-                black_box(span.id());
-            }
+            // Он и не виден на месте вызова — страж выдаётся всегда, а потеря
+            // учтена счётчиком.
+            let span = ns.span(bench::spans::Work);
+            black_box(span.id());
         });
     });
 
@@ -351,12 +349,12 @@ fn bench_throughput(c: &mut Criterion) {
                 let root = bench_root();
                 let config = store_config(&root);
                 let store = Store::open(config.clone()).unwrap();
-                let ns = store.namespace("bench-0", bench::SCHEMA, &config).unwrap();
+                let ns = store.namespace("bench-0", bench::SCHEMA).unwrap();
                 (root, store, ns)
             },
             |(root, store, ns)| {
                 for i in 0..BATCH {
-                    ns.log(bench::events::Tick { n: i as u32 }).ok();
+                    ns.log(bench::events::Tick { n: i as u32 });
                 }
                 ns.sync().unwrap();
                 store.shutdown();
@@ -377,13 +375,13 @@ fn bench_throughput(c: &mut Criterion) {
                 let root = bench_root();
                 let config = store_config(&root);
                 let store = Store::open(config.clone()).unwrap();
-                let ns = store.namespace("bench-0", bench::SCHEMA, &config).unwrap();
+                let ns = store.namespace("bench-0", bench::SCHEMA).unwrap();
                 let series = ns.series(bench::metrics::Temp).unwrap();
                 (root, store, series)
             },
             |(root, store, series)| {
                 for i in 0..BATCH {
-                    series.sample_f32(20.0 + i as f32).ok();
+                    series.sample(20.0 + i as f32);
                 }
                 store.sync().unwrap();
                 store.shutdown();
@@ -416,7 +414,7 @@ fn bench_scale(c: &mut Criterion) {
                     for i in 0..count {
                         namespaces.push(
                             store
-                                .namespace(&format!("orc-svc-{i}"), bench::SCHEMA, &config)
+                                .namespace(&format!("orc-svc-{i}"), bench::SCHEMA)
                                 .unwrap(),
                         );
                     }
@@ -445,13 +443,13 @@ fn bench_read(c: &mut Criterion) {
         let mut written = 0u64;
         for inst in 0..4 {
             let ns = store
-                .namespace(&format!("orc-radio-{inst}"), bench::SCHEMA, &config)
+                .namespace(&format!("orc-radio-{inst}"), bench::SCHEMA)
                 .unwrap();
             for i in 0..25_000u32 {
                 // Наполнение идёт с ретраями: обычный канал вправе терять
                 // записи под давлением, но набор для чтения должен быть
                 // предсказуемым.
-                while ns.log(bench::events::Tick { n: i }).is_err() {
+                while ns.try_log(bench::events::Tick { n: i }).is_err() {
                     std::thread::yield_now();
                 }
                 written += 1;

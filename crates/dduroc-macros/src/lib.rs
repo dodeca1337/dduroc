@@ -507,6 +507,31 @@ fn vtype_path(vtype: &Ident) -> syn::Result<TokenStream2> {
     })
 }
 
+/// Rust-тип, которым метрика параметризует свою константу.
+///
+/// Он и определяет, что примет `sample`: у `Metric<f32>` — только `f32`.
+/// У перечисления это сам сгенерированный enum, поэтому состояние чужой
+/// метрики не проходит проверку типов.
+fn marker_path(vtype: &Ident, states_enum: Option<&Ident>) -> syn::Result<TokenStream2> {
+    if let Some(name) = states_enum {
+        return Ok(quote!(#name));
+    }
+    Ok(match vtype.to_string().as_str() {
+        "f32" => quote!(f32),
+        "f64" => quote!(f64),
+        "i64" => quote!(i64),
+        "u64" => quote!(u64),
+        "bool" => quote!(bool),
+        "blob" => quote!(::dduroc::Blob),
+        other => {
+            return Err(syn::Error::new(
+                vtype.span(),
+                format!("неизвестный тип значения `{other}`: ожидались f32/f64/i64/u64/bool/blob"),
+            ));
+        }
+    })
+}
+
 fn severity_path(severity: Option<&Ident>) -> syn::Result<TokenStream2> {
     let Some(s) = severity else {
         return Ok(quote!(::dduroc::Severity::Normal));
@@ -816,8 +841,21 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         let warn = range_tokens(m.warn.as_ref())?;
         let alarm = range_tokens(m.alarm.as_ref())?;
 
+        // Константа несёт тип значения: `Metric<f32>` не даст записать в эту
+        // метрику целое, а `Metric<LinkState>` — состояние чужой метрики.
+        // Имя занимает пространство значений, поэтому перечисление состояний
+        // может называться так же.
+        let marker = marker_path(
+            vtype_ident,
+            if m.states.is_empty() {
+                None
+            } else {
+                Some(name)
+            },
+        )?;
         metric_consts.push(quote! {
-            pub const #name: ::dduroc::MetricId = ::dduroc::MetricId(#id);
+            pub const #name: ::dduroc::Metric<#marker> =
+                ::dduroc::Metric::new(::dduroc::MetricId(#id));
         });
 
         // Статика подписей состояний: имена и важность живут в схеме, на диск
@@ -882,6 +920,17 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                         match self {
                             #(#name_arms),*
                         }
+                    }
+                }
+
+                // Значение, допустимое для этой метрики, — только её же
+                // состояния. Реализация именно здесь, а не общая по всем
+                // перечислениям: общая пересеклась бы со встроенными типами,
+                // потому что компилятор не умеет опираться на «f32 никогда не
+                // станет состоянием метрики».
+                impl ::dduroc::MetricValue<#name> for #name {
+                    fn into_owned(self) -> ::dduroc::OwnedValue {
+                        ::dduroc::OwnedValue::U64(self as u64)
                     }
                 }
             });

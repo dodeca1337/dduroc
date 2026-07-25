@@ -7,9 +7,17 @@ authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Слой чтения включён по умолчанию: на устройстве журнал показывает сам прибор.
+# Прошивке, которая только пишет, его можно отключить — на armv7 с ограниченным
+# флешем размер бинаря значим.
+default = ["read"]
+read = ["dep:dduroc-read"]
+
 [dependencies]
 chrono.workspace = true
 dduroc-engine.workspace = true
+dduroc-read = { workspace = true, optional = true }
 dduroc-format.workspace = true
 dduroc-macros.workspace = true
 postcard.workspace = true

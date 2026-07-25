@@ -29,7 +29,7 @@ use dduroc_format::footer::Trailer;
 use dduroc_format::segment::{SegmentHeader, SegmentName};
 use dduroc_format::{Micros, block};
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// Открытый на запись сегмент.
@@ -60,6 +60,7 @@ impl SegmentWriter {
             // create_new: сегмент с таким именем уже существовать не может —
             // иначе мы затёрли бы чужие данные тем же (boot, время) ключом.
             .create_new(true)
+            .mode(fsutil::FILE_MODE)
             .open(&path)
             .ctx_path("создание сегмента", &path)?;
 

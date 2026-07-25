@@ -15,7 +15,25 @@
 use crate::error::{IoContext, Result};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+/// Права на создаваемые файлы: владельцу — чтение и запись, группе — чтение,
+/// **посторонним — ничего**.
+///
+/// Задаются явно, а не оставляются на umask процесса: журнал прибора — это
+/// диагностика работающей установки (адреса, режимы, параметры настройки), и
+/// при типичной umask 022 он оказался бы доступен на чтение любому
+/// пользователю системы. Ядро может только сузить эти права своей umask,
+/// расширить — нет.
+///
+/// Группа оставлена читающей намеренно: веб-интерфейс прибора и утилита сбора
+/// дампов часто работают отдельным пользователем в общей группе, и снимать им
+/// доступ значило бы обязать их к root.
+pub const FILE_MODE: u32 = 0o640;
+
+/// Права на каталоги хранилища: то же плюс обход для владельца и группы.
+pub const DIR_MODE: u32 = 0o750;
 
 /// Синхронизировать каталог: делает долговечными операции над **именами**
 /// (создание, переименование, удаление файлов внутри него).
@@ -39,7 +57,11 @@ pub fn create_dir_all_synced(dir: &Path) -> Result<()> {
     if dir.is_dir() {
         return Ok(());
     }
-    std::fs::create_dir_all(dir).ctx_path("создание каталога", dir)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(dir)
+        .ctx_path("создание каталога", dir)?;
     // Долговечно должно стать имя каждого созданного звена, поэтому
     // синхронизируем цепочку родителей снизу вверх.
     let mut cur = Some(dir);
@@ -71,6 +93,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(FILE_MODE)
             .open(&tmp)
             .ctx_path("создание временного файла", &tmp)?;
         f.write_all(bytes).ctx_path("запись", &tmp)?;
@@ -199,6 +222,37 @@ mod tests {
         create_dir_all_synced(&nested).unwrap();
         assert!(nested.is_dir());
         create_dir_all_synced(&nested).unwrap();
+    }
+
+    #[test]
+    fn created_files_and_dirs_are_not_world_readable() {
+        // Журнал прибора — диагностика работающей установки. При типичной
+        // umask 022 он оказался бы доступен на чтение любому пользователю
+        // системы, поэтому права задаются явно. Проверяется именно отсутствие
+        // прав у посторонних: umask способна только сузить наши, и точное
+        // значение зависит от неё.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("ns/default");
+        create_dir_all_synced(&nested).unwrap();
+        let path = nested.join("meta");
+        write_atomic(&path, b"secret").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o007,
+            0,
+            "посторонние не должны читать журнал: {mode:#o}"
+        );
+        assert_eq!(mode & 0o600, 0o600, "владелец обязан читать и писать");
+
+        let dir_mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(
+            dir_mode & 0o007,
+            0,
+            "каталог не должен быть открыт посторонним: {dir_mode:#o}"
+        );
     }
 
     #[test]

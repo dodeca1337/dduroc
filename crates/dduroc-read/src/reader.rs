@@ -148,6 +148,112 @@ impl QueryResult {
     }
 }
 
+/// Поток записей запроса: слияние каналов по времени без сборки ответа целиком.
+///
+/// Порядок тот же, что у [`Reader::query`]: курсоры сливаются по полному
+/// моменту (запуск, µs), а не по микросекундам — сравнивать их между разными
+/// запусками бессмысленно.
+#[derive(Debug)]
+pub struct EntryStream<'a> {
+    reader: &'a Reader,
+    /// Копия запроса: разбор записи сверяется с фильтром на каждой.
+    query: Query,
+    bounds: Bounds,
+    cursors: Vec<ChannelCursor>,
+    /// Схема на каждый курсор, в том же порядке.
+    schemas: Vec<Option<Schema>>,
+    /// Каталоги, которые не удалось прочитать — известны сразу при открытии.
+    damaged: Vec<Damage>,
+    limit: usize,
+    yielded: usize,
+    truncated: bool,
+}
+
+impl Iterator for EntryStream<'_> {
+    type Item = Entry;
+
+    fn next(&mut self) -> Option<Entry> {
+        if self.yielded >= self.limit {
+            self.truncated = true;
+            return None;
+        }
+        loop {
+            // Курсор с самой ранней (или поздней) записью.
+            let mut best: Option<(usize, BootTime)> = None;
+            for (i, c) in self.cursors.iter_mut().enumerate() {
+                let Some(head) = c.peek() else { continue };
+                let better = match best {
+                    None => true,
+                    Some((_, at)) => match self.query.order {
+                        Order::Oldest => head.at < at,
+                        Order::Newest => head.at > at,
+                    },
+                };
+                if better {
+                    best = Some((i, head.at));
+                }
+            }
+            let (idx, _) = best?;
+            let Some(raw) = self.cursors[idx].next_entry() else {
+                continue;
+            };
+
+            // Записи вне окна пропускаются, но обход продолжается: сегмент мог
+            // начаться раньше нижней границы.
+            if !self.bounds.contains(raw.at) {
+                continue;
+            }
+
+            let ns = std::sync::Arc::clone(&self.cursors[idx].namespace);
+            let ch = std::sync::Arc::clone(&self.cursors[idx].channel);
+            if let Some(entry) =
+                self.reader
+                    .build_entry(ns, ch, self.schemas[idx].as_ref(), &raw, &self.query)
+            {
+                self.yielded += 1;
+                return Some(entry);
+            }
+        }
+    }
+}
+
+impl EntryStream<'_> {
+    /// Фрагменты, которые не удалось прочитать. Полон список только после
+    /// того, как поток исчерпан: повреждение обнаруживается при чтении блока.
+    pub fn damaged(&self) -> Vec<Damage> {
+        let mut out = self.damaged.clone();
+        for c in &self.cursors {
+            out.extend_from_slice(c.damaged());
+        }
+        out
+    }
+
+    /// Запуски, чьи сегменты выпали из выборки за неимением якоря — см.
+    /// [`QueryResult::unanchored`].
+    pub fn unanchored(&self) -> Vec<BootCounter> {
+        let mut out: Vec<BootCounter> = Vec::new();
+        for c in &self.cursors {
+            for boot in c.unanchored() {
+                if !out.contains(boot) {
+                    out.push(*boot);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Оборван ли обход по `limit` запроса.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Сколько записей уже выдано.
+    pub fn yielded(&self) -> usize {
+        self.yielded
+    }
+}
+
 /// Открытые под запрос курсоры вместе с разрешёнными схемами.
 #[derive(Debug)]
 struct OpenedCursors {
@@ -213,6 +319,37 @@ impl Reader {
 
     pub fn epochs(&self) -> &Epochs {
         &self.epochs
+    }
+
+    /// Текст записи на указанном языке.
+    ///
+    /// `None` — рендерить нечего: это не сообщение схемы, либо схема
+    /// неизвестна этому билду (тогда у записи остаются идентификатор и
+    /// payload, и выдумывать текст читатель не станет).
+    ///
+    /// Схема ищется по неймспейсу самой записи. Раньше её приходилось искать
+    /// вызывающему и передавать вручную — а он мог передать чужую, и тогда
+    /// payload разбирался бы декодером другого события: текст получался бы
+    /// правдоподобным и неверным.
+    pub fn render(&self, entry: &Entry, lang: &str) -> Option<String> {
+        match &entry.kind {
+            EntryKind::Message { event, payload, .. } => {
+                let schema = self.schema_of(&entry.namespace)?;
+                render(schema, *event, payload, lang)
+            }
+            // Свободный текст уже текст: у него нет ни шаблона, ни языков.
+            EntryKind::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Схема неймспейса — по его метаданным на диске.
+    ///
+    /// Ищется имя схемы каталога, а не первая подходящая: два неймспейса могут
+    /// жить под разными схемами в одном хранилище.
+    pub fn schema_of(&self, namespace: &str) -> Option<&Schema> {
+        let meta = read_ns_meta(&self.root.join(namespace))?;
+        self.schemas.get(&meta.schema_name)
     }
 
     /// Перечислить неймспейсы.
@@ -283,87 +420,60 @@ impl Reader {
         Ok(out)
     }
 
-    /// Выполнить запрос.
-    pub fn query(&self, q: &Query) -> Result<QueryResult> {
+    /// Открыть запрос потоком: записи разбираются по мере обхода.
+    ///
+    /// Память ограничена одним распакованным блоком на канал — тем же, чем
+    /// ограничен курсор. Это единственный способ читать много: [`Reader::query`]
+    /// собирает ответ целиком, и запрос без `limit` по двухсотгигабайтному
+    /// хранилищу не поместился бы в памяти armv7.
+    ///
+    /// Обход можно прервать в любой момент; о повреждениях и выпавших запусках
+    /// поток сообщает теми же средствами, что и `query`, — но полны эти
+    /// сведения только после того, как поток исчерпан либо оставлен.
+    pub fn stream(&self, q: &Query) -> Result<EntryStream<'_>> {
         // Границы приводятся к относительной шкале один раз: настенная
         // граница требует якоря на каждый запуск, и делать это на запись
         // значило бы линейный поиск по эпохам на каждую из сотен тысяч.
-        let resolution = q.resolve(&self.epochs);
+        let bounds = q.resolve(&self.epochs).bounds;
         let OpenedCursors {
-            mut cursors,
+            cursors,
             schemas,
             damaged,
-        } = self.open_cursors(q, &resolution.bounds)?;
-        // Выпавшие запуски собираются по сегментам, а не по реестру эпох:
-        // реестр перечислил бы и те, у которых в запрошенных каналах нет ни
-        // одного файла, — то есть пожаловался бы на данные, которых нет.
-        let mut result = QueryResult {
+        } = self.open_cursors(q, &bounds)?;
+        Ok(EntryStream {
+            reader: self,
+            query: q.clone(),
+            bounds,
+            cursors,
+            schemas,
             damaged,
-            ..QueryResult::default()
+            limit: q.limit.unwrap_or(usize::MAX),
+            yielded: 0,
+            truncated: false,
+        })
+    }
+
+    /// Выполнить запрос, собрав ответ целиком.
+    ///
+    /// Годится, когда объём ответа ограничен — `limit`, узкое окно, редкий тип
+    /// событий. Для всего остального есть [`Reader::stream`].
+    pub fn query(&self, q: &Query) -> Result<QueryResult> {
+        let mut stream = self.stream(q)?;
+        let entries: Vec<Entry> = stream.by_ref().collect();
+        let mut result = QueryResult {
+            entries,
+            truncated: stream.truncated(),
+            // Повреждения собираются и при обрезке по лимиту: ответ, из
+            // которого часть данных выпала из-за порчи, не должен выглядеть
+            // полным.
+            damaged: stream.damaged(),
+            unanchored: stream.unanchored(),
+            seeds: Vec::new(),
         };
-        let limit = q.limit.unwrap_or(usize::MAX);
-
-        loop {
-            // Выбираем курсор с самой ранней (или поздней) записью. Момент
-            // сравнивается целиком — пара (запуск, µs) упорядочена
-            // лексикографически, и это хронологический порядок.
-            let mut best: Option<(usize, BootTime)> = None;
-            for (i, c) in cursors.iter_mut().enumerate() {
-                let Some(head) = c.peek() else { continue };
-                let better = match best {
-                    None => true,
-                    Some((_, at)) => match q.order {
-                        Order::Oldest => head.at < at,
-                        Order::Newest => head.at > at,
-                    },
-                };
-                if better {
-                    best = Some((i, head.at));
-                }
-            }
-            let Some((idx, _)) = best else { break };
-
-            let Some(raw) = cursors[idx].next_entry() else {
-                continue;
-            };
-
-            // Записи вне окна пропускаются, но обход продолжается: сегмент мог
-            // начаться раньше нижней границы.
-            if !resolution.bounds.contains(raw.at) {
-                continue;
-            }
-
-            let ns_name = std::sync::Arc::clone(&cursors[idx].namespace);
-            let ch_name = std::sync::Arc::clone(&cursors[idx].channel);
-            let Some(entry) = self.build_entry(ns_name, ch_name, schemas[idx].as_ref(), &raw, q)
-            else {
-                continue;
-            };
-
-            result.entries.push(entry);
-            if result.entries.len() >= limit {
-                result.truncated = true;
-                break;
-            }
-        }
-
-        // Повреждения собираются и при обрезке по лимиту: ответ, из которого
-        // часть данных выпала из-за порчи, не должен выглядеть полным.
-        for c in &cursors {
-            result.damaged.extend_from_slice(c.damaged());
-            // Запуски, чьи сегменты на диске есть, а в реестре эпох нет: дамп
-            // могли скопировать без `epochs.bin`. По самим эпохам их не
-            // перечислить — только по каталогу.
-            for boot in c.unanchored() {
-                if !result.unanchored.contains(boot) {
-                    result.unanchored.push(*boot);
-                }
-            }
-        }
-        result.unanchored.sort_unstable();
 
         if q.seed_states && q.from.is_some() {
-            result.seeds = self.collect_state_seeds(q, &resolution.bounds, &mut result.damaged)?;
+            let bounds = stream.bounds.clone();
+            result.seeds = self.collect_state_seeds(q, &bounds, &mut result.damaged)?;
         }
         Ok(result)
     }
@@ -679,11 +789,12 @@ impl Reader {
             ),
         };
 
-        if let Some(want) = &q.filter.spans {
-            let id = span.map(|s| s.0).unwrap_or(0);
-            if !want.contains(&id) {
-                return None;
-            }
+        // Записи вне спанов отбрасываются вместе со всеми, чей спан не
+        // назван: «привязана к этому спану» неверно для обеих.
+        if let Some(want) = &q.filter.spans
+            && !span.is_some_and(|s| want.contains(&s))
+        {
+            return None;
         }
 
         Some(Entry {
@@ -771,7 +882,8 @@ fn read_store_id(root: &Path) -> Option<u64> {
 
 /// Отрендерить сообщение по шаблону схемы.
 ///
-/// Используется слоем представления (GraphQL, вьюер).
+/// Низкоуровневый путь: схему приходится искать самому. Обычно нужен
+/// [`Reader::render`] — он берёт её по неймспейсу записи.
 ///
 /// Шаблоны на диске не хранятся: `{поле}` подставляется декодером,
 /// сгенерированным макросом схемы. Без декодера возвращается сам шаблон.
@@ -878,31 +990,34 @@ mod tests {
         }
     }
 
+    /// Типизированные константы метрик — то, что порождает макрос схемы.
+    const TEMP: dduroc_engine::metric::Metric<f32> =
+        dduroc_engine::metric::Metric::new(MetricId(1));
+
     /// Наполнить хранилище и закрыть его.
     fn populate(root: &Path) {
-        let cfg = StoreConfig::new(root).with_budget(16 * 1024 * 1024);
-        let store = Store::open(cfg.clone()).unwrap();
+        let store = Store::open(StoreConfig::new(root).with_budget(16 * 1024 * 1024)).unwrap();
         for inst in 0..2 {
             let ns = store
-                .namespace(&format!("orc-radio-{inst}"), schema(), &cfg)
+                .namespace(&format!("orc-radio-{inst}"), schema())
                 .unwrap();
             for i in 0..20u8 {
-                ns.log_raw(EventId(1), &[i], None).unwrap();
+                ns.log_raw(EventId(1), &[i], None);
             }
-            ns.log_raw(EventId(2), &[0xFF], None).unwrap();
+            ns.log_raw(EventId(2), &[0xFF], None);
 
-            let temp = ns.series(MetricId(1)).unwrap();
+            let temp = ns.series(TEMP).unwrap();
             for i in 0..10 {
-                temp.sample_f32(20.0 + i as f32).unwrap();
+                temp.sample(20.0 + i as f32);
             }
             {
-                let cal = ns.span(SpanKindId(1)).unwrap();
-                cal.log_raw(EventId(1), &[99]).unwrap();
+                let cal = ns.span(SpanKindId(1));
+                cal.log_raw(EventId(1), &[99]);
             }
             ns.sync().unwrap();
         }
-        let ns = store.namespace("apt-modem-0", schema(), &cfg).unwrap();
-        ns.log_raw(EventId(1), &[1], None).unwrap();
+        let ns = store.namespace("apt-modem-0", schema()).unwrap();
+        ns.log_raw(EventId(1), &[1], None);
         ns.sync().unwrap();
         store.shutdown();
     }
@@ -1091,18 +1206,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
         let store = Store::open(cfg.clone()).unwrap();
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         // Переход в Lock — единственный отсчёт состояния, рано.
-        let link = ns.series(MetricId(2)).unwrap();
-        link.sample(dduroc_engine::staged::OwnedValue::U64(1))
-            .unwrap();
+        let link = ns.series_untyped(MetricId(2)).unwrap();
+        link.sample_raw(dduroc_engine::staged::OwnedValue::U64(1));
         let after_state = ns.now();
 
         // Дальше идёт только температура: окно будет без состояний.
-        let temp = ns.series(MetricId(1)).unwrap();
+        let temp = ns.series(TEMP).unwrap();
         for i in 0..20 {
-            temp.sample_f32(20.0 + i as f32).unwrap();
+            temp.sample(20.0 + i as f32);
         }
         ns.sync().unwrap();
         store.shutdown();
@@ -1191,10 +1305,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
         let store = Store::open(cfg.clone()).unwrap();
-        let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
-        let temp = ns.series(MetricId(1)).unwrap();
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
+        let temp = ns.series(TEMP).unwrap();
         for i in 0..10 {
-            temp.sample_f32(20.0 + i as f32).unwrap();
+            temp.sample(20.0 + i as f32);
         }
         ns.sync().unwrap(); // данные на диске, но сегмент не запечатан
 
@@ -1426,8 +1540,8 @@ mod tests {
         {
             let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
             let store = Store::open(cfg.clone()).unwrap();
-            let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
-            ns.log_raw(EventId(1), &[1], None).unwrap();
+            let ns = store.namespace("orc-radio-0", schema()).unwrap();
+            ns.log_raw(EventId(1), &[1], None);
             ns.sync().unwrap();
             store
                 .record_sync(
@@ -1459,7 +1573,7 @@ mod tests {
         {
             let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
             let store = Store::open(cfg.clone()).unwrap();
-            let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+            let ns = store.namespace("orc-radio-0", schema()).unwrap();
             store
                 .record_sync(
                     DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
@@ -1467,7 +1581,7 @@ mod tests {
                 )
                 .unwrap();
             for i in 0..40u8 {
-                ns.log_raw(EventId(1), &[i], None).unwrap();
+                ns.log_raw(EventId(1), &[i], None);
             }
             ns.sync().unwrap();
             store.shutdown();
@@ -1547,6 +1661,62 @@ mod tests {
             .unwrap();
         assert!(!r.entries.is_empty());
         assert!(r.unanchored.is_empty());
+    }
+
+    #[test]
+    fn stream_reads_without_collecting_everything() {
+        // Ради этого поток и существует: ответ на запрос без `limit` по
+        // большому хранилищу в память не поместился бы, а прервать обход
+        // посередине `query` не позволяет.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let q = Query::new().order(Order::Oldest);
+
+        // Первые пять записей — и обход прекращён, остальные сегменты даже не
+        // дочитаны.
+        let head: Vec<Entry> = reader.stream(&q).unwrap().take(5).collect();
+        assert_eq!(head.len(), 5);
+
+        // Поток и собранный ответ обязаны совпадать запись в запись: иначе
+        // «то же самое, но лениво» было бы неправдой.
+        let whole: Vec<Entry> = reader.stream(&q).unwrap().collect();
+        let collected = reader.query(&q).unwrap();
+        assert_eq!(whole, collected.entries);
+        assert_eq!(&whole[..5], &head[..]);
+
+        // Лимит и признак обрезки работают и в потоке.
+        let mut limited = reader.stream(&q.clone().limit(3)).unwrap();
+        assert_eq!(limited.by_ref().count(), 3);
+        assert!(limited.truncated());
+        assert_eq!(limited.yielded(), 3);
+    }
+
+    #[test]
+    fn render_finds_the_schema_by_the_entry_itself() {
+        // Схему больше не надо искать вызывающему: передать чужую значило бы
+        // разобрать payload декодером другого события — текст вышел бы
+        // правдоподобным и неверным.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let r = reader
+            .query(&Query::new().order(Order::Oldest).kinds(KindFilter::LOGS))
+            .unwrap();
+
+        let msg = r
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, EntryKind::Message { .. }))
+            .unwrap();
+        assert_eq!(reader.render(msg, "ru").as_deref(), Some("мощность задана"));
+        assert_eq!(reader.render(msg, "en").as_deref(), Some("power set"));
+        // Неизвестный язык — первый объявленный, а не отказ.
+        assert_eq!(reader.render(msg, "de").as_deref(), Some("power set"));
+
+        // Читателю без схем рендерить нечем, и выдумывать он не станет.
+        let blind = Reader::open(dir.path(), &[]).unwrap();
+        assert_eq!(blind.render(msg, "ru"), None);
     }
 
     #[test]

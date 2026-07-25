@@ -35,4 +35,6 @@ pub use error::{ReadError, Result};
 pub use query::{
     Bounds, Filter, KindFilter, NsSelect, Order, Query, Resolution, RunBounds, Timestamp,
 };
-pub use reader::{Entry, EntryKind, NamespaceInfo, QueryResult, Reader, render as reader_render};
+pub use reader::{
+    Entry, EntryKind, EntryStream, NamespaceInfo, QueryResult, Reader, render as reader_render,
+};
