@@ -24,6 +24,9 @@ thiserror = "2.0"
 rustix = { version = "1.1", features = ["fs", "time", "process"] }
 crossbeam-channel = "0.5"
 smallvec = { version = "1", features = ["union"] }
+# Настенное время — только UTC: часовые пояса прибору не нужны, а `clock`
+# притащил бы базу зон (iana-time-zone). `now` даёт `Utc::now()` без неё.
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 
 # ── serde / payload ───────────────────────────────────────────────────────────
 serde = { version = "1.0", features = ["derive"] }

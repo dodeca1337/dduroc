@@ -8,7 +8,7 @@
 //! Абсолютное время появляется только при чтении и только если для этого
 //! hardware-boot'а был зафиксирован UTC-якорь (см. [`crate::epochs`]).
 
-use dduroc_format::Micros;
+use dduroc_format::{BootCounter, BootTime, Micros};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,6 +32,8 @@ pub struct Clock {
 
 #[derive(Debug)]
 struct ClockInner {
+    /// Запуск, в шкале которого идёт отсчёт.
+    boot: BootCounter,
     /// `CLOCK_BOOTTIME` на момент регистрации run'а.
     base_us: u64,
     last: AtomicU64,
@@ -39,17 +41,18 @@ struct ClockInner {
 
 impl Clock {
     /// Часы, отсчитывающие от текущего момента.
-    pub fn start() -> Self {
-        Self::with_base(boottime_us())
+    pub fn start(boot: BootCounter) -> Self {
+        Self::with_base(boot, boottime_us())
     }
 
     /// Часы с явной базой — используется при регистрации run'а, чтобы база
     /// часов и `boottime_at_init_us` в `epochs.bin` были **одним и тем же**
     /// значением. В прототипе они брались независимыми вызовами, и конверсия
     /// в UTC уезжала на разницу между ними.
-    pub fn with_base(base_us: u64) -> Self {
+    pub fn with_base(boot: BootCounter, base_us: u64) -> Self {
         Self {
             inner: Arc::new(ClockInner {
+                boot,
                 base_us,
                 last: AtomicU64::new(0),
             }),
@@ -61,10 +64,24 @@ impl Clock {
         self.inner.base_us
     }
 
-    /// Текущая метка времени.
+    /// Запуск, которому принадлежат выдаваемые метки.
+    pub fn boot(&self) -> BootCounter {
+        self.inner.boot
+    }
+
+    /// Текущее время от старта запуска.
+    ///
+    /// Записи хранят именно эту величину: запуск у них имплицитен из заголовка
+    /// сегмента, и повторять его в каждой записи незачем.
     pub fn now(&self) -> Micros {
         let raw = boottime_us().saturating_sub(self.inner.base_us);
         Micros(self.inner.last.fetch_max(raw, Ordering::Relaxed).max(raw))
+    }
+
+    /// Текущий момент целиком — в тех же координатах, в каких приходят записи
+    /// из читателя.
+    pub fn now_at(&self) -> BootTime {
+        BootTime::new(self.inner.boot, self.now())
     }
 }
 
@@ -82,7 +99,7 @@ mod tests {
 
     #[test]
     fn starts_near_zero_and_advances() {
-        let clock = Clock::start();
+        let clock = Clock::start(BootCounter(7));
         let t0 = clock.now();
         assert!(t0.0 < 1_000_000, "старт отсчёта близок к нулю: {t0}");
 
@@ -92,11 +109,16 @@ mod tests {
             spin += 1;
         }
         assert!(clock.now().0 >= t0.0);
+
+        // Полный момент несёт запуск: без него метка не сравнима с чужой.
+        let at = clock.now_at();
+        assert_eq!(at.boot, BootCounter(7));
+        assert!(at.at >= t0);
     }
 
     #[test]
     fn never_goes_backwards_across_threads() {
-        let clock = Clock::with_base(boottime_us());
+        let clock = Clock::with_base(BootCounter(3), boottime_us());
         let mut handles = Vec::new();
         for _ in 0..4 {
             let c = clock.clone();
@@ -119,7 +141,7 @@ mod tests {
     fn base_in_future_clamps_to_zero() {
         // База «из будущего» (например, epochs.bin с чужой машины) не должна
         // приводить к переполнению — только к нулевому времени.
-        let clock = Clock::with_base(boottime_us() + 60_000_000);
+        let clock = Clock::with_base(BootCounter(0), boottime_us() + 60_000_000);
         assert_eq!(clock.now(), Micros(0));
     }
 }

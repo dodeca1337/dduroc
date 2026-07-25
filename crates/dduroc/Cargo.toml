@@ -8,6 +8,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono.workspace = true
 dduroc-engine.workspace = true
 dduroc-format.workspace = true
 dduroc-macros.workspace = true

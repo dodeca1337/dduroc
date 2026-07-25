@@ -10,6 +10,8 @@ use crate::schema::{Schema, StorageClass};
 use crate::staged::{DropCounters, NsId};
 use crate::stats::{Counters, Stats};
 use crate::writer::{NsSetup, QueueSizes, Writer};
+use chrono::{DateTime, Utc};
+use dduroc_format::BootTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
@@ -131,7 +133,10 @@ impl Store {
         // BOOTTIME: расхождение между ними уехало бы в конверсию в UTC.
         let base_us = boottime_us();
         let epochs = EpochStore::open_and_register(&config.root, base_us)?;
-        let clock = Clock::with_base(base_us);
+        let clock = Clock::with_base(
+            dduroc_format::BootCounter(epochs.current_run().boot_counter),
+            base_us,
+        );
 
         let counters = Arc::new(Counters::default());
         let writer = Writer::spawn(Arc::clone(&counters), config.queues)?;
@@ -277,21 +282,24 @@ impl Store {
     ///
     /// Возвращает `false`, если источник менее достоверен, чем уже
     /// записанный якорь (ручной ввод не перебивает GPS).
-    pub fn record_sync(&self, utc_ms: i64, source: SyncSource) -> Result<bool> {
+    pub fn record_sync(&self, utc: DateTime<Utc>, source: SyncSource) -> Result<bool> {
         // Заведомо невозможное время не должно портить всю историю: якорь
         // ретроактивен, и один вызов с мусором исказил бы UTC у всех событий
         // этой загрузки.
-        if !is_plausible_utc_ms(utc_ms) {
+        if !is_plausible_utc(utc) {
             return Ok(false);
         }
-        self.locked_epochs().record_sync(utc_ms, source)
+        self.locked_epochs().record_sync(utc, source)
     }
 
-    /// Перевести относительное время в UTC (мс). `None` — нет якоря.
-    pub fn to_utc_ms(&self, boot_counter: u32, micros: u64) -> Option<i64> {
-        self.locked_epochs()
-            .epochs()
-            .to_utc_ms(boot_counter, micros)
+    /// Перевести относительное время в настенное. `None` — нет якоря.
+    pub fn to_utc(&self, at: BootTime) -> Option<DateTime<Utc>> {
+        self.locked_epochs().epochs().to_utc(at)
+    }
+
+    /// Текущий момент в тех же координатах, что и у записей.
+    pub fn now(&self) -> BootTime {
+        self.clock.now_at()
     }
 
     /// Текущий `boot_counter`.
@@ -375,10 +383,10 @@ impl Drop for Store {
 ///
 /// Ниже границы лежат нули и мусор от неинициализированных часов, выше —
 /// переполнения и заведомо испорченные значения.
-fn is_plausible_utc_ms(ms: i64) -> bool {
-    const MIN: i64 = 1_000_000_000_000;
-    const MAX: i64 = 4_102_444_800_000;
-    (MIN..MAX).contains(&ms)
+fn is_plausible_utc(utc: DateTime<Utc>) -> bool {
+    const MIN_MS: i64 = 1_000_000_000_000;
+    const MAX_MS: i64 = 4_102_444_800_000;
+    (MIN_MS..MAX_MS).contains(&utc.timestamp_millis())
 }
 
 /// Взять эксклюзивную блокировку корня хранилища.
@@ -504,6 +512,11 @@ pub(crate) fn next_span_id(counter: &AtomicU32) -> dduroc_format::SpanId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Момент времени из миллисекунд эпохи.
+    fn utc_ms(ms: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(ms).expect("миллисекунды в пределах эпохи")
+    }
 
     #[test]
     fn store_id_is_stable_across_reopen() {
@@ -651,22 +664,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(StoreConfig::new(dir.path())).unwrap();
 
-        assert!(!s.record_sync(0, SyncSource::Gps).unwrap(), "нулевое время");
         assert!(
-            !s.record_sync(-1, SyncSource::Gps).unwrap(),
+            !s.record_sync(DateTime::UNIX_EPOCH, SyncSource::Gps)
+                .unwrap(),
+            "нулевое время"
+        );
+        assert!(
+            !s.record_sync(utc_ms(-1), SyncSource::Gps).unwrap(),
             "отрицательное время"
         );
         assert!(
-            !s.record_sync(i64::MAX, SyncSource::Gps).unwrap(),
+            !s.record_sync(DateTime::<Utc>::MAX_UTC, SyncSource::Gps)
+                .unwrap(),
             "время за пределами разумного"
         );
         assert!(
-            s.record_sync(1_700_000_000_000, SyncSource::Ntp).unwrap(),
+            s.record_sync(utc_ms(1_700_000_000_000), SyncSource::Ntp)
+                .unwrap(),
             "правдоподобное время принимается"
         );
         // Менее достоверный источник не перебивает.
-        assert!(!s.record_sync(1_800_000_000_000, SyncSource::User).unwrap());
-        assert!(s.record_sync(1_800_000_000_000, SyncSource::Gps).unwrap());
+        assert!(
+            !s.record_sync(utc_ms(1_800_000_000_000), SyncSource::User)
+                .unwrap()
+        );
+        assert!(
+            s.record_sync(utc_ms(1_800_000_000_000), SyncSource::Gps)
+                .unwrap()
+        );
+
+        // Конверсия туда и обратно: запись текущего момента получает UTC.
+        let at = s.now();
+        let utc = s.to_utc(at).expect("якорь есть");
+        assert!(
+            (1_800_000_000_000..1_800_000_001_000).contains(&utc.timestamp_millis()),
+            "UTC рядом с точкой синхронизации: {utc}"
+        );
     }
 
     #[test]
@@ -682,9 +715,9 @@ mod tests {
 
     #[test]
     fn plausible_range() {
-        assert!(!is_plausible_utc_ms(0));
-        assert!(!is_plausible_utc_ms(999_999_999_999));
-        assert!(is_plausible_utc_ms(1_700_000_000_000));
-        assert!(!is_plausible_utc_ms(4_102_444_800_000));
+        assert!(!is_plausible_utc(utc_ms(0)));
+        assert!(!is_plausible_utc(utc_ms(999_999_999_999)));
+        assert!(is_plausible_utc(utc_ms(1_700_000_000_000)));
+        assert!(!is_plausible_utc(utc_ms(4_102_444_800_000)));
     }
 }

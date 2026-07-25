@@ -97,6 +97,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -230,6 +239,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 name = "dduroc"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "criterion",
  "dduroc-engine",
  "dduroc-format",
@@ -245,6 +255,7 @@ dependencies = [
 name = "dduroc-engine"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossbeam-channel",
  "dduroc-format",
  "postcard",
@@ -279,6 +290,7 @@ dependencies = [
 name = "dduroc-read"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dduroc-engine",
  "dduroc-format",
  "postcard",

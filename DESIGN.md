@@ -288,9 +288,12 @@ Durability per канал:
 
 ## Наследуется из прототипа (проверенные решения)
 
-- Модель времени: `(boot_counter, µs от старта run)`, источник CLOCK_BOOTTIME;
-  идентичность HW-boot через `/proc/sys/kernel/random/boot_id`; ретроактивный
-  UTC-якорь per hw-boot. **Якорь обновляемый, с приоритетом источников**:
+- Модель времени: `BootTime` = `(boot_counter, µs от старта run)` **одним
+  типом** (порознь эти числа моментом не являются: `Micros` разных запусков
+  несравнимы), источник CLOCK_BOOTTIME; идентичность HW-boot через
+  `/proc/sys/kernel/random/boot_id`; ретроактивный
+  UTC-якорь per hw-boot. Настенное время наружу — `chrono::DateTime<Utc>`.
+  **Якорь обновляемый, с приоритетом источников**:
   User/Manual < NTP < GPS. Новая синхронизация перезаписывает якорь, только
   если её приоритет ≥ текущего (GPS поверх ручного — да, ручное поверх GPS —
   нет; свежий GPS уточняет старый GPS). Конверсия выполняется при чтении,
@@ -397,14 +400,26 @@ ns.log_in(&sub, radio::events::PowerSet { dbm: 30.0 });    // привязка �
 Чтение (тот же API на устройстве и в вьюере):
 
 ```rust
-let reader = store.reader(); // или Reader::open_dir(path, &[radio::SCHEMA, ...])
-let it = reader.query(Query {
-    namespaces: NsSelect::Group("orc"),        // или Glob("orc-radio-*")
-    channels: All, time: last_hours(2),
-    filter: Filter::default().levels(Warn..).tags(["rf"]),
-    order: Newest,
-})?; // merged-итератор: Message | SpanStart/End | Sample
+let reader = Reader::open(path, &[radio::SCHEMA])?;
+let result = reader.query(
+    &Query::new()
+        .group("orc-")                       // все экземпляры оркестратора
+        .since(Utc::now() - TimeDelta::hours(2))  // или .since(BootTime)
+        .min_level(Level::Warn)
+        .order(Order::Newest)
+        .limit(500),
+)?;
+// result.entries       — слитый по времени поток Message | Span | Sample | Text
+// result.damaged       — что не прочиталось; пусто → ответ полон
+// result.unanchored    — запуски, выпавшие из настенного окна: якоря нет
 ```
+
+Границы окна — один тип, `Timestamp`: либо `BootTime` (запуск + µs от его
+старта), либо `DateTime<Utc>`. Настенная граница переводится в шкалу каждого
+запуска по его якорю **до** сканирования; запуск без якоря сопоставить с
+настенными часами нечем, он выпадает из выборки и называется в
+`result.unanchored` — молчание выглядело бы как «прибор в эти часы ничего не
+писал».
 
 GraphQL — тонкая обёртка над `dduroc-read`: queries `logs / spans /
 series / namespaces / storageStats`, cursor-пагинация (base64 позиции),

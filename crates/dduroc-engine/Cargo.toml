@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 dduroc-format.workspace = true
+chrono.workspace = true
 crossbeam-channel.workspace = true
 postcard.workspace = true
 rustix.workspace = true

@@ -6,8 +6,10 @@
 //! события, время дельтой от соседней записи и бинарные поля. Уровни,
 //! шаблоны текста, тэги и имена живут в схеме прошивки и подставляются при
 //! чтении. Времени по абсолютным часам у оборудования нет, поэтому метка —
-//! это `(номер запуска, микросекунды от старта)`, а UTC появляется задним
-//! числом, когда приходит синхронизация.
+//! это [`BootTime`] (запуск плюс микросекунды от его старта), а настенное
+//! время появляется задним числом, когда приходит синхронизация: якорь
+//! ретроактивен, и одна синхронизация даёт UTC всем записям этой загрузки,
+//! включая сделанные до неё.
 //!
 //! ```no_run
 //! dduroc::schema! {
@@ -87,6 +89,9 @@
 //!     let cal = ns.span(radio::spans::Calibration)?;
 //!     cal.log(radio::events::PowerSet { dbm: 30.0 })?;
 //! } // конец спана записывается здесь
+//!
+//! // Пришёл GPS: якорь ретроактивен, UTC получают и записи выше.
+//! store.record_sync(Utc::now(), SyncSource::Gps)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -101,6 +106,10 @@ extern crate self as dduroc;
 
 /// Объявить схему неймспейса.
 pub use dduroc_macros::schema;
+
+/// Настенное время — [`chrono`], чтобы не заводить свой тип даты и не
+/// заставлять пользователя добавлять зависимость ради одного вызова.
+pub use chrono;
 
 // Реэкспорты для кода, генерируемого макросом: пользователю не нужно
 // добавлять serde и postcard в свои зависимости.
@@ -126,15 +135,20 @@ pub use dduroc_engine::store::{Store, StoreConfig};
 pub use dduroc_engine::writer::QueueSizes;
 pub use dduroc_engine::{Clock, Error, Result};
 pub use dduroc_format::{
-    EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId, ValueType,
+    BootCounter, BootTime, EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId,
+    ValueType,
 };
 
 /// Всё, что нужно для записи: типы и трейты одной строкой.
 pub mod prelude {
     pub use crate::{
-        Event, Level, MetricLimits, MetricState, NamespaceExt, OwnedValue, Severity, SpanExt,
-        Store, StoreConfig, SyncSource, Thresholds,
+        BootTime, Event, Level, MetricLimits, MetricState, NamespaceExt, OwnedValue, Severity,
+        SpanExt, Store, StoreConfig, SyncSource, Thresholds,
     };
+    /// Настенное время нужно ровно для [`crate::Store::record_sync`], но нужно
+    /// почти всегда: без синхронизации у записей есть только относительное
+    /// время.
+    pub use chrono::{DateTime, Utc};
 }
 
 /// Тип события, объявленный макросом [`schema!`].

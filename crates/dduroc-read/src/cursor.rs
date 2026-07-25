@@ -11,9 +11,10 @@
 //! исходов для диагностики.
 
 use crate::error::{ReadError, Result};
+use crate::query::{Bounds, Fit};
 use dduroc_engine::segment::{SegmentReader, parse_block};
 use dduroc_format::segment::SegmentName;
-use dduroc_format::{Micros, Record};
+use dduroc_format::{BootCounter, BootTime, Micros, Record};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -25,11 +26,13 @@ use std::sync::Arc;
 /// не восстановить идентичность сэмплов.
 pub type Prefilter = Arc<dyn Fn(&Record<'_>) -> bool + Send + Sync>;
 
-/// Одна прочитанная запись с восстановленным абсолютным временем.
+/// Одна прочитанная запись.
+///
+/// Время — целиком: микросекунды пришли из записи, запуск — из заголовка
+/// сегмента, и порознь они не сравнимы.
 #[derive(Debug, Clone)]
 pub struct RawEntry {
-    pub at: Micros,
-    pub boot: u32,
+    pub at: BootTime,
     pub record: OwnedRecord,
 }
 
@@ -232,8 +235,8 @@ impl SegmentCursor {
         })
     }
 
-    pub fn boot(&self) -> u32 {
-        self.reader.header().boot.0
+    pub fn boot(&self) -> BootCounter {
+        self.reader.header().boot
     }
 
     pub fn protocol_version(&self) -> u16 {
@@ -340,7 +343,7 @@ impl SegmentCursor {
                 }
             };
 
-            let boot = self.reader.header().boot.0;
+            let boot = self.reader.header().boot;
             self.buffered.clear();
             self.pos = 0;
             let mut broken = None;
@@ -358,8 +361,7 @@ impl SegmentCursor {
                             continue;
                         }
                         self.buffered.push(RawEntry {
-                            at,
-                            boot,
+                            at: BootTime::new(boot, at),
                             record: own(&record),
                         });
                     }
@@ -395,11 +397,13 @@ pub struct ChannelCursor {
     next: usize,
     current: Option<SegmentCursor>,
     reverse: bool,
-    from: Option<Micros>,
+    bounds: Bounds,
     expect_store: Option<u64>,
     prefilter: Option<Prefilter>,
     require_metrics: Option<Arc<std::collections::HashSet<dduroc_format::MetricId>>>,
     damaged: Vec<Damage>,
+    /// Запуски, чьи сегменты пришлось пропустить: окно настенное, якоря нет.
+    unanchored: Vec<BootCounter>,
     /// Неймспейс и канал — для маркировки выдаваемых записей.
     ///
     /// `Arc<str>`, а не `String`: имя копируется в каждую выдаваемую запись,
@@ -411,9 +415,10 @@ pub struct ChannelCursor {
 /// Параметры открытия канала.
 #[derive(Clone, Default)]
 pub struct ChannelScope {
-    pub from: Option<Micros>,
-    pub to: Option<Micros>,
-    pub boot: Option<u32>,
+    /// Окно, уже приведённое к относительной шкале запусков: настенные
+    /// границы переводить по якорям — дело запроса, а не курсора.
+    pub bounds: Bounds,
+    pub boot: Option<BootCounter>,
     pub reverse: bool,
     pub expect_store: Option<u64>,
     pub prefilter: Option<Prefilter>,
@@ -427,7 +432,11 @@ pub struct ChannelScope {
     pub require_metrics: Option<Arc<std::collections::HashSet<dduroc_format::MetricId>>>,
 }
 
-/// Отобрать сегменты, которые могут содержать записи из диапазона.
+/// Отобрать сегменты, которые могут содержать записи из окна.
+///
+/// Границы берутся отдельно на каждый запуск: сравнивать микросекунды разных
+/// запусков нельзя, а запуск, которого в окне нет вовсе, отбрасывается целиком
+/// — без открытия его файлов.
 ///
 /// Имя сегмента несёт время его **первой** записи, поэтому верхняя граница
 /// отсекается точно: сегмент, начавшийся позже `to`, не нужен заведомо.
@@ -444,23 +453,35 @@ pub struct ChannelScope {
 /// выборки, которая её включает.
 fn select_segments(
     all: &[SegmentName],
-    from: Option<Micros>,
-    to: Option<Micros>,
-    boot: Option<u32>,
+    bounds: &Bounds,
+    boot: Option<BootCounter>,
+    unanchored: &mut Vec<BootCounter>,
 ) -> Vec<SegmentName> {
     let mut segments = Vec::new();
     for (i, name) in all.iter().enumerate() {
         if let Some(b) = boot
-            && name.boot.0 != b
+            && name.boot != b
         {
             continue;
         }
-        if let Some(to) = to
+        let run = match bounds.fit(name.boot) {
+            Fit::In(run) => run,
+            Fit::Outside => continue,
+            // Данные есть, но приложить их к настенному окну нечем. Молчание
+            // здесь выглядело бы как «в эти часы прибор ничего не писал».
+            Fit::Unanchored => {
+                if !unanchored.contains(&name.boot) {
+                    unanchored.push(name.boot);
+                }
+                continue;
+            }
+        };
+        if let Some(to) = run.to
             && name.base > to
         {
             continue;
         }
-        if let Some(from) = from
+        if let Some(from) = run.from
             && let Some(next) = all.get(i + 1)
             && next.base < from
             && next.boot == name.boot
@@ -480,17 +501,12 @@ impl ChannelCursor {
         channel: Arc<str>,
         scope: &ChannelScope,
     ) -> Result<Self> {
-        let (from, to, boot, reverse, expect_store) = (
-            scope.from,
-            scope.to,
-            scope.boot,
-            scope.reverse,
-            scope.expect_store,
-        );
+        let (boot, reverse, expect_store) = (scope.boot, scope.reverse, scope.expect_store);
         let inventory = dduroc_engine::rotation::Inventory::scan(dir).map_err(ReadError::Engine)?;
         let all: Vec<SegmentName> = inventory.iter().map(|e| e.name).collect();
 
-        let mut segments = select_segments(&all, from, to, boot);
+        let mut unanchored = Vec::new();
+        let mut segments = select_segments(&all, &scope.bounds, boot, &mut unanchored);
         if reverse {
             segments.reverse();
         }
@@ -507,11 +523,12 @@ impl ChannelCursor {
             next: 0,
             current: None,
             reverse,
-            from,
+            bounds: scope.bounds.clone(),
             expect_store,
             prefilter: scope.prefilter.clone(),
             require_metrics: scope.require_metrics.clone(),
             damaged: Vec::new(),
+            unanchored,
             namespace,
             channel,
         })
@@ -519,6 +536,12 @@ impl ChannelCursor {
 
     pub fn damaged(&self) -> &[Damage] {
         &self.damaged
+    }
+
+    /// Запуски, чьи сегменты лежат в этом канале, но в выборку не попали:
+    /// окно задано настенным временем, а якоря у них нет.
+    pub fn unanchored(&self) -> &[BootCounter] {
+        &self.unanchored
     }
 
     pub fn peek(&mut self) -> Option<&RawEntry> {
@@ -583,7 +606,9 @@ impl ChannelCursor {
                     {
                         continue;
                     }
-                    if let Some(from) = self.from {
+                    // Нижняя граница — в шкале того запуска, которому
+                    // принадлежит сегмент.
+                    if let Some(from) = self.bounds.for_boot(c.boot()).and_then(|b| b.from) {
                         c.seek_from(from);
                     }
                     self.current = Some(c);
@@ -607,8 +632,7 @@ impl ChannelCursor {
 impl std::fmt::Debug for ChannelScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelScope")
-            .field("from", &self.from)
-            .field("to", &self.to)
+            .field("bounds", &self.bounds)
             .field("boot", &self.boot)
             .field("reverse", &self.reverse)
             .field("expect_store", &self.expect_store)
@@ -644,7 +668,8 @@ impl std::fmt::Debug for ChannelCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dduroc_format::BootCounter;
+    use crate::query::Query;
+    use dduroc_engine::epochs::Epochs;
 
     fn seg(boot: u32, base: u64) -> SegmentName {
         SegmentName::new(BootCounter(boot), Micros(base))
@@ -652,6 +677,19 @@ mod tests {
 
     fn bases(v: &[SegmentName]) -> Vec<u64> {
         v.iter().map(|n| n.base.0).collect()
+    }
+
+    /// Отбор без интереса к выпавшим запускам — их проверяет отдельный тест.
+    fn select(all: &[SegmentName], bounds: &Bounds, boot: Option<BootCounter>) -> Vec<SegmentName> {
+        select_segments(all, bounds, boot, &mut Vec::new())
+    }
+
+    /// Границы одного запуска — так, как их построит запрос.
+    fn within(boot: u32, from: Option<u64>, to: Option<u64>) -> Bounds {
+        let mut q = Query::new();
+        q.from = from.map(|m| BootTime::from_raw(boot, m).into());
+        q.to = to.map(|m| BootTime::from_raw(boot, m).into());
+        q.resolve(&Epochs::default()).bounds
     }
 
     #[test]
@@ -664,24 +702,24 @@ mod tests {
         // во всплеске два соседних события получают одну микросекунду.
         // Отбросить первый сегмент значило бы потерять эту запись.
         assert_eq!(
-            bases(&select_segments(&all, Some(Micros(100)), None, None)),
+            bases(&select(&all, &within(0, Some(100), None), None)),
             vec![0, 100, 200],
             "сегмент, чья последняя запись может лежать ровно на границе, нужен"
         );
 
         // from строго внутри второго: первый заведомо весь позади.
         assert_eq!(
-            bases(&select_segments(&all, Some(Micros(101)), None, None)),
+            bases(&select(&all, &within(0, Some(101), None), None)),
             vec![100, 200]
         );
         assert_eq!(
-            bases(&select_segments(&all, Some(Micros(250)), None, None)),
+            bases(&select(&all, &within(0, Some(250), None), None)),
             vec![200]
         );
         // Позже всех данных: последний сегмент всё равно проверяется — он
         // открыт и мог получить записи после составления инвентаря.
         assert_eq!(
-            bases(&select_segments(&all, Some(Micros(9_999)), None, None)),
+            bases(&select(&all, &within(0, Some(9_999), None), None)),
             vec![200]
         );
     }
@@ -692,43 +730,90 @@ mod tests {
         // Имя несёт время первой записи, поэтому сегмент, начавшийся позже
         // `to`, не нужен заведомо. Начавшийся ровно на `to` — нужен.
         assert_eq!(
-            bases(&select_segments(&all, None, Some(Micros(100)), None)),
+            bases(&select(&all, &within(0, None, Some(100)), None)),
             vec![0, 100]
         );
         assert_eq!(
-            bases(&select_segments(&all, None, Some(Micros(99)), None)),
+            bases(&select(&all, &within(0, None, Some(99)), None)),
             vec![0]
         );
-        assert!(select_segments(&all, None, Some(Micros(0)), None).len() == 1);
+        assert_eq!(select(&all, &within(0, None, Some(0)), None).len(), 1);
     }
 
     #[test]
-    fn boot_filter_and_run_boundary() {
-        // Нижняя граница не должна отбрасывать сегмент через границу запуска:
-        // время у разных run'ов своё, и «следующий начался раньше» там
-        // ничего не означает.
+    fn bounds_of_one_run_do_not_touch_another() {
+        // Время у разных запусков своё, поэтому «следующий начался раньше»
+        // через границу запуска ничего не означает.
         let all = [seg(0, 500), seg(1, 10), seg(1, 900)];
         assert_eq!(
-            bases(&select_segments(&all, Some(Micros(400)), None, None)),
+            bases(&select(&all, &within(0, Some(400), None), None)),
             vec![500, 10, 900],
-            "сегмент run'а 0 не отбрасывается по времени run'а 1"
+            "сегмент запуска 0 не отбрасывается по времени запуска 1"
         );
 
+        // А вот граница в шкале запуска 1 отбрасывает запуск 0 целиком: он
+        // весь позади. Раньше это было невыразимо — микросекунды без запуска
+        // прикладывались к каждой шкале.
         assert_eq!(
-            bases(&select_segments(&all, None, None, Some(1))),
+            bases(&select(&all, &within(1, Some(400), None), None)),
             vec![10, 900]
         );
-        assert!(select_segments(&all, None, None, Some(7)).is_empty());
+        assert_eq!(
+            bases(&select(&all, &within(0, None, Some(600)), None)),
+            vec![500],
+            "верхняя граница запуска 0 отсекает весь запуск 1"
+        );
+        // Та же граница ниже старта единственного сегмента запуска 0 не
+        // оставляет ничего: 500 > 400, а запуск 1 весь позже.
+        assert!(select(&all, &within(0, None, Some(400)), None).is_empty());
+    }
+
+    #[test]
+    fn boot_filter_selects_one_run() {
+        let all = [seg(0, 500), seg(1, 10), seg(1, 900)];
+        assert_eq!(
+            bases(&select(&all, &Bounds::All, Some(BootCounter(1)))),
+            vec![10, 900]
+        );
+        assert!(select(&all, &Bounds::All, Some(BootCounter(7))).is_empty());
+    }
+
+    #[test]
+    fn segments_of_unanchored_runs_are_named_not_just_skipped() {
+        // Настенное окно и пустой реестр эпох — дамп скопировали без
+        // `epochs.bin`. Сегменты на диске есть, но приложить их к настенным
+        // часам нечем; перечислить такие запуски можно только по каталогу.
+        let all = [seg(0, 100), seg(0, 900), seg(3, 50)];
+        let utc = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let bounds = Query::new().since(utc).resolve(&Epochs::default()).bounds;
+
+        let mut unanchored = Vec::new();
+        let picked = select_segments(&all, &bounds, None, &mut unanchored);
+        assert!(picked.is_empty(), "сопоставить нечем");
+        assert_eq!(
+            unanchored,
+            vec![BootCounter(0), BootCounter(3)],
+            "каждый запуск назван по разу"
+        );
+
+        // Относительное окно от эпох не зависит и ничего не теряет.
+        let mut unanchored = Vec::new();
+        let bounds = within(0, Some(0), None);
+        assert_eq!(
+            bases(&select_segments(&all, &bounds, None, &mut unanchored)),
+            vec![100, 900, 50]
+        );
+        assert!(unanchored.is_empty());
     }
 
     #[test]
     fn empty_and_single() {
-        assert!(select_segments(&[], Some(Micros(5)), Some(Micros(9)), None).is_empty());
+        assert!(select(&[], &within(0, Some(5), Some(9)), None).is_empty());
         let one = [seg(0, 100)];
         // Единственный сегмент не отбрасывается никогда: за ним ничего нет,
         // и его верхняя граница неизвестна без чтения.
         assert_eq!(
-            bases(&select_segments(&one, Some(Micros(u64::MAX)), None, None)),
+            bases(&select(&one, &within(0, Some(u64::MAX), None), None)),
             vec![100]
         );
     }

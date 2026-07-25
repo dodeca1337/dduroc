@@ -8,6 +8,14 @@
 //! Работает и на устройстве, и в офлайн-вьюере: там и там нужны каталог
 //! хранилища и схемы приложения, потому что расшифровать записи без схемы
 //! нельзя — на диске лежат только идентификаторы и бинарные поля.
+//!
+//! # Время
+//!
+//! У записи всегда есть относительное время ([`BootTime`] — запуск плюс
+//! микросекунды от его старта) и **иногда** настенное (`Entry::utc`): второе
+//! появляется только там, где для загрузки железа был зафиксирован якорь
+//! синхронизации. Границы запроса принимают любую из двух шкал —
+//! см. [`Timestamp`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -17,7 +25,14 @@ mod error;
 pub mod query;
 mod reader;
 
+/// Настенное время — [`chrono`]: свой тип даты заводить незачем, а
+/// пользователю не нужно добавлять зависимость ради границы запроса.
+pub use chrono;
+
 pub use cursor::{Damage, OwnedRecord, OwnedSampleValue, RawEntry};
+pub use dduroc_format::{BootCounter, BootTime, Micros};
 pub use error::{ReadError, Result};
-pub use query::{Filter, KindFilter, NsSelect, Order, Query};
+pub use query::{
+    Bounds, Filter, KindFilter, NsSelect, Order, Query, Resolution, RunBounds, Timestamp,
+};
 pub use reader::{Entry, EntryKind, NamespaceInfo, QueryResult, Reader, render as reader_render};

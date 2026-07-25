@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 dduroc-engine.workspace = true
 dduroc-format.workspace = true
+chrono.workspace = true
 thiserror.workspace = true
 postcard.workspace = true
 serde.workspace = true

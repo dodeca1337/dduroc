@@ -14,7 +14,9 @@ use crate::staged::{ChannelIdx, DropCounters, NsId, OwnedValue, Payload, Staged,
 use crate::store::next_span_id;
 use crate::writer::Writer;
 use crate::{Clock, schema};
-use dduroc_format::{EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId};
+use dduroc_format::{
+    BootTime, EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -177,8 +179,21 @@ impl Namespace {
         self.inner.schema.version
     }
 
-    /// Текущее время неймспейса.
-    pub fn now(&self) -> Micros {
+    /// Текущий момент — в тех же координатах, в каких его вернёт читатель.
+    ///
+    /// Именно момент, а не только микросекунды: сравнивать `Micros` разных
+    /// запусков между собой бессмысленно, и тип это запрещает.
+    pub fn now(&self) -> BootTime {
+        self.inner.clock.now_at()
+    }
+
+    /// Метка для записи: только микросекунды.
+    ///
+    /// Запуск в запись не идёт — он имплицитен из заголовка сегмента, и
+    /// повторять его в каждой записи значило бы платить четыре байта за то,
+    /// что и так известно из имени файла.
+    #[inline]
+    fn stamp(&self) -> Micros {
         self.inner.clock.now()
     }
 
@@ -229,7 +244,7 @@ impl Namespace {
         let item = Staged {
             ns: self.inner.id,
             channel: self.channel_of(desc.class)?,
-            at: self.now(),
+            at: self.stamp(),
             record: StagedRecord::Message {
                 event,
                 span,
@@ -260,7 +275,7 @@ impl Namespace {
         let item = Staged {
             ns: self.inner.id,
             channel: self.channel_of(class)?,
-            at: self.now(),
+            at: self.stamp(),
             record: StagedRecord::Text {
                 level,
                 span,
@@ -353,7 +368,7 @@ impl Namespace {
             Staged {
                 ns: self.inner.id,
                 channel,
-                at: self.now(),
+                at: self.stamp(),
                 record: StagedRecord::SpanStart { span, kind, parent },
             },
             critical,
@@ -434,7 +449,7 @@ impl Series {
         let item = Staged {
             ns: self.ns.inner.id,
             channel: self.channel,
-            at: self.ns.now(),
+            at: self.ns.stamp(),
             record: StagedRecord::Sample {
                 metric: self.metric,
                 value,
@@ -525,7 +540,7 @@ impl SpanGuard {
         let item = Staged {
             ns: self.ns.inner.id,
             channel: self.channel,
-            at: self.ns.now(),
+            at: self.ns.stamp(),
             record: StagedRecord::SpanEnd { span: self.span },
         };
         let writer = &self.ns.inner.writer;
@@ -958,7 +973,7 @@ mod tests {
 
         // Небольшая занятая пауза, чтобы время старта заведомо было > 0.
         let mut spin = 0u64;
-        while ns.now().0 < 1_000 && spin < 200_000_000 {
+        while ns.now().at.0 < 1_000 && spin < 200_000_000 {
             spin += 1;
         }
         let before = ns.now();
@@ -976,7 +991,7 @@ mod tests {
         let parsed = dduroc_format::segment::SegmentName::parse(&name).expect("имя разбирается");
 
         assert!(
-            parsed.base >= before && parsed.base <= after,
+            parsed.start() >= before && parsed.start() <= after,
             "имя сегмента {name} должно нести время первой записи ({before}..{after})"
         );
         assert_ne!(parsed.base.0, 0, "нулевая база — признак старой ошибки");

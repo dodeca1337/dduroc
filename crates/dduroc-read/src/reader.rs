@@ -2,11 +2,12 @@
 
 use crate::cursor::{ChannelCursor, Damage, OwnedRecord, OwnedSampleValue};
 use crate::error::{ReadError, Result};
-use crate::query::{Filter, KindFilter, Order, Query};
+use crate::query::{Bounds, Filter, KindFilter, Order, Query};
+use chrono::{DateTime, Utc};
 use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
 use dduroc_engine::schema::{MetricKind, Schema, Severity};
-use dduroc_format::{EventId, Level, MetricId, Micros, SpanId, Value};
+use dduroc_format::{BootCounter, BootTime, EventId, Level, MetricId, SpanId, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -93,11 +94,12 @@ pub enum EntryKind {
 pub struct Entry {
     pub namespace: std::sync::Arc<str>,
     pub channel: std::sync::Arc<str>,
-    /// Относительное время от старта запуска.
-    pub at: Micros,
-    pub boot: u32,
-    /// Абсолютное время, если для этой загрузки железа есть якорь.
-    pub utc_ms: Option<i64>,
+    /// Относительное время: запуск плюс микросекунды от его старта. Есть
+    /// всегда — прибору для этого не нужны ни RTC, ни синхронизация.
+    pub at: BootTime,
+    /// Настенное время. `None` — для загрузки железа нет якоря
+    /// синхронизации, и абсолютного времени у записи просто нет.
+    pub utc: Option<DateTime<Utc>>,
     /// Спан, к которому привязана запись.
     pub span: Option<SpanId>,
     pub kind: EntryKind,
@@ -129,6 +131,14 @@ pub struct QueryResult {
     pub damaged: Vec<Damage>,
     /// Ответ обрезан по `limit`.
     pub truncated: bool,
+    /// Запуски, чьи сегменты попали бы в выборку, но выпали: границы заданы
+    /// настенным временем, а якоря синхронизации у этих запусков нет —
+    /// сравнивать их записи с настенными часами нечем.
+    ///
+    /// Непустой список означает, что часть истории в ответ не попала, и **не
+    /// потому, что её нет**. Без этого поля такой ответ выглядел бы как «в
+    /// запрошенные часы прибор ничего не писал».
+    pub unanchored: Vec<BootCounter>,
 }
 
 impl QueryResult {
@@ -275,11 +285,18 @@ impl Reader {
 
     /// Выполнить запрос.
     pub fn query(&self, q: &Query) -> Result<QueryResult> {
+        // Границы приводятся к относительной шкале один раз: настенная
+        // граница требует якоря на каждый запуск, и делать это на запись
+        // значило бы линейный поиск по эпохам на каждую из сотен тысяч.
+        let resolution = q.resolve(&self.epochs);
         let OpenedCursors {
             mut cursors,
             schemas,
             damaged,
-        } = self.open_cursors(q)?;
+        } = self.open_cursors(q, &resolution.bounds)?;
+        // Выпавшие запуски собираются по сегментам, а не по реестру эпох:
+        // реестр перечислил бы и те, у которых в запрошенных каналах нет ни
+        // одного файла, — то есть пожаловался бы на данные, которых нет.
         let mut result = QueryResult {
             damaged,
             ..QueryResult::default()
@@ -287,35 +304,32 @@ impl Reader {
         let limit = q.limit.unwrap_or(usize::MAX);
 
         loop {
-            // Выбираем курсор с самой ранней (или поздней) записью.
-            let mut best: Option<(usize, Micros, u32)> = None;
+            // Выбираем курсор с самой ранней (или поздней) записью. Момент
+            // сравнивается целиком — пара (запуск, µs) упорядочена
+            // лексикографически, и это хронологический порядок.
+            let mut best: Option<(usize, BootTime)> = None;
             for (i, c) in cursors.iter_mut().enumerate() {
                 let Some(head) = c.peek() else { continue };
-                let key = (head.boot, head.at.0);
                 let better = match best {
                     None => true,
-                    Some((_, at, boot)) => match q.order {
-                        Order::Oldest => key < (boot, at.0),
-                        Order::Newest => key > (boot, at.0),
+                    Some((_, at)) => match q.order {
+                        Order::Oldest => head.at < at,
+                        Order::Newest => head.at > at,
                     },
                 };
                 if better {
-                    best = Some((i, head.at, head.boot));
+                    best = Some((i, head.at));
                 }
             }
-            let Some((idx, _, _)) = best else { break };
+            let Some((idx, _)) = best else { break };
 
             let Some(raw) = cursors[idx].next_entry() else {
                 continue;
             };
 
-            if !q.in_range(raw.at) {
-                // Записи вне диапазона пропускаются, но обход продолжается:
-                // сегмент мог начаться раньше `from`.
-                if q.order == Order::Oldest && q.to.is_some_and(|to| raw.at > to) {
-                    // Дальше по этому курсору будет только позже.
-                    continue;
-                }
+            // Записи вне окна пропускаются, но обход продолжается: сегмент мог
+            // начаться раньше нижней границы.
+            if !resolution.bounds.contains(raw.at) {
                 continue;
             }
 
@@ -337,10 +351,19 @@ impl Reader {
         // часть данных выпала из-за порчи, не должен выглядеть полным.
         for c in &cursors {
             result.damaged.extend_from_slice(c.damaged());
+            // Запуски, чьи сегменты на диске есть, а в реестре эпох нет: дамп
+            // могли скопировать без `epochs.bin`. По самим эпохам их не
+            // перечислить — только по каталогу.
+            for boot in c.unanchored() {
+                if !result.unanchored.contains(boot) {
+                    result.unanchored.push(*boot);
+                }
+            }
         }
+        result.unanchored.sort_unstable();
 
         if q.seed_states && q.from.is_some() {
-            result.seeds = self.collect_state_seeds(q, &mut result.damaged)?;
+            result.seeds = self.collect_state_seeds(q, &resolution.bounds, &mut result.damaged)?;
         }
         Ok(result)
     }
@@ -355,7 +378,12 @@ impl Reader {
     ///
     /// Сегменты, в которых нужных метрик нет вовсе, отбрасываются по множеству
     /// идентификаторов из footer'а, без чтения блоков.
-    fn collect_state_seeds(&self, q: &Query, damaged: &mut Vec<Damage>) -> Result<Vec<Entry>> {
+    fn collect_state_seeds(
+        &self,
+        q: &Query,
+        window: &Bounds,
+        damaged: &mut Vec<Damage>,
+    ) -> Result<Vec<Entry>> {
         let Some(from) = q.from else {
             return Ok(Vec::new());
         };
@@ -374,11 +402,11 @@ impl Reader {
         }
         let wanted = std::sync::Arc::new(wanted);
 
-        // Окно ищем строго ДО `from`, порядок — от свежих к старым, чтобы
-        // первым встреченным отсчётом ряда оказался последний по времени.
+        // Ищем строго ДО `from`, порядок — от свежих к старым, чтобы первым
+        // встреченным отсчётом ряда оказался последний по времени.
         let probe = Query {
             from: None,
-            to: Some(Micros(from.0.saturating_sub(1))),
+            to: Some(from.just_before()),
             order: Order::Newest,
             limit: None,
             seed_states: false,
@@ -388,12 +416,13 @@ impl Reader {
             },
             ..q.clone()
         };
+        let probe_bounds = probe.resolve(&self.epochs).bounds;
 
         let OpenedCursors {
             mut cursors,
             schemas,
             damaged: open_damaged,
-        } = self.open_cursors_with(&probe, |scope| {
+        } = self.open_cursors_with(&probe, &probe_bounds, |scope| {
             scope.max_segments = Some(SEED_SEGMENTS);
             scope.require_metrics = Some(std::sync::Arc::clone(&wanted));
         })?;
@@ -406,7 +435,11 @@ impl Reader {
 
         for (idx, cursor) in cursors.iter_mut().enumerate() {
             while let Some(raw) = cursor.next_entry() {
-                if raw.at >= from {
+                // Затравка обязана лежать строго ДО окна. Проверяется именно
+                // «не внутри окна», а не «раньше границы на микросекунду»:
+                // граница может быть настенной, а у запуска, начавшегося с
+                // нулевой микросекунды, вычитать не из чего.
+                if window.contains(raw.at) || !probe_bounds.contains(raw.at) {
                     continue;
                 }
                 let OwnedRecord::Sample { metric, .. } = &raw.record else {
@@ -430,7 +463,7 @@ impl Reader {
             damaged.extend_from_slice(c.damaged());
         }
 
-        out.sort_by_key(|e| (e.boot, e.at.0));
+        out.sort_by_key(|e| e.at);
         Ok(out)
     }
 
@@ -439,8 +472,8 @@ impl Reader {
     /// Резолв схемы читает `ns-meta` с диска. Делать это на каждую запись,
     /// как было поначалу, означало бы файловую операцию на запись — именно
     /// это и оказалось главным ограничителем скорости чтения.
-    fn open_cursors(&self, q: &Query) -> Result<OpenedCursors> {
-        self.open_cursors_with(q, |_| {})
+    fn open_cursors(&self, q: &Query, bounds: &Bounds) -> Result<OpenedCursors> {
+        self.open_cursors_with(q, bounds, |_| {})
     }
 
     /// То же с правкой параметров открытия — для поиска затравок, где нужны
@@ -448,6 +481,7 @@ impl Reader {
     fn open_cursors_with(
         &self,
         q: &Query,
+        bounds: &Bounds,
         adjust: impl Fn(&mut crate::cursor::ChannelScope),
     ) -> Result<OpenedCursors> {
         let mut cursors = Vec::new();
@@ -461,8 +495,7 @@ impl Reader {
             let schema = self.schemas.get(&ns.schema_name).copied();
             let ns_name: std::sync::Arc<str> = std::sync::Arc::from(ns.name.as_str());
             let mut scope = crate::cursor::ChannelScope {
-                from: q.from,
-                to: q.to,
+                bounds: bounds.clone(),
                 boot: q.boot,
                 reverse: q.order == Order::Newest,
                 expect_store: self.store_id,
@@ -657,8 +690,7 @@ impl Reader {
             namespace: ns,
             channel,
             at: raw.at,
-            boot: raw.boot,
-            utc_ms: self.epochs.to_utc_ms(raw.boot, raw.at.0),
+            utc: self.epochs.to_utc(raw.at),
             span,
             kind,
         })
@@ -758,7 +790,7 @@ mod tests {
     use crate::query::KindFilter;
     use dduroc_engine::schema::{EventDesc, Language, MetricDesc, SpanDesc, StorageClass};
     use dduroc_engine::store::{Store, StoreConfig};
-    use dduroc_format::{MetricId, ProtocolVersion, SpanKindId, ValueType};
+    use dduroc_format::{MetricId, Micros, ProtocolVersion, SpanKindId, ValueType};
 
     static LANGS: &[Language] = &[Language("en"), Language("ru")];
     static EVENTS: &[EventDesc] = &[
@@ -1078,7 +1110,7 @@ mod tests {
 
         let reader = Reader::open(dir.path(), &[schema()]).unwrap();
         let window = Query {
-            from: Some(Micros(after_state.0 + 1)),
+            from: Some(BootTime::new(after_state.boot, Micros(after_state.at.0 + 1)).into()),
             order: Order::Oldest,
             filter: crate::Filter {
                 kinds: KindFilter::TELEMETRY,
@@ -1141,7 +1173,7 @@ mod tests {
         let reader = Reader::open(dir.path(), &[schema()]).unwrap();
         let r = reader
             .query(&Query {
-                from: Some(Micros(0)),
+                from: Some(BootTime::from_raw(0, 0).into()),
                 seed_states: true,
                 order: Order::Oldest,
                 ..Query::new()
@@ -1206,7 +1238,7 @@ mod tests {
 
         let narrowed = reader
             .query(&Query {
-                from: Some(mid),
+                from: Some(mid.into()),
                 order: Order::Oldest,
                 filter: crate::Filter {
                     kinds: KindFilter::TELEMETRY,
@@ -1241,7 +1273,7 @@ mod tests {
         assert!(newest.truncated, "ответ обрезан по лимиту");
 
         // Время не возрастает.
-        let times: Vec<u64> = newest.entries.iter().map(|e| e.at.0).collect();
+        let times: Vec<BootTime> = newest.entries.iter().map(|e| e.at).collect();
         assert!(
             times.windows(2).all(|w| w[0] >= w[1]),
             "порядок от нового к старому: {times:?}"
@@ -1250,7 +1282,7 @@ mod tests {
         let oldest = reader
             .query(&Query::new().order(Order::Oldest).limit(5))
             .unwrap();
-        let times: Vec<u64> = oldest.entries.iter().map(|e| e.at.0).collect();
+        let times: Vec<BootTime> = oldest.entries.iter().map(|e| e.at).collect();
         assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
     }
 
@@ -1261,7 +1293,7 @@ mod tests {
         let reader = Reader::open(dir.path(), &[schema()]).unwrap();
 
         let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
-        let keys: Vec<(u32, u64)> = all.entries.iter().map(|e| (e.boot, e.at.0)).collect();
+        let keys: Vec<BootTime> = all.entries.iter().map(|e| e.at).collect();
         assert!(
             keys.windows(2).all(|w| w[0] <= w[1]),
             "слияние обязано давать глобальный порядок по времени"
@@ -1306,7 +1338,7 @@ mod tests {
 
         let narrowed = reader
             .query(&Query {
-                from: Some(mid),
+                from: Some(mid.into()),
                 order: Order::Oldest,
                 ..Query::new()
             })
@@ -1398,7 +1430,10 @@ mod tests {
             ns.log_raw(EventId(1), &[1], None).unwrap();
             ns.sync().unwrap();
             store
-                .record_sync(1_700_000_000_000, dduroc_engine::SyncSource::Gps)
+                .record_sync(
+                    DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                    dduroc_engine::SyncSource::Gps,
+                )
                 .unwrap();
             store.shutdown();
         }
@@ -1406,14 +1441,142 @@ mod tests {
         let reader = Reader::open(dir.path(), &[schema()]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         let entry = &result.entries[0];
+        let utc = entry
+            .utc
+            .expect("якорь ретроактивен: событие записано ДО синхронизации");
         assert!(
-            entry.utc_ms.is_some(),
-            "якорь ретроактивен: событие записано ДО синхронизации"
-        );
-        let utc = entry.utc_ms.unwrap();
-        assert!(
-            (1_699_999_000_000..1_700_001_000_000).contains(&utc),
+            (1_699_999_000_000..1_700_001_000_000).contains(&utc.timestamp_millis()),
             "UTC рядом с точкой синхронизации: {utc}"
         );
+    }
+
+    #[test]
+    fn wall_clock_window_selects_the_same_records_as_the_relative_one() {
+        // Синхронизированный прибор: одно и то же окно, заданное настенными
+        // часами и относительным временем, обязано дать одну выборку.
+        // Иначе граница «с 12:00» врала бы ровно на ошибку конверсии.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+            let store = Store::open(cfg.clone()).unwrap();
+            let ns = store.namespace("orc-radio-0", schema(), &cfg).unwrap();
+            store
+                .record_sync(
+                    DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                    dduroc_engine::SyncSource::Gps,
+                )
+                .unwrap();
+            for i in 0..40u8 {
+                ns.log_raw(EventId(1), &[i], None).unwrap();
+            }
+            ns.sync().unwrap();
+            store.shutdown();
+        }
+
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
+        assert_eq!(all.entries.len(), 40);
+        let mid = &all.entries[all.entries.len() / 2];
+        let mid_utc = mid.utc.expect("якорь есть");
+
+        let by_wall = reader
+            .query(&Query::new().order(Order::Oldest).since(mid_utc))
+            .unwrap();
+        let by_relative = reader
+            .query(&Query::new().order(Order::Oldest).since(mid.at))
+            .unwrap();
+
+        assert!(by_wall.unanchored.is_empty(), "запуск синхронизирован");
+        assert_eq!(
+            by_wall.entries, by_relative.entries,
+            "настенное и относительное окно обязаны дать одну выборку: \
+             конверсия по якорю точна до микросекунды"
+        );
+        assert!(by_wall.entries.iter().all(|e| e.at >= mid.at));
+        assert!(by_wall.entries.len() < all.entries.len());
+
+        // Верхняя граница — симметрично.
+        let until_wall = reader
+            .query(&Query::new().order(Order::Oldest).until(mid_utc))
+            .unwrap();
+        let until_relative = reader
+            .query(&Query::new().order(Order::Oldest).until(mid.at))
+            .unwrap();
+        assert_eq!(until_wall.entries, until_relative.entries);
+        assert!(until_wall.entries.iter().all(|e| e.at <= mid.at));
+        // Вместе половины покрывают всё; пересечение — записи ровно на
+        // границе, а их может быть больше одной: часы монотонны, но не строго
+        // возрастают, и во всплеске два события получают одну микросекунду.
+        let on_edge = all.entries.iter().filter(|e| e.at == mid.at).count();
+        assert_eq!(
+            until_wall.entries.len() + by_wall.entries.len(),
+            all.entries.len() + on_edge
+        );
+    }
+
+    #[test]
+    fn wall_clock_window_reports_runs_it_had_to_drop() {
+        // Прибор без синхронизации. Запрос по настенным часам не может
+        // сказать, попадают ли его записи в окно, — и обязан сообщить, что
+        // выборка неполна, а не показать пустоту.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let utc = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let r = reader
+            .query(&Query::new().order(Order::Oldest).since(utc))
+            .unwrap();
+
+        assert!(r.entries.is_empty(), "сопоставить нечем");
+        assert_eq!(
+            r.unanchored,
+            vec![BootCounter(0)],
+            "выпавший запуск обязан быть назван: молчание выглядело бы как \
+             «прибор ничего не писал»"
+        );
+
+        // Относительное окно работает и без синхронизации — оно ни от чего
+        // не зависит.
+        let r = reader
+            .query(
+                &Query::new()
+                    .order(Order::Oldest)
+                    .since(BootTime::from_raw(0, 0)),
+            )
+            .unwrap();
+        assert!(!r.entries.is_empty());
+        assert!(r.unanchored.is_empty());
+    }
+
+    #[test]
+    fn dump_without_epochs_file_still_names_its_runs() {
+        // Дамп скопировали без `epochs.bin` — так бывает, когда забирают
+        // только каталог. Записи на месте, но настенного времени у них нет ни
+        // у одной, а перечислить выпавшие запуски по эпохам невозможно:
+        // единственный источник — имена сегментов.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        std::fs::remove_file(dir.path().join(dduroc_engine::epochs::EPOCHS_FILE)).unwrap();
+
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let utc = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let r = reader
+            .query(&Query::new().order(Order::Oldest).since(utc))
+            .unwrap();
+
+        assert!(r.entries.is_empty());
+        assert_eq!(
+            r.unanchored,
+            vec![BootCounter(0)],
+            "без реестра эпох запуск известен только по имени сегмента"
+        );
+
+        // Без настенных границ дамп читается как обычно: относительное время
+        // лежит в самих файлах.
+        let r = reader.query(&Query::new().order(Order::Oldest)).unwrap();
+        assert!(!r.entries.is_empty());
+        assert!(r.entries.iter().all(|e| e.utc.is_none()));
+        assert!(r.unanchored.is_empty());
     }
 }

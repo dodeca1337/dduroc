@@ -21,6 +21,8 @@
 use crate::clock::boottime_us;
 use crate::error::{Error, IoContext, Result};
 use crate::fsutil;
+use chrono::{DateTime, Utc};
+use dduroc_format::{BootTime, Micros};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -67,10 +69,38 @@ pub struct HwBoot {
     pub kernel_boot_id: [u8; 16],
     /// UTC (мс), соответствующее `CLOCK_BOOTTIME == 0`. `None` — не было
     /// синхронизации: события этой загрузки имеют только относительное время.
+    ///
+    /// На диске — миллисекунды целым, а не разобранная дата: восемь байт
+    /// против двенадцати у сериализованного `DateTime`, и никакой зависимости
+    /// формата файла от представления даты в чужом крейте. Наружу отдаётся
+    /// нормальный тип — [`HwBoot::utc_anchor`].
     pub utc_anchor_ms: Option<i64>,
     pub anchor_source: Option<SyncSource>,
     /// `CLOCK_BOOTTIME` в момент фиксации якоря.
     pub anchor_captured_us: Option<u64>,
+}
+
+impl HwBoot {
+    /// Якорь как момент времени. `None` — синхронизации не было.
+    pub fn utc_anchor(&self) -> Option<DateTime<Utc>> {
+        DateTime::from_timestamp_millis(self.utc_anchor_ms?)
+    }
+}
+
+/// Куда настенный момент попадает в относительной шкале запуска.
+///
+/// Трёхзначность здесь по делу: «раньше старта» и «якоря нет» — разные вещи.
+/// Первое — обычное дело для нижней границы окна (весь запуск лежит внутри),
+/// второе означает, что сравнивать нечем, и запуск выпадает из выборки, о чём
+/// придётся сказать вызывающему.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOffset {
+    /// Момент раньше старта запуска — в его шкале не выражается.
+    BeforeStart,
+    /// Микросекунды от старта запуска.
+    At(Micros),
+    /// Запуск неизвестен или его загрузка не синхронизирована.
+    Unanchored,
 }
 
 /// Содержимое `epochs.bin`.
@@ -89,14 +119,54 @@ impl Epochs {
         self.hw_boots.iter().find(|b| b.hw_boot_id == id)
     }
 
-    /// Перевести время события в UTC (мс). `None` — для hardware boot'а этого
-    /// run'а нет якоря.
-    pub fn to_utc_ms(&self, boot_counter: u32, micros: u64) -> Option<i64> {
-        let run = self.run(boot_counter)?;
+    /// Перевести относительное время в настенное. `None` — для hardware
+    /// boot'а этого run'а нет якоря, и абсолютного времени у записи нет.
+    ///
+    /// Якорь хранится с точностью до миллисекунды, но смещение внутри run'а
+    /// прибавляется микросекундами: округлять относительное время до
+    /// миллисекунд незачем — его-то как раз измерили точно.
+    pub fn to_utc(&self, at: BootTime) -> Option<DateTime<Utc>> {
+        let run = self.run(at.boot.0)?;
         let hw = self.hw_boot(run.hw_boot_id)?;
-        let anchor = hw.utc_anchor_ms?;
-        let event_boottime_us = run.boottime_at_init_us.checked_add(micros)?;
-        anchor.checked_add((event_boottime_us / 1_000) as i64)
+        let anchor_ms = hw.utc_anchor_ms?;
+        let event_boottime_us = run.boottime_at_init_us.checked_add(at.at.0)?;
+        let total_us = i128::from(anchor_ms) * 1_000 + i128::from(event_boottime_us);
+        DateTime::from_timestamp_micros(i64::try_from(total_us).ok()?)
+    }
+
+    /// Обратный перевод: где настенный момент лежит в шкале данного запуска.
+    ///
+    /// Нужен запросу с границами по настенным часам: сравнивать записи с ним
+    /// напрямую нельзя — у каждого запуска своя шкала и свой якорь.
+    pub fn from_utc(&self, boot_counter: u32, utc: DateTime<Utc>) -> RunOffset {
+        let Some(run) = self.run(boot_counter) else {
+            return RunOffset::Unanchored;
+        };
+        let Some(anchor_ms) = self.hw_boot(run.hw_boot_id).and_then(|hw| hw.utc_anchor_ms) else {
+            return RunOffset::Unanchored;
+        };
+        let boottime_us = i128::from(utc.timestamp_micros()) - i128::from(anchor_ms) * 1_000;
+        let from_start = boottime_us - i128::from(run.boottime_at_init_us);
+        if from_start < 0 {
+            return RunOffset::BeforeStart;
+        }
+        // Насыщение вместо ошибки: 2^64 µs — это 584 тысячи лет, столько
+        // относительное время не набирает, а паниковать на арифметике границы
+        // запроса тем более не за что.
+        RunOffset::At(Micros(u64::try_from(from_start).unwrap_or(u64::MAX)))
+    }
+
+    /// Есть ли у запуска якорь: можно ли его записи сопоставить с настенными
+    /// часами вообще.
+    pub fn is_anchored(&self, boot_counter: u32) -> bool {
+        self.run(boot_counter)
+            .and_then(|r| self.hw_boot(r.hw_boot_id))
+            .is_some_and(|hw| hw.utc_anchor_ms.is_some())
+    }
+
+    /// Запуски в хронологическом порядке регистрации.
+    pub fn runs(&self) -> &[Run] {
+        &self.runs
     }
 
     /// Обновить якорь загрузки. Возвращает `true`, если якорь принят.
@@ -107,7 +177,7 @@ impl Epochs {
     pub fn set_anchor(
         &mut self,
         hw_boot_id: u32,
-        utc_ms: i64,
+        utc: DateTime<Utc>,
         source: SyncSource,
         now_boottime_us: u64,
     ) -> bool {
@@ -124,7 +194,10 @@ impl Epochs {
             return false;
         }
         // Якорь — это UTC момента, когда BOOTTIME был нулём.
-        hw.utc_anchor_ms = Some(utc_ms.saturating_sub((now_boottime_us / 1_000) as i64));
+        hw.utc_anchor_ms = Some(
+            utc.timestamp_millis()
+                .saturating_sub((now_boottime_us / 1_000) as i64),
+        );
         hw.anchor_source = Some(source);
         hw.anchor_captured_us = Some(now_boottime_us);
         true
@@ -268,10 +341,10 @@ impl EpochStore {
 
     /// Зафиксировать синхронизацию времени для текущей загрузки железа.
     /// Возвращает `false`, если источник менее достоверен, чем текущий якорь.
-    pub fn record_sync(&mut self, utc_ms: i64, source: SyncSource) -> Result<bool> {
-        let accepted =
-            self.epochs
-                .set_anchor(self.current.hw_boot_id, utc_ms, source, boottime_us());
+    pub fn record_sync(&mut self, utc: DateTime<Utc>, source: SyncSource) -> Result<bool> {
+        let accepted = self
+            .epochs
+            .set_anchor(self.current.hw_boot_id, utc, source, boottime_us());
         if accepted {
             self.persist()?;
         }
@@ -331,6 +404,11 @@ mod tests {
         EpochStore::open_and_register(dir, base_us).unwrap()
     }
 
+    /// Момент времени из миллисекунд эпохи — короче, чем разбирать дату.
+    fn utc(ms: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(ms).expect("миллисекунды в пределах эпохи")
+    }
+
     #[test]
     fn registers_runs_incrementally_within_one_hw_boot() {
         let dir = tempfile::tempdir().unwrap();
@@ -349,20 +427,80 @@ mod tests {
     fn anchor_is_retroactive_for_events_before_sync() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path(), 5_000_000); // run стартовал на 5-й секунде BOOTTIME
+        let at = BootTime::from_raw(0, 1_000_000); // BOOTTIME 6 с
 
-        // Событие на 1-й секунде после старта run'а = BOOTTIME 6 с.
-        assert_eq!(s.epochs().to_utc_ms(0, 1_000_000), None, "якоря ещё нет");
+        assert_eq!(s.epochs().to_utc(at), None, "якоря ещё нет");
 
         // Синхронизация: сейчас BOOTTIME ~T, UTC = 1_700_000_000_000.
         let now_boottime = boottime_us();
         assert!(
             s.epochs
-                .set_anchor(0, 1_700_000_000_000, SyncSource::Ntp, now_boottime)
+                .set_anchor(0, utc(1_700_000_000_000), SyncSource::Ntp, now_boottime)
         );
 
-        let utc = s.epochs().to_utc_ms(0, 1_000_000).expect("якорь есть");
+        let got = s.epochs().to_utc(at).expect("якорь есть");
         let expected = 1_700_000_000_000 - (now_boottime / 1_000) as i64 + 6_000;
-        assert_eq!(utc, expected, "событие ДО синхронизации получило UTC");
+        assert_eq!(
+            got.timestamp_millis(),
+            expected,
+            "событие ДО синхронизации получило UTC"
+        );
+
+        // Обратный перевод возвращает то же относительное время: округление
+        // якоря до миллисекунд не должно уводить границу запроса.
+        assert_eq!(
+            s.epochs().from_utc(0, got),
+            RunOffset::At(Micros(1_000_000))
+        );
+    }
+
+    #[test]
+    fn from_utc_distinguishes_before_start_from_no_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 5_000_000);
+
+        // Без якоря сравнивать нечем — и это не то же самое, что «раньше».
+        assert_eq!(
+            s.epochs().from_utc(0, utc(1_700_000_000_000)),
+            RunOffset::Unanchored
+        );
+
+        s.epochs
+            .set_anchor(0, utc(1_700_000_000_000), SyncSource::Gps, 5_000_000);
+        // Якорь = UTC при BOOTTIME 0, run стартовал на 5-й секунде.
+        let anchor = s.epochs().hw_boot(0).unwrap().utc_anchor().unwrap();
+        assert_eq!(
+            s.epochs().from_utc(0, anchor),
+            RunOffset::BeforeStart,
+            "момент нулевого BOOTTIME раньше старта run'а"
+        );
+        assert_eq!(
+            s.epochs()
+                .from_utc(0, anchor + chrono::TimeDelta::seconds(5)),
+            RunOffset::At(Micros(0)),
+            "ровно старт run'а"
+        );
+        assert_eq!(
+            s.epochs()
+                .from_utc(0, anchor + chrono::TimeDelta::seconds(7)),
+            RunOffset::At(Micros(2_000_000))
+        );
+        assert_eq!(
+            s.epochs().from_utc(42, utc(1_700_000_000_000)),
+            RunOffset::Unanchored
+        );
+    }
+
+    #[test]
+    fn anchored_runs_are_distinguishable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1_000);
+        assert!(!s.epochs().is_anchored(0));
+        assert!(!s.epochs().is_anchored(7), "неизвестный запуск");
+        s.record_sync(utc(1_700_000_000_000), SyncSource::Gps)
+            .unwrap();
+        assert!(s.epochs().is_anchored(0));
+        assert_eq!(s.epochs().runs().len(), 1);
     }
 
     #[test]
@@ -383,21 +521,21 @@ mod tests {
         };
 
         assert!(
-            e.set_anchor(0, 1_000_000, SyncSource::User, 0),
+            e.set_anchor(0, utc(1_000_000), SyncSource::User, 0),
             "первый якорь"
         );
         assert!(
-            e.set_anchor(0, 2_000_000, SyncSource::Gps, 0),
+            e.set_anchor(0, utc(2_000_000), SyncSource::Gps, 0),
             "GPS поверх ручного"
         );
         assert_eq!(e.hw_boots[0].utc_anchor_ms, Some(2_000_000));
 
         assert!(
-            !e.set_anchor(0, 3_000_000, SyncSource::User, 0),
+            !e.set_anchor(0, utc(3_000_000), SyncSource::User, 0),
             "ручное поверх GPS — нет"
         );
         assert!(
-            !e.set_anchor(0, 3_000_000, SyncSource::Ntp, 0),
+            !e.set_anchor(0, utc(3_000_000), SyncSource::Ntp, 0),
             "NTP поверх GPS — нет"
         );
         assert_eq!(
@@ -407,13 +545,14 @@ mod tests {
         );
 
         assert!(
-            e.set_anchor(0, 4_000_000, SyncSource::Gps, 0),
+            e.set_anchor(0, utc(4_000_000), SyncSource::Gps, 0),
             "свежий GPS уточняет старый"
         );
         assert_eq!(e.hw_boots[0].utc_anchor_ms, Some(4_000_000));
+        assert_eq!(e.hw_boots[0].utc_anchor(), Some(utc(4_000_000)));
 
         assert!(
-            !e.set_anchor(99, 1, SyncSource::Gps, 0),
+            !e.set_anchor(99, utc(1), SyncSource::Gps, 0),
             "неизвестная загрузка"
         );
     }
@@ -423,7 +562,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut s = store(dir.path(), 1_000);
-            s.record_sync(1_700_000_000_000, SyncSource::Gps).unwrap();
+            s.record_sync(utc(1_700_000_000_000), SyncSource::Gps)
+                .unwrap();
         }
         let s = store(dir.path(), 2_000);
         assert_eq!(s.current_run().boot_counter, 1);
@@ -431,7 +571,7 @@ mod tests {
         assert!(hw.utc_anchor_ms.is_some(), "якорь пережил перезапуск");
         assert_eq!(hw.anchor_source, Some(SyncSource::Gps));
         // Новый run наследует якорь своей загрузки железа.
-        assert!(s.epochs().to_utc_ms(1, 0).is_some());
+        assert!(s.epochs().to_utc(BootTime::from_raw(1, 0)).is_some());
     }
 
     #[test]
@@ -475,7 +615,8 @@ mod tests {
 
         // Целый файл читается как обычно.
         let mut s = store(dir.path(), 1_000);
-        s.record_sync(1_700_000_000_000, SyncSource::Gps).unwrap();
+        s.record_sync(utc(1_700_000_000_000), SyncSource::Gps)
+            .unwrap();
         let epochs = EpochStore::open_read_only(dir.path()).unwrap();
         assert_eq!(epochs.runs.len(), 1);
     }
@@ -526,6 +667,18 @@ mod tests {
     #[test]
     fn utc_conversion_handles_missing_data() {
         let e = Epochs::default();
-        assert_eq!(e.to_utc_ms(0, 0), None, "нет run'а");
+        assert_eq!(e.to_utc(BootTime::from_raw(0, 0)), None, "нет run'а");
+        assert_eq!(e.from_utc(0, utc(1_700_000_000_000)), RunOffset::Unanchored);
+    }
+
+    #[test]
+    fn absurd_relative_time_does_not_panic() {
+        // Битый сегмент может дать любое время. Конверсия обязана вернуть
+        // `None`, а не переполниться.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path(), 1_000);
+        s.record_sync(utc(1_700_000_000_000), SyncSource::Gps)
+            .unwrap();
+        assert_eq!(s.epochs().to_utc(BootTime::from_raw(0, u64::MAX)), None);
     }
 }

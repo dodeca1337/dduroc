@@ -1,7 +1,10 @@
 //! Идентификаторы и метки времени формата.
 //!
-//! Все — прозрачные newtype'ы над целыми: типизация ловит перепутанные
-//! аргументы, стоимость нулевая.
+//! Идентификаторы — прозрачные newtype'ы над целыми: типизация ловит
+//! перепутанные аргументы, стоимость нулевая. Метка времени — [`BootTime`],
+//! пара «запуск + микросекунды от его старта»: порознь эти числа моментом не
+//! являются, и держать их в одном типе дешевле, чем ловить сравнение
+//! микросекунд разных запусков в отладке.
 //!
 //! # Пространства
 //!
@@ -44,6 +47,13 @@ use core::fmt;
 #[repr(transparent)]
 pub struct BootCounter(pub u32);
 
+impl From<u32> for BootCounter {
+    #[inline]
+    fn from(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
 /// Микросекунды от старта текущего run'а (`CLOCK_BOOTTIME` минус базa).
 ///
 /// Полный u64: в отличие от прототипа, `boot_counter` больше не упакован
@@ -52,6 +62,53 @@ pub struct BootCounter(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct Micros(pub u64);
+
+/// Момент относительного времени: запуск ПО плюс микросекунды от его старта.
+///
+/// Метка времени прибора без RTC состоит **ровно из этих двух чисел**, и по
+/// отдельности ни одно из них моментом не является: `Micros(500)` из разных
+/// запусков — разные моменты, а сравнение их между собой бессмысленно.
+/// Поэтому они и лежат в одном типе, а не двумя полями рядом.
+///
+/// # Порядок
+///
+/// Порядок лексикографический — сначала `boot`, потом `at`, — и он совпадает
+/// с хронологическим: `boot_counter` растёт с каждым запуском ПО. Отсюда же
+/// порядок полей в объявлении: производный `Ord` берёт их сверху вниз, и
+/// перестановка полей молча превратила бы сравнение в мусор.
+///
+/// Тот же порядок даёт и имя файла сегмента (`<boot:08x>-<micros:016x>`),
+/// поэтому лексикографический обход каталога — это обход по времени.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct BootTime {
+    /// Запуск ПО, в шкале которого отсчитано `at`.
+    pub boot: BootCounter,
+    /// Микросекунды от старта этого запуска.
+    pub at: Micros,
+}
+
+impl BootTime {
+    #[inline]
+    pub const fn new(boot: BootCounter, at: Micros) -> Self {
+        Self { boot, at }
+    }
+
+    /// То же из голых чисел — для тестов и мест, где ширины уже проверены.
+    #[inline]
+    pub const fn from_raw(boot: u32, micros: u64) -> Self {
+        Self {
+            boot: BootCounter(boot),
+            at: Micros(micros),
+        }
+    }
+}
+
+impl fmt::Display for BootTime {
+    /// `#3 01:23:45.678_901` — запуск и время от его старта.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{} {}", self.boot.0, self.at)
+    }
+}
 
 /// Версия протокола схемы неймспейса. Монотонно растёт, миграции —
 /// цепочка шагов `vN → vN+1`.
@@ -173,6 +230,40 @@ mod tests {
         // Немонотонный вход (битые данные) не паникует.
         assert_eq!(Micros(4).saturating_delta(Micros(10)), 0);
         assert_eq!(Micros(u64::MAX).checked_add_delta(1), None);
+    }
+
+    #[test]
+    fn boot_time_orders_chronologically() {
+        // Лексикографический порядок пары = хронологический: boot_counter
+        // растёт с каждым запуском. Проверка держит порядок полей: поменяй их
+        // местами — и сравнение начнёт сравнивать микросекунды разных
+        // запусков между собой.
+        let mut v = [
+            BootTime::from_raw(1, 500),
+            BootTime::from_raw(0, 900),
+            BootTime::from_raw(1, 100),
+            BootTime::from_raw(0, 100),
+        ];
+        v.sort();
+        assert_eq!(
+            v,
+            [
+                BootTime::from_raw(0, 100),
+                BootTime::from_raw(0, 900),
+                BootTime::from_raw(1, 100),
+                BootTime::from_raw(1, 500),
+            ]
+        );
+        // Более позднее время раннего запуска остаётся раньше.
+        assert!(BootTime::from_raw(0, u64::MAX) < BootTime::from_raw(1, 0));
+    }
+
+    #[test]
+    fn boot_time_display() {
+        assert_eq!(
+            BootTime::from_raw(3, 3_723_456_789).to_string(),
+            "#3 01:02:03.456_789"
+        );
     }
 
     #[test]
