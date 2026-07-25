@@ -787,7 +787,7 @@ mod tests {
         dduroc_engine::schema::StateDesc {
             code: 0,
             name: "Los",
-            severity: Severity::Critical,
+            severity: Severity::Alarm,
         },
         dduroc_engine::schema::StateDesc {
             code: 1,
@@ -810,7 +810,7 @@ mod tests {
                     min: None,
                     max: Some(25.0),
                 },
-                critical: dduroc_engine::schema::Range {
+                alarm: dduroc_engine::schema::Range {
                     min: None,
                     max: Some(28.0),
                 },

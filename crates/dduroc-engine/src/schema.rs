@@ -110,12 +110,20 @@ impl EventDesc {
 /// Вычисляется при чтении по пределам, на диск не пишется: пределы —
 /// настраиваемое свойство установки, а не свойство измерения. Одна и та же
 /// температура нормальна для одного усилителя и аварийна для другого.
+///
+/// Слово `critical` здесь намеренно **не** используется: оно занято классом
+/// хранения ([`StorageClass::CRITICAL`] — устойчивость к потере питания). Это
+/// разные оси: класс хранения говорит, *как записать*, важность — *что
+/// значение означает*, а в объявлении метрики они стоят рядом. Пара
+/// `warn` → `alarm` привычна в промышленной телеметрии и не путается.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub enum Severity {
     #[default]
     Normal,
+    /// Величина вышла из нормы.
     Warn,
-    Critical,
+    /// Величина вышла за допустимое — авария.
+    Alarm,
 }
 
 impl Severity {
@@ -123,7 +131,7 @@ impl Severity {
         match self {
             Severity::Normal => "normal",
             Severity::Warn => "warn",
-            Severity::Critical => "critical",
+            Severity::Alarm => "alarm",
         }
     }
 
@@ -195,31 +203,31 @@ impl Range {
 /// Пределы числовой метрики: диапазоны, **вне** которых значение требует
 /// внимания.
 ///
-/// `critical` обязан включать `warn`: сначала величина выходит из нормы, потом
-/// из допустимого. Обратное означало бы, что значение критично, но не тревожно.
-/// Проверяется в [`Schema::validate`].
+/// `alarm` обязан включать `warn`: сначала величина выходит из нормы, потом
+/// из допустимого. Обратное означало бы, что значение аварийно, не будучи
+/// тревожным. Проверяется в [`Schema::validate`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Thresholds {
     /// Вне этого диапазона — [`Severity::Warn`].
     pub warn: Range,
-    /// Вне этого — [`Severity::Critical`].
-    pub critical: Range,
+    /// Вне этого — [`Severity::Alarm`].
+    pub alarm: Range,
 }
 
 impl Thresholds {
     pub const NONE: Self = Self {
         warn: Range::NONE,
-        critical: Range::NONE,
+        alarm: Range::NONE,
     };
 
     pub const fn is_unset(&self) -> bool {
-        self.warn.is_unset() && self.critical.is_unset()
+        self.warn.is_unset() && self.alarm.is_unset()
     }
 
     /// Важность числового значения. Более тяжёлый диагноз побеждает.
     pub fn severity_of(&self, v: f64) -> Severity {
-        if !self.critical.is_unset() && !self.critical.contains(v) {
-            return Severity::Critical;
+        if !self.alarm.is_unset() && !self.alarm.contains(v) {
+            return Severity::Alarm;
         }
         if !self.warn.is_unset() && !self.warn.contains(v) {
             return Severity::Warn;
@@ -583,7 +591,7 @@ impl Schema {
 
         for (r, what) in [
             (m.thresholds.warn, "тревожный"),
-            (m.thresholds.critical, "критический"),
+            (m.thresholds.alarm, "аварийный"),
         ] {
             if matches!((r.min, r.max), (Some(lo), Some(hi)) if lo > hi) {
                 let _ = what;
@@ -924,7 +932,7 @@ mod tests {
             StateDesc {
                 code: 0,
                 name: "Los",
-                severity: Severity::Critical,
+                severity: Severity::Alarm,
             },
             StateDesc {
                 code: 2,
@@ -1073,7 +1081,7 @@ mod tests {
             StateDesc {
                 code: 0,
                 name: "Unlocked",
-                severity: Severity::Critical,
+                severity: Severity::Alarm,
             },
             StateDesc {
                 code: 1,
@@ -1092,7 +1100,7 @@ mod tests {
         let d = with_metric(G).metric(MetricId(1)).unwrap();
         assert_eq!(
             d.severity_of(&dduroc_format::Value::Bool(false)),
-            Severity::Critical
+            Severity::Alarm
         );
         assert_eq!(
             d.severity_of(&dduroc_format::Value::Bool(true)),
@@ -1109,7 +1117,7 @@ mod tests {
             &[],
             Thresholds {
                 warn: range(Some(10.0), Some(1.0)),
-                critical: Range::NONE,
+                alarm: Range::NONE,
             },
         )];
         assert!(matches!(
@@ -1124,7 +1132,7 @@ mod tests {
             &[],
             Thresholds {
                 warn: range(None, Some(80.0)),
-                critical: range(None, Some(50.0)),
+                alarm: range(None, Some(50.0)),
             },
         )];
         assert!(matches!(
@@ -1140,7 +1148,7 @@ mod tests {
             &[],
             Thresholds {
                 warn: range(None, Some(f64::NAN)),
-                critical: Range::NONE,
+                alarm: Range::NONE,
             },
         )];
         assert!(matches!(
@@ -1160,7 +1168,7 @@ mod tests {
             STATES,
             Thresholds {
                 warn: range(Some(0.0), Some(1.0)),
-                critical: Range::NONE,
+                alarm: Range::NONE,
             },
         )];
         assert!(matches!(
@@ -1175,7 +1183,7 @@ mod tests {
             &[],
             Thresholds {
                 warn: range(None, Some(70.0)),
-                critical: range(Some(-273.15), None),
+                alarm: range(Some(-273.15), None),
             },
         )];
         with_metric(OPEN).validate().expect("открытые границы");

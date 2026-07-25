@@ -81,10 +81,10 @@ struct MetricDef {
     states: Vec<StateDef>,
     /// Диапазоны допустимых значений: вне них — соответствующая важность.
     warn: Option<syn::ExprRange>,
-    critical: Option<syn::ExprRange>,
+    alarm: Option<syn::ExprRange>,
 }
 
-/// Одно состояние метрики-перечисления: `Los = 0: critical`.
+/// Одно состояние метрики-перечисления: `Los = 0: alarm`.
 #[derive(Clone)]
 struct StateDef {
     name: Ident,
@@ -307,7 +307,7 @@ fn parse_event(input: ParseStream, languages: &[Ident]) -> syn::Result<EventDef>
     })
 }
 
-/// Разобрать список состояний: `[Los = 0: critical, Sync = 1: warn, Lock = 2]`.
+/// Разобрать список состояний: `[Los = 0: alarm, Sync = 1: warn, Lock = 2]`.
 ///
 /// Коды **обязательно** явные: позиционная нумерация сдвинулась бы при вставке
 /// состояния в середину списка, и уже записанные сегменты стали бы читаться
@@ -360,7 +360,7 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     let mut kind = None;
     let mut states = Vec::new();
     let mut warn = None;
-    let mut critical = None;
+    let mut alarm = None;
 
     while !content.is_empty() {
         let key: Ident = content.parse()?;
@@ -373,13 +373,23 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
             "kind" => kind = Some(content.parse::<Ident>()?),
             "states" => states = parse_states(&content)?,
             "warn" => warn = Some(content.parse::<syn::ExprRange>()?),
-            "critical" => critical = Some(content.parse::<syn::ExprRange>()?),
+            "alarm" => alarm = Some(content.parse::<syn::ExprRange>()?),
+            // Подсказка вместо «неизвестный ключ»: пара warn/critical —
+            // естественная догадка, а слово занято классом хранения.
+            "critical" => {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "аварийный диапазон называется `alarm`, а не `critical`: \
+                     слово `critical` занято классом хранения (`store: critical`), \
+                     и в одном объявлении метрики они означали бы разное",
+                ));
+            }
             other => {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
                         "у метрики неизвестный ключ `{other}`: ожидались vtype, unit, \
-                         tags, store, kind, states, warn, critical"
+                         tags, store, kind, states, warn, alarm"
                     ),
                 ));
             }
@@ -412,7 +422,7 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         kind,
         states,
         warn,
-        critical,
+        alarm,
     })
 }
 
@@ -504,11 +514,21 @@ fn severity_path(severity: Option<&Ident>) -> syn::Result<TokenStream2> {
     Ok(match s.to_string().as_str() {
         "normal" => quote!(::dduroc::Severity::Normal),
         "warn" => quote!(::dduroc::Severity::Warn),
-        "critical" => quote!(::dduroc::Severity::Critical),
+        "alarm" => quote!(::dduroc::Severity::Alarm),
+        // `critical` занято классом хранения: `store: critical` и
+        // `Los = 0: critical` в одном объявлении означали бы совсем разное.
+        "critical" => {
+            return Err(syn::Error::new(
+                s.span(),
+                "важность `critical` переименована в `alarm`: слово `critical` \
+                 занято классом хранения (`store: critical`), и в одном \
+                 объявлении метрики они означали бы разное",
+            ));
+        }
         other => {
             return Err(syn::Error::new(
                 s.span(),
-                format!("неизвестная важность `{other}`: ожидались normal/warn/critical"),
+                format!("неизвестная важность `{other}`: ожидались normal/warn/alarm"),
             ));
         }
     })
@@ -794,7 +814,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         let tags: Vec<String> = m.tags.iter().map(|t| t.to_string()).collect();
         let kind = metric_kind_path(m.kind.as_ref(), !m.states.is_empty())?;
         let warn = range_tokens(m.warn.as_ref())?;
-        let critical = range_tokens(m.critical.as_ref())?;
+        let alarm = range_tokens(m.alarm.as_ref())?;
 
         metric_consts.push(quote! {
             pub const #name: ::dduroc::MetricId = ::dduroc::MetricId(#id);
@@ -878,7 +898,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 tags: &[#(#tags),*],
                 kind: #kind,
                 states: #states_ref,
-                thresholds: ::dduroc::Thresholds { warn: #warn, critical: #critical },
+                thresholds: ::dduroc::Thresholds { warn: #warn, alarm: #alarm },
             }
         });
     }
@@ -989,7 +1009,7 @@ fn clone_metric(m: &MetricDef) -> MetricDef {
         kind: m.kind.clone(),
         states: m.states.clone(),
         warn: m.warn.clone(),
-        critical: m.critical.clone(),
+        alarm: m.alarm.clone(),
     }
 }
 

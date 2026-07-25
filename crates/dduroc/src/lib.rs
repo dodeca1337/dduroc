@@ -34,10 +34,10 @@
 //!
 //!     metrics {
 //!         // Непрерывная величина с пределами: вне `warn` — тревога,
-//!         // вне `critical` — авария. Верхняя граница включительная,
+//!         // вне `alarm` — авария. Верхняя граница включительная,
 //!         // поэтому `..=`.
 //!         TempPa = 0x01 { vtype: f32, unit: "°C", tags: [thermal],
-//!                         warn: ..=70.0, critical: ..=85.0 },
+//!                         warn: ..=70.0, alarm: ..=85.0 },
 //!         // Второй датчик — отдельная метрика, а не размерность первой:
 //!         // рантайм-тэгов нет, и различающий признак не занимает места
 //!         // в каждом отсчёте.
@@ -45,7 +45,7 @@
 //!         // Конечный автомат как временной ряд. Коды явные: позиционная
 //!         // нумерация сдвинулась бы при вставке состояния в середину.
 //!         LinkState = 0x03 {
-//!             states: [Los = 0: critical, Sync = 1: warn, Lock = 2],
+//!             states: [Los = 0: alarm, Sync = 1: warn, Lock = 2],
 //!             tags: [rf],
 //!         },
 //!     }
@@ -79,7 +79,7 @@
 //!     radio::metrics::TempPa,
 //!     Some(MetricLimits::numeric(Thresholds {
 //!         warn: dduroc::Range { min: None, max: Some(60.0) },
-//!         critical: dduroc::Range { min: None, max: Some(75.0) },
+//!         alarm: dduroc::Range { min: None, max: Some(75.0) },
 //!     })),
 //! )?;
 //!
@@ -228,15 +228,15 @@ mod tests {
 
         metrics {
             Temp = 0x01 { vtype: f32, unit: "°C", tags: [thermal],
-                          warn: ..=70.0, critical: ..=85.0 },
+                          warn: ..=70.0, alarm: ..=85.0 },
             Spectrum = 0x02 { vtype: blob, store: telemetry },
             LinkState = 0x03 {
-                states: [Los = 0: critical, Sync = 1: warn, Lock = 2],
+                states: [Los = 0: alarm, Sync = 1: warn, Lock = 2],
                 tags: [rf],
             },
             Locked = 0x04 {
                 vtype: bool,
-                states: [Unlocked = 0: critical, Locked = 1],
+                states: [Unlocked = 0: alarm, Locked = 1],
             },
         }
 
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(link.tags, &["rf"]);
         assert_eq!(link.states.len(), 3);
         assert_eq!(link.state(0).unwrap().name, "Los");
-        assert_eq!(link.state(0).unwrap().severity, Severity::Critical);
+        assert_eq!(link.state(0).unwrap().severity, Severity::Alarm);
         assert_eq!(link.state(1).unwrap().severity, Severity::Warn);
         assert_eq!(link.state(2).unwrap().severity, Severity::Normal);
 
@@ -414,13 +414,13 @@ mod tests {
         let locked = testing::SCHEMA.metric(MetricId(4)).unwrap();
         assert_eq!(locked.value_type, ValueType::Bool);
         assert_eq!(locked.kind, MetricKind::State);
-        assert_eq!(locked.state(0).unwrap().severity, Severity::Critical);
+        assert_eq!(locked.state(0).unwrap().severity, Severity::Alarm);
 
         // Пределы из диапазонов: верхняя граница включительная.
         let temp = testing::SCHEMA.metric(MetricId(1)).unwrap();
         assert_eq!(temp.thresholds.warn.max, Some(70.0));
         assert_eq!(temp.thresholds.warn.min, None);
-        assert_eq!(temp.thresholds.critical.max, Some(85.0));
+        assert_eq!(temp.thresholds.alarm.max, Some(85.0));
         assert_eq!(
             temp.severity_of(&dduroc_format::Value::F32(70.0)),
             Severity::Normal
@@ -431,7 +431,7 @@ mod tests {
         );
         assert_eq!(
             temp.severity_of(&dduroc_format::Value::F32(90.0)),
-            Severity::Critical
+            Severity::Alarm
         );
 
         // Метрика без пределов и без состояний.
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                ("Los", Severity::Critical),
+                ("Los", Severity::Alarm),
                 ("Sync", Severity::Warn),
                 ("Lock", Severity::Normal),
                 ("Locked", Severity::Normal),

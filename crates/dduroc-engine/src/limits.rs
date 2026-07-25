@@ -235,16 +235,16 @@ fn resolve(schema: &Schema, metric: MetricId) -> Result<(usize, &'static MetricD
         .ok_or(Error::UnknownMetric { id: metric.0 })
 }
 
-/// `critical` обязан включать `warn`: величина сначала выходит из нормы и
+/// `alarm` обязан включать `warn`: величина сначала выходит из нормы и
 /// только потом из допустимого.
 pub(crate) fn check_nesting(metric: &'static str, t: &Thresholds) -> Result<()> {
-    let bad_low = matches!((t.warn.min, t.critical.min), (Some(w), Some(c)) if c > w);
-    let bad_high = matches!((t.warn.max, t.critical.max), (Some(w), Some(c)) if c < w);
+    let bad_low = matches!((t.warn.min, t.alarm.min), (Some(w), Some(c)) if c > w);
+    let bad_high = matches!((t.warn.max, t.alarm.max), (Some(w), Some(c)) if c < w);
     if bad_low || bad_high {
         return Err(Error::BadLimits {
             metric,
-            reason: "критический диапазон обязан включать тревожный: иначе \
-                     значение оказалось бы критическим, не будучи тревожным",
+            reason: "аварийный диапазон обязан включать тревожный: иначе \
+                     значение оказалось бы аварийным, не будучи тревожным",
         });
     }
     Ok(())
@@ -262,7 +262,7 @@ mod tests {
         StateDesc {
             code: 0,
             name: "Los",
-            severity: Severity::Critical,
+            severity: Severity::Alarm,
         },
         StateDesc {
             code: 1,
@@ -291,7 +291,7 @@ mod tests {
                     min: Some(0.0),
                     max: Some(70.0),
                 },
-                critical: Range {
+                alarm: Range {
                     min: Some(-10.0),
                     max: Some(85.0),
                 },
@@ -335,11 +335,11 @@ mod tests {
         assert_eq!(sev(70.0), Severity::Normal);
         assert_eq!(sev(71.0), Severity::Warn);
         assert_eq!(sev(-5.0), Severity::Warn, "ниже нормы — тоже тревога");
-        assert_eq!(sev(90.0), Severity::Critical);
-        assert_eq!(sev(-50.0), Severity::Critical);
+        assert_eq!(sev(90.0), Severity::Alarm);
+        assert_eq!(sev(-50.0), Severity::Alarm);
         assert_eq!(
             sev(f32::NAN),
-            Severity::Critical,
+            Severity::Alarm,
             "неизвестное значение не может считаться нормальным"
         );
     }
@@ -348,7 +348,7 @@ mod tests {
     fn state_severity_comes_from_the_state_not_from_ranges() {
         let (s, r) = (schema(), registry());
         let sev = |code: u64| r.severity_of(&s, MetricId(2), &Value::U64(code));
-        assert_eq!(sev(0), Severity::Critical, "Los");
+        assert_eq!(sev(0), Severity::Alarm, "Los");
         assert_eq!(sev(1), Severity::Warn, "Sync");
         assert_eq!(sev(2), Severity::Normal, "Lock");
         assert_eq!(
@@ -370,7 +370,7 @@ mod tests {
                     min: None,
                     max: Some(40.0),
                 },
-                critical: Range {
+                alarm: Range {
                     min: None,
                     max: Some(50.0),
                 },
@@ -381,7 +381,7 @@ mod tests {
         let sev = |v: f32| r.severity_of(&s, MetricId(1), &Value::F32(v));
         assert_eq!(sev(36.6), Severity::Normal);
         assert_eq!(sev(45.0), Severity::Warn, "схема сказала бы Normal");
-        assert_eq!(sev(60.0), Severity::Critical);
+        assert_eq!(sev(60.0), Severity::Alarm);
 
         let eff = r.effective(&s, MetricId(1)).unwrap();
         assert!(eff.overridden);
@@ -411,7 +411,7 @@ mod tests {
         );
         assert_eq!(
             r.severity_of(&s, MetricId(2), &Value::U64(0)),
-            Severity::Critical,
+            Severity::Alarm,
             "непереопределённые состояния остаются схемными"
         );
 
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(eff.states.len(), 3);
         assert_eq!(eff.states[1].name, "Sync");
         assert_eq!(eff.states[1].severity, Severity::Normal);
-        assert_eq!(eff.states[0].severity, Severity::Critical);
+        assert_eq!(eff.states[0].severity, Severity::Alarm);
         assert_eq!(eff.kind, MetricKind::State);
     }
 
@@ -438,7 +438,7 @@ mod tests {
                         min: Some(0.0),
                         max: Some(1.0),
                     },
-                    critical: Range::NONE,
+                    alarm: Range::NONE,
                 })),
             )
             .unwrap_err();
@@ -472,7 +472,7 @@ mod tests {
                         min: None,
                         max: Some(80.0),
                     },
-                    critical: Range {
+                    alarm: Range {
                         min: None,
                         max: Some(50.0),
                     },

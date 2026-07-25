@@ -592,7 +592,7 @@ mod tests {
         crate::schema::StateDesc {
             code: 0,
             name: "Los",
-            severity: Severity::Critical,
+            severity: Severity::Alarm,
         },
         crate::schema::StateDesc {
             code: 1,
@@ -620,7 +620,7 @@ mod tests {
                     min: None,
                     max: Some(70.0),
                 },
-                critical: crate::schema::Range {
+                alarm: crate::schema::Range {
                     min: None,
                     max: Some(85.0),
                 },
@@ -1118,7 +1118,7 @@ mod tests {
         let sev = |v: f32| ns.severity_of(MetricId(1), &OwnedValue::F32(v));
         assert_eq!(sev(36.6), Severity::Normal);
         assert_eq!(sev(75.0), Severity::Warn);
-        assert_eq!(sev(90.0), Severity::Critical);
+        assert_eq!(sev(90.0), Severity::Alarm);
 
         // Внешняя система определила модель усилителя и сузила пределы.
         ns.set_limits(
@@ -1128,7 +1128,7 @@ mod tests {
                     min: None,
                     max: Some(40.0),
                 },
-                critical: crate::schema::Range {
+                alarm: crate::schema::Range {
                     min: None,
                     max: Some(50.0),
                 },
@@ -1146,10 +1146,10 @@ mod tests {
         assert_eq!(link.kind, MetricKind::State);
         assert_eq!(link.states.len(), 3);
         assert_eq!(link.states[0].name, "Los");
-        assert_eq!(link.states[0].severity, Severity::Critical);
+        assert_eq!(link.states[0].severity, Severity::Alarm);
         assert_eq!(
             ns.severity_of(MetricId(2), &OwnedValue::U64(0)),
-            Severity::Critical
+            Severity::Alarm
         );
 
         // Пределы не попадают в поток записей.
@@ -1178,7 +1178,7 @@ mod tests {
                     min: None,
                     max: Some(10.0),
                 },
-                critical: crate::schema::Range::NONE,
+                alarm: crate::schema::Range::NONE,
             })),
         )
         .unwrap();
