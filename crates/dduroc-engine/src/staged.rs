@@ -2,7 +2,7 @@
 //!
 //! Через очередь нельзя передать [`dduroc_format::Record`] — он заимствует
 //! байты. Поэтому запись «стажируется»: payload копируется в
-//! [`SmallVec`][smallvec::SmallVec] с inline-ёмкостью, которой хватает
+//! [`smallvec::SmallVec`] с inline-ёмкостью, которой хватает
 //! типичному событию, и обращения к куче на горячем пути нет.
 
 use dduroc_format::{
@@ -181,8 +181,15 @@ impl DropCounters {
     /// Отметить потерю в канале.
     #[inline]
     pub fn record(&self, channel: ChannelIdx) {
+        self.record_n(channel, 1);
+    }
+
+    /// Отметить сразу несколько потерь: блок теряется целиком, а объявить
+    /// одну запись вместо сотни значило бы соврать о размере дыры.
+    #[inline]
+    pub fn record_n(&self, channel: ChannelIdx, n: u64) {
         if let Some(c) = self.per_channel.get(channel.0 as usize) {
-            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

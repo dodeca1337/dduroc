@@ -128,28 +128,6 @@ fn own(record: &Record<'_>) -> OwnedRecord {
     }
 }
 
-/// Пройти незапечатанный сегмент по заголовкам блоков.
-///
-/// Тела не разбираются вовсе: идентичность ряда лежит в самом сэмпле, и
-/// восстанавливать её больше нечем и незачем. Раньше здесь был второй проход
-/// по всему сегменту — он собирал определения серий, которые при обратном
-/// обходе оказывались позади своих сэмплов.
-fn scan_offsets(reader: &SegmentReader) -> (Vec<u64>, Option<(u64, String)>) {
-    let mut offsets = Vec::new();
-    let mut buf = Vec::new();
-    let mut offset = SegmentReader::first_block_offset();
-    loop {
-        match reader.read_block_at(offset, &mut buf) {
-            Ok(Some(next)) => {
-                offsets.push(offset);
-                offset = next;
-            }
-            Ok(None) => return (offsets, None),
-            Err(e) => return (offsets, Some((offset, e.to_string()))),
-        }
-    }
-}
-
 /// Курсор по записям одного сегмента.
 pub struct SegmentCursor {
     reader: SegmentReader,
@@ -207,7 +185,9 @@ impl SegmentCursor {
         let mut offsets: Vec<u64> = match reader.footer() {
             Some(footer) => footer.blocks.iter().map(|b| b.offset).collect(),
             None => {
-                let (offsets, stopped) = scan_offsets(&reader);
+                // Скан заодно ловит разрыв нумерации блоков: тела разбирать
+                // для этого не нужно, номер лежит в заголовке.
+                let (offsets, stopped) = reader.scan_block_offsets();
                 if let Some((offset, reason)) = stopped {
                     damaged.push(Damage {
                         path: path.to_owned(),
@@ -502,8 +482,9 @@ impl ChannelCursor {
         scope: &ChannelScope,
     ) -> Result<Self> {
         let (boot, reverse, expect_store) = (scope.boot, scope.reverse, scope.expect_store);
-        let inventory = dduroc_engine::rotation::Inventory::scan(dir).map_err(ReadError::Engine)?;
-        let all: Vec<SegmentName> = inventory.iter().map(|e| e.name).collect();
+        // Только имена: размеры сегментов стоят `stat` на файл, а отбор по
+        // окну идёт по именам — время первой записи в них и лежит.
+        let all = dduroc_engine::rotation::Inventory::scan_names(dir).map_err(ReadError::Engine)?;
 
         let mut unanchored = Vec::new();
         let mut segments = select_segments(&all, &scope.bounds, boot, &mut unanchored);

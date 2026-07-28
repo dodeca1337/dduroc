@@ -111,12 +111,29 @@ pub struct Epochs {
 }
 
 impl Epochs {
+    /// Запуск по номеру.
+    ///
+    /// Поиск двоичный: `to_utc` вызывается на **каждую** запись ответа, а
+    /// запусков в файле накапливается тем больше, чем дольше живёт прибор
+    /// (двадцать перезапусков в сутки за пять лет — тридцать шесть тысяч).
+    /// Линейный обход означал бы тридцать шесть тысяч сравнений на строчку
+    /// журнала. Записи добавляются с возрастающим `boot_counter`, а уборка
+    /// порядок сохраняет; на файле, изменённом руками, есть честный откат.
     pub fn run(&self, boot_counter: u32) -> Option<&Run> {
-        self.runs.iter().find(|r| r.boot_counter == boot_counter)
+        match self
+            .runs
+            .binary_search_by_key(&boot_counter, |r| r.boot_counter)
+        {
+            Ok(i) => Some(&self.runs[i]),
+            Err(_) => self.runs.iter().find(|r| r.boot_counter == boot_counter),
+        }
     }
 
     pub fn hw_boot(&self, id: u32) -> Option<&HwBoot> {
-        self.hw_boots.iter().find(|b| b.hw_boot_id == id)
+        match self.hw_boots.binary_search_by_key(&id, |b| b.hw_boot_id) {
+            Ok(i) => Some(&self.hw_boots[i]),
+            Err(_) => self.hw_boots.iter().find(|b| b.hw_boot_id == id),
+        }
     }
 
     /// Перевести относительное время в настенное. `None` — для hardware

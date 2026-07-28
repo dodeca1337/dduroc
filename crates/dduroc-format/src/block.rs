@@ -417,11 +417,27 @@ impl<'a> Block<'a> {
         let body = input
             .get(BlockHeader::SIZE..body_end)
             .ok_or(Error::Truncated)?;
-        header.verify(body)?;
-        Ok(Some(Self {
+        // CRC считает `from_parts` — второй раз здесь считать нечего: он
+        // проходит по всему телу, а блоки читаются десятками тысяч.
+        Ok(Some(Self::from_parts(header, body)?))
+    }
+
+    /// Собрать блок из уже разобранного заголовка и тела **как оно лежит на
+    /// диске**.
+    ///
+    /// Для того, кто читает заголовок и тело по отдельности (восстановление
+    /// сегмента читает заголовок первым, чтобы отличить нулевой хвост от
+    /// данных, и только потом знает длину тела). CRC проверяется здесь же:
+    /// пропустить проверку значило бы отдать наружу непроверенные байты.
+    pub fn from_parts(header: BlockHeader, body_on_disk: &'a [u8]) -> Result<Self> {
+        if body_on_disk.len() != header.body_len as usize {
+            return Err(Error::Truncated);
+        }
+        header.verify(body_on_disk)?;
+        Ok(Self {
             header,
-            body: header.decompress(body)?,
-        }))
+            body: header.decompress(body_on_disk)?,
+        })
     }
 
     /// Тело в распакованном виде.

@@ -140,6 +140,22 @@ impl Record<'_> {
     }
 }
 
+/// Записать идентификатор спана, отвергнув зарезервированный ноль.
+///
+/// Ноль означает «спана нет» и допустимым [`SpanId`] не является. Проверяется
+/// на **кодировании**, а не только на разборе: декодер такой байт отвергает, и
+/// кодек не имеет права порождать то, чего сам же не прочитает. Молча
+/// пропустив ноль, писатель получил бы блок, теряемый читателем целиком на
+/// первой же такой записи, — не одна запись, а весь остаток тела.
+#[inline]
+fn write_span(out: &mut Vec<u8>, span: SpanId) -> Result<()> {
+    if span.0 == SpanId::NONE_RAW {
+        return Err(Error::ReservedNotZero);
+    }
+    varint::write_u64(out, u64::from(span.0));
+    Ok(())
+}
+
 /// Закодировать запись с дельтой `dt`. Возвращает число дописанных байт.
 pub fn encode(record: &Record<'_>, dt: u64, out: &mut Vec<u8>) -> Result<usize> {
     let start = out.len();
@@ -153,23 +169,40 @@ pub fn encode(record: &Record<'_>, dt: u64, out: &mut Vec<u8>) -> Result<usize> 
     out.push((record.kind() << 4) | flags);
     varint::write_u64(out, dt);
 
+    // Проверки живут внутри разбора, а не отдельным проходом перед ним:
+    // сэмпл — самая частая запись, и лишний разбор варианта на ней виден
+    // в замерах. Цена — откат буфера при отказе, но отказ здесь означает
+    // дефект вызывающего и случается ноль раз за жизнь процесса.
+    if let Err(e) = encode_body(record, out) {
+        out.truncate(start);
+        return Err(e);
+    }
+    Ok(out.len() - start)
+}
+
+fn encode_body(record: &Record<'_>, out: &mut Vec<u8>) -> Result<()> {
     match record {
         Record::Message(m) => {
             varint::write_u64(out, u64::from(m.event.0));
             if let Some(span) = m.span {
-                varint::write_u64(out, u64::from(span.0));
+                write_span(out, span)?;
             }
             varint::write_u64(out, m.payload.len() as u64);
             out.extend_from_slice(m.payload);
         }
         Record::SpanStart(s) => {
-            varint::write_u64(out, u64::from(s.span.0));
+            write_span(out, s.span)?;
             varint::write_u64(out, u64::from(s.kind.0));
-            varint::write_u64(out, u64::from(SpanId::raw_or_none(s.parent)));
+            // `None` у родителя кодируется нулём штатно; явный `Some(0)` —
+            // то же зарезервированное значение под другим именем.
+            match s.parent {
+                Some(parent) => write_span(out, parent)?,
+                None => {
+                    varint::write_u64(out, u64::from(SpanId::NONE_RAW));
+                }
+            }
         }
-        Record::SpanEnd { span } => {
-            varint::write_u64(out, u64::from(span.0));
-        }
+        Record::SpanEnd { span } => write_span(out, *span)?,
         Record::Sample(s) => {
             varint::write_u64(out, u64::from(s.metric.0));
             s.value.encode(out);
@@ -177,7 +210,7 @@ pub fn encode(record: &Record<'_>, dt: u64, out: &mut Vec<u8>) -> Result<usize> 
         Record::Text(t) => {
             out.push(t.level as u8);
             if let Some(span) = t.span {
-                varint::write_u64(out, u64::from(span.0));
+                write_span(out, span)?;
             }
             write_str(out, t.target);
             write_str(out, t.text);
@@ -187,8 +220,7 @@ pub fn encode(record: &Record<'_>, dt: u64, out: &mut Vec<u8>) -> Result<usize> 
             out.extend_from_slice(bytes);
         }
     }
-
-    Ok(out.len() - start)
+    Ok(())
 }
 
 /// Раскодировать одну запись из начала `input`.
@@ -599,6 +631,55 @@ mod tests {
         varint::write_u64(&mut buf, 0); // span = 0 — недопустимо
         varint::write_u64(&mut buf, 0); // payload_len
         assert_eq!(decode(&buf), Err(Error::ReservedNotZero));
+    }
+
+    #[test]
+    fn encoder_refuses_to_produce_what_it_cannot_read() {
+        // Кодек обязан быть симметричен: `SpanId(0)` — зарезервированное
+        // значение, декодер его отвергает. Пропустив ноль на записи, писатель
+        // положил бы в блок запись, на которой читатель останавливается, —
+        // и потерял бы весь остаток блока, а не одну запись.
+        let mut buf = Vec::new();
+        for rec in [
+            Record::Message(Message {
+                event: EventId(1),
+                span: Some(SpanId(0)),
+                payload: &[],
+            }),
+            Record::Text(Text {
+                level: Level::Info,
+                span: Some(SpanId(0)),
+                target: "t",
+                text: "x",
+            }),
+            Record::SpanStart(SpanStart {
+                span: SpanId(0),
+                kind: SpanKindId(1),
+                parent: None,
+            }),
+            Record::SpanStart(SpanStart {
+                span: SpanId(1),
+                kind: SpanKindId(1),
+                parent: Some(SpanId(0)),
+            }),
+            Record::SpanEnd { span: SpanId(0) },
+        ] {
+            assert_eq!(encode(&rec, 0, &mut buf), Err(Error::ReservedNotZero));
+            assert!(buf.is_empty(), "отказ не должен оставлять обрывок: {buf:?}");
+        }
+
+        // Корневой спан по-прежнему кодируется нулём в поле `parent`.
+        let n = encode(
+            &Record::SpanStart(SpanStart {
+                span: SpanId(1),
+                kind: SpanKindId(1),
+                parent: None,
+            }),
+            0,
+            &mut buf,
+        )
+        .expect("корневой спан законен");
+        assert_eq!(n, buf.len());
     }
 
     #[test]

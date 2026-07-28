@@ -102,6 +102,17 @@ struct SpanDef {
 struct MigrationDef {
     from: u16,
     func: syn::Path,
+    /// Типы, затронутые шагом. `None` — не объявлены, значит шаг считается
+    /// затрагивающим **всё**: пропустить сегмент молча хуже, чем переписать
+    /// лишний.
+    touches: Option<Touches>,
+}
+
+/// Затронутые шагом миграции типы.
+#[derive(Clone, Default)]
+struct Touches {
+    events: Vec<Ident>,
+    metrics: Vec<Ident>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -185,9 +196,16 @@ impl Parse for SchemaInput {
                     while !content.is_empty() {
                         let lit: LitInt = content.parse()?;
                         content.parse::<Token![=>]>()?;
+                        let func: syn::Path = content.parse()?;
+                        let touches = if content.peek(syn::token::Brace) {
+                            Some(parse_touches(&content)?)
+                        } else {
+                            None
+                        };
                         migrations.push(MigrationDef {
                             from: lit.base10_parse()?,
-                            func: content.parse()?,
+                            func,
+                            touches,
                         });
                         let _ = content.parse::<Token![,]>();
                     }
@@ -426,6 +444,39 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     })
 }
 
+/// Разобрать затронутые шагом типы: `{ events: [A, B], metrics: [Temp] }`.
+///
+/// Объявление необязательно, и это осознанный выбор: миграция переписывает
+/// только сегменты, содержащие затронутые типы (множества их идентификаторов
+/// лежат в footer'е), а не переписанный сегмент — сэкономленный ресурс флеша.
+/// Но экономия обязана быть **включена явно**: забытый список не должен
+/// означать «ничего не трогаем», иначе шаг молча обошёл бы всю историю
+/// стороной, оставив её в прежней раскладке.
+fn parse_touches(input: ParseStream) -> syn::Result<Touches> {
+    let content;
+    braced!(content in input);
+    let mut out = Touches::default();
+    while !content.is_empty() {
+        let key: Ident = content.parse()?;
+        content.parse::<Token![:]>()?;
+        match key.to_string().as_str() {
+            "events" => out.events = parse_ident_list(&content)?,
+            "metrics" => out.metrics = parse_ident_list(&content)?,
+            other => {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!(
+                        "у шага миграции неизвестный ключ `{other}`: ожидались \
+                         events, metrics"
+                    ),
+                ));
+            }
+        }
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(out)
+}
+
 fn parse_span(input: ParseStream) -> syn::Result<SpanDef> {
     let name: Ident = input.parse()?;
     let id = parse_id(input)?;
@@ -648,6 +699,27 @@ fn range_tokens(range: Option<&syn::ExprRange>) -> syn::Result<TokenStream2> {
         None => quote!(None),
     };
     Ok(quote!(::dduroc::Range { min: #min, max: #max }))
+}
+
+/// Найти идентификатор объявленного типа по его имени.
+///
+/// Опечатка в списке затронутых типов обязана быть ошибкой компиляции: иначе
+/// шаг миграции тихо не нашёл бы свой тип и обошёл бы стороной ровно те
+/// сегменты, ради которых написан.
+fn lookup_id<'a>(
+    name: &Ident,
+    mut declared: impl Iterator<Item = (&'a Ident, u16)>,
+    what: &str,
+) -> syn::Result<u16> {
+    declared
+        .find(|(n, _)| *n == name)
+        .map(|(_, id)| id)
+        .ok_or_else(|| {
+            syn::Error::new(
+                name.span(),
+                format!("шаг миграции называет {what} `{name}`, которого нет в схеме"),
+            )
+        })
 }
 
 /// Проверить уникальность идентификаторов.
@@ -973,28 +1045,69 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
     }
 
     // ── миграции ─────────────────────────────────────────────────────────
+    //
+    // Затронутые типы решают, переписывать ли сегмент: множества их
+    // идентификаторов лежат в footer'е, и незатронутый сегмент не тратит
+    // цикла записи флеша. Не объявлены — значит `touches_all`, то есть
+    // переписывается всё: молча пропустить историю хуже, чем переписать её.
     let migration_descs: Vec<TokenStream2> = input
         .migrations
         .iter()
         .map(|m| {
             let from = m.from;
             let func = &m.func;
-            quote! {
+            let (all, events, metrics) = match &m.touches {
+                None => (quote!(true), Vec::new(), Vec::new()),
+                Some(t) => {
+                    let events = t
+                        .events
+                        .iter()
+                        .map(|name| {
+                            let id = lookup_id(
+                                name,
+                                input.events.iter().map(|e| (&e.name, e.id)),
+                                "событие",
+                            )?;
+                            Ok(quote!(::dduroc::EventId(#id)))
+                        })
+                        .collect::<syn::Result<Vec<_>>>()?;
+                    let metrics = t
+                        .metrics
+                        .iter()
+                        .map(|name| {
+                            let id = lookup_id(
+                                name,
+                                input.metrics.iter().map(|m| (&m.name, m.id)),
+                                "метрику",
+                            )?;
+                            Ok(quote!(::dduroc::MetricId(#id)))
+                        })
+                        .collect::<syn::Result<Vec<_>>>()?;
+                    (quote!(false), events, metrics)
+                }
+            };
+            Ok(quote! {
                 ::dduroc::Migration {
                     from: #from,
-                    events: &[],
-                    metrics: &[],
+                    touches_all: #all,
+                    events: &[#(#events),*],
+                    metrics: &[#(#metrics),*],
                     migrate: #func,
                 }
-            }
+            })
         })
-        .collect();
+        .collect::<syn::Result<Vec<_>>>()?;
 
     let mod_name = &input.name;
 
     Ok(quote! {
         #[allow(non_snake_case, non_upper_case_globals, clippy::all, unused_imports)]
         pub mod #mod_name {
+            // Имена из области, где объявлена схема, видны и здесь: иначе
+            // `migrations { 2 => migrate_v2 }` требовало бы писать
+            // `super::migrate_v2` — функция шага лежит рядом с объявлением,
+            // а раскрывается внутрь порождённого модуля.
+            use super::*;
 
             /// Типы событий этой схемы.
             pub mod events {
@@ -1074,6 +1187,7 @@ fn clone_migration(m: &MigrationDef) -> MigrationDef {
     MigrationDef {
         from: m.from,
         func: m.func.clone(),
+        touches: m.touches.clone(),
     }
 }
 

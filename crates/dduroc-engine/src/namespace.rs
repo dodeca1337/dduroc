@@ -83,14 +83,14 @@ impl NsMeta {
                         });
                     }
                 }
-                if meta.protocol_version != schema.version.0 {
-                    let updated = Self {
-                        schema_name: meta.schema_name,
-                        protocol_version: schema.version.0,
-                    };
-                    fsutil::write_atomic(&path, &postcard::to_allocvec(&updated)?)?;
-                    return Ok(updated);
-                }
+                // `protocol_version` в мете — версия последней **завершённой**
+                // миграции, и переписывать её здесь нельзя: физического
+                // прогона ещё нет, сегменты остались в прежней раскладке.
+                // Проштамповав мету, этот билд объявил бы неймспейс
+                // мигрированным, и будущая миграция обошла бы старые сегменты
+                // стороной — их разобрали бы декодерами новой версии, молча и
+                // неверно. Смешанное состояние легально: версию несёт
+                // заголовок каждого сегмента, и она у них своя.
                 Ok(meta)
             }
         }
@@ -186,6 +186,23 @@ impl Namespace {
 
     pub fn protocol_version(&self) -> ProtocolVersion {
         self.inner.schema.version
+    }
+
+    /// Незавершённая миграция: `(с какой версии, до какой)`.
+    ///
+    /// `Some` означает, что в каталоге лежат сегменты прежней раскладки:
+    /// схема этого билда новее, чем версия последней завершённой миграции.
+    /// Данные читаются — версию несёт заголовок каждого сегмента, — но пока
+    /// физический прогон миграций не написан, привести их к текущему виду
+    /// нечем. Стоит записать это событие в журнал: молчание превратило бы
+    /// отложенную работу в забытую.
+    ///
+    /// Новые сегменты пишутся текущей версией схемы; смешанное состояние
+    /// каталога легально и ожидаемо.
+    pub fn pending_migration(&self) -> Option<(u16, u16)> {
+        let stored = self.inner.meta.protocol_version;
+        let current = self.inner.schema.version.0;
+        (stored < current).then_some((stored, current))
     }
 
     /// Текущий момент — в тех же координатах, в каких его вернёт читатель.
@@ -1035,6 +1052,85 @@ mod tests {
         assert!(
             matches!(err, Error::ProtocolFromFuture { stored: 99, .. }),
             "получено {err}"
+        );
+    }
+
+    #[test]
+    fn pending_migration_is_reported_and_meta_is_not_stamped() {
+        // `protocol_version` в мете — версия последней ЗАВЕРШЁННОЙ миграции.
+        // Проштамповав её при подъёме, этот билд объявил бы неймспейс
+        // мигрированным, хотя физического прогона ещё нет. Будущая миграция
+        // обошла бы старые сегменты стороной, и их разобрали бы декодерами
+        // новой версии — молча и неверно. Регрессия была бы совершенно тихой.
+        use crate::schema::{DecodeError, MigratedRecord, Migration, OwnedRecord};
+
+        fn noop(_: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+            Ok(Some(OwnedRecord::AsIs))
+        }
+        static STEPS: &[Migration] = &[Migration {
+            from: 1,
+            touches_all: true,
+            events: &[],
+            metrics: &[],
+            migrate: noop,
+        }];
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = open_store(dir.path());
+            let ns = store.namespace("orc-radio-0", schema()).unwrap();
+            assert_eq!(ns.pending_migration(), None, "версии совпадают");
+            ns.log_raw(EventId(1), &[1], None);
+            ns.sync().unwrap();
+            store.shutdown();
+        }
+
+        let v2 = Schema {
+            version: ProtocolVersion(2),
+            migrations: STEPS,
+            ..schema()
+        };
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", v2).unwrap();
+        assert_eq!(
+            ns.pending_migration(),
+            Some((1, 2)),
+            "незавершённая миграция обязана быть названа"
+        );
+        assert_eq!(
+            ns.meta().protocol_version,
+            1,
+            "мета остаётся на версии последней завершённой миграции"
+        );
+        ns.log_raw(EventId(1), &[2], None);
+        ns.sync().unwrap();
+        store.shutdown();
+
+        // На диске мета по-прежнему объявляет версию 1.
+        let raw = std::fs::read(dir.path().join("orc-radio-0").join(NS_META)).unwrap();
+        let meta: NsMeta = postcard::from_bytes(&raw).unwrap();
+        assert_eq!(meta.protocol_version, 1);
+
+        // А сегменты несут каждый свою версию — смешанное состояние легально.
+        let seg_dir = dir.path().join("orc-radio-0").join("default");
+        let mut versions: Vec<u16> = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "seg"))
+            .map(|p| {
+                crate::segment::SegmentReader::open(&p)
+                    .unwrap()
+                    .header()
+                    .protocol_version
+                    .0
+            })
+            .collect();
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            vec![1, 2],
+            "старый сегмент сохранил свою версию, новый получил текущую"
         );
     }
 

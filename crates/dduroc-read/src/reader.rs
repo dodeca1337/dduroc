@@ -8,8 +8,10 @@ use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
 use dduroc_engine::schema::{MetricKind, Schema, Severity};
 use dduroc_format::{BootCounter, BootTime, EventId, Level, MetricId, SpanId, Value};
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 /// Сколько сегментов назад искать состояние на левый край окна.
 ///
@@ -148,11 +150,48 @@ impl QueryResult {
     }
 }
 
+/// Голова курсора в куче слияния.
+///
+/// [`BinaryHeap`] — максимальная куча, поэтому «лучший» обязан оказаться
+/// наибольшим, и сравнение переворачивается для порядка от старого к новому.
+/// При равном времени побеждает курсор с меньшим номером: одинаковые моменты
+/// — обычное дело (часы монотонны, но не строго возрастают), и порядок между
+/// ними обязан быть устойчивым, иначе один и тот же запрос выдавал бы записи
+/// вразнобой от раза к разу.
+#[derive(Debug, PartialEq, Eq)]
+struct Head {
+    at: BootTime,
+    idx: usize,
+    newest_first: bool,
+}
+
+impl Ord for Head {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let by_time = if self.newest_first {
+            self.at.cmp(&other.at)
+        } else {
+            other.at.cmp(&self.at)
+        };
+        by_time.then_with(|| other.idx.cmp(&self.idx))
+    }
+}
+
+impl PartialOrd for Head {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Поток записей запроса: слияние каналов по времени без сборки ответа целиком.
 ///
 /// Порядок тот же, что у [`Reader::query`]: курсоры сливаются по полному
 /// моменту (запуск, µs), а не по микросекундам — сравнивать их между разными
 /// запусками бессмысленно.
+///
+/// Слияние идёт кучей, а не перебором курсоров на каждую запись: курсор
+/// заводится на каждую пару (неймспейс, канал), и при заявленных двадцати
+/// четырёх тысячах неймспейсов линейный поиск головы означал бы десятки тысяч
+/// сравнений на **каждую** выданную строчку.
 #[derive(Debug)]
 pub struct EntryStream<'a> {
     reader: &'a Reader,
@@ -162,41 +201,48 @@ pub struct EntryStream<'a> {
     cursors: Vec<ChannelCursor>,
     /// Схема на каждый курсор, в том же порядке.
     schemas: Vec<Option<Schema>>,
+    /// Головы непустых курсоров.
+    heads: BinaryHeap<Head>,
     /// Каталоги, которые не удалось прочитать — известны сразу при открытии.
     damaged: Vec<Damage>,
     limit: usize,
     yielded: usize,
     truncated: bool,
+    /// Обход окончен: повторный вызов не должен выдавать записи после того,
+    /// как поток уже ответил `None`.
+    done: bool,
+}
+
+impl EntryStream<'_> {
+    /// Вернуть голову курсора в кучу, если она есть.
+    fn requeue(&mut self, idx: usize) {
+        let newest_first = self.query.order == Order::Newest;
+        if let Some(head) = self.cursors[idx].peek() {
+            let at = head.at;
+            self.heads.push(Head {
+                at,
+                idx,
+                newest_first,
+            });
+        }
+    }
 }
 
 impl Iterator for EntryStream<'_> {
     type Item = Entry;
 
     fn next(&mut self) -> Option<Entry> {
-        if self.yielded >= self.limit {
-            self.truncated = true;
+        if self.done {
             return None;
         }
         loop {
-            // Курсор с самой ранней (или поздней) записью.
-            let mut best: Option<(usize, BootTime)> = None;
-            for (i, c) in self.cursors.iter_mut().enumerate() {
-                let Some(head) = c.peek() else { continue };
-                let better = match best {
-                    None => true,
-                    Some((_, at)) => match self.query.order {
-                        Order::Oldest => head.at < at,
-                        Order::Newest => head.at > at,
-                    },
-                };
-                if better {
-                    best = Some((i, head.at));
-                }
-            }
-            let (idx, _) = best?;
-            let Some(raw) = self.cursors[idx].next_entry() else {
-                continue;
+            let Some(Head { idx, .. }) = self.heads.pop() else {
+                self.done = true;
+                return None;
             };
+            let taken = self.cursors[idx].next_entry();
+            self.requeue(idx);
+            let Some(raw) = taken else { continue };
 
             // Записи вне окна пропускаются, но обход продолжается: сегмент мог
             // начаться раньше нижней границы.
@@ -210,6 +256,16 @@ impl Iterator for EntryStream<'_> {
                 self.reader
                     .build_entry(ns, ch, self.schemas[idx].as_ref(), &raw, &self.query)
             {
+                // Обрезка объявляется, только когда очередная запись
+                // действительно **есть**, а места в ответе уже нет. Ставить
+                // отметку при входе значило бы объявлять обрезанным всякий
+                // ответ ровно в `limit` записей, даже если больше их и не было
+                // — а для веб-слоя это вечная кнопка «дальше».
+                if self.yielded >= self.limit {
+                    self.truncated = true;
+                    self.done = true;
+                    return None;
+                }
                 self.yielded += 1;
                 return Some(entry);
             }
@@ -285,6 +341,12 @@ pub struct Reader {
     /// Идентичность хранилища; `None` — не проверять (чтение чужого дампа
     /// разрешено явно).
     store_id: Option<u64>,
+    /// Схема, разрешённая по имени неймспейса. Резолв читает `ns-meta` с
+    /// диска, а спрашивают о нём на **каждую** показываемую запись — файловая
+    /// операция на запись была бы ровно тем дефектом, который уже убран с
+    /// пути запроса. `None` в значении — «неймспейс есть, схемы к нему у
+    /// этого билда нет»; такой ответ тоже стоит запомнить.
+    schema_cache: RwLock<HashMap<String, Option<Schema>>>,
 }
 
 impl Reader {
@@ -301,6 +363,7 @@ impl Reader {
             schemas: schemas.iter().map(|s| (s.name.to_owned(), *s)).collect(),
             epochs,
             store_id,
+            schema_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -335,7 +398,7 @@ impl Reader {
         match &entry.kind {
             EntryKind::Message { event, payload, .. } => {
                 let schema = self.schema_of(&entry.namespace)?;
-                render(schema, *event, payload, lang)
+                render(&schema, *event, payload, lang)
             }
             // Свободный текст уже текст: у него нет ни шаблона, ни языков.
             EntryKind::Text { text, .. } => Some(text.clone()),
@@ -347,18 +410,51 @@ impl Reader {
     ///
     /// Ищется имя схемы каталога, а не первая подходящая: два неймспейса могут
     /// жить под разными схемами в одном хранилище.
-    pub fn schema_of(&self, namespace: &str) -> Option<&Schema> {
-        let meta = read_ns_meta(&self.root.join(namespace))?;
-        self.schemas.get(&meta.schema_name)
+    ///
+    /// Ответ запоминается: `ns-meta` читается один раз на неймспейс, а не на
+    /// каждый вызов. [`Reader::render`] зовут на каждую показываемую запись, и
+    /// без этого отрисовка пятисот строк стоила бы пятисот открытий файла.
+    /// Схема — `Copy` и лежит в `.rodata`, копия ничего не стоит.
+    pub fn schema_of(&self, namespace: &str) -> Option<Schema> {
+        if let Ok(cache) = self.schema_cache.read()
+            && let Some(found) = cache.get(namespace)
+        {
+            return *found;
+        }
+        let resolved = read_ns_meta(&self.root.join(namespace))
+            .and_then(|meta| self.schemas.get(&meta.schema_name).copied());
+        if let Ok(mut cache) = self.schema_cache.write() {
+            cache.insert(namespace.to_owned(), resolved);
+        }
+        resolved
     }
 
-    /// Перечислить неймспейсы.
+    /// Перечислить неймспейсы вместе с занятым объёмом.
+    ///
+    /// Объём стоит `stat` каждого сегмента, поэтому путь запроса им не
+    /// пользуется: ему хватает имён неймспейсов и каналов.
     pub fn namespaces(&self) -> Result<Vec<NamespaceInfo>> {
-        self.namespaces_reporting(&mut Vec::new())
+        let mut out = Vec::new();
+        for ns in self.namespace_dirs(&mut Vec::new())? {
+            let mut bytes = 0;
+            for channel in &ns.channels {
+                if let Ok(inv) = dduroc_engine::rotation::Inventory::scan(
+                    &self.root.join(&ns.name).join(channel),
+                ) {
+                    bytes += inv.total_bytes();
+                }
+            }
+            out.push(NamespaceInfo { bytes, ..ns });
+        }
+        Ok(out)
     }
 
-    /// То же, но с накоплением каталогов, которые не удалось прочитать.
-    fn namespaces_reporting(&self, unreadable: &mut Vec<PathBuf>) -> Result<Vec<NamespaceInfo>> {
+    /// Неймспейсы и их каналы — без обращения к размерам файлов.
+    ///
+    /// `bytes` в результате всегда нулевой: на пути запроса он не нужен, а
+    /// стоил бы `stat` на каждый сегмент. Каталоги с нечитаемой метой
+    /// накапливаются в `unreadable`.
+    fn namespace_dirs(&self, unreadable: &mut Vec<PathBuf>) -> Result<Vec<NamespaceInfo>> {
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(e) => e,
@@ -391,7 +487,6 @@ impl Reader {
             };
 
             let mut channels = Vec::new();
-            let mut bytes = 0;
             if let Ok(dir) = std::fs::read_dir(&path) {
                 for ch in dir.flatten() {
                     let ch_path = ch.path();
@@ -399,9 +494,6 @@ impl Reader {
                         continue;
                     }
                     if let Some(ch_name) = ch_path.file_name().and_then(|n| n.to_str()) {
-                        if let Ok(inv) = dduroc_engine::rotation::Inventory::scan(&ch_path) {
-                            bytes += inv.total_bytes();
-                        }
                         channels.push(ch_name.to_owned());
                     }
                 }
@@ -413,7 +505,7 @@ impl Reader {
                 schema_name: meta.schema_name,
                 protocol_version: meta.protocol_version,
                 channels,
-                bytes,
+                bytes: 0,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -436,20 +528,37 @@ impl Reader {
         // значило бы линейный поиск по эпохам на каждую из сотен тысяч.
         let bounds = q.resolve(&self.epochs).bounds;
         let OpenedCursors {
-            cursors,
+            mut cursors,
             schemas,
             damaged,
         } = self.open_cursors(q, &bounds)?;
+
+        // Кучу заряжаем сразу: пустой курсор в неё просто не попадает, и
+        // дальше слияние не тратит на него ни одного сравнения.
+        let newest_first = q.order == Order::Newest;
+        let mut heads = BinaryHeap::with_capacity(cursors.len());
+        for (idx, cursor) in cursors.iter_mut().enumerate() {
+            if let Some(head) = cursor.peek() {
+                heads.push(Head {
+                    at: head.at,
+                    idx,
+                    newest_first,
+                });
+            }
+        }
+
         Ok(EntryStream {
             reader: self,
             query: q.clone(),
             bounds,
             cursors,
             schemas,
+            heads,
             damaged,
             limit: q.limit.unwrap_or(usize::MAX),
             yielded: 0,
             truncated: false,
+            done: false,
         })
     }
 
@@ -500,17 +609,24 @@ impl Reader {
 
         // Ряды-состояния собираются по схемам, а не по данным: их немного, и
         // знать их заранее дешевле, чем выяснять чтением.
-        let wanted: std::collections::HashSet<MetricId> = self
+        //
+        // Объединение по всем схемам нужно только для отсечения сегментов по
+        // множеству из footer'а: там оно работает как «в этом сегменте нет
+        // ничего похожего», и лишний номер приводит лишь к лишнему открытию.
+        // Отбирать записи по нему нельзя — пространство `metric_id` своё у
+        // каждой схемы, и метрика чужой схемы с тем же номером означает
+        // совсем другую величину.
+        let union: HashSet<MetricId> = self
             .schemas
             .values()
             .flat_map(|s| s.metrics.iter())
             .filter(|m| m.kind == MetricKind::State)
             .map(|m| m.id)
             .collect();
-        if wanted.is_empty() {
+        if union.is_empty() {
             return Ok(Vec::new());
         }
-        let wanted = std::sync::Arc::new(wanted);
+        let union = std::sync::Arc::new(union);
 
         // Ищем строго ДО `from`, порядок — от свежих к старым, чтобы первым
         // встреченным отсчётом ряда оказался последний по времени.
@@ -534,16 +650,22 @@ impl Reader {
             damaged: open_damaged,
         } = self.open_cursors_with(&probe, &probe_bounds, |scope| {
             scope.max_segments = Some(SEED_SEGMENTS);
-            scope.require_metrics = Some(std::sync::Arc::clone(&wanted));
+            scope.require_metrics = Some(std::sync::Arc::clone(&union));
         })?;
         damaged.extend(open_damaged);
 
         // Первое встреченное значение ряда и есть последнее по времени.
-        let mut seen: std::collections::HashSet<(usize, MetricId)> =
-            std::collections::HashSet::new();
+        let mut seen: HashSet<(usize, MetricId)> = HashSet::new();
         let mut out: Vec<Entry> = Vec::new();
 
         for (idx, cursor) in cursors.iter_mut().enumerate() {
+            // Ряды-состояния берутся из схемы ЭТОГО неймспейса: номера метрик
+            // у разных схем свои, и общий набор дал бы затравку из чужого
+            // ряда — с чужой подписью состояния.
+            let wanted = state_metrics(schemas[idx].as_ref());
+            if wanted.is_empty() {
+                continue;
+            }
             while let Some(raw) = cursor.next_entry() {
                 // Затравка обязана лежать строго ДО окна. Проверяется именно
                 // «не внутри окна», а не «раньше границы на микросекунду»:
@@ -598,7 +720,7 @@ impl Reader {
         let mut schemas = Vec::new();
         let mut unreadable = Vec::new();
 
-        for ns in self.namespaces_reporting(&mut unreadable)? {
+        for ns in self.namespace_dirs(&mut unreadable)? {
             if !q.namespaces.matches(&ns.name) {
                 continue;
             }
@@ -859,6 +981,17 @@ fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilte
         dduroc_format::Record::SpanStart(_) | dduroc_format::Record::SpanEnd { .. } => kinds.spans,
         dduroc_format::Record::Sample(_) => kinds.samples,
         dduroc_format::Record::Ext { .. } => true,
+    })
+}
+
+/// Метрики-состояния одной схемы. Пусто, если схема этому билду неизвестна.
+fn state_metrics(schema: Option<&Schema>) -> HashSet<MetricId> {
+    schema.map_or_else(HashSet::new, |s| {
+        s.metrics
+            .iter()
+            .filter(|m| m.kind == MetricKind::State)
+            .map(|m| m.id)
+            .collect()
     })
 }
 
@@ -1279,6 +1412,88 @@ mod tests {
     }
 
     #[test]
+    fn state_seeds_come_from_the_schema_of_their_own_namespace() {
+        // Пространство `metric_id` своё у каждой схемы. Ряды-состояния,
+        // собранные объединением по всем схемам, дали бы затравку из чужого
+        // ряда: метрика номер 2 у «radio» — конечный автомат, у «modem» —
+        // обычная непрерывная величина, и подписывать её состояниями нельзя.
+        static OTHER_METRICS: &[MetricDesc] = &[MetricDesc {
+            id: MetricId(2), // тот же номер, другая величина
+            name: "voltage",
+            value_type: ValueType::F32,
+            class: StorageClass::DEFAULT,
+            unit: "V",
+            tags: &[],
+            kind: MetricKind::Gauge,
+            states: &[],
+            thresholds: dduroc_engine::schema::Thresholds::NONE,
+        }];
+        fn other() -> Schema {
+            Schema {
+                name: "modem",
+                metrics: OTHER_METRICS,
+                ..schema()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let after;
+        {
+            let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+            let store = Store::open(cfg).unwrap();
+
+            let radio = store.namespace("orc-radio-0", schema()).unwrap();
+            radio
+                .series_untyped(MetricId(2))
+                .unwrap()
+                .sample_raw(dduroc_engine::staged::OwnedValue::U64(1));
+
+            let modem = store.namespace("apt-modem-0", other()).unwrap();
+            modem
+                .series_untyped(MetricId(2))
+                .unwrap()
+                .sample_raw(dduroc_engine::staged::OwnedValue::F32(3.3));
+
+            after = radio.now();
+            // Дальше — только то, что окно и увидит.
+            radio.series(TEMP).unwrap().sample(21.0);
+            radio.sync().unwrap();
+            modem.sync().unwrap();
+            store.shutdown();
+        }
+
+        let reader = Reader::open(dir.path(), &[schema(), other()]).unwrap();
+        let seeded = reader
+            .query(&Query {
+                from: Some(BootTime::new(after.boot, Micros(after.at.0 + 1)).into()),
+                order: Order::Oldest,
+                seed_states: true,
+                filter: crate::Filter {
+                    kinds: KindFilter::TELEMETRY,
+                    ..Default::default()
+                },
+                ..Query::new()
+            })
+            .unwrap();
+
+        assert_eq!(
+            seeded.seeds.len(),
+            1,
+            "затравка только у настоящего ряда-состояния: {:?}",
+            seeded.seeds
+        );
+        let seed = &seeded.seeds[0];
+        assert_eq!(&*seed.namespace, "orc-radio-0");
+        match &seed.kind {
+            EntryKind::Sample { state, kind, .. } => {
+                assert_eq!(*state, Some("Lock"));
+                assert_eq!(*kind, Some(MetricKind::State));
+            }
+            other => panic!("ожидалось состояние: {other:?}"),
+        }
+    }
+
+    #[test]
     fn state_seed_is_absent_when_there_is_nothing_before_the_window() {
         // Запрос от начала времён: до окна ничего нет, и выдумывать затравку
         // неоткуда.
@@ -1398,6 +1613,72 @@ mod tests {
             .unwrap();
         let times: Vec<BootTime> = oldest.entries.iter().map(|e| e.at).collect();
         assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+    }
+
+    #[test]
+    fn truncation_is_announced_only_when_something_was_left_out() {
+        // Отметка ставилась при входе в выдачу, а не тогда, когда запись
+        // действительно не влезла: ответ ровно в `limit` записей объявлялся
+        // обрезанным, даже если больше их и не было. Для веб-слоя это вечная
+        // кнопка «дальше», ведущая в пустоту.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+
+        let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
+        let total = all.entries.len();
+        assert!(!all.truncated, "запрос без лимита не бывает обрезан");
+
+        // Лимит ровно по числу записей: обрезать было нечего.
+        let exact = reader
+            .query(&Query::new().order(Order::Oldest).limit(total))
+            .unwrap();
+        assert_eq!(exact.entries.len(), total);
+        assert!(
+            !exact.truncated,
+            "записей ровно {total}, больше нет — ответ полон"
+        );
+
+        // На единицу меньше — обрезан по-настоящему.
+        let cut = reader
+            .query(&Query::new().order(Order::Oldest).limit(total - 1))
+            .unwrap();
+        assert_eq!(cut.entries.len(), total - 1);
+        assert!(cut.truncated, "одна запись осталась за бортом");
+
+        // Пустой ответ при нулевом лимите: записи есть, места нет.
+        let none = reader
+            .query(&Query::new().order(Order::Oldest).limit(0))
+            .unwrap();
+        assert!(none.entries.is_empty());
+        assert!(none.truncated);
+    }
+
+    #[test]
+    fn render_resolves_the_schema_without_touching_the_disk() {
+        // Резолв схемы читал `ns-meta` на КАЖДЫЙ вызов: отрисовка пятисот
+        // строк стоила пятисот открытий файла — ровно тот дефект, который
+        // уже убран с пути запроса. Проверяется тем, что рендер продолжает
+        // работать, когда файла на диске больше нет.
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let result = reader
+            .query(&Query::new().order(Order::Oldest).kinds(KindFilter::LOGS))
+            .unwrap();
+        let msg = result
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, EntryKind::Message { .. }))
+            .unwrap();
+        assert_eq!(reader.render(msg, "ru").as_deref(), Some("мощность задана"));
+
+        std::fs::remove_file(dir.path().join("orc-radio-0").join(NS_META)).unwrap();
+        assert_eq!(
+            reader.render(msg, "ru").as_deref(),
+            Some("мощность задана"),
+            "схема обязана быть разрешена один раз, а не на каждый вызов"
+        );
     }
 
     #[test]

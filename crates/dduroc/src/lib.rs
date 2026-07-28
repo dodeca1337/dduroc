@@ -320,6 +320,86 @@ mod tests {
         }
     }
 
+    /// Шаги миграции живут рядом с объявлением схемы; макрос раскрывается в
+    /// отдельный модуль, но имена из этой области там видны.
+    fn migrate_v1(_: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+        Ok(Some(OwnedRecord::AsIs))
+    }
+    fn migrate_v2(_: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+        Ok(Some(OwnedRecord::AsIs))
+    }
+
+    schema! {
+        name: migrating,
+        version: 3,
+        languages: [en],
+
+        events {
+            Renamed = 0x01 { level: Info, en: "renamed" },
+            Untouched = 0x02 { level: Info, en: "untouched" },
+        }
+
+        metrics {
+            Temp = 0x01 { vtype: f32 },
+        }
+
+        // Ключ — версия, ИЗ которой мигрируем: цепочка обязана быть
+        // непрерывной от 1 до текущей.
+        migrations {
+            // Затронутые типы названы: сегменты без них не переписываются.
+            1 => migrate_v1 { events: [Renamed], metrics: [Temp] },
+            // Не названы — значит затрагивает всё.
+            2 => migrate_v2,
+        }
+    }
+
+    #[test]
+    fn migration_touches_everything_unless_told_otherwise() {
+        // Множества типов в footer'е решают, переписывать ли сегмент. Пустые
+        // списки означали «не затрагивает ничего», и шаг, у которого их забыли
+        // объявить, молча обходил бы всю историю стороной — а обнаружилось бы
+        // это только на нечитаемых логах через месяц.
+        use dduroc_format::{FooterBuilder, MetricId};
+
+        migrating::SCHEMA.validate().expect("схема корректна");
+
+        let footer_of = |events: &[EventId], metrics: &[MetricId]| {
+            let mut b = FooterBuilder::new();
+            for e in events {
+                b.add_event(*e);
+            }
+            for m in metrics {
+                b.add_metric(*m);
+            }
+            let bytes = b.build();
+            dduroc_format::Footer::parse(&bytes).unwrap().unwrap()
+        };
+
+        let narrow = migrating::SCHEMA.migration(1).expect("шаг объявлен");
+        assert!(!narrow.touches_all, "затронутые типы названы явно");
+        assert_eq!(narrow.events, &[EventId(1)]);
+        assert_eq!(narrow.metrics, &[MetricId(1)]);
+        assert!(
+            narrow.touches(&footer_of(&[EventId(1)], &[])),
+            "сегмент с затронутым событием переписывается"
+        );
+        assert!(
+            !narrow.touches(&footer_of(&[EventId(2)], &[])),
+            "сегмент без затронутых типов не тратит цикла записи флеша"
+        );
+
+        let wide = migrating::SCHEMA.migration(2).expect("шаг объявлен");
+        assert!(
+            wide.touches_all,
+            "списки не объявлены — шаг обязан считаться затрагивающим всё"
+        );
+        assert!(
+            wide.touches(&footer_of(&[EventId(2)], &[])),
+            "молча пропустить сегмент хуже, чем переписать лишний"
+        );
+        assert!(wide.touches(&footer_of(&[], &[])), "и пустой тоже");
+    }
+
     #[test]
     fn generated_schema_is_valid() {
         testing::SCHEMA.validate().expect("схема корректна");

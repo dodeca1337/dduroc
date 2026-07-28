@@ -77,6 +77,27 @@ impl Inventory {
         })
     }
 
+    /// Только имена сегментов, в порядке времени.
+    ///
+    /// Отдельно от [`Inventory::scan`], потому что размеры стоят `stat` на
+    /// каждый файл, а читателю они не нужны вовсе: отбор сегментов по окну
+    /// идёт по именам. При сотнях сегментов в канале и тысячах каналов это
+    /// разница между одним `readdir` и сотнями тысяч системных вызовов на
+    /// запрос.
+    pub fn scan_names(dir: &Path) -> Result<Vec<SegmentName>> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).ctx_path("чтение каталога канала", dir),
+        };
+        let mut names: Vec<SegmentName> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(SegmentName::parse))
+            .collect();
+        names.sort_unstable();
+        Ok(names)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.segments.is_empty()
     }

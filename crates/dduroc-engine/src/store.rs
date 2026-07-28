@@ -145,7 +145,7 @@ impl Store {
         let counters = Arc::new(Counters::default());
         let writer = Writer::spawn(Arc::clone(&counters), config.queues)?;
 
-        Ok(Arc::new(Self {
+        let store = Arc::new(Self {
             root: config.root.clone(),
             meta,
             upgraded_from,
@@ -157,7 +157,16 @@ impl Store {
             next_span: Arc::new(AtomicU32::new(1)),
             open: Mutex::new(HashMap::new()),
             _lock: lock,
-        }))
+        });
+
+        // Файл эпох растёт на запись за перезапуск и читается целиком при
+        // каждом старте. Подметаем его, когда он действительно вырос, — иначе
+        // обход имён сегментов стоил бы дороже, чем экономит.
+        let runs = store.locked_epochs().epochs().runs.len();
+        if runs > EPOCH_COMPACT_THRESHOLD {
+            let _ = store.compact_epochs();
+        }
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {
@@ -263,6 +272,7 @@ impl Store {
             Arc::new(NamespaceLease {
                 store: Arc::clone(self),
                 name: name.to_owned(),
+                id,
             }),
             id,
             name.to_owned(),
@@ -299,6 +309,24 @@ impl Store {
             return Ok(false);
         }
         self.locked_epochs().record_sync(utc, source)
+    }
+
+    /// Убрать из `epochs.bin` записи о запусках, от которых не осталось
+    /// сегментов. Возвращает число удалённых записей.
+    ///
+    /// Обходятся только **имена** файлов: `readdir` по каналам, без единого
+    /// открытия сегмента. Текущий запуск не удаляется никогда — он ещё пишет.
+    ///
+    /// Вызывается автоматически при подъёме хранилища, но лишь когда файл
+    /// действительно вырос (порядка тысячи запусков): обход каталогов при
+    /// тысячах неймспейсов не бесплатен, а лишняя запись об эпохе стоит
+    /// десятки байт. Приложение вправе позвать уборку и само.
+    pub fn compact_epochs(&self) -> Result<usize> {
+        let live = live_boots(&self.root);
+        let mut epochs = self.locked_epochs();
+        let before = epochs.epochs().runs.len();
+        epochs.retain_runs(&|boot| live.contains(&boot))?;
+        Ok(before - epochs.epochs().runs.len())
     }
 
     /// Перевести относительное время в настенное. `None` — нет якоря.
@@ -347,6 +375,7 @@ impl Store {
 struct NamespaceLease {
     store: Arc<Store>,
     name: String,
+    id: NsId,
 }
 
 impl Drop for NamespaceLease {
@@ -354,6 +383,11 @@ impl Drop for NamespaceLease {
         if let Ok(mut open) = self.store.open.lock() {
             open.remove(&self.name);
         }
+        // Writer'у тоже надо сказать: без этого состояние канала жило бы до
+        // конца процесса, а повторный подъём того же имени дал бы два
+        // состояния на один каталог — с двумя инвентарями и двумя ротациями.
+        // Порядок с последующим `register` держит очередь команд.
+        self.store.writer.release(self.id);
     }
 }
 
@@ -386,6 +420,43 @@ impl Drop for Store {
         // и без этого — но footer экономит чтению целый проход по файлу.
         self.writer.shutdown();
     }
+}
+
+/// При каком числе записей о запусках подметать `epochs.bin` на старте.
+///
+/// Уборка стоит обхода имён во всех каналах, а невычищенная запись — десятки
+/// байт, поэтому платить за обход на каждом старте незачем: порог
+/// амортизирует его на тысячу с лишним перезапусков. Файл при этом остаётся
+/// ограниченным, а данные — нет: запуск, от которого остались сегменты,
+/// уборка не трогает, и UTC его записей не теряется.
+const EPOCH_COMPACT_THRESHOLD: usize = 1024;
+
+/// Номера запусков, за которыми ещё стоят сегменты.
+///
+/// Только `readdir` и разбор имён — ни одного открытия файла: имя сегмента
+/// несёт `boot_counter` первыми восемью символами.
+fn live_boots(root: &Path) -> std::collections::BTreeSet<u32> {
+    use dduroc_format::segment::SegmentName;
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(namespaces) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for ns in namespaces.flatten() {
+        let Ok(channels) = std::fs::read_dir(ns.path()) else {
+            continue;
+        };
+        for ch in channels.flatten() {
+            let Ok(segments) = std::fs::read_dir(ch.path()) else {
+                continue;
+            };
+            for seg in segments.flatten() {
+                if let Some(name) = seg.file_name().to_str().and_then(SegmentName::parse) {
+                    out.insert(name.boot.0);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Разумен ли момент времени: между 2001-09-09 и 2100-01-01.
@@ -667,6 +738,88 @@ mod tests {
 
         let b = Store::open(cfg).unwrap();
         assert_eq!(b.boot_counter(), 1);
+    }
+
+    #[test]
+    fn epoch_cleanup_keeps_runs_that_still_have_segments() {
+        // `epochs.bin` читается целиком при каждом старте и растёт на запись
+        // за перезапуск: двадцать перезапусков в сутки за пять лет — тридцать
+        // шесть тысяч записей. Уборка обязана выбрасывать запуски, от которых
+        // не осталось сегментов, и не трогать те, от которых осталось: их UTC
+        // потерялся бы вместе с записью об эпохе.
+        use crate::schema::{EventDesc, Language, Schema, StorageClass};
+        use dduroc_format::{EventId, Level, ProtocolVersion};
+
+        static LANGS: &[Language] = &[Language("en")];
+        static EVENTS: &[EventDesc] = &[EventDesc {
+            id: EventId(1),
+            name: "Tick",
+            level: Level::Info,
+            class: StorageClass::DEFAULT,
+            tags: &[],
+            templates: &["tick"],
+            fields: &[],
+            decoders: None,
+        }];
+        let schema = Schema {
+            name: "probe",
+            version: ProtocolVersion(1),
+            languages: LANGS,
+            events: EVENTS,
+            metrics: &[],
+            spans: &[],
+            migrations: &[],
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+
+        // Запуск 0 оставляет после себя сегмент.
+        {
+            let store = Store::open(cfg.clone()).unwrap();
+            let ns = store.namespace("orc-0", schema).unwrap();
+            ns.log_raw(EventId(1), &[1], None);
+            ns.sync().unwrap();
+            store.shutdown();
+        }
+        // Запуски 1..4 не пишут ничего — сегментов за ними нет.
+        for _ in 0..3 {
+            let store = Store::open(cfg.clone()).unwrap();
+            store.shutdown();
+        }
+
+        let store = Store::open(cfg).unwrap();
+        assert_eq!(store.boot_counter(), 4);
+        assert_eq!(store.locked_epochs().epochs().runs().len(), 5);
+
+        let removed = store.compact_epochs().unwrap();
+        assert_eq!(removed, 3, "убраны запуски без сегментов");
+
+        let kept: Vec<u32> = store
+            .locked_epochs()
+            .epochs()
+            .runs()
+            .iter()
+            .map(|r| r.boot_counter)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![0, 4],
+            "остались запуск с сегментами и текущий — он ещё пишет"
+        );
+
+        // Записи запуска 0 по-прежнему переводятся в UTC.
+        store
+            .record_sync(utc_ms(1_700_000_000_000), SyncSource::Gps)
+            .unwrap();
+        assert!(
+            store.to_utc(BootTime::from_raw(0, 0)).is_some(),
+            "уборка не имеет права лишать UTC живые данные"
+        );
+
+        // Повторная уборка ничего не находит.
+        assert_eq!(store.compact_epochs().unwrap(), 0);
+        store.shutdown();
     }
 
     #[test]

@@ -342,6 +342,13 @@ pub struct SpanDesc {
 pub struct Migration {
     /// Версия, из которой мигрируем.
     pub from: u16,
+    /// Шаг затрагивает любой сегмент, что бы в нём ни лежало.
+    ///
+    /// `true` — затронутые типы не объявлены, и решать по ним нельзя.
+    /// Это **безопасное умолчание**: переписать лишний сегмент дорого ровно
+    /// на один цикл записи флеша, а пропустить нужный — значит навсегда
+    /// оставить его в прежней раскладке, притом молча.
+    pub touches_all: bool,
     /// Типы, затронутые шагом. Сегменты, не содержащие ни одного из них,
     /// переписывать не нужно — прямая экономия ресурса флеша.
     pub events: &'static [EventId],
@@ -350,10 +357,22 @@ pub struct Migration {
     pub migrate: fn(MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError>,
 }
 
+impl Migration {
+    /// Нужно ли переписывать сегмент с таким footer'ом.
+    ///
+    /// Единственное место, где решается этот вопрос: множества типов в
+    /// footer'е отвечают на него без чтения блоков, а `touches_all` —
+    /// без чтения вовсе.
+    pub fn touches(&self, footer: &dduroc_format::Footer) -> bool {
+        self.touches_all || footer.touches(self.events, self.metrics)
+    }
+}
+
 impl std::fmt::Debug for Migration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Migration")
             .field("from", &self.from)
+            .field("touches_all", &self.touches_all)
             .field("events", &self.events)
             .field("metrics", &self.metrics)
             .finish_non_exhaustive()
@@ -884,6 +903,7 @@ mod tests {
         }
         static STEPS: &[Migration] = &[Migration {
             from: 1,
+            touches_all: true,
             events: &[],
             metrics: &[],
             migrate: noop,
@@ -911,12 +931,14 @@ mod tests {
         static FULL: &[Migration] = &[
             Migration {
                 from: 1,
+                touches_all: true,
                 events: &[],
                 metrics: &[],
                 migrate: noop,
             },
             Migration {
                 from: 2,
+                touches_all: true,
                 events: &[],
                 metrics: &[],
                 migrate: noop,

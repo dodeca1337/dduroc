@@ -37,7 +37,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use dduroc_format::block::{BlockBuilder, BlockHeader};
 use dduroc_format::segment::{SegmentHeader, SegmentName};
 use dduroc_format::{BootCounter, FooterBuilder, Level, Micros, ProtocolVersion};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -116,6 +116,14 @@ const DIAG_TARGET: &str = "dduroc";
 enum Control {
     /// Зарегистрировать неймспейс.
     Register(Box<NsSetup>, Sender<Result<NsId>>),
+    /// Отпустить неймспейс: запечатать его сегменты и освободить слот.
+    ///
+    /// Идёт той же очередью, что и `Register`, поэтому повторный подъём того
+    /// же имени гарантированно обрабатывается **после** освобождения. Иначе на
+    /// один каталог пришлось бы два состояния канала со своими инвентарями, и
+    /// ротация одного удаляла бы сегмент, открытый другим, — записи уходили бы
+    /// в файл без имени и пропадали при закрытии.
+    Release(NsId),
     /// Вытолкнуть и синхронизировать всё накопленное неймспейсом.
     Sync(Option<NsId>, Sender<Result<()>>),
     /// Запечатать активные сегменты и завершить работу.
@@ -268,6 +276,15 @@ impl Writer {
         Error::WriterDead
     }
 
+    /// Отпустить неймспейс: writer запечатает его сегменты и освободит слот.
+    ///
+    /// Вызывается при уничтожении последней ручки. Без ответа: вызывающий —
+    /// `Drop`, и ждать носитель в нём нельзя. Порядок с последующим
+    /// `register` сохраняет сама очередь команд.
+    pub fn release(&self, ns: NsId) {
+        let _ = self.control.send(Control::Release(ns));
+    }
+
     /// Вытолкнуть накопленное и дождаться `fdatasync`.
     ///
     /// `None` — все неймспейсы.
@@ -321,13 +338,26 @@ impl Writer {
 // Состояние канала
 // ════════════════════════════════════════════════════════════════════════════
 
-struct ChannelState {
-    config: ChannelConfig,
-    dir: PathBuf,
-    /// Неизменные атрибуты, которые уходят в заголовок каждого сегмента.
+/// Неизменные атрибуты, которые уходят в заголовок каждого сегмента канала.
+///
+/// Одним типом, а не тремя полями рядом: они всегда передаются вместе и
+/// всегда попадают в один и тот же заголовок.
+#[derive(Debug, Clone, Copy)]
+struct SegmentIdentity {
     protocol_version: ProtocolVersion,
     store_id: u64,
     boot: BootCounter,
+}
+
+struct ChannelState {
+    config: ChannelConfig,
+    dir: PathBuf,
+    /// Свой номер и счётчики потерь неймспейса: потерю, обнаруженную уже в
+    /// writer'е, надо отметить там же, где образовалась дыра, — иначе она не
+    /// попадёт в поток отдельной записью.
+    index: ChannelIdx,
+    drops: Arc<DropCounters>,
+    identity: SegmentIdentity,
     inventory: Inventory,
     /// Открытый сегмент. `None` — канал ещё ничего не писал либо закрыт
     /// по бездействию: пустой неймспейс не должен занимать ни файлового
@@ -351,11 +381,13 @@ impl ChannelState {
     fn new(
         dir: PathBuf,
         config: ChannelConfig,
-        protocol_version: ProtocolVersion,
-        store_id: u64,
-        boot: BootCounter,
+        identity: SegmentIdentity,
+        index: ChannelIdx,
+        drops: Arc<DropCounters>,
+        counters: &Counters,
     ) -> Result<Self> {
-        let inventory = Inventory::scan(&dir)?;
+        let mut inventory = Inventory::scan(&dir)?;
+        Self::recover_orphan(&dir, &mut inventory, identity, counters);
         let now = Instant::now();
         Ok(Self {
             // Буфер растёт при первой записи: неймспейс, который ничего не
@@ -365,9 +397,9 @@ impl ChannelState {
             builder: BlockBuilder::new(),
             config,
             dir,
-            protocol_version,
-            store_id,
-            boot,
+            index,
+            drops,
+            identity,
             inventory,
             segment: None,
             footer: FooterBuilder::new(),
@@ -377,6 +409,50 @@ impl ChannelState {
             last_sync: now,
             dirty_since_sync: false,
         })
+    }
+
+    /// Запечатать сегмент, оборванный прошлым запуском.
+    ///
+    /// Смысл — вернуть преаллокацию: незапечатанный сегмент числится в бюджете
+    /// канала целиком, и несколько аварийных остановок подряд выедают бюджет
+    /// пустотой, после чего ротация принимается за живую историю.
+    ///
+    /// Трогается **только** сегмент чужого запуска. Сегмент текущего может
+    /// быть открыт живым состоянием этого же процесса (неймспейс подняли
+    /// повторно), и обрезать его под ним значило бы потерять данные. Смены
+    /// запуска для этого достаточно: сегмент по формату не пересекает её
+    /// границу, поэтому в чужой уже никто не пишет.
+    ///
+    /// Отказ восстановления не фатален: сегмент останется незапечатанным и
+    /// будет читаться сканом — ровно так, как было до этой правки.
+    fn recover_orphan(
+        dir: &Path,
+        inventory: &mut Inventory,
+        identity: SegmentIdentity,
+        counters: &Counters,
+    ) {
+        let Some(newest) = inventory.newest().cloned() else {
+            return;
+        };
+        if newest.name.boot == identity.boot {
+            return;
+        }
+        match crate::segment::seal_orphan(&newest.path(dir), Some(identity.store_id)) {
+            Ok(Some(recovered)) => {
+                inventory.update_size(recovered.name, recovered.size);
+                Counters::bump(&counters.segments_sealed);
+                if recovered.truncated {
+                    Counters::bump(&counters.recovered_tails);
+                }
+            }
+            Ok(None) => {}
+            // Сегмент, принесённый с другого прибора, — не отказ носителя, а
+            // законное состояние каталога: кто-то положил сюда чужой дамп.
+            // Трогать его нельзя, а объявлять хранилище неисправным — тем
+            // более: об этих файлах честно сообщает читатель.
+            Err(Error::ForeignSegment { .. }) => {}
+            Err(_) => Counters::bump(&counters.io_errors),
+        }
     }
 
     /// Пора ли вытолкнуть неполный блок.
@@ -412,7 +488,10 @@ struct NsState {
 // ════════════════════════════════════════════════════════════════════════════
 
 struct WriterLoop {
-    namespaces: Vec<NsState>,
+    /// Слоты неймспейсов. `None` — отпущенный: [`NsId`] это индекс, поэтому
+    /// освобождённый слот обнуляется и переиспользуется, а не удаляется —
+    /// сдвиг индексов увёл бы записи в полёте в чужой неймспейс.
+    namespaces: Vec<Option<NsState>>,
     counters: Arc<Counters>,
     /// Переиспользуемый буфер батча.
     batch: Vec<Staged>,
@@ -501,9 +580,28 @@ impl WriterLoop {
         // Очередь всё ещё пополняется быстрее, чем вычерпывается. Дальше
         // ждать нельзя: остановка процесса не должна зависеть от того,
         // перестанут ли прикладные потоки писать.
-        let leftover = normal.len() + critical.len();
+        //
+        // Остаток забирается поимённо, а не просто пересчитывается: потеря
+        // обязана быть отмечена в канале, где образовалась дыра, — иначе она
+        // не попадёт в поток отдельной записью и станет неотличима от тишины.
+        // Число проходов ограничено снимком длины: производитель, пишущий
+        // быстрее, не должен удерживать остановку.
+        let mut leftover = 0u64;
+        for rx in [critical, normal] {
+            for _ in 0..rx.len() {
+                let Ok(item) = rx.try_recv() else { break };
+                if let Some(ns) = self
+                    .namespaces
+                    .get(item.ns.0 as usize)
+                    .and_then(|n| n.as_ref())
+                {
+                    ns.drops.record(item.channel);
+                }
+                leftover += 1;
+            }
+        }
         if leftover > 0 {
-            Counters::add(&self.counters.dropped, leftover as u64);
+            Counters::add(&self.counters.dropped, leftover);
         }
     }
 
@@ -559,7 +657,14 @@ impl WriterLoop {
         // одного обращения к носителю.
         let counters = Arc::clone(&self.counters);
         for &(ns_idx, ch_idx) in &self.active {
-            let ch = &mut self.namespaces[ns_idx].channels[ch_idx];
+            let Some(ch) = self
+                .namespaces
+                .get_mut(ns_idx)
+                .and_then(|n| n.as_mut())
+                .and_then(|n| n.channels.get_mut(ch_idx))
+            else {
+                continue;
+            };
             if ch.config.durability == Durability::Immediate && ch.dirty_since_sync {
                 let done = Self::flush_block(ch, &counters)
                     .and_then(|()| Self::sync_channel(ch, &counters));
@@ -573,14 +678,23 @@ impl WriterLoop {
     fn push(&mut self, item: &Staged) -> Result<()> {
         let ns_idx = item.ns.0 as usize;
         let ch_idx = item.channel.0 as usize;
-        if ns_idx >= self.namespaces.len() || ch_idx >= self.namespaces[ns_idx].channels.len() {
-            // Адрес не существует — записать некуда. Молчать нельзя: это
-            // ошибка вызывающего, и она обязана быть видна в счётчиках.
+        let exists = self
+            .namespaces
+            .get(ns_idx)
+            .and_then(|n| n.as_ref())
+            .is_some_and(|n| ch_idx < n.channels.len());
+        if !exists {
+            // Адрес не существует либо неймспейс уже отпущен — записать
+            // некуда. Молчать нельзя: это ошибка вызывающего, и она обязана
+            // быть видна в счётчиках.
             Counters::bump(&self.counters.dropped);
             return Ok(());
         }
 
-        let ch = &mut self.namespaces[ns_idx].channels[ch_idx];
+        let ch = &mut self.namespaces[ns_idx]
+            .as_mut()
+            .expect("наличие проверено выше")
+            .channels[ch_idx];
 
         // Монотонность внутри канала: время из прошлого подтягивается вперёд.
         // Считается ДО открытия блока: именем и базой нового сегмента должно
@@ -632,7 +746,11 @@ impl WriterLoop {
     }
 
     fn open_segment(ch: &mut ChannelState, at: Micros, counters: &Counters) -> Result<()> {
-        let (protocol_version, store_id, boot) = (ch.protocol_version, ch.store_id, ch.boot);
+        let SegmentIdentity {
+            protocol_version,
+            store_id,
+            boot,
+        } = ch.identity;
         // Имя сегмента — (boot, время его первой записи). Совпадение имён
         // возможно только при регрессе времени; сдвигаем на микросекунду,
         // чтобы не затереть существующий файл.
@@ -697,8 +815,11 @@ impl WriterLoop {
         let Some(seg) = ch.segment.as_mut() else {
             // Собранный блок некуда положить: сегмент не открыт. Такого быть
             // не должно (его открывает `ensure_room`), но потерю всё равно
-            // нужно показать, а не отдать `Ok`.
-            Counters::add(&counters.dropped, u64::from(ch.builder.count()));
+            // нужно показать, а не отдать `Ok` — и показать там же, где она
+            // образовалась, чтобы отметка попала в поток этого канала.
+            let lost = u64::from(ch.builder.count());
+            Counters::add(&counters.dropped, lost);
+            ch.drops.record_n(ch.index, lost);
             ch.builder.reset();
             return Ok(());
         };
@@ -722,9 +843,27 @@ impl WriterLoop {
         if !seg.fits(out.len() as u64) {
             Self::seal_segment(ch, counters)?;
             Self::open_segment(ch, header.base, counters)?;
-            let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
+            let next_seq = {
+                let seg = ch.segment.as_ref().ok_or(Error::WriterDead)?;
+                // Свежий сегмент тоже может не вместить блок: одна запись
+                // бывает крупнее целого сегмента (несжимаемый blob). Писать её
+                // всё равно значило бы выйти за преаллокацию, то есть
+                // отказаться от единственной гарантии, ради которой она
+                // делается: ENOSPC приходит один раз, при создании сегмента,
+                // а не посреди записи критического события. Блок
+                // отбрасывается, потеря объявляется отметкой в потоке.
+                if !seg.fits(out.len() as u64) {
+                    let lost = u64::from(header.count);
+                    Counters::add(&counters.dropped, lost);
+                    ch.drops.record_n(ch.index, lost);
+                    out.clear();
+                    ch.scratch = out;
+                    return Ok(());
+                }
+                seg.next_seq()
+            };
             // Нумерация блоков в новом сегменте начинается заново.
-            dduroc_format::restamp_seq(&mut out, seg.next_seq())?;
+            dduroc_format::restamp_seq(&mut out, next_seq)?;
         }
 
         let result = (|| {
@@ -805,18 +944,30 @@ impl WriterLoop {
         Ok(true)
     }
 
-    /// Ближайший дедлайн среди всех каналов.
+    /// Ближайший дедлайн — только по каналам, которым есть что обслуживать.
+    ///
+    /// Обходить все каналы подряд нельзя: при заявленных двадцати четырёх
+    /// тысячах неймспейсов их десятки тысяч, а вызывается это на **каждом**
+    /// холостом обороте цикла, то есть до четырёх раз в секунду. Дедлайн
+    /// бывает только у канала с открытым блоком или несинхронизованными
+    /// данными — то есть ровно у того, кто уже лежит в `active`.
     fn next_deadline(&self) -> Option<Duration> {
         let now = Instant::now();
         let mut best: Option<Instant> = None;
-        for ns in &self.namespaces {
-            for ch in &ns.channels {
-                for d in [ch.flush_deadline(), ch.sync_deadline()]
-                    .into_iter()
-                    .flatten()
-                {
-                    best = Some(best.map_or(d, |b: Instant| b.min(d)));
-                }
+        for &(ns_idx, ch_idx) in &self.active {
+            let Some(ch) = self
+                .namespaces
+                .get(ns_idx)
+                .and_then(|n| n.as_ref())
+                .and_then(|n| n.channels.get(ch_idx))
+            else {
+                continue;
+            };
+            for d in [ch.flush_deadline(), ch.sync_deadline()]
+                .into_iter()
+                .flatten()
+            {
+                best = Some(best.map_or(d, |b: Instant| b.min(d)));
             }
         }
         best.map(|d| d.saturating_duration_since(now))
@@ -830,7 +981,14 @@ impl WriterLoop {
         let counters = Arc::clone(&self.counters);
         let active = std::mem::take(&mut self.active);
         for &(ns_idx, ch_idx) in &active {
-            let ch = &mut self.namespaces[ns_idx].channels[ch_idx];
+            let Some(ch) = self
+                .namespaces
+                .get_mut(ns_idx)
+                .and_then(|n| n.as_mut())
+                .and_then(|n| n.channels.get_mut(ch_idx))
+            else {
+                continue;
+            };
 
             if ch.flush_deadline().is_some_and(|d| d <= now)
                 && Self::flush_block(ch, &counters).is_err()
@@ -857,7 +1015,8 @@ impl WriterLoop {
     /// дефект прототипа, ради которого здесь ведётся учёт.
     fn emit_drop_notices(&mut self) {
         let mut notices: Vec<(NsId, ChannelIdx, u64, Micros)> = Vec::new();
-        for (ns_idx, ns) in self.namespaces.iter().enumerate() {
+        for (ns_idx, slot) in self.namespaces.iter().enumerate() {
+            let Some(ns) = slot.as_ref() else { continue };
             for ch_idx in 0..ns.channels.len() {
                 let channel = ChannelIdx(ch_idx as u16);
                 let count = ns.drops.take(channel);
@@ -919,6 +1078,14 @@ impl WriterLoop {
                 let _ = reply.send(self.register(*setup));
                 ControlOutcome::Continue
             }
+            Control::Release(ns) => {
+                // Сначала записи, потом освобождение: то, что прикладной поток
+                // успел поставить в очередь до уничтожения ручки, обязано лечь
+                // на диск — `log()` на него уже ответил `Ok`.
+                self.drain_pending(normal, critical);
+                self.release(ns);
+                ControlOutcome::Continue
+            }
             Control::Sync(ns, reply) => {
                 // Сначала записи, потом отчёт: иначе `sync` подтвердил бы
                 // сохранность того, что ещё стоит в очереди.
@@ -936,35 +1103,80 @@ impl WriterLoop {
     }
 
     fn register(&mut self, setup: NsSetup) -> Result<NsId> {
+        let identity = SegmentIdentity {
+            protocol_version: setup.protocol_version,
+            store_id: setup.store_id,
+            boot: setup.boot,
+        };
         let mut channels = Vec::with_capacity(setup.channels.len());
-        for cfg in setup.channels {
+        for (i, cfg) in setup.channels.into_iter().enumerate() {
             crate::fsutil::create_dir_all_synced(&setup.dir.join(&cfg.name))?;
             channels.push(ChannelState::new(
                 setup.dir.join(&cfg.name),
                 cfg,
-                setup.protocol_version,
-                setup.store_id,
-                setup.boot,
+                identity,
+                ChannelIdx(i as u16),
+                Arc::clone(&setup.drops),
+                &self.counters,
             )?);
         }
-        let id = NsId(self.namespaces.len() as u32);
-        self.namespaces.push(NsState {
+        let state = NsState {
             name: setup.name,
             channels,
             drops: setup.drops,
-        });
-        Ok(id)
+        };
+        // Слот отпущенного неймспейса переиспользуется: иначе повторный
+        // подъём того же имени (переподключение сервиса) растил бы таблицу
+        // до конца жизни процесса.
+        match self.namespaces.iter().position(Option::is_none) {
+            Some(i) => {
+                self.namespaces[i] = Some(state);
+                Ok(NsId(i as u32))
+            }
+            None => {
+                self.namespaces.push(Some(state));
+                Ok(NsId((self.namespaces.len() - 1) as u32))
+            }
+        }
+    }
+
+    /// Отпустить неймспейс: дописать, запечатать сегменты, освободить слот.
+    ///
+    /// Без этого состояние канала жило бы до конца процесса, и повторный
+    /// подъём того же имени дал бы **два** состояния на один каталог со своими
+    /// инвентарями. Ротация одного не знала бы об активном сегменте другого и
+    /// удалила бы его: запись продолжалась бы в файл, у которого больше нет
+    /// имени, и всё записанное после этого исчезло бы при закрытии.
+    fn release(&mut self, ns: NsId) {
+        // Отметки о потерях выталкиваются ДО запечатывания — иначе дыра,
+        // образовавшаяся перед закрытием, не попала бы в поток вовсе.
+        self.emit_drop_notices();
+
+        let idx = ns.0 as usize;
+        let counters = Arc::clone(&self.counters);
+        if let Some(slot) = self.namespaces.get_mut(idx)
+            && let Some(state) = slot.as_mut()
+        {
+            for ch in &mut state.channels {
+                if Self::seal_segment(ch, &counters).is_err() {
+                    Counters::bump(&counters.io_errors);
+                }
+            }
+            *slot = None;
+        }
+        self.active.retain(|&(n, _)| n != idx);
     }
 
     fn sync_all(&mut self, only: Option<NsId>) -> Result<()> {
         let counters = Arc::clone(&self.counters);
         let mut first_error = None;
-        for (idx, ns) in self.namespaces.iter_mut().enumerate() {
+        for (idx, slot) in self.namespaces.iter_mut().enumerate() {
             if let Some(NsId(want)) = only
                 && want as usize != idx
             {
                 continue;
             }
+            let Some(ns) = slot.as_mut() else { continue };
             for ch in &mut ns.channels {
                 let r = Self::flush_block(ch, &counters)
                     .and_then(|()| Self::sync_channel(ch, &counters));
@@ -989,7 +1201,7 @@ impl WriterLoop {
         self.emit_drop_notices();
 
         let counters = Arc::clone(&self.counters);
-        for ns in &mut self.namespaces {
+        for ns in self.namespaces.iter_mut().flatten() {
             for ch in &mut ns.channels {
                 if Self::seal_segment(ch, &counters).is_err() {
                     Counters::bump(&counters.io_errors);

@@ -44,7 +44,7 @@ pub use schema::{
     EventDesc, Language, MetricDesc, MetricKind, Range, Schema, Severity, SpanDesc, StateDesc,
     StorageClass, Thresholds,
 };
-pub use segment::{Scan, SegmentReader, SegmentWriter};
+pub use segment::{Recovered, Scan, SegmentReader, SegmentWriter, seal_orphan};
 pub use staged::{NsId, Staged, StagedRecord};
 pub use stats::Stats;
 pub use store::{Store, StoreConfig};

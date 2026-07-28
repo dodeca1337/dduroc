@@ -679,11 +679,12 @@ mod tests {
 
     #[test]
     fn duplicate_ids_in_set_rejected() {
-        // Собираем множество вручную с нулевой дельтой — дубль.
+        // Число блоков берётся из трейлера (0), поэтому секции начинаются
+        // сразу с множества событий. Собираем его вручную с нулевой дельтой
+        // после первого элемента — это дубль, и он обязан быть отвергнут.
         let mut sections = Vec::new();
-        varint::write_u64(&mut sections, 0); // блоков нет
         varint::write_u64(&mut sections, 2); // 2 события
-        varint::write_u64(&mut sections, 5);
+        varint::write_u64(&mut sections, 5); // первое — абсолютное значение
         varint::write_u64(&mut sections, 0); // дубль
         varint::write_u64(&mut sections, 0); // метрик нет
 
