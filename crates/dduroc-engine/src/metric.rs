@@ -130,7 +130,11 @@ impl MetricValue<Blob> for &[u8] {
 impl MetricValue<Blob> for Vec<u8> {
     #[inline]
     fn into_owned(self) -> OwnedValue {
-        OwnedValue::Blob(self.as_slice().into())
+        // Владение переезжает без копии: буфер вектора становится кучным
+        // хранилищем SmallVec. Прежний `as_slice().into()` копировал
+        // мегабайтный снимок спектра целиком — лишняя копия и лишний пик
+        // транзиентной памяти на каждый blob-отсчёт.
+        OwnedValue::Blob(crate::staged::Payload::from_vec(self))
     }
 }
 

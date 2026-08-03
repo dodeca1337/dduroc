@@ -259,6 +259,11 @@ pub struct BlockBuilder {
     last: Micros,
     count: u16,
     body: Vec<u8>,
+    /// Выход LZ4 — переиспользуется между flush'ами. Раньше `compress`
+    /// аллоцировал свежий вектор размером с тело на каждый блок: при пяти
+    /// flush'ах в секунду это сотни килобайт аллокационного трафика впустую,
+    /// а на мегабайтном blob'е — мегабайтный спайк на каждый отсчёт.
+    lz4: Vec<u8>,
 }
 
 impl BlockBuilder {
@@ -354,15 +359,25 @@ impl BlockBuilder {
         }
         let raw_len = len as u32;
 
-        let compressed = match compression {
+        let compressed: Option<&[u8]> = match compression {
             Compression::None | Compression::Zstd => None,
             Compression::Lz4 => {
-                let c = lz4_flex::block::compress(&self.body);
-                (c.len() < self.body.len()).then_some(c)
+                // Сжатие в переиспользуемый буфер. `len` буфера держится на
+                // высшей отметке и не сбрасывается: `resize` зануляет только
+                // прирост, поэтому повторные flush'и не платят ни аллокацией,
+                // ни memset'ом.
+                let max = lz4_flex::block::get_maximum_output_size(len);
+                if self.lz4.len() < max {
+                    self.lz4.resize(max, 0);
+                }
+                match lz4_flex::block::compress_into(&self.body, &mut self.lz4) {
+                    Ok(n) if n < len => Some(&self.lz4[..n]),
+                    _ => None,
+                }
             }
         };
 
-        let (used, body_on_disk): (Compression, &[u8]) = match &compressed {
+        let (used, body_on_disk): (Compression, &[u8]) = match compressed {
             Some(c) => (Compression::Lz4, c),
             None => (Compression::None, &self.body),
         };
@@ -391,6 +406,33 @@ impl BlockBuilder {
         self.last = Micros(0);
         self.count = 0;
         self.body.clear();
+    }
+
+    /// Суммарная ёмкость внутренних буферов (тело + выход сжатия), байт.
+    ///
+    /// Для контроля удержания: `reset` и `finish` намеренно сохраняют
+    /// ёмкость под переиспользование, и снаружи должно быть видно, сколько
+    /// её накопилось.
+    pub fn capacity(&self) -> usize {
+        self.body.capacity() + self.lz4.capacity()
+    }
+
+    /// Отдать память сверх `capacity` байт на буфер. Действует только на
+    /// пустой накопитель — недописанный блок терять нельзя.
+    ///
+    /// Ёмкость буферов растёт до крупнейшего блока, прошедшего через
+    /// накопитель, и без этого вызова остаётся такой навсегда: один
+    /// мегабайтный blob закреплял бы мегабайты за каналом до конца жизни
+    /// процесса. Вызывается движком, когда канал уходит в бездействие.
+    pub fn shrink_to(&mut self, capacity: usize) {
+        if self.count != 0 {
+            return;
+        }
+        self.body.shrink_to(capacity);
+        // Содержимое выхода сжатия — мусор между flush'ами; длину надо
+        // сбросить, иначе `shrink_to` не опустит ёмкость ниже неё.
+        self.lz4.clear();
+        self.lz4.shrink_to(capacity);
     }
 }
 
@@ -557,6 +599,61 @@ mod tests {
         } else {
             assert!(header.body_len < header.raw_len);
         }
+    }
+
+    #[test]
+    fn shrink_returns_peak_capacity_but_never_a_pending_block() {
+        // Ёмкость буферов — след самого крупного блока: один мегабайтный blob
+        // без возврата закреплял бы мегабайты за каналом навсегда.
+        let big = vec![0xA5u8; 1 << 20];
+        let mut b = BlockBuilder::new();
+        b.push(Micros(0), &msg(1, &big)).unwrap();
+
+        // Недописанный блок сжатие не трогает: терять записи нельзя.
+        let before = b.capacity();
+        b.shrink_to(0);
+        assert_eq!(b.capacity(), before, "непустой накопитель не сжимается");
+
+        let mut out = Vec::new();
+        b.finish(0, Compression::Lz4, &mut out).unwrap();
+        assert!(
+            b.capacity() >= 1 << 20,
+            "после мегабайтного блока ёмкость удержана: {}",
+            b.capacity()
+        );
+
+        b.shrink_to(0);
+        assert_eq!(b.capacity(), 0, "пустой накопитель обязан отдать всё");
+
+        // Накопитель остаётся рабочим после возврата памяти.
+        b.push(Micros(1), &msg(2, &[1, 2, 3])).unwrap();
+        let mut out = Vec::new();
+        b.finish(1, Compression::None, &mut out).unwrap();
+        assert!(Block::parse(&out).unwrap().is_some());
+    }
+
+    #[test]
+    fn lz4_buffer_is_reused_across_blocks() {
+        // Выход сжатия переиспользуется между flush'ами; второй блок не должен
+        // ни читать мусор первого, ни зависеть от его длины.
+        let mut b = BlockBuilder::new();
+        let mut bytes = Vec::new();
+
+        for i in 0..50 {
+            b.push(Micros(i * 10), &msg(7, &[0xAA; 64])).unwrap();
+        }
+        b.finish(0, Compression::Lz4, &mut bytes).unwrap();
+
+        // Второй блок заметно короче и с другим содержимым.
+        b.push(Micros(1_000), &msg(9, &[0x55; 16])).unwrap();
+        let mut second = Vec::new();
+        let h = b.finish(1, Compression::Lz4, &mut second).unwrap();
+
+        let block = Block::parse(&second).unwrap().unwrap();
+        let recs: Vec<_> = block.records().map(|r| r.unwrap()).collect();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].1, msg(9, &[0x55; 16]));
+        assert_eq!(h.seq, 1);
     }
 
     #[test]

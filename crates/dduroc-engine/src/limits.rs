@@ -117,16 +117,22 @@ pub struct EffectiveLimits {
 /// Индексируется позицией метрики в [`Schema::metrics`], а не хеш-таблицей:
 /// метрик единицы-сотни, позиция уже находится бинарным поиском по схеме, и
 /// лишняя хеш-таблица тут была бы дороже самого доступа.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LimitsRegistry {
     slots: RwLock<Vec<Option<MetricLimits>>>,
 }
 
 impl LimitsRegistry {
-    pub fn new(metric_count: usize) -> Self {
-        Self {
-            slots: RwLock::new(vec![None; metric_count]),
-        }
+    /// Реестр без единого выделенного слота.
+    ///
+    /// Слоты появляются при первом переопределении (`set` доращивает вектор
+    /// сам): у подавляющего большинства неймспейсов переопределений нет
+    /// вовсе, а плотный `vec![None; metric_count]` стоил бы ~сотню байт на
+    /// метрику — при сотне метрик и заявленных десятках тысяч неймспейсов
+    /// это сотни мегабайт, выделенных за пустоту. Чтение по несуществующему
+    /// индексу и так отвечает «переопределения нет».
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Выставить пределы. `None` — снять переопределение.
@@ -323,7 +329,7 @@ mod tests {
     }
 
     fn registry() -> LimitsRegistry {
-        LimitsRegistry::new(METRICS.len())
+        LimitsRegistry::new()
     }
 
     #[test]
@@ -502,7 +508,7 @@ mod tests {
             metrics: PLAIN,
             ..schema()
         };
-        let r = LimitsRegistry::new(PLAIN.len());
+        let r = LimitsRegistry::new();
         for v in [0u64, 1, u64::MAX] {
             assert_eq!(
                 r.severity_of(&s, MetricId(1), &Value::U64(v)),

@@ -167,6 +167,7 @@ impl Writer {
         let loop_state = WriterLoop {
             namespaces: Vec::new(),
             counters: Arc::clone(&counters),
+            diag_target: Arc::from(DIAG_TARGET),
             batch: Vec::new(),
             active: Vec::new(),
         };
@@ -375,6 +376,12 @@ struct ChannelState {
     block_opened: Option<Instant>,
     last_sync: Instant,
     dirty_since_sync: bool,
+    /// Числится ли канал в списке `active` writer'а.
+    ///
+    /// Флаг, а не `active.contains(..)`: проверка выполняется на **каждую**
+    /// запись, и линейный поиск по списку в десятки тысяч пар превращал бы
+    /// раскладку батча в квадрат от числа пишущих каналов.
+    in_active: bool,
 }
 
 impl ChannelState {
@@ -408,7 +415,28 @@ impl ChannelState {
             block_opened: None,
             last_sync: now,
             dirty_since_sync: false,
+            in_active: false,
         })
+    }
+
+    /// Вернуть память бездействующего канала аллокатору.
+    ///
+    /// Буферы канала растут до крупнейшего блока, прошедшего через них, и без
+    /// возврата остаются такими навсегда: один мегабайтный blob закреплял бы
+    /// ~2× своего размера за каналом до конца жизни процесса, а стационарные
+    /// 64–128 КиБ на канал при заявленных десятках тысяч каналов складывались
+    /// бы в гигабайты. Поэтому при уходе в бездействие память отдаётся
+    /// **целиком**, а не сжимается до порога: пишущих в любой момент единицы,
+    /// и держать пустые буферы за молчащими нечем оправдать.
+    ///
+    /// Цена возврата — реаллокация при следующем пробуждении, но канал уходит
+    /// в бездействие не раньше, чем выполнит sync, то есть не чаще периода
+    /// синхронизации: одна аллокация в несколько секунд на канал не видна
+    /// даже на armv7.
+    fn release_buffers(&mut self) {
+        self.builder.shrink_to(0);
+        self.scratch = Vec::new();
+        self.footer.shrink_to_fit();
     }
 
     /// Запечатать сегмент, оборванный прошлым запуском.
@@ -493,6 +521,10 @@ struct WriterLoop {
     /// сдвиг индексов увёл бы записи в полёте в чужой неймспейс.
     namespaces: Vec<Option<NsState>>,
     counters: Arc<Counters>,
+    /// Источник отметок о потерях — один на всю жизнь writer'а: `Arc::from`
+    /// аллоцирует, а отметки появляются ровно тогда, когда система под
+    /// давлением.
+    diag_target: Arc<str>,
     /// Переиспользуемый буфер батча.
     batch: Vec<Staged>,
     /// Каналы, которым есть что обслуживать: открытый блок, несинхронизованные
@@ -703,12 +735,24 @@ impl WriterLoop {
         let at = Micros(item.at.0.max(ch.last_time.0));
         ch.last_time = at;
 
+        // Запись, не дошедшая до накопителя (нет места под сегмент, не
+        // закодировалась), — потеряна, и учесть её надо там, где образовалась
+        // дыра: `io_errors` скажет «что-то сломалось», но не «сколько записей
+        // пропало», и отметка в поток без поканального счётчика не попадёт.
         if ch.builder.is_empty() {
-            Self::ensure_room(ch, at, &self.counters)?;
+            if let Err(e) = Self::ensure_room(ch, at, &self.counters) {
+                Counters::bump(&self.counters.dropped);
+                ch.drops.record(ch.index);
+                return Err(e);
+            }
             ch.block_opened = Some(Instant::now());
         }
 
-        ch.builder.push(at, &item.record.as_record())?;
+        if let Err(e) = ch.builder.push(at, &item.record.as_record()) {
+            Counters::bump(&self.counters.dropped);
+            ch.drops.record(ch.index);
+            return Err(e.into());
+        }
         Counters::bump(&self.counters.records_written);
         // Множества типов в footer'е: миграция по ним решает, переписывать ли
         // сегмент, а читатель — что в сегменте вообще есть.
@@ -720,7 +764,8 @@ impl WriterLoop {
             ch.footer.add_metric(id);
         }
         ch.dirty_since_sync = true;
-        if !self.active.contains(&(ns_idx, ch_idx)) {
+        if !ch.in_active {
+            ch.in_active = true;
             self.active.push((ns_idx, ch_idx));
         }
 
@@ -836,11 +881,56 @@ impl WriterLoop {
             }
         };
 
+        // Дальше любой исход проходит через одну точку возврата буфера:
+        // раньше четыре ранних `?` роняли `out` на пол — вместе с ёмкостью,
+        // которую следующий flush реаллоцировал бы, — а записи блока исчезали
+        // с одним лишь `io_errors`, без учёта в потерях и без отметки в
+        // потоке канала.
+        let placed = Self::place_block(ch, counters, &mut out, &header);
+        let written = out.len() as u64;
+        ch.scratch = out;
+
+        match placed {
+            Ok(Placement::At(offset)) => {
+                ch.footer.add_block(offset, &header, last);
+                Counters::bump(&counters.blocks_written);
+                Counters::add(&counters.bytes_written, written);
+                Ok(())
+            }
+            Ok(Placement::Dropped) => {
+                // Негабаритный блок раздул буферы до размеров, которых канал
+                // больше не увидит, — держать их за ним незачем.
+                ch.release_buffers();
+                Ok(())
+            }
+            Err(e) => {
+                let lost = u64::from(header.count);
+                Counters::add(&counters.dropped, lost);
+                ch.drops.record_n(ch.index, lost);
+                Err(e)
+            }
+        }
+    }
+
+    /// Положить собранный блок в сегмент, при необходимости сменив сегмент.
+    ///
+    /// Ошибка означает, что блок потерян: учёт потерь и возврат буфера —
+    /// забота вызывающего, у которого буфер и остаётся.
+    fn place_block(
+        ch: &mut ChannelState,
+        counters: &Counters,
+        out: &mut [u8],
+        header: &BlockHeader,
+    ) -> Result<Placement> {
         // Резерв в `ensure_room` рассчитан по `block_max_bytes`, но одна
         // крупная запись могла перевалить порог: писать за границу
         // преаллокации нельзя — там нет зарезервированного на носителе места,
         // и запись упёрлась бы в ENOSPC уже посреди блока.
-        if !seg.fits(out.len() as u64) {
+        let fits = ch
+            .segment
+            .as_ref()
+            .is_some_and(|seg| seg.fits(out.len() as u64));
+        if !fits {
             Self::seal_segment(ch, counters)?;
             Self::open_segment(ch, header.base, counters)?;
             let next_seq = {
@@ -856,29 +946,15 @@ impl WriterLoop {
                     let lost = u64::from(header.count);
                     Counters::add(&counters.dropped, lost);
                     ch.drops.record_n(ch.index, lost);
-                    out.clear();
-                    ch.scratch = out;
-                    return Ok(());
+                    return Ok(Placement::Dropped);
                 }
                 seg.next_seq()
             };
             // Нумерация блоков в новом сегменте начинается заново.
-            dduroc_format::restamp_seq(&mut out, next_seq)?;
+            dduroc_format::restamp_seq(out, next_seq)?;
         }
-
-        let result = (|| {
-            let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
-            let offset = seg.append_block(&out)?;
-            Ok::<u64, Error>(offset)
-        })();
-        let written = out.len() as u64;
-        ch.scratch = out;
-
-        let offset = result?;
-        ch.footer.add_block(offset, &header, last);
-        Counters::bump(&counters.blocks_written);
-        Counters::add(&counters.bytes_written, written);
-        Ok(())
+        let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
+        Ok(Placement::At(seg.append_block(out)?))
     }
 
     fn sync_channel(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
@@ -1001,10 +1077,19 @@ impl WriterLoop {
                 Counters::bump(&counters.io_errors);
             }
 
-            // Канал, которому больше нечего обслуживать, покидает список:
-            // иначе он оставался бы в нём до конца жизни процесса.
-            if ch.block_opened.is_some() || ch.dirty_since_sync {
+            // Канал остаётся в списке, только пока ему есть что обслуживать:
+            // открытый блок или дедлайн синхронизации. Проверять сырой
+            // `dirty_since_sync` нельзя — у Relaxed-канала он не сбрасывается
+            // до самого seal, и канал жил бы в списке вечно, возвращая полный
+            // обход, ради устранения которого список заведён.
+            if ch.block_opened.is_some() || ch.sync_deadline().is_some() {
                 self.active.push((ns_idx, ch_idx));
+            } else {
+                // Уходящий в бездействие канал отдаёт буферы: их ёмкость —
+                // след самого крупного блока, и держать её за молчащим
+                // каналом значит закрепить пик навсегда.
+                ch.in_active = false;
+                ch.release_buffers();
             }
         }
     }
@@ -1039,7 +1124,7 @@ impl WriterLoop {
                 record: StagedRecord::Text {
                     level: Level::Error,
                     span: None,
-                    target: Arc::from(DIAG_TARGET),
+                    target: Arc::clone(&self.diag_target),
                     text: format!("потеряно записей: {count} (очередь переполнена)")
                         .into_boxed_str(),
                 },
@@ -1216,6 +1301,14 @@ enum ControlOutcome {
     Stop,
 }
 
+/// Куда лёг собранный блок.
+enum Placement {
+    /// Записан по смещению.
+    At(u64),
+    /// Отброшен: не помещается даже в свежий сегмент. Потеря уже учтена.
+    Dropped,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,6 +1330,85 @@ mod tests {
 
         let d = QueueSizes::default();
         assert_eq!(d.sanitized(), d, "разумные значения не искажаются");
+    }
+
+    #[test]
+    fn idle_channel_gives_its_buffers_back() {
+        // Буферы канала растут до крупнейшего блока и без возврата остаются
+        // такими навсегда: RSS-замер показывал +16 МиБ после ОДНОГО blob'а
+        // на 8 МиБ — буфер блока плюс scratch, оба по размеру блока.
+        // При уходе канала в бездействие память обязана вернуться аллокатору.
+        use dduroc_format::record::Sample;
+        use dduroc_format::{MetricId, Record, Value};
+
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Counters::default();
+        let drops = Arc::new(DropCounters::new(1));
+        let mut ch = ChannelState::new(
+            dir.path().to_path_buf(),
+            ChannelConfig::new("default", 64 * 1024 * 1024),
+            SegmentIdentity {
+                protocol_version: ProtocolVersion(1),
+                store_id: 0,
+                boot: BootCounter(0),
+            },
+            ChannelIdx(0),
+            drops,
+            &counters,
+        )
+        .unwrap();
+
+        // Мегабайтный несжимаемый blob — блок заведомо крупнее block_max.
+        let noise: Vec<u8> = {
+            let mut s: u64 = 0x2545_F491_4F6C_DD1D;
+            (0..1 << 20)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s as u8
+                })
+                .collect()
+        };
+        WriterLoop::ensure_room(&mut ch, Micros(0), &counters).unwrap();
+        ch.builder
+            .push(
+                Micros(0),
+                &Record::Sample(Sample {
+                    metric: MetricId(1),
+                    value: Value::Blob(&noise),
+                }),
+            )
+            .unwrap();
+        WriterLoop::flush_block(&mut ch, &counters).unwrap();
+
+        let held = ch.builder.capacity() + ch.scratch.capacity();
+        assert!(
+            held >= 2 << 20,
+            "после blob'а буферы обязаны быть раздуты (иначе тест пуст): {held}"
+        );
+
+        // То, что делает tick с каналом, покинувшим active.
+        ch.release_buffers();
+        assert_eq!(
+            ch.builder.capacity() + ch.scratch.capacity(),
+            0,
+            "бездействующий канал не имеет права держать пик"
+        );
+
+        // Канал остаётся рабочим: следующая запись переоткрывает буферы.
+        ch.builder
+            .push(
+                Micros(10),
+                &Record::Sample(Sample {
+                    metric: MetricId(1),
+                    value: Value::U64(7),
+                }),
+            )
+            .unwrap();
+        WriterLoop::flush_block(&mut ch, &counters).unwrap();
+        assert_eq!(counters.snapshot().dropped, 0);
+        assert_eq!(counters.snapshot().blocks_written, 2);
     }
 
     #[test]

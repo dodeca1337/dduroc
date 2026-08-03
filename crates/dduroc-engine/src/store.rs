@@ -219,7 +219,7 @@ impl Store {
         // независимому writer-состоянию на один каталог, и оба писали бы
         // сегменты с одинаковыми именами.
         {
-            let mut open = self.open.lock().map_err(|_| Error::ShuttingDown)?;
+            let mut open = self.locked_open();
             if open.contains_key(name) {
                 return Err(Error::NamespaceBusy(name.to_owned()));
             }
@@ -263,9 +263,7 @@ impl Store {
             drops: Arc::clone(&drops),
         })?;
 
-        if let Ok(mut open) = self.open.lock() {
-            open.insert(name.to_owned(), Some(id));
-        }
+        self.locked_open().insert(name.to_owned(), Some(id));
         guard.disarm();
 
         Ok(Namespace::new(
@@ -284,6 +282,17 @@ impl Store {
             Arc::clone(&self.next_span),
             meta,
         ))
+    }
+
+    /// Реестр открытых неймспейсов, с восстановлением после отравления.
+    ///
+    /// Причина та же, что у [`Store::locked_epochs`]: отравление означает
+    /// панику в другом потоке, а не противоречивые данные — под мьютексом
+    /// только вставки и удаления в готовой таблице. Отказ обошёлся бы дороже:
+    /// ручка неймспейса при уничтожении не смогла бы снять пометку «занято»,
+    /// имя осталось бы занятым навсегда, а его строка — неосвобождённой.
+    fn locked_open(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<NsId>>> {
+        self.open.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Эпохи под мьютексом, с восстановлением после отравления.
@@ -380,9 +389,7 @@ struct NamespaceLease {
 
 impl Drop for NamespaceLease {
     fn drop(&mut self) {
-        if let Ok(mut open) = self.store.open.lock() {
-            open.remove(&self.name);
-        }
+        self.store.locked_open().remove(&self.name);
         // Writer'у тоже надо сказать: без этого состояние канала жило бы до
         // конца процесса, а повторный подъём того же имени дал бы два
         // состояния на один каталог — с двумя инвентарями и двумя ротациями.
@@ -406,10 +413,8 @@ impl ReserveGuard<'_> {
 
 impl Drop for ReserveGuard<'_> {
     fn drop(&mut self) {
-        if self.armed
-            && let Ok(mut open) = self.store.open.lock()
-        {
-            open.remove(self.name);
+        if self.armed {
+            self.store.locked_open().remove(self.name);
         }
     }
 }

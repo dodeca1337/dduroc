@@ -149,7 +149,7 @@ impl Namespace {
         next_span: Arc<AtomicU32>,
         meta: NsMeta,
     ) -> Self {
-        let limits = LimitsRegistry::new(schema.metrics.len());
+        let limits = LimitsRegistry::new();
         Self {
             inner: Arc::new(NamespaceInner {
                 _store: store,

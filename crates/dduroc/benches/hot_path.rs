@@ -209,6 +209,25 @@ fn bench_block(c: &mut Criterion) {
         });
     }
 
+    // Стационарный путь writer'а: накопитель живёт между flush'ами, буферы
+    // (тело и выход LZ4) переиспользуются. Именно так работает канал в
+    // процессе; вариант с холодным накопителем выше — это первый flush после
+    // пробуждения из бездействия, он платит аллокацию и инициализацию.
+    g.bench_function("build/lz4_steady", |b| {
+        let mut builder = BlockBuilder::new();
+        let mut out = Vec::new();
+        let mut seq = 0u32;
+        b.iter(|| {
+            out.clear();
+            for i in 0..RECORDS {
+                builder.push(Micros(i as u64 * 100), &rec).unwrap();
+            }
+            let h = builder.finish(seq, Compression::Lz4, &mut out).unwrap();
+            seq = seq.wrapping_add(1);
+            black_box(h.body_len)
+        });
+    });
+
     // Чтение блока: распаковка + разбор всех записей.
     let mut builder = BlockBuilder::with_capacity(64 * 1024);
     for i in 0..RECORDS {

@@ -403,6 +403,20 @@ impl FooterBuilder {
         self.min = None;
         self.max = Micros(0);
     }
+
+    /// Отдать слак индекса, сохранив накопленное.
+    ///
+    /// Индекс блоков растёт на запись за каждый flush и после `reset`
+    /// сохраняет пиковую ёмкость: критический канал с 8-КиБ блоками при
+    /// 256-МиБ сегменте накапливает до ~770 КиБ на канал — навсегда.
+    /// Живые записи открытого сегмента при этом нужны до самого seal, поэтому
+    /// здесь именно `shrink_to_fit`, а не сброс. Вызывается движком при
+    /// бездействии канала.
+    pub fn shrink_to_fit(&mut self) {
+        self.blocks.shrink_to_fit();
+        self.events.ids.shrink_to_fit();
+        self.metrics.ids.shrink_to_fit();
+    }
 }
 
 fn write_id_set(out: &mut Vec<u8>, set: &IdSet) {
