@@ -225,8 +225,24 @@ impl Footer {
 /// гигабайты по счётчику из недоверенного файла нельзя: на armv7 это паника
 /// «capacity overflow», на 64-битном вьюере — OOM-killer.
 fn bounded(count: u32, available: usize, min_entry: usize) -> usize {
-    (count as usize).min(available / min_entry.max(1))
+    (count as usize)
+        .min(available / min_entry.max(1))
+        .min(PREALLOC_MAX)
 }
+
+/// Потолок предварительного выделения по счётчику из файла.
+///
+/// Одного [`bounded`] мало: он считает, сколько элементов физически влезло бы
+/// в секции, но влезает-то на диске, а в памяти элемент крупнее — индекс
+/// блоков втрое (три varint'а против двадцати четырёх байт), множество id
+/// ввосьмеро (байт против `u64`). Без потолка секция в шестьдесят мегабайт
+/// требовала бы полгигабайта, и файл с валидным CRC (а CRC32C — не подпись,
+/// его пересчитывает кто угодно) укладывал бы вьюер OOM-killer'ом.
+///
+/// Потолок разрывает связь между числом из файла и размером аллокации.
+/// Вектор дорастёт сам, если данных действительно столько: ни один разбор от
+/// этого не откажет, а лишние реаллокации на фоне чтения файла не видны.
+const PREALLOC_MAX: usize = 4096;
 
 fn read_id_set(c: &mut Cursor<'_>, what: &'static str, available: usize) -> Result<Vec<u64>> {
     let n = c.varint_u32(what)?;
@@ -302,6 +318,17 @@ pub struct FooterBuilder {
     blocks: Vec<BlockIndexEntry>,
     events: IdSet,
     metrics: IdSet,
+    /// Типы, встреченные в **ещё не записанном** блоке.
+    ///
+    /// Отдельная ступень, потому что блок не обязан лечь в тот сегмент, над
+    /// которым он собирался: не поместившийся блок переезжает в свежий
+    /// (см. правила записи в SPEC §5). Без ступени его типы оказывались бы в
+    /// footer'е сегмента, где блока **нет**, и отсутствовали бы в том, где он
+    /// есть, — а по этим множествам миграция решает, переписывать ли сегмент,
+    /// и читатель судит, есть ли в нём нужная телеметрия. Оба ответа
+    /// оказывались бы неверными.
+    pending_events: IdSet,
+    pending_metrics: IdSet,
     min: Option<Micros>,
     max: Micros,
 }
@@ -318,7 +345,17 @@ impl FooterBuilder {
     /// предыдущей (переупорядочивание записей между потоками) не отбрасывается
     /// — его база подтягивается к предыдущей, чтобы индекс остался
     /// сортированным, а фактический минимум учитывается в `min` отдельно.
+    /// Типы накопленного блока переходят в множества сегмента здесь же:
+    /// блок записан, значит его типы в этом сегменте есть — и ровно в этом.
     pub fn add_block(&mut self, offset: u64, header: &BlockHeader, last: Micros) {
+        for id in self.pending_events.iter() {
+            self.events.insert(id);
+        }
+        for id in self.pending_metrics.iter() {
+            self.metrics.insert(id);
+        }
+        self.discard_pending();
+
         let prev = self.blocks.last().map_or(0, |b| b.base.0);
         self.blocks.push(BlockIndexEntry {
             offset,
@@ -336,9 +373,13 @@ impl FooterBuilder {
     }
 
     /// Отметить встреченный тип сообщения. Вызывается на каждую запись.
+    ///
+    /// Попадает в ступень незакрытого блока и переходит в множество сегмента
+    /// в [`Self::add_block`] — то есть тогда, когда известно, в какой сегмент
+    /// блок лёг.
     #[inline]
     pub fn add_event(&mut self, id: EventId) {
-        self.events.insert(id.0);
+        self.pending_events.insert(id.0);
     }
 
     /// Отметить встреченную метрику. Вызывается на каждый отсчёт.
@@ -348,7 +389,13 @@ impl FooterBuilder {
     /// сегменте с телеметрией — иначе миграция молча пропустила бы историю.
     #[inline]
     pub fn add_metric(&mut self, id: MetricId) {
-        self.metrics.insert(id.0);
+        self.pending_metrics.insert(id.0);
+    }
+
+    /// Забыть типы незакрытого блока: блок отброшен и никуда не ляжет.
+    pub fn discard_pending(&mut self) {
+        self.pending_events.clear();
+        self.pending_metrics.clear();
     }
 
     pub fn block_count(&self) -> usize {
@@ -396,6 +443,12 @@ impl FooterBuilder {
         out
     }
 
+    /// Начать footer нового сегмента.
+    ///
+    /// Ступень незакрытого блока **сохраняется**: сегмент меняют как раз
+    /// потому, что блок в прежний не поместился, и его типы обязаны уехать
+    /// вместе с ним. Блок, который решили не писать вовсе, снимается
+    /// отдельным [`Self::discard_pending`].
     pub fn reset(&mut self) {
         self.blocks.clear();
         self.events.clear();
@@ -416,6 +469,8 @@ impl FooterBuilder {
         self.blocks.shrink_to_fit();
         self.events.ids.shrink_to_fit();
         self.metrics.ids.shrink_to_fit();
+        self.pending_events.ids.shrink_to_fit();
+        self.pending_metrics.ids.shrink_to_fit();
     }
 }
 
@@ -445,18 +500,149 @@ mod tests {
         }
     }
 
+    /// Порядок как у writer'а: типы приходят с записями собираемого блока и
+    /// закрепляются за сегментом, когда блок в него лёг.
     fn sample_builder() -> FooterBuilder {
         let mut b = FooterBuilder::new();
-        b.add_block(32, &header(1_000, 5), Micros(1_900));
-        b.add_block(200, &header(2_000, 7), Micros(2_500));
-        b.add_block(512, &header(9_000, 3), Micros(9_100));
         b.add_event(EventId(1));
+        b.add_metric(MetricId(5));
+        b.add_block(32, &header(1_000, 5), Micros(1_900));
+
         b.add_event(EventId(300));
         b.add_event(EventId(1)); // дубли схлопываются
-        b.add_metric(MetricId(5));
         b.add_metric(MetricId(6));
         b.add_metric(MetricId(5)); // дубли схлопываются
+        b.add_block(200, &header(2_000, 7), Micros(2_500));
+
+        b.add_block(512, &header(9_000, 3), Micros(9_100));
         b
+    }
+
+    #[test]
+    fn types_of_a_relocated_block_follow_it_to_the_new_segment() {
+        // Блок, не поместившийся в сегмент, переезжает в свежий (SPEC §5).
+        // Его типы обязаны переехать вместе с ним: по этим множествам
+        // миграция решает, переписывать ли сегмент, а читатель — есть ли в
+        // нём нужная телеметрия. Оставь их в старом footer'е — и оба ответа
+        // окажутся неверными: старый сегмент объявит типы, которых в нём нет,
+        // новый умолчит о тех, которые в нём есть, и миграция обойдёт
+        // стороной ровно ту историю, ради которой написана.
+        let mut b = FooterBuilder::new();
+
+        // Первый блок лёг в текущий сегмент.
+        b.add_event(EventId(1));
+        b.add_block(32, &header(1_000, 5), Micros(1_100));
+
+        // Второй собран, но в сегмент не влез: типы уже отмечены.
+        b.add_event(EventId(7));
+        b.add_metric(MetricId(3));
+
+        // Сегмент запечатывается БЕЗ него.
+        let sealed = Footer::parse(&b.build()).unwrap().expect("запечатан");
+        assert_eq!(
+            sealed.events,
+            vec![EventId(1)],
+            "в старом сегменте только типы блоков, которые в нём лежат"
+        );
+        assert!(sealed.metrics.is_empty());
+
+        // Новый сегмент, тот же накопитель — и переехавший блок ложится сюда.
+        b.reset();
+        b.add_block(32, &header(2_000, 9), Micros(2_100));
+        let fresh = Footer::parse(&b.build()).unwrap().expect("запечатан");
+        assert_eq!(fresh.events, vec![EventId(7)], "типы уехали с блоком");
+        assert_eq!(fresh.metrics, vec![MetricId(3)]);
+        assert_eq!(fresh.blocks.len(), 1);
+    }
+
+    #[test]
+    fn a_discarded_block_leaves_its_types_nowhere() {
+        // Блок крупнее целого сегмента отбрасывается, и его типов нет ни в
+        // одном сегменте — объявить их значило бы отправить миграцию
+        // переписывать сегмент ради записей, которых там нет.
+        let mut b = FooterBuilder::new();
+        b.add_event(EventId(1));
+        b.add_block(32, &header(1_000, 5), Micros(1_100));
+
+        b.add_event(EventId(7));
+        b.add_metric(MetricId(3));
+        b.discard_pending();
+
+        b.add_event(EventId(2));
+        b.add_block(200, &header(2_000, 5), Micros(2_100));
+
+        let footer = Footer::parse(&b.build()).unwrap().expect("запечатан");
+        assert_eq!(footer.events, vec![EventId(1), EventId(2)]);
+        assert!(
+            footer.metrics.is_empty(),
+            "метрика была только у отброшенного"
+        );
+    }
+
+    #[test]
+    fn footer_larger_than_the_prealloc_cap_still_parses() {
+        // Предварительное выделение ограничено потолком, чтобы счётчик из
+        // недоверенного файла не управлял размером аллокации. Потолок обязан
+        // быть только подсказкой: настоящий сегмент на 256 МиБ с блоками по
+        // 64 КиБ даёт четыре тысячи записей индекса, и разбор такого footer'а
+        // должен пройти целиком, дорастив вектор сам.
+        let n = PREALLOC_MAX * 2 + 7;
+        let mut b = FooterBuilder::new();
+        // Множества id тоже крупнее потолка: пространство u16 это позволяет.
+        for id in 1..=(PREALLOC_MAX as u16 + 500) {
+            b.add_event(EventId(id));
+        }
+        for i in 0..n {
+            b.add_block(
+                32 + i as u64 * 64,
+                &header(i as u64 * 1_000, 4),
+                Micros(i as u64 * 1_000 + 900),
+            );
+        }
+        let bytes = b.build();
+        let footer = Footer::parse(&bytes).unwrap().expect("сегмент запечатан");
+        assert_eq!(footer.blocks.len(), n);
+        assert_eq!(footer.blocks[n - 1].offset, 32 + (n as u64 - 1) * 64);
+        assert_eq!(footer.events.len(), PREALLOC_MAX + 500);
+        assert_eq!(footer.min, Micros(0));
+        assert_eq!(footer.max, Micros((n as u64 - 1) * 1_000 + 900));
+    }
+
+    #[test]
+    fn a_forged_count_cannot_drive_the_allocation() {
+        // Ради чего потолок и заведён: `block_count` лежит в трейлере, а
+        // трейлер защищён только CRC32C — не подписью, его пересчитывает кто
+        // угодно. Число оттуда не имеет права управлять размером аллокации:
+        // на armv7 это паника «capacity overflow», на 64-битном вьюере —
+        // OOM-killer.
+        //
+        // Собираем правдоподобный footer, подменяем счётчик блоков на
+        // заведомо невозможный и пересчитываем CRC — ровно то, что сделал бы
+        // подсунутый дамп. Разбор обязан отказать по нехватке байт, а не
+        // попытаться выделить память под объявленное.
+        let bytes = sample_builder().build();
+        let mut forged = bytes.clone();
+        let trailer_at = forged.len() - Trailer::SIZE;
+        forged[trailer_at + 4..trailer_at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let crc = {
+            let sections = &forged[..trailer_at];
+            crc32c::crc32c_append(
+                crc32c::crc32c(sections),
+                &forged[trailer_at..trailer_at + 24],
+            )
+        };
+        forged[trailer_at + 24..trailer_at + 28].copy_from_slice(&crc.to_le_bytes());
+
+        // CRC сходится — значит разбор дошёл до чтения записей и остановился
+        // на исчерпании секций, а не на проверке целостности.
+        assert!(
+            matches!(Footer::parse(&forged), Err(Error::Truncated)),
+            "счётчик из файла обязан упереться в реальные байты"
+        );
+        assert!(
+            bounded(u32::MAX, forged.len(), 3) <= PREALLOC_MAX,
+            "и не имеет права заказать больше потолка"
+        );
     }
 
     #[test]

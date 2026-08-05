@@ -98,6 +98,17 @@ const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 /// завершиться ни `sync`, ни `shutdown` — процесс не смог бы остановиться.
 const DRAIN_ROUNDS: usize = 64;
 
+/// Сколько канал должен простоять без дела, прежде чем отдаст буферы.
+///
+/// Мгновенный возврат неверен: канал с [`Durability::Immediate`] оказывается
+/// «без дела» после **каждой** групповой фиксации — блок вытолкнут,
+/// синхронизировать нечего, — и отдавал бы буфер блока со scratch'ем на
+/// каждом батче, чтобы тут же выделить их снова. Это ровно горячий путь
+/// критических записей. Пауза его не касается, а настоящее бездействие от
+/// неё не убежит: держать пик лишние секунды дешевле, чем платить парой
+/// аллокаций за каждую аварийную запись.
+const RELEASE_AFTER: Duration = Duration::from_secs(2);
+
 /// Источник отметок о служебных событиях в потоке записей.
 const DIAG_TARGET: &str = "dduroc";
 
@@ -153,6 +164,18 @@ pub struct Writer {
     critical: Sender<Staged>,
     control: Sender<Control>,
     counters: Arc<Counters>,
+    /// Началась остановка: очередь ещё принимает, но разбирать её уже некому.
+    ///
+    /// Между вычерпыванием очереди в `shutdown` и выходом потока очередь жива,
+    /// и `try_send` отвечал бы `Ok` записям, которые затем гибнут в
+    /// деструкторе канала — без счётчика, без отметки, без ответа вызывающему.
+    /// Отказ здесь честнее: [`Error::ShuttingDown`] и без того объявлен
+    /// потерей ([`Error::loses_record`]), просто до сих пор его никто не
+    /// порождал.
+    ///
+    /// Цена — одно расслабленное чтение на запись; предсказуемое ветвление,
+    /// на armv7 неразличимое на фоне самой постановки в очередь.
+    stopping: std::sync::atomic::AtomicBool,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -169,6 +192,7 @@ impl Writer {
             counters: Arc::clone(&counters),
             diag_target: Arc::from(DIAG_TARGET),
             batch: Vec::new(),
+            drops_seen: 0,
             active: Vec::new(),
         };
 
@@ -185,6 +209,7 @@ impl Writer {
             critical: critical_tx,
             control: control_tx,
             counters,
+            stopping: std::sync::atomic::AtomicBool::new(false),
             handle: Mutex::new(Some(handle)),
         }))
     }
@@ -221,6 +246,14 @@ impl Writer {
     /// ожидание места превратило бы аварийное завершение в зависание.
     #[inline]
     pub fn write_no_wait(&self, item: Staged, critical: bool, drops: &DropCounters) -> Result<()> {
+        // Идёт остановка — очередь ещё принимает, но разбирать её уже некому:
+        // всё, что ляжет в неё сейчас, умрёт в деструкторе канала. Отказать
+        // честнее, чем ответить `Ok` записи, которой не будет на носителе.
+        if self.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+            drops.record(item.channel);
+            Counters::publish(&self.counters.dropped);
+            return Err(Error::ShuttingDown);
+        }
         let queue = if critical {
             &self.critical
         } else {
@@ -229,8 +262,13 @@ impl Writer {
         match queue.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(item)) => {
-                Counters::bump(&self.counters.dropped);
+                // Порядок обязателен: сначала поканальный счётчик, потом
+                // общий — и общий с публикацией. По его изменению writer
+                // решает, обходить ли каналы за отметками о потерях, и с
+                // обратным порядком он мог бы застать обход пустым, счесть
+                // отметку выданной и оставить дыру необъявленной.
                 drops.record(item.channel);
+                Counters::publish(&self.counters.dropped);
                 Err(Error::QueueFull)
             }
             Err(TrySendError::Disconnected(item)) => Err(self.writer_died(item)),
@@ -243,6 +281,13 @@ impl Writer {
     }
 
     fn write_critical(&self, item: Staged, drops: &DropCounters) -> Result<()> {
+        // См. `write_no_wait`: ждать места в очереди, которую уже никто не
+        // разбирает, значило бы ждать пять секунд ради гарантированной потери.
+        if self.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+            drops.record(item.channel);
+            Counters::publish(&self.counters.dropped);
+            return Err(Error::ShuttingDown);
+        }
         match self.critical.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(item)) => {
@@ -252,8 +297,10 @@ impl Writer {
                 match self.critical.send_timeout(item, BACKPRESSURE_TIMEOUT) {
                     Ok(()) => Ok(()),
                     Err(crossbeam_channel::SendTimeoutError::Timeout(item)) => {
-                        Counters::bump(&self.counters.dropped);
+                        // Порядок тот же и по той же причине, что в
+                        // `write_no_wait`.
                         drops.record(item.channel);
+                        Counters::publish(&self.counters.dropped);
                         Err(Error::QueueFull)
                     }
                     Err(crossbeam_channel::SendTimeoutError::Disconnected(item)) => {
@@ -299,6 +346,11 @@ impl Writer {
 
     /// Завершить работу: дописать, запечатать, дождаться потока.
     pub fn shutdown(&self) {
+        // Флаг ставится ДО команды: между вычерпыванием очереди в потоке и
+        // его выходом очередь остаётся живой, и без флага `try_send` отвечал
+        // бы `Ok` записям, которые затем гибнут вместе с каналом.
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = crossbeam_channel::bounded(1);
         if self.control.send(Control::Shutdown(tx)).is_ok() {
             let _ = rx.recv();
@@ -382,6 +434,10 @@ struct ChannelState {
     /// запись, и линейный поиск по списку в десятки тысяч пар превращал бы
     /// раскладку батча в квадрат от числа пишущих каналов.
     in_active: bool,
+    /// С какого момента каналу нечего обслуживать. `None` — есть.
+    ///
+    /// Отсрочка возврата буферов, см. [`RELEASE_AFTER`].
+    idle_since: Option<Instant>,
 }
 
 impl ChannelState {
@@ -416,6 +472,7 @@ impl ChannelState {
             last_sync: now,
             dirty_since_sync: false,
             in_active: false,
+            idle_since: None,
         })
     }
 
@@ -527,6 +584,10 @@ struct WriterLoop {
     diag_target: Arc<str>,
     /// Переиспользуемый буфер батча.
     batch: Vec<Staged>,
+    /// Значение общего счётчика потерь на момент последнего обхода отметок.
+    ///
+    /// Сторож полного прохода по флоту — см. [`WriterLoop::emit_drop_notices`].
+    drops_seen: u64,
     /// Каналы, которым есть что обслуживать: открытый блок, несинхронизованные
     /// данные или незапечатанный сегмент.
     ///
@@ -601,18 +662,44 @@ impl WriterLoop {
     /// `sync` отчитывался бы об успехе, не записав их, а `shutdown` запечатывал
     /// сегменты поверх недописанного — записи исчезали бы, хотя `log()`
     /// вернул `Ok`.
-    fn drain_pending(&mut self, normal: &Receiver<Staged>, critical: &Receiver<Staged>) {
-        for _ in 0..DRAIN_ROUNDS {
+    fn drain_pending(
+        &mut self,
+        normal: &Receiver<Staged>,
+        critical: &Receiver<Staged>,
+        leftovers: Leftovers,
+    ) -> bool {
+        self.drain_pending_rounds(normal, critical, leftovers, DRAIN_ROUNDS)
+    }
+
+    /// То же с явным числом проходов: воспроизвести исчерпание отведённых
+    /// проходов подбором нагрузки нельзя — оно зависит от того, кому
+    /// планировщик дал ход, а поведение на этой границе как раз и решает,
+    /// сохранятся записи или будут уничтожены.
+    fn drain_pending_rounds(
+        &mut self,
+        normal: &Receiver<Staged>,
+        critical: &Receiver<Staged>,
+        leftovers: Leftovers,
+        rounds: usize,
+    ) -> bool {
+        for _ in 0..rounds {
             let got = self.drain(critical) + self.drain(normal);
             if got == 0 {
-                return;
+                return true;
             }
             self.apply_batch();
         }
         // Очередь всё ещё пополняется быстрее, чем вычерпывается. Дальше
         // ждать нельзя: остановка процесса не должна зависеть от того,
         // перестанут ли прикладные потоки писать.
-        //
+        if leftovers == Leftovers::Keep {
+            // Записывать их ещё будет кому — обычным ходом цикла. Выбросить
+            // их значило бы уничтожить принятое ради операции, которая
+            // ничего от этого не выигрывает: очередь и так продолжит
+            // разбираться. Вызывающему сообщается, что обещание выполнено
+            // не до конца.
+            return false;
+        }
         // Остаток забирается поимённо, а не просто пересчитывается: потеря
         // обязана быть отмечена в канале, где образовалась дыра, — иначе она
         // не попадёт в поток отдельной записью и станет неотличима от тишины.
@@ -635,6 +722,7 @@ impl WriterLoop {
         if leftover > 0 {
             Counters::add(&self.counters.dropped, leftover);
         }
+        false
     }
 
     /// Забрать из очереди сколько получится, не превышая лимит.
@@ -764,6 +852,9 @@ impl WriterLoop {
             ch.footer.add_metric(id);
         }
         ch.dirty_since_sync = true;
+        // Канал снова при деле: отсчёт бездействия начнётся заново, когда
+        // ему опять станет нечего обслуживать.
+        ch.idle_since = None;
         if !ch.in_active {
             ch.in_active = true;
             self.active.push((ns_idx, ch_idx));
@@ -866,6 +957,7 @@ impl WriterLoop {
             Counters::add(&counters.dropped, lost);
             ch.drops.record_n(ch.index, lost);
             ch.builder.reset();
+            ch.footer.discard_pending();
             return Ok(());
         };
 
@@ -873,10 +965,25 @@ impl WriterLoop {
         out.clear();
         let last = ch.builder.last().unwrap_or(ch.last_time);
         let seq = seg.next_seq();
+        // Число записей снимается ДО `finish`: на превышении потолка тела он
+        // сбрасывает накопитель, и посчитать потерю потом будет нечем.
+        let pending = ch.builder.count();
         let header = match ch.builder.finish(seq, ch.config.compression, &mut out) {
             Ok(h) => h,
             Err(e) => {
                 ch.scratch = out;
+                // Блок не собрался — его записи потеряны, и это обязано быть
+                // видно там же, где образовалась дыра. Один `io_errors`
+                // сказал бы «что-то сломалось», но не «сколько пропало», и
+                // отметка в поток без поканального счётчика не попадёт.
+                let lost = u64::from(pending);
+                Counters::add(&counters.dropped, lost);
+                ch.drops.record_n(ch.index, lost);
+                // Накопитель сбрасывается и здесь: `finish` делает это только
+                // на превышении потолка, а заряженный накопитель заклинил бы
+                // канал на той же ошибке при каждом следующем flush'е.
+                ch.builder.reset();
+                ch.footer.discard_pending();
                 return Err(e.into());
             }
         };
@@ -898,6 +1005,9 @@ impl WriterLoop {
                 Ok(())
             }
             Ok(Placement::Dropped) => {
+                // Блока не будет ни в одном сегменте — его типы не должны
+                // осесть в множествах ни того, ни другого.
+                ch.footer.discard_pending();
                 // Негабаритный блок раздул буферы до размеров, которых канал
                 // больше не увидит, — держать их за ним незачем.
                 ch.release_buffers();
@@ -907,6 +1017,7 @@ impl WriterLoop {
                 let lost = u64::from(header.count);
                 Counters::add(&counters.dropped, lost);
                 ch.drops.record_n(ch.index, lost);
+                ch.footer.discard_pending();
                 Err(e)
             }
         }
@@ -1083,13 +1194,23 @@ impl WriterLoop {
             // до самого seal, и канал жил бы в списке вечно, возвращая полный
             // обход, ради устранения которого список заведён.
             if ch.block_opened.is_some() || ch.sync_deadline().is_some() {
+                ch.idle_since = None;
                 self.active.push((ns_idx, ch_idx));
             } else {
                 // Уходящий в бездействие канал отдаёт буферы: их ёмкость —
                 // след самого крупного блока, и держать её за молчащим
-                // каналом значит закрепить пик навсегда.
-                ch.in_active = false;
-                ch.release_buffers();
+                // каналом значит закрепить пик навсегда. Но не сразу:
+                // Immediate-канал попадает сюда после каждой групповой
+                // фиксации (см. `RELEASE_AFTER`), и мгновенный возврат стоил
+                // бы пары аллокаций на каждую аварийную запись.
+                let idle_since = *ch.idle_since.get_or_insert(now);
+                if now.duration_since(idle_since) >= RELEASE_AFTER {
+                    ch.in_active = false;
+                    ch.idle_since = None;
+                    ch.release_buffers();
+                } else {
+                    self.active.push((ns_idx, ch_idx));
+                }
             }
         }
     }
@@ -1099,6 +1220,30 @@ impl WriterLoop {
     /// Дыра, о которой нигде не сказано, неотличима от тишины — ровно тот
     /// дефект прототипа, ради которого здесь ведётся учёт.
     fn emit_drop_notices(&mut self) {
+        // Обход всех каналов всех неймспейсов — это десятки тысяч атомарных
+        // обменов при заявленном масштабе, а зовётся он на каждом обороте
+        // цикла, то есть до четырёх раз в секунду даже в полном простое.
+        // Ровно тот полный проход, ради устранения которого заведён список
+        // `active`.
+        //
+        // Каждая поканальная потеря сопровождается инкрементом общего
+        // счётчика — иначе она не попала бы в `Stats`, — поэтому
+        // неизменившийся общий счётчик доказывает, что обходить нечего.
+        // Одно атомарное чтение вместо прохода по флоту.
+        // Чтение с захватом: поканальные счётчики растут на прикладных
+        // потоках ДО публикации общего ([`Counters::publish`]), и увидеть
+        // новый общий счётчик значит увидеть и их. С `Relaxed` обход мог бы
+        // застать поканальный счётчик ещё нулевым, счесть отметку выданной и
+        // оставить дыру необъявленной до следующей потери.
+        let total = self
+            .counters
+            .dropped
+            .load(std::sync::atomic::Ordering::Acquire);
+        if total == self.drops_seen {
+            return;
+        }
+        self.drops_seen = total;
+
         let mut notices: Vec<(NsId, ChannelIdx, u64, Micros)> = Vec::new();
         for (ns_idx, slot) in self.namespaces.iter().enumerate() {
             let Some(ns) = slot.as_ref() else { continue };
@@ -1167,19 +1312,37 @@ impl WriterLoop {
                 // Сначала записи, потом освобождение: то, что прикладной поток
                 // успел поставить в очередь до уничтожения ручки, обязано лечь
                 // на диск — `log()` на него уже ответил `Ok`.
-                self.drain_pending(normal, critical);
+                //
+                // Остаток очереди не трогаем. Очередь общая на процесс, и в
+                // ней лежат записи ЧУЖИХ, живых неймспейсов: отпустить один
+                // неймспейс не значит уничтожить всё, что успели написать
+                // остальные. Записи самого отпускаемого писать уже некуда —
+                // их учтёт `push` по несуществующему адресу.
+                self.drain_pending(normal, critical, Leftovers::Keep);
                 self.release(ns);
                 ControlOutcome::Continue
             }
             Control::Sync(ns, reply) => {
                 // Сначала записи, потом отчёт: иначе `sync` подтвердил бы
                 // сохранность того, что ещё стоит в очереди.
-                self.drain_pending(normal, critical);
-                let _ = reply.send(self.sync_all(ns));
+                let drained = self.drain_pending(normal, critical, Leftovers::Keep);
+                let mut outcome = self.sync_all(ns);
+                if outcome.is_ok() && !drained {
+                    // Забранное лежит на носителе, но очередь пополняется
+                    // быстрее, чем разбирается. Записи не потеряны — они
+                    // по-прежнему в очереди, — а вот обещание «всё
+                    // накопленное на носителе» в этот раз не выполнено, и
+                    // отдать `Ok` значило бы соврать.
+                    outcome = Err(Error::SyncIncomplete);
+                }
+                let _ = reply.send(outcome);
                 ControlOutcome::Continue
             }
             Control::Shutdown(reply) => {
-                self.drain_pending(normal, critical);
+                // Единственный случай, когда остаток очереди отбрасывается:
+                // после остановки записывать его будет некому, и держать
+                // процесс живым до молчания пишущих потоков нельзя.
+                self.drain_pending(normal, critical, Leftovers::Discard);
                 self.finish();
                 let _ = reply.send(());
                 ControlOutcome::Stop
@@ -1301,6 +1464,15 @@ enum ControlOutcome {
     Stop,
 }
 
+/// Что делать с записями, оставшимися в очереди после отведённых проходов.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leftovers {
+    /// Оставить в очереди: их запишет обычный ход цикла.
+    Keep,
+    /// Отбросить и учесть как потерю: писать их больше некому.
+    Discard,
+}
+
 /// Куда лёг собранный блок.
 enum Placement {
     /// Записан по смещению.
@@ -1409,6 +1581,193 @@ mod tests {
         WriterLoop::flush_block(&mut ch, &counters).unwrap();
         assert_eq!(counters.snapshot().dropped, 0);
         assert_eq!(counters.snapshot().blocks_written, 2);
+    }
+
+    fn loop_with_one_channel(dir: &Path, config: ChannelConfig) -> (WriterLoop, NsId) {
+        let counters = Arc::new(Counters::default());
+        let mut w = WriterLoop {
+            namespaces: Vec::new(),
+            counters,
+            diag_target: Arc::from(DIAG_TARGET),
+            batch: Vec::new(),
+            drops_seen: 0,
+            active: Vec::new(),
+        };
+        let ns = w
+            .register(NsSetup {
+                name: "ns".to_owned(),
+                dir: dir.to_path_buf(),
+                protocol_version: ProtocolVersion(1),
+                store_id: 0,
+                boot: BootCounter(0),
+                channels: vec![config],
+                drops: Arc::new(DropCounters::new(1)),
+            })
+            .unwrap();
+        (w, ns)
+    }
+
+    fn held_bytes(w: &WriterLoop) -> usize {
+        let ch = &w.namespaces[0].as_ref().unwrap().channels[0];
+        ch.builder.capacity() + ch.scratch.capacity()
+    }
+
+    #[test]
+    fn an_immediate_channel_keeps_its_buffers_between_batches() {
+        // Канал с немедленной долговечностью после КАЖДОЙ групповой фиксации
+        // оказывается «без дела»: блок вытолкнут, синхронизировать нечего.
+        // Возврат буферов на этом основании означал бы освобождение и
+        // повторное выделение буфера блока со scratch'ем на каждой аварийной
+        // записи — ровно на том пути, ради скорости которого канал и заведён.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, ns) = loop_with_one_channel(
+            dir.path(),
+            ChannelConfig::critical("critical", 16 * 1024 * 1024),
+        );
+
+        w.batch.push(Staged {
+            ns,
+            channel: ChannelIdx(0),
+            at: Micros(1),
+            record: SR::Sample {
+                metric: MetricId(1),
+                value: OwnedValue::U64(7),
+            },
+        });
+        w.apply_batch();
+
+        let held = held_bytes(&w);
+        assert!(held > 0, "буферы выделены под записанный блок");
+        assert_eq!(
+            w.counters.snapshot().syncs,
+            1,
+            "групповая фиксация состоялась"
+        );
+
+        w.tick();
+        assert_eq!(
+            held_bytes(&w),
+            held,
+            "буферы обязаны пережить обслуженный батч"
+        );
+        assert_eq!(
+            w.active.len(),
+            1,
+            "канал остаётся под наблюдением — иначе некому будет отдать буферы"
+        );
+
+        // Но настоящее бездействие их всё-таки забирает: отматываем начало
+        // простоя за отведённую паузу.
+        {
+            let ch = &mut w.namespaces[0].as_mut().unwrap().channels[0];
+            ch.idle_since = Instant::now().checked_sub(RELEASE_AFTER * 2);
+            assert!(ch.idle_since.is_some(), "часы монотонны и уже идут");
+        }
+        w.tick();
+        assert_eq!(held_bytes(&w), 0, "простоявший канал возвращает память");
+        assert!(w.active.is_empty(), "и уходит из списка обслуживаемых");
+    }
+
+    #[test]
+    fn sync_never_throws_away_what_it_could_not_keep_up_with() {
+        // Вычерпывание очереди ограничено числом проходов: иначе `sync` не
+        // вернулся бы, пока пишущие потоки не замолчат. Но остаток при этом
+        // НЕ выбрасывается — писать его по-прежнему есть кому, обычным ходом
+        // цикла. Отбросить принятое ради операции, которая от этого ничего не
+        // выигрывает, значит уничтожить данные, на которые `log()` ответил
+        // `Ok`. Отбрасывает только `shutdown`, и только потому, что после
+        // него записывать некому.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut w, ns) =
+            loop_with_one_channel(dir.path(), ChannelConfig::new("default", 16 * 1024 * 1024));
+
+        // Один проход забирает не больше DRAIN_LIMIT записей, поэтому очередь
+        // на одну запись длиннее заведомо не разбирается за отведённый
+        // единственный проход — без всякой зависимости от планировщика.
+        let n = DRAIN_LIMIT + 1;
+        let (tx, rx) = crossbeam_channel::bounded::<Staged>(n);
+        let (_ctx, crx) = crossbeam_channel::bounded::<Staged>(1);
+        let item = Staged {
+            ns,
+            channel: ChannelIdx(0),
+            at: Micros(1),
+            record: SR::Sample {
+                metric: MetricId(1),
+                value: OwnedValue::U64(1),
+            },
+        };
+        for _ in 0..n {
+            tx.send(item.clone()).unwrap();
+        }
+
+        let drained = w.drain_pending_rounds(&rx, &crx, Leftovers::Keep, 1);
+        assert!(!drained, "проход отведён один, записей больше");
+        assert_eq!(rx.len(), 1, "остаток остался в очереди, а не выброшен");
+        assert_eq!(
+            w.counters.snapshot().dropped,
+            0,
+            "ничего не потеряно: писать остаток по-прежнему есть кому"
+        );
+        assert_eq!(
+            w.counters.snapshot().records_written,
+            DRAIN_LIMIT as u64,
+            "забранное записано"
+        );
+
+        // Для остановки — наоборот: писать остаток будет некому, поэтому он
+        // отбрасывается, но не молча, а с учётом потери. Проходов снова
+        // ровно один, чтобы отказ вычерпывания был настоящим, а не следствием
+        // нулевого числа попыток.
+        for _ in 0..DRAIN_LIMIT {
+            tx.send(item.clone()).unwrap();
+        }
+        let before = w.counters.snapshot().dropped;
+        let drained = w.drain_pending_rounds(&rx, &crx, Leftovers::Discard, 1);
+        assert!(!drained, "проход отведён один, записей больше");
+        assert_eq!(rx.len(), 0, "очередь опустошена");
+        assert_eq!(
+            w.counters.snapshot().dropped - before,
+            1,
+            "отброшенная запись обязана быть учтена"
+        );
+    }
+
+    #[test]
+    fn a_stopping_store_refuses_instead_of_swallowing() {
+        // Между вычерпыванием очереди в `shutdown` и выходом потока очередь
+        // остаётся живой. Без признака остановки `try_send` отвечал бы `Ok`
+        // записям, которые тут же гибнут в деструкторе канала: ни счётчика,
+        // ни отметки, ни ответа вызывающему — то есть ровно та неотличимая от
+        // тишины дыра, против которой заведён весь учёт потерь.
+        let counters = Arc::new(Counters::default());
+        let writer = Writer::spawn(Arc::clone(&counters), QueueSizes::default()).unwrap();
+        let drops = DropCounters::new(1);
+        let item = Staged {
+            ns: NsId(0),
+            channel: ChannelIdx(0),
+            at: Micros(1),
+            record: SR::Sample {
+                metric: MetricId(1),
+                value: OwnedValue::U64(1),
+            },
+        };
+
+        writer.shutdown();
+
+        let e = writer
+            .write(item, false, &drops)
+            .expect_err("после остановки записывать некуда");
+        assert!(
+            matches!(e, Error::ShuttingDown),
+            "причина названа своим именем: {e}"
+        );
+        assert!(e.loses_record(), "и это потеря, а не дефект вызова");
+        assert_eq!(
+            counters.snapshot().dropped,
+            1,
+            "потеря учтена, а не проглочена"
+        );
+        assert_eq!(drops.take(ChannelIdx(0)), 1, "и отмечена в своём канале");
     }
 
     #[test]

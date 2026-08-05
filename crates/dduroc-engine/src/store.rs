@@ -37,12 +37,22 @@ pub struct StoreMeta {
 }
 
 /// Настройки хранилища.
+///
+/// Строятся цепочкой: каждый метод возвращает настройки, а не меняет их на
+/// месте. `config.with_budget(n);` отдельным выражением не сделало бы ничего.
 #[derive(Debug, Clone)]
+#[must_use = "настройки строятся цепочкой: результат метода и есть настройки"]
 pub struct StoreConfig {
     pub root: PathBuf,
-    /// Конфигурации каналов по имени класса хранения. Класс, которого здесь
-    /// нет, получает настройки по умолчанию для своего бюджета.
-    pub channels: HashMap<String, ChannelConfig>,
+    /// Конфигурации каналов по классу хранения. Класс, которого здесь нет,
+    /// получает настройки по умолчанию для своего бюджета.
+    ///
+    /// Ключ — сам [`StorageClass`], а не его имя строкой. Со строковым ключом
+    /// имя канала жило в двух местах — в ключе и в `ChannelConfig::name`, — и
+    /// они могли разойтись: описка в одном из них не давала ни ошибки, ни
+    /// предупреждения, а просто оставляла класс с настройками по умолчанию.
+    /// Критические данные при этом молча получали политику обычного канала.
+    pub channels: HashMap<StorageClass, ChannelConfig>,
     /// Бюджет по умолчанию на канал неймспейса.
     pub default_budget_bytes: u64,
     /// Ёмкости очередей записи. Выделяются целиком при открытии хранилища.
@@ -75,14 +85,19 @@ impl StoreConfig {
         self
     }
 
-    /// Задать настройки конкретного канала.
-    pub fn channel(mut self, config: ChannelConfig) -> Self {
-        self.channels.insert(config.name.clone(), config);
+    /// Задать настройки канала указанного класса хранения.
+    ///
+    /// Имя канала (и его каталога) берётся из класса, а не из переданного
+    /// конфига: два источника одного имени неизбежно расходятся, и расхождение
+    /// здесь стоило бы классу его политики долговечности.
+    pub fn channel(mut self, class: StorageClass, mut config: ChannelConfig) -> Self {
+        config.name = class.as_str().to_owned();
+        self.channels.insert(class, config);
         self
     }
 
     fn config_for(&self, class: StorageClass) -> ChannelConfig {
-        if let Some(c) = self.channels.get(class.as_str()) {
+        if let Some(c) = self.channels.get(&class) {
             return c.clone();
         }
         if class == StorageClass::CRITICAL {
@@ -90,6 +105,33 @@ impl StoreConfig {
         } else {
             ChannelConfig::new(class.as_str(), self.default_budget_bytes)
         }
+    }
+
+    /// Проверить всё, что задало приложение.
+    ///
+    /// Настройки канала приходят снаружи и до сих пор нигде не проверялись:
+    /// бюджет меньше двух сегментов или блок размером с сегмент доезжали до
+    /// writer'а как есть и ломали ротацию уже на работающем приборе.
+    /// Отказать при открытии — единственный момент, когда это ещё поправимо.
+    ///
+    /// Проверяются и **синтезированные** конфигурации — те, что получит класс,
+    /// для которого приложение ничего не задавало. Их большинство, и они тоже
+    /// выводятся из внешнего числа: размер сегмента зажат снизу четырьмя
+    /// мебибайтами, поэтому `default_budget_bytes` меньше восьми даёт бюджет
+    /// меньше двух сегментов — ротация съедала бы единственный сегмент сразу
+    /// после запечатывания, и канал не хранил бы ничего.
+    fn validate(&self) -> Result<()> {
+        for config in self.channels.values() {
+            config.validate()?;
+        }
+        for class in [
+            StorageClass::DEFAULT,
+            StorageClass::CRITICAL,
+            StorageClass::TELEMETRY,
+        ] {
+            self.config_for(class).validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -127,6 +169,7 @@ impl Store {
     /// перезаписывали бы `epochs.bin` друг друга и выдавали бы одинаковые
     /// `boot_counter`, из-за чего имена сегментов столкнулись бы.
     pub fn open(config: StoreConfig) -> Result<Arc<Self>> {
+        config.validate()?;
         fsutil::create_dir_all_synced(&config.root)?;
         let lock = acquire_lock(&config.root)?;
         fsutil::sweep_tmp(&config.root)?;
@@ -136,7 +179,14 @@ impl Store {
         // База часов и запись в epochs.bin берут одно и то же значение
         // BOOTTIME: расхождение между ними уехало бы в конверсию в UTC.
         let base_us = boottime_us();
-        let epochs = EpochStore::open_and_register(&config.root, base_us)?;
+        // Номер запуска не имеет права оказаться ниже того, что уже написан на
+        // именах сегментов: файл эпох мог не пережить порчу или чистку, а
+        // сегменты пережили, и повторно выданный номер увёл бы новые записи в
+        // прошлое (см. `EpochStore::open_and_register`). Обход имён делается
+        // лениво — только когда файла эпох не осталось.
+        let epochs = EpochStore::open_and_register(&config.root, base_us, &|| {
+            Ok(live_boots(&config.root)?.into_iter().next_back())
+        })?;
         let clock = Clock::with_base(
             dduroc_format::BootCounter(epochs.current_run().boot_counter),
             base_us,
@@ -331,7 +381,7 @@ impl Store {
     /// тысячах неймспейсов не бесплатен, а лишняя запись об эпохе стоит
     /// десятки байт. Приложение вправе позвать уборку и само.
     pub fn compact_epochs(&self) -> Result<usize> {
-        let live = live_boots(&self.root);
+        let live = live_boots(&self.root)?;
         let mut epochs = self.locked_epochs();
         let before = epochs.epochs().runs.len();
         epochs.retain_runs(&|boot| live.contains(&boot))?;
@@ -389,12 +439,18 @@ struct NamespaceLease {
 
 impl Drop for NamespaceLease {
     fn drop(&mut self) {
-        self.store.locked_open().remove(&self.name);
-        // Writer'у тоже надо сказать: без этого состояние канала жило бы до
-        // конца процесса, а повторный подъём того же имени дал бы два
-        // состояния на один каталог — с двумя инвентарями и двумя ротациями.
-        // Порядок с последующим `register` держит очередь команд.
+        // Writer'у — ПЕРВЫМ, и только потом снимается пометка «имя занято».
+        // Обратный порядок оставлял окно: между снятием пометки и отправкой
+        // команды другой поток успевает поднять тот же неймспейс, его
+        // `Register` встаёт в очередь команд впереди нашего `Release`, и на
+        // один каталог оказывается два состояния канала — с двумя
+        // инвентарями и двумя ротациями. Ротация одного удалила бы сегмент,
+        // открытый другим: запись продолжалась бы в файл без имени и пропала
+        // при закрытии.
+        //
+        // Порядок между самими командами держит их общая очередь.
         self.store.writer.release(self.id);
+        self.store.locked_open().remove(&self.name);
     }
 }
 
@@ -440,28 +496,63 @@ const EPOCH_COMPACT_THRESHOLD: usize = 1024;
 ///
 /// Только `readdir` и разбор имён — ни одного открытия файла: имя сегмента
 /// несёт `boot_counter` первыми восемью символами.
-fn live_boots(root: &Path) -> std::collections::BTreeSet<u32> {
+///
+/// Ошибка обхода — **отказ**, а не пустое множество. Результат используется
+/// двояко, и в обеих ролях недосмотр необратим: уборка эпох по неполному
+/// списку удалила бы якоря запусков, чьи сегменты просто не удалось
+/// перечислить, а нижняя граница номера запуска по нему же дала бы повторную
+/// нумерацию. «Не смог посмотреть» и «там ничего нет» — разные ответы.
+///
+/// Строгость при этом распространяется только на **своё**. Корень хранилища
+/// бывает точкой монтирования, и рядом с неймспейсами лежит чужое: `lost+found`
+/// с правами root, каталоги соседних подсистем, висячие симлинки. Уронить на
+/// них `Store::open` значило бы оставить прибор без журнала ровно тогда, когда
+/// он нужнее всего, — и ровно в том сценарии, ради которого обход заведён
+/// (файл эпох не пережил прошлый запуск, в том числе при первом же старте).
+///
+/// Признак «это не наше» — имя: каталог неймспейса создаётся только через
+/// [`Store::namespace`], которая проверяет имя тем же [`validate_component`].
+/// Вход с недопустимым именем не может содержать сегментов **этого**
+/// хранилища, поэтому в него не заходят вовсе — до всякого `read_dir`.
+/// Всё, что прошло проверку имени, обходится строго.
+fn live_boots(root: &Path) -> Result<std::collections::BTreeSet<u32>> {
+    use crate::channel::validate_component;
     use dduroc_format::segment::SegmentName;
+
+    /// Перечислить каталог. `NotADirectory` — обычный файл на месте каталога,
+    /// `NotFound` — вход исчез между перечислением и заходом (внешняя чистка,
+    /// висячий симлинк): и то, и другое означает «сегментов здесь нет», а не
+    /// «не смог посмотреть».
+    fn entries(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
+        use std::io::ErrorKind::{NotADirectory, NotFound};
+        match std::fs::read_dir(path) {
+            Ok(it) => it
+                .collect::<std::io::Result<Vec<_>>>()
+                .ctx_path("обход каталога", path),
+            Err(e) if matches!(e.kind(), NotADirectory | NotFound) => Ok(Vec::new()),
+            Err(e) => Err(e).ctx_path("обход каталога", path),
+        }
+    }
+
+    /// Могло ли это имя быть создано хранилищем.
+    fn ours(entry: &std::fs::DirEntry) -> bool {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| validate_component(n).is_ok())
+    }
+
     let mut out = std::collections::BTreeSet::new();
-    let Ok(namespaces) = std::fs::read_dir(root) else {
-        return out;
-    };
-    for ns in namespaces.flatten() {
-        let Ok(channels) = std::fs::read_dir(ns.path()) else {
-            continue;
-        };
-        for ch in channels.flatten() {
-            let Ok(segments) = std::fs::read_dir(ch.path()) else {
-                continue;
-            };
-            for seg in segments.flatten() {
+    for ns in entries(root)?.iter().filter(|e| ours(e)) {
+        for ch in entries(&ns.path())?.iter().filter(|e| ours(e)) {
+            for seg in entries(&ch.path())? {
                 if let Some(name) = seg.file_name().to_str().and_then(SegmentName::parse) {
                     out.insert(name.boot.0);
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Разумен ли момент времени: между 2001-09-09 и 2100-01-01.
@@ -743,6 +834,93 @@ mod tests {
 
         let b = Store::open(cfg).unwrap();
         assert_eq!(b.boot_counter(), 1);
+    }
+
+    #[test]
+    fn a_lost_epochs_file_never_renumbers_over_existing_segments() {
+        // Сквозная проверка связки «граница ↔ скан имён»: `boot_counter`
+        // попадает в имя каждого сегмента, а порядок имён объявлен временным.
+        // Начать нумерацию заново поверх сегментов, переживших потерю файла
+        // эпох, значит поставить новые записи в историю ПЕРЕД старыми:
+        // ротация примется за свежее, читатель отдаст историю вперемешку.
+        use crate::schema::{EventDesc, Language, Schema, StorageClass};
+        use dduroc_format::segment::SegmentName;
+        use dduroc_format::{EventId, Level, ProtocolVersion};
+
+        static LANGS: &[Language] = &[Language("en")];
+        static EVENTS: &[EventDesc] = &[EventDesc {
+            id: EventId(1),
+            name: "Tick",
+            level: Level::Info,
+            class: StorageClass::DEFAULT,
+            tags: &[],
+            templates: &["tick"],
+            fields: &[],
+            decoders: None,
+        }];
+        let schema = Schema {
+            name: "probe",
+            version: ProtocolVersion(1),
+            languages: LANGS,
+            events: EVENTS,
+            metrics: &[],
+            spans: &[],
+            migrations: &[],
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+
+        // Три запуска, каждый оставляет свой сегмент.
+        for _ in 0..3 {
+            let store = Store::open(cfg.clone()).unwrap();
+            let ns = store.namespace("orc-0", schema).unwrap();
+            ns.log_raw(EventId(1), &[1], None);
+            ns.sync().unwrap();
+            store.shutdown();
+        }
+
+        let channel = dir.path().join("orc-0").join("default");
+        let names = |dir: &std::path::Path| -> Vec<SegmentName> {
+            let mut v: Vec<SegmentName> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().and_then(SegmentName::parse))
+                .collect();
+            v.sort_by_key(|n| n.to_string());
+            v
+        };
+        let before = names(&channel);
+        let highest = before.iter().map(|n| n.boot.0).max().unwrap();
+        assert_eq!(highest, 2, "три запуска — сегменты запусков 0, 1, 2");
+
+        // Файл эпох потерян: чистка носителя, карантин после порчи — исход
+        // один и тот же.
+        std::fs::remove_file(dir.path().join(crate::epochs::EPOCHS_FILE)).unwrap();
+
+        let store = Store::open(cfg).unwrap();
+        assert!(
+            store.boot_counter() > highest,
+            "номер запуска обязан продолжить, а не начать заново: \
+             {} против {highest} на диске",
+            store.boot_counter()
+        );
+        let ns = store.namespace("orc-0", schema).unwrap();
+        ns.log_raw(EventId(1), &[2], None);
+        ns.sync().unwrap();
+        store.shutdown();
+
+        // И самое главное — следствие: новый сегмент сортируется ПОСЛЕ всех
+        // прежних, то есть попадает в конец истории, а не в её начало.
+        let after = names(&channel);
+        let fresh = after
+            .iter()
+            .find(|n| !before.contains(n))
+            .expect("новый сегмент создан");
+        assert!(
+            before.iter().all(|old| old.to_string() < fresh.to_string()),
+            "новое имя обязано сортироваться после старых: {fresh} против {before:?}"
+        );
     }
 
     #[test]

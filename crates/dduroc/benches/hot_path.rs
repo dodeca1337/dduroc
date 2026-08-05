@@ -70,14 +70,20 @@ fn store_config(root: &std::path::Path) -> StoreConfig {
         .with_budget(256 * 1024 * 1024)
         // Долговечность отключена намеренно: иначе бенчмарк мерил бы
         // fdatasync носителя, а не стоимость собственного кода.
-        .channel(ChannelConfig {
-            durability: Durability::Relaxed,
-            ..ChannelConfig::new(StorageClass::DEFAULT.as_str(), 256 * 1024 * 1024)
-        })
-        .channel(ChannelConfig {
-            durability: Durability::Relaxed,
-            ..ChannelConfig::critical(StorageClass::CRITICAL.as_str(), 64 * 1024 * 1024)
-        })
+        .channel(
+            StorageClass::DEFAULT,
+            ChannelConfig {
+                durability: Durability::Relaxed,
+                ..ChannelConfig::new(StorageClass::DEFAULT.as_str(), 256 * 1024 * 1024)
+            },
+        )
+        .channel(
+            StorageClass::CRITICAL,
+            ChannelConfig {
+                durability: Durability::Relaxed,
+                ..ChannelConfig::critical(StorageClass::CRITICAL.as_str(), 64 * 1024 * 1024)
+            },
+        )
 }
 
 // ════════════════════════════════════════════════════════════════════════════

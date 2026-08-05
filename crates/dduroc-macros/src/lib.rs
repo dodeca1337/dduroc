@@ -170,7 +170,7 @@ impl Parse for SchemaInput {
                     let content;
                     braced!(content in input);
                     while !content.is_empty() {
-                        events.push(parse_event(&content, &languages)?);
+                        events.push(parse_event(&content)?);
                         let _ = content.parse::<Token![,]>();
                     }
                 }
@@ -231,6 +231,7 @@ impl Parse for SchemaInput {
                 "не задан `languages:` — рендерить сообщения будет нечем",
             ));
         }
+        Self::check_templates(&events, &languages)?;
 
         Ok(Self {
             name,
@@ -244,7 +245,61 @@ impl Parse for SchemaInput {
     }
 }
 
-fn parse_event(input: ParseStream, languages: &[Ident]) -> syn::Result<EventDef> {
+impl SchemaInput {
+    /// Сверить шаблоны событий с объявленными языками.
+    ///
+    /// Делается после разбора всего объявления, а не по ходу: секции не
+    /// обязаны идти в каком-либо порядке, и до конца разбора список языков
+    /// неизвестен.
+    fn check_templates(events: &[EventDef], languages: &[Ident]) -> syn::Result<()> {
+        for ev in events {
+            // Шаблон обязан быть на каждом объявленном языке: недостающий
+            // всплыл бы при чтении логов на языке, которого нет, — то есть в
+            // самый неудачный момент.
+            for lang in languages {
+                if !ev.templates.iter().any(|(l, _)| l == lang) {
+                    return Err(syn::Error::new(
+                        ev.name.span(),
+                        format!("у события `{}` нет шаблона для языка `{lang}`", ev.name),
+                    ));
+                }
+            }
+            // И наоборот: шаблон на языке, которого нет в `languages:`,
+            // никогда не будет показан. Промолчать значило бы оставить
+            // перевод, который пользователь считает работающим.
+            for (lang, _) in &ev.templates {
+                if !languages.contains(lang) {
+                    let declared: Vec<String> = languages.iter().map(|l| l.to_string()).collect();
+                    return Err(syn::Error::new(
+                        lang.span(),
+                        format!(
+                            "у события `{}` шаблон на языке `{lang}`, но в `languages:` \
+                             объявлены только {}",
+                            ev.name,
+                            declared.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Разобрать объявление события.
+///
+/// Список языков сюда **не передаётся**: секции объявления не обязаны идти в
+/// каком-то порядке, и `events` выше `languages` — законная запись. Раньше
+/// шаблон отличался от поля принадлежностью ключа к списку языков, поэтому при
+/// таком порядке `en: "мощность {dbm}"` разбиралось как поле типа
+/// `"мощность {dbm}"`, и пользователь получал ошибку о неразобранном типе
+/// вместо внятного сообщения о своей схеме.
+///
+/// Признак теперь синтаксический: значение шаблона — строковый литерал,
+/// значение поля — тип, а тип строковым литералом быть не может. Полнота
+/// шаблонов по языкам проверяется потом, когда объявление разобрано целиком
+/// (см. [`SchemaInput::check_templates`]).
+fn parse_event(input: ParseStream) -> syn::Result<EventDef> {
     let name: Ident = input.parse()?;
     let id = parse_id(input)?;
     let content;
@@ -267,7 +322,7 @@ fn parse_event(input: ParseStream, languages: &[Ident]) -> syn::Result<EventDef>
             store = Some(content.parse::<Ident>()?);
         } else if key_str == "tags" {
             tags = parse_ident_list(&content)?;
-        } else if languages.contains(&key) {
+        } else if content.peek(LitStr) {
             if templates.iter().any(|(l, _)| *l == key) {
                 return Err(syn::Error::new(
                     key.span(),
@@ -286,19 +341,8 @@ fn parse_event(input: ParseStream, languages: &[Ident]) -> syn::Result<EventDef>
         syn::Error::new(name.span(), format!("у события `{name}` не задан `level:`"))
     })?;
 
-    // Шаблон обязан быть на каждом объявленном языке: недостающий всплыл бы
-    // при чтении логов на языке, которого нет, — то есть в самый неудачный
-    // момент.
-    for lang in languages {
-        if !templates.iter().any(|(l, _)| l == lang) {
-            return Err(syn::Error::new(
-                name.span(),
-                format!("у события `{name}` нет шаблона для языка `{lang}`"),
-            ));
-        }
-    }
-
-    // Плейсхолдеры обязаны ссылаться на существующие поля.
+    // Плейсхолдеры обязаны ссылаться на существующие поля. Это проверяется
+    // здесь: список языков для такой проверки не нужен.
     let field_names: Vec<String> = fields.iter().map(|(n, _)| n.to_string()).collect();
     for (lang, tmpl) in &templates {
         for placeholder in template::placeholders(&tmpl.value()) {
@@ -534,9 +578,21 @@ fn class_path(store: Option<&Ident>) -> syn::Result<TokenStream2> {
         "default" => quote!(::dduroc::StorageClass::DEFAULT),
         "critical" => quote!(::dduroc::StorageClass::CRITICAL),
         "telemetry" => quote!(::dduroc::StorageClass::TELEMETRY),
+        // Неизвестное имя — ошибка, а не новый класс. Раньше любой
+        // идентификатор молча превращался в `StorageClass("…")`: описка в
+        // `critical` давала канал с другим именем, другой политикой
+        // долговечности и другим бюджетом — то есть ровно то, от чего класс
+        // хранения защищает, и без единого признака. Уровень (`level:`) на
+        // опечатку отказывает с самого начала; здесь была единственная
+        // молчаливая ветка во всём макросе.
         other => {
-            let name = other.to_owned();
-            quote!(::dduroc::StorageClass(#name))
+            return Err(syn::Error::new(
+                store.span(),
+                format!(
+                    "неизвестный класс хранения `{other}`: ожидались \
+                     default/critical/telemetry"
+                ),
+            ));
         }
     })
 }
@@ -1198,5 +1254,146 @@ pub fn schema(input: TokenStream) -> TokenStream {
     match codegen(&parsed) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Разобрать и, если разбор прошёл, сгенерировать код: часть диагностик
+    /// живёт в разборе, часть — в кодогенерации, а пользователю разницы нет.
+    fn check(src: &str) -> Result<(), String> {
+        let parsed: SchemaInput = syn::parse_str(src).map_err(|e| e.to_string())?;
+        codegen(&parsed).map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    fn err(src: &str) -> String {
+        check(src).expect_err("объявление обязано быть отвергнуто")
+    }
+
+    const GOOD: &str = r#"
+        name: radio, version: 1, languages: [en, ru],
+        events { PowerSet = 0x01 { level: Info, en: "power {dbm}", ru: "мощность {dbm}", dbm: f32 } }
+        metrics { Temp = 0x01 { vtype: f32 } }
+        spans { Cal = 0x01 }
+    "#;
+
+    #[test]
+    fn a_correct_declaration_compiles() {
+        check(GOOD).expect("образцовое объявление");
+    }
+
+    #[test]
+    fn sections_may_come_in_any_order() {
+        // Порядок секций — дело вкуса пишущего, а не требование макроса.
+        // Раньше `events` выше `languages` разбирался с пустым списком
+        // языков, шаблон `en: "…"` принимался за поле типа `"…"`, и
+        // пользователь получал жалобу на неразобранный тип вместо внятного
+        // сообщения о своей схеме.
+        check(
+            r#"
+            events { PowerSet = 0x01 { level: Info, en: "power {dbm}", ru: "мощность {dbm}", dbm: f32 } }
+            languages: [en, ru],
+            version: 1,
+            name: radio,
+        "#,
+        )
+        .expect("секции в любом порядке");
+    }
+
+    #[test]
+    fn an_unknown_storage_class_is_refused() {
+        // Единственная молчаливая ветка макроса: описка в `critical` давала
+        // канал с другим именем, другой политикой долговечности и другим
+        // бюджетом — без единого признака, что что-то не так.
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               events { Boom = 0x01 { level: Error, store: critcal, en: "x" } }"#);
+        assert!(
+            e.contains("critcal"),
+            "сказано, что именно не опознано: {e}"
+        );
+        assert!(e.contains("critical"), "и что ожидалось: {e}");
+    }
+
+    #[test]
+    fn a_template_for_an_undeclared_language_is_refused() {
+        // Перевод, который никогда не будет показан, — это молчание там, где
+        // пишущий уверен в обратном.
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               events { Boom = 0x01 { level: Error, en: "x", ru: "х" } }"#);
+        assert!(e.contains("ru"), "названо, какой шаблон лишний: {e}");
+    }
+
+    #[test]
+    fn a_missing_template_is_refused() {
+        let e = err(r#"name: radio, version: 1, languages: [en, ru],
+               events { Boom = 0x01 { level: Error, en: "x" } }"#);
+        assert!(e.contains("ru"), "названо, какого языка не хватает: {e}");
+    }
+
+    #[test]
+    fn a_placeholder_without_a_field_is_refused() {
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               events { Boom = 0x01 { level: Error, en: "перегрев {t}" } }"#);
+        // Проверять одну букву нельзя: если признак «шаблон — строковый
+        // литерал» сломается, `en: "…"` снова уедет в поля, syn пожалуется
+        // «expected type», и латинская `t` найдётся уже там.
+        assert!(
+            e.contains("{t}") && e.contains("такого поля нет"),
+            "жалоба — на шаблон, а не на неразобранный тип: {e}"
+        );
+    }
+
+    #[test]
+    fn a_field_named_like_a_language_is_still_a_field() {
+        // Обратное направление того же признака: ключ совпал с языком, но
+        // значение — тип, значит это поле. Различать по списку языков нельзя,
+        // и по имени ключа — тоже.
+        check(
+            r#"name: radio, version: 1, languages: [en],
+               events { Boom = 0x01 { level: Error, en: "код {ru}", ru: u8 } }"#,
+        )
+        .expect("поле с именем языка — это поле");
+    }
+
+    #[test]
+    fn an_unknown_level_is_refused() {
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               events { Boom = 0x01 { level: Fatal, en: "x" } }"#);
+        assert!(e.contains("Fatal"), "{e}");
+    }
+
+    #[test]
+    fn a_missing_level_is_refused() {
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               events { Boom = 0x01 { en: "x" } }"#);
+        assert!(e.contains("level"), "{e}");
+    }
+
+    #[test]
+    fn an_unknown_section_is_refused() {
+        let e = err(r#"name: radio, version: 1, languages: [en], metrix { }"#);
+        assert!(e.contains("metrix"), "{e}");
+    }
+
+    #[test]
+    fn a_schema_without_languages_is_refused() {
+        let e = err(r#"name: radio, version: 1, events { }"#);
+        assert!(e.contains("languages"), "{e}");
+    }
+
+    #[test]
+    fn a_duplicate_template_is_refused() {
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               events { Boom = 0x01 { level: Error, en: "x", en: "y" } }"#);
+        assert!(e.contains("дважды"), "{e}");
+    }
+
+    #[test]
+    fn an_identifier_too_large_for_u16_is_refused() {
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               events { Boom = 70000 { level: Error, en: "x" } }"#);
+        assert!(e.contains("u16"), "{e}");
     }
 }

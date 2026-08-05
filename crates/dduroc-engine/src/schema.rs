@@ -713,7 +713,16 @@ impl Schema {
 
     /// Все каналы, которые может использовать схема.
     pub fn classes(&self) -> Vec<StorageClass> {
-        let mut out: Vec<StorageClass> = Vec::new();
+        // Обычный канал есть всегда, даже если его не объявил ни один тип.
+        // Свободному тексту своего класса взять неоткуда — у него нет типа в
+        // схеме, — а писать его надо: это мост из чужих логов, обработчик
+        // паники и однократное объявление дефекта сборки. Схема из одной
+        // телеметрии оставляла бы всё это без канала, и объявление, ради
+        // которого механизм заведён, молча отказывало бы.
+        //
+        // Пустой канал не стоит почти ничего: каталог создаётся при подъёме,
+        // а сегмент — только первой записью.
+        let mut out: Vec<StorageClass> = vec![StorageClass::DEFAULT];
         let all = self
             .events
             .iter()
@@ -827,6 +836,42 @@ mod tests {
         assert_eq!(
             s.event(EventId(1)).unwrap().template(1),
             Some("мощность {dbm}")
+        );
+    }
+
+    #[test]
+    fn the_default_channel_exists_even_if_no_type_asks_for_it() {
+        // Схема из одной телеметрии не объявляет обычного канала, а
+        // свободному тексту деться больше некуда: у него нет типа в схеме, а
+        // значит и класса хранения. Без безусловного `default` объявление
+        // дефекта сборки, сообщение моста и обработчик паники молча
+        // отказывали бы — то есть механизм, заведённый против тишины, сам бы
+        // и молчал.
+        static METRICS: &[MetricDesc] = &[MetricDesc {
+            id: MetricId(1),
+            name: "Spectrum",
+            unit: "",
+            tags: &[],
+            value_type: ValueType::Blob,
+            kind: MetricKind::Gauge,
+            class: StorageClass::TELEMETRY,
+            states: &[],
+            thresholds: Thresholds::NONE,
+        }];
+        let s = Schema {
+            name: "telemetry-only",
+            version: ProtocolVersion(1),
+            languages: &[Language("en")],
+            events: &[],
+            metrics: METRICS,
+            spans: &[],
+            migrations: &[],
+        };
+        s.validate().expect("схема корректна");
+        assert_eq!(
+            s.classes(),
+            vec![StorageClass::DEFAULT, StorageClass::TELEMETRY],
+            "обычный канал есть всегда"
         );
     }
 

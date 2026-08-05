@@ -351,15 +351,26 @@ impl Namespace {
         text: impl Into<Box<str>>,
         span: Option<SpanId>,
     ) -> Result<()> {
-        let critical = level >= Level::Error;
-        let class = if critical {
-            StorageClass::CRITICAL
-        } else {
-            StorageClass::DEFAULT
+        // Свободный текст не объявлен в схеме, поэтому и класса хранения у
+        // него нет. Ошибочный уровень просится в критический канал, но схема
+        // не обязана его объявлять: отказать значило бы промолчать ровно там,
+        // где текст и пишется ради того, чтобы не молчать (объявление дефекта
+        // сборки, сообщение моста, паника). Берём критический, если он есть,
+        // иначе обычный — он есть всегда (`Schema::classes`).
+        //
+        // Очередь выбирается по каналу, который достался на самом деле:
+        // ожидание места ради доставки в канал с отложенной синхронизацией
+        // было бы платой без гарантии.
+        let (channel, critical) = match level >= Level::Error {
+            true => match self.channel_of(StorageClass::CRITICAL) {
+                Ok(idx) => (idx, true),
+                Err(_) => (self.channel_of(StorageClass::DEFAULT)?, false),
+            },
+            false => (self.channel_of(StorageClass::DEFAULT)?, false),
         };
         let item = Staged {
             ns: self.inner.id,
-            channel: self.channel_of(class)?,
+            channel,
             at: self.stamp(),
             record: StagedRecord::Text {
                 level,
@@ -650,7 +661,14 @@ impl<M> Series<M> {
 }
 
 /// Страж спана: конец записывается при уничтожении.
+///
+/// Значение обязано быть куда-то положено: `ns.span(kind);` без привязки
+/// уничтожает стража тем же выражением, которое его создало, и спан
+/// схлопывается в нулевую длительность — две записи подряд вместо отрезка
+/// работы. Внешне это выглядит как «спан есть, но пустой», и разбирать такое
+/// в журнале не по чему.
 #[derive(Debug)]
+#[must_use = "спан живёт, пока жив страж: `ns.span(kind);` закрывает его сразу же"]
 pub struct SpanGuard {
     ns: Namespace,
     span: SpanId,

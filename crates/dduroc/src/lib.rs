@@ -148,8 +148,8 @@ pub use dduroc_engine::store::{Store, StoreConfig};
 pub use dduroc_engine::writer::QueueSizes;
 pub use dduroc_engine::{Clock, Error, Result};
 pub use dduroc_format::{
-    BootCounter, BootTime, EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId,
-    ValueType,
+    BootCounter, BootTime, Compression, EventId, Level, MetricId, Micros, ProtocolVersion, SpanId,
+    SpanKindId, ValueType,
 };
 
 /// Всё, что нужно для записи: типы и трейты одной строкой.
@@ -363,7 +363,12 @@ mod tests {
 
         migrating::SCHEMA.validate().expect("схема корректна");
 
+        // Типы попадают в множества сегмента вместе с блоком, в котором
+        // встретились: блок, не поместившийся в сегмент, уезжает в следующий,
+        // и его типы обязаны уехать с ним. Поэтому footer собирается так же,
+        // как его собирает writer, — записи, потом блок.
         let footer_of = |events: &[EventId], metrics: &[MetricId]| {
+            use dduroc_format::block::{BlockHeader, Compression};
             let mut b = FooterBuilder::new();
             for e in events {
                 b.add_event(*e);
@@ -371,6 +376,19 @@ mod tests {
             for m in metrics {
                 b.add_metric(*m);
             }
+            b.add_block(
+                32,
+                &BlockHeader {
+                    body_len: 10,
+                    raw_len: 10,
+                    seq: 0,
+                    base: dduroc_format::Micros(0),
+                    count: 1,
+                    compression: Compression::None,
+                    crc: 0,
+                },
+                dduroc_format::Micros(1),
+            );
             let bytes = b.build();
             dduroc_format::Footer::parse(&bytes).unwrap().unwrap()
         };
@@ -398,6 +416,75 @@ mod tests {
             "молча пропустить сегмент хуже, чем переписать лишний"
         );
         assert!(wide.touches(&footer_of(&[], &[])), "и пустой тоже");
+    }
+
+    #[test]
+    fn channel_policy_is_configurable_through_the_facade_alone() {
+        // Фасад — единственная зависимость приложения, поэтому всё, что
+        // фигурирует в сигнатурах его же реэкспортов, обязано быть названо им
+        // самим. `Compression` не был реэкспортирован, и настроить сжатие
+        // канала, не добавив в проект `dduroc-engine` вручную, было нельзя —
+        // при том, что поле в `ChannelConfig` публичное.
+        // Заодно проверяется, что имя канала берётся из класса, а не из
+        // конфига: два источника одного имени расходятся, и расхождение здесь
+        // увело бы записи класса в чужой каталог с чужой политикой. Имя в
+        // конфиге намеренно неверное.
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig::new(dir.path())
+            .with_budget(16 * 1024 * 1024)
+            .channel(
+                StorageClass::TELEMETRY,
+                ChannelConfig {
+                    compression: Compression::None,
+                    durability: Durability::Relaxed,
+                    ..ChannelConfig::new("opechatka", 16 * 1024 * 1024)
+                },
+            );
+        {
+            let store = Store::open(config).unwrap();
+            let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
+            ns.series(testing::metrics::Spectrum)
+                .unwrap()
+                .sample(vec![1u8, 2, 3]);
+            ns.sync().unwrap();
+            assert!(store.stats().is_clean(), "{:?}", store.stats());
+            store.shutdown();
+        }
+
+        let channels: Vec<String> = std::fs::read_dir(dir.path().join("orc-radio-0"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        assert!(
+            channels.iter().any(|c| c == "telemetry"),
+            "каталог назван классом: {channels:?}"
+        );
+        assert!(
+            !channels.iter().any(|c| c == "opechatka"),
+            "и только им: {channels:?}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_channel_config_is_refused_at_open() {
+        // Настройки канала приходят снаружи и до сих пор не проверялись
+        // нигде: бюджет меньше двух сегментов доезжал до writer'а как есть, и
+        // ротация съедала единственный сегмент сразу после запечатывания.
+        let dir = tempfile::tempdir().unwrap();
+        let broken = StoreConfig::new(dir.path()).channel(
+            StorageClass::DEFAULT,
+            ChannelConfig {
+                budget_bytes: 4 * 1024 * 1024,
+                segment_bytes: 4 * 1024 * 1024,
+                ..ChannelConfig::new("default", 4 * 1024 * 1024)
+            },
+        );
+        let err = Store::open(broken).expect_err("бюджет в один сегмент бессмыслен");
+        assert!(
+            matches!(err, Error::BadChannel { .. }),
+            "отказ пришёл именно от проверки настроек канала: {err}"
+        );
     }
 
     #[test]

@@ -317,15 +317,24 @@ impl BlockBuilder {
         }
 
         let dt = match self.base {
-            None => {
-                self.base = Some(at);
-                0
-            }
+            None => 0,
             Some(_) => at.saturating_delta(self.last),
         };
-        self.last = Micros(self.last.0.max(at.0));
 
+        // Кодируем СНАЧАЛА, состояние двигаем ПОТОМ. Запись, которую кодек
+        // отверг, не имеет права оставить за собой базу времени: база — это
+        // время первой записи блока, и декодер приписывает её первой
+        // выжившей записи, игнорируя её собственную дельту (`BlockRecords`
+        // ниже). Отравленная база означала бы, что весь блок читается со
+        // сдвигом назад на разницу времён — молча, без ошибки и без
+        // счётчика. Сам `encode` свой буфер откатывает (`record::encode`),
+        // но сообщить накопителю об откате ему нечем.
         let n = record::encode(rec, dt, &mut self.body)?;
+
+        if self.base.is_none() {
+            self.base = Some(at);
+        }
+        self.last = Micros(self.last.0.max(at.0));
         self.count += 1;
         Ok(n)
     }
@@ -344,6 +353,15 @@ impl BlockBuilder {
         compression: Compression,
         out: &mut Vec<u8>,
     ) -> Result<BlockHeader> {
+        // Признак пустоты — `count`, а не наличие базы: они обязаны
+        // совпадать (см. `push`), но пустотой блок делает именно отсутствие
+        // записей, и завязка на них исключает заголовок с `body_len == 0`
+        // физически. Такой заголовок `BlockHeader::parse` считает порчей —
+        // кодек не имеет права порождать байты, на которых сам же
+        // останавливается.
+        if self.count == 0 {
+            return Err(Error::EmptyBlock);
+        }
         let base = self.base.ok_or(Error::EmptyBlock)?;
         let len = self.body.len();
         if len > BlockHeader::MAX_BODY as usize {
@@ -599,6 +617,56 @@ mod tests {
         } else {
             assert!(header.body_len < header.raw_len);
         }
+    }
+
+    #[test]
+    fn rejected_record_leaves_no_trace_in_the_accumulator() {
+        // База блока — время его ПЕРВОЙ записи, и декодер приписывает её
+        // первой записи безусловно, игнорируя её собственную дельту. Значит
+        // запись, которую кодек отверг, не имеет права выставить базу: она
+        // стала бы базой блока, которого не видела, и весь блок прочитался бы
+        // со сдвигом назад — без ошибки, без счётчика, без следа в файле.
+        // Дефект был достижим из публичного API через `SpanId(0)`.
+        use crate::ids::SpanId;
+
+        let mut b = BlockBuilder::new();
+        let bad = Record::Message(Message {
+            event: EventId(1),
+            span: Some(SpanId(0)),
+            payload: &[],
+        });
+        assert!(matches!(
+            b.push(Micros(100), &bad),
+            Err(Error::ReservedNotZero)
+        ));
+        assert!(b.is_empty(), "отвергнутая запись не считается");
+        assert_eq!(b.base(), None, "и не задаёт базу времени");
+        assert_eq!(b.last(), None);
+        assert_eq!(b.body_len(), 0, "буфер тела откачен кодеком");
+
+        // Накопитель на пустом ходу отдаёт EmptyBlock, а не заголовок с
+        // нулевым телом, который сам же считает порчей.
+        let mut out = Vec::new();
+        assert!(matches!(
+            b.finish(0, Compression::None, &mut out),
+            Err(Error::EmptyBlock)
+        ));
+
+        // Следующие записи получают своё настоящее время.
+        b.push(Micros(500), &msg(2, &[1])).unwrap();
+        b.push(Micros(600), &msg(3, &[2])).unwrap();
+        out.clear();
+        let header = b.finish(0, Compression::None, &mut out).unwrap();
+        assert_eq!(header.base, Micros(500), "база — время первой ЗАПИСАННОЙ");
+        assert_eq!(header.count, 2);
+
+        let block = Block::parse(&out).unwrap().expect("блок есть");
+        let times: Vec<Micros> = block.records().map(|r| r.unwrap().0).collect();
+        assert_eq!(
+            times,
+            vec![Micros(500), Micros(600)],
+            "времена читаются такими, какими записаны"
+        );
     }
 
     #[test]

@@ -274,12 +274,17 @@ impl Iterator for EntryStream<'_> {
 }
 
 impl EntryStream<'_> {
-    /// Фрагменты, которые не удалось прочитать. Полон список только после
-    /// того, как поток исчерпан: повреждение обнаруживается при чтении блока.
+    /// Фрагменты, которые не удалось прочитать.
+    ///
+    /// Список отражает всё, что обнаружено **к этому моменту**, включая
+    /// повреждения в недочитанных сегментах: обход обрывается по `limit`, и
+    /// ответ, из которого часть данных выпала из-за порчи, не имеет права
+    /// выглядеть полным. Дальше по потоку список может только пополниться —
+    /// повреждение обнаруживается при чтении блока.
     pub fn damaged(&self) -> Vec<Damage> {
         let mut out = self.damaged.clone();
         for c in &self.cursors {
-            out.extend_from_slice(c.damaged());
+            out.extend(c.damaged());
         }
         out
     }
@@ -329,6 +334,26 @@ pub struct NamespaceInfo {
     pub channels: Vec<String>,
     /// Суммарный размер сегментов, байт.
     pub bytes: u64,
+}
+
+/// Что нашлось в корне при перечислении неймспейсов.
+///
+/// Отдельный тип, а не просто список: перечисление, из которого молча выпал
+/// нечитаемый неймспейс, выглядит как «такого сервиса на приборе нет» — то же
+/// молчание, против которого заведено [`QueryResult::damaged`]. Пустой
+/// `damaged` означает, что перечислено всё.
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceListing {
+    pub namespaces: Vec<NamespaceInfo>,
+    /// Каталоги, опознанные как неймспейсы, но не поддавшиеся чтению.
+    pub damaged: Vec<Damage>,
+}
+
+impl NamespaceListing {
+    /// Перечислено ли всё, что есть в корне.
+    pub fn is_complete(&self) -> bool {
+        self.damaged.is_empty()
+    }
 }
 
 /// Читатель хранилища.
@@ -433,9 +458,16 @@ impl Reader {
     ///
     /// Объём стоит `stat` каждого сегмента, поэтому путь запроса им не
     /// пользуется: ему хватает имён неймспейсов и каналов.
-    pub fn namespaces(&self) -> Result<Vec<NamespaceInfo>> {
-        let mut out = Vec::new();
-        for ns in self.namespace_dirs(&mut Vec::new())? {
+    ///
+    /// Неймспейс с нечитаемой метой попадает не в список, а в
+    /// [`NamespaceListing::damaged`]: показать его нечем, но и промолчать
+    /// нельзя — иначе перечисление объявляло бы полным ответ, из которого
+    /// целый неймспейс выпал, и его данные исчезли бы бесследно.
+    pub fn namespaces(&self) -> Result<NamespaceListing> {
+        let mut unreadable = Vec::new();
+        let dirs = self.namespace_dirs(&mut unreadable)?;
+        let mut namespaces = Vec::with_capacity(dirs.len());
+        for ns in dirs {
             let mut bytes = 0;
             for channel in &ns.channels {
                 if let Ok(inv) = dduroc_engine::rotation::Inventory::scan(
@@ -444,9 +476,19 @@ impl Reader {
                     bytes += inv.total_bytes();
                 }
             }
-            out.push(NamespaceInfo { bytes, ..ns });
+            namespaces.push(NamespaceInfo { bytes, ..ns });
         }
-        Ok(out)
+        Ok(NamespaceListing {
+            namespaces,
+            damaged: unreadable
+                .into_iter()
+                .map(|path| Damage {
+                    path,
+                    offset: 0,
+                    reason: "мета неймспейса не читается".to_owned(),
+                })
+                .collect(),
+        })
     }
 
     /// Неймспейсы и их каналы — без обращения к размерам файлов.
@@ -691,8 +733,11 @@ impl Reader {
                 }
             }
         }
+        // Поиск затравки обрывается, едва найдены все нужные ряды, — то есть
+        // почти всегда посреди сегмента. Повреждения недочитанного сегмента
+        // обязаны попасть в отчёт и отсюда.
         for c in &cursors {
-            damaged.extend_from_slice(c.damaged());
+            damaged.extend(c.damaged());
         }
 
         out.sort_by_key(|e| e.at);
@@ -1161,7 +1206,9 @@ mod tests {
         populate(dir.path());
 
         let reader = Reader::open(dir.path(), &[schema()]).unwrap();
-        let namespaces = reader.namespaces().unwrap();
+        let listing = reader.namespaces().unwrap();
+        assert!(listing.is_complete(), "все неймспейсы перечислены");
+        let namespaces = listing.namespaces;
         assert_eq!(namespaces.len(), 3, "три неймспейса");
         assert_eq!(namespaces[0].name, "apt-modem-0");
         assert_eq!(namespaces[0].schema_name, "radio");
@@ -1812,6 +1859,64 @@ mod tests {
                 .iter()
                 .any(|e| &*e.namespace == "orc-radio-1" || &*e.namespace == "apt-modem-0"),
             "порча одного сегмента не должна прятать остальные"
+        );
+    }
+
+    #[test]
+    fn damage_is_reported_even_when_the_walk_stops_early() {
+        // Повреждения переезжали из сегмента в отчёт только при его
+        // закрытии, а обход обрывается по `limit` посреди сегмента. Ответ, из
+        // которого выпал блок, объявлял себя полным — то есть врал ровно в том
+        // поле, ради которого оно заведено.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store =
+                Store::open(StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024)).unwrap();
+            let ns = store.namespace("orc-radio-0", schema()).unwrap();
+            // Восемь блоков в одном сегменте: `sync` закрывает блок, поэтому
+            // сегмент заведомо не будет дочитан до конца под лимитом.
+            for round in 0..8u8 {
+                for i in 0..5u8 {
+                    ns.log_raw(EventId(1), &[round, i], None);
+                }
+                ns.sync().unwrap();
+            }
+            store.shutdown();
+        }
+
+        let ch = dir.path().join("orc-radio-0").join("default");
+        let seg = std::fs::read_dir(&ch)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "seg"))
+            .unwrap();
+        {
+            // Первый блок сегмента: заголовок начинается сразу за заголовком
+            // сегмента (32 байта).
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+            f.write_all_at(&[0xFF; 16], 40).unwrap();
+        }
+
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let result = reader
+            .query(&Query::new().order(Order::Oldest).limit(1))
+            .unwrap();
+        assert_eq!(result.entries.len(), 1, "лимит соблюдён");
+        assert!(result.truncated, "обход оборван, сегмент не дочитан");
+        assert!(
+            !result.is_complete(),
+            "часть данных выпала из-за порчи — ответ не полон"
+        );
+
+        // Тот же ответ у ленивого пути: читатель обязан признаваться в
+        // пропаже и когда обход прерывает сам вызывающий.
+        let mut stream = reader.stream(&Query::new().order(Order::Oldest)).unwrap();
+        let _first = stream.next().expect("хоть одна запись есть");
+        assert!(
+            !stream.damaged().is_empty(),
+            "повреждение видно, не дожидаясь конца обхода"
         );
     }
 

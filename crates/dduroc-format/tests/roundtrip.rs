@@ -333,6 +333,16 @@ proptest! {
         let mut offset = SegmentHeader::SIZE as u64;
         let mut base = 0u64;
         let mut expected_blocks = Vec::new();
+        // Типы отмечаются до блока: они приходят с его записями и
+        // закрепляются за сегментом вместе с ним. Множества, объявленные
+        // после последнего блока, принадлежат блоку, который ещё собирается,
+        // и в этот footer не попадают — на то они и отдельная ступень.
+        for e in &events {
+            builder.add_event(EventId(*e));
+        }
+        for m in &metrics {
+            builder.add_metric(MetricId(*m));
+        }
         for (delta, count) in &blocks {
             base += delta;
             let header = BlockHeader {
@@ -347,12 +357,6 @@ proptest! {
             builder.add_block(offset, &header, Micros(base));
             expected_blocks.push((offset, base, *count));
             offset += 24 + 16;
-        }
-        for e in &events {
-            builder.add_event(EventId(*e));
-        }
-        for m in &metrics {
-            builder.add_metric(MetricId(*m));
         }
 
         let bytes = builder.build();
@@ -369,11 +373,16 @@ proptest! {
 
         // Множества — отсортированные и без дублей: по ним идёт бинарный
         // поиск и в миграции, и при вопросе «какая телеметрия здесь есть».
+        //
+        // Сегмент без единого блока не содержит и записей, поэтому типов в
+        // нём нет: отмеченные принадлежат блоку, который ещё собирается, и
+        // уедут в тот сегмент, куда он ляжет.
+        let sealed = !blocks.is_empty();
         for (declared, got) in [
             (&events, footer.events.iter().map(|e| e.0).collect::<Vec<u16>>()),
             (&metrics, footer.metrics.iter().map(|m| m.0).collect::<Vec<u16>>()),
         ] {
-            let mut expected: Vec<u16> = declared.clone();
+            let mut expected: Vec<u16> = if sealed { declared.clone() } else { Vec::new() };
             expected.sort_unstable();
             expected.dedup();
             prop_assert_eq!(got, expected);

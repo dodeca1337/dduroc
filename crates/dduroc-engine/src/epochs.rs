@@ -253,9 +253,28 @@ impl EpochStore {
     ///
     /// `boottime_at_init_us` передаётся снаружи, чтобы совпасть с базой часов
     /// ровно до микросекунды.
-    pub fn open_and_register(root: &Path, boottime_at_init_us: u64) -> Result<Self> {
+    ///
+    /// `floor_boot` — наибольший номер запуска, написанный на именах уже
+    /// лежащих сегментов. Спрашивается **только** если файл эпох не пережил
+    /// прошлый запуск (потерян или уведён в карантин после порчи): у целого
+    /// файла максимум по `runs` и так покрывает всё, что есть на диске, а
+    /// обход каталогов при тысячах неймспейсов стоит дороже, чем экономит, —
+    /// ровно поэтому уборка эпох и делается по порогу, а не на каждом старте.
+    ///
+    /// Без этой границы потеря `epochs.bin` начинала бы нумерацию заново,
+    /// поверх запусков, чьи сегменты никуда не делись. Имя сегмента — это
+    /// `(boot, µs)`, и его лексикографический порядок объявлен временным:
+    /// повторно выданный номер поставил бы новые сегменты в историю **перед**
+    /// старыми. Ротация, удаляющая старейшее, принялась бы за свежие записи, а
+    /// читатель отдал бы историю вперемешку.
+    pub fn open_and_register(
+        root: &Path,
+        boottime_at_init_us: u64,
+        floor_boot: &dyn Fn() -> Result<Option<u32>>,
+    ) -> Result<Self> {
         let path = root.join(EPOCHS_FILE);
-        let mut epochs = Self::load_for_write(&path)?;
+        let (mut epochs, lost) = Self::load_for_write(&path)?;
+        let floor_boot = if lost { floor_boot()? } else { None };
         let kernel_boot_id = read_kernel_boot_id()?;
 
         // Та же загрузка железа, что и у предыдущего run'а? Сверяем UUID ядра.
@@ -287,6 +306,7 @@ impl EpochStore {
             .runs
             .iter()
             .map(|r| r.boot_counter)
+            .chain(floor_boot)
             .max()
             .map_or(0, |m| m.saturating_add(1));
 
@@ -336,14 +356,18 @@ impl EpochStore {
     ///
     /// Молча затирать его нельзя — по нему разбирают, что случилось с
     /// привязкой ко времени.
-    fn load_for_write(path: &Path) -> Result<Epochs> {
+    ///
+    /// Второй элемент — «прежнего состояния не осталось»: файла не было или
+    /// он оказался нечитаем. Это единственный случай, когда нумерацию
+    /// запусков приходится восстанавливать по диску.
+    fn load_for_write(path: &Path) -> Result<(Epochs, bool)> {
         match Self::read(path)? {
-            Loaded::Ok(e) => Ok(e),
-            Loaded::Missing => Ok(Epochs::default()),
+            Loaded::Ok(e) => Ok((e, false)),
+            Loaded::Missing => Ok((Epochs::default(), true)),
             Loaded::Corrupt => {
                 let backup = path.with_extension("corrupt");
                 let _ = std::fs::rename(path, &backup);
-                Ok(Epochs::default())
+                Ok((Epochs::default(), true))
             }
         }
     }
@@ -418,7 +442,61 @@ mod tests {
     use super::*;
 
     fn store(dir: &Path, base_us: u64) -> EpochStore {
-        EpochStore::open_and_register(dir, base_us).unwrap()
+        EpochStore::open_and_register(dir, base_us, &|| Ok(None)).unwrap()
+    }
+
+    /// То же, но с известной нижней границей номера запуска: так открывается
+    /// хранилище, у которого сегменты пережили файл эпох.
+    fn store_with_floor(dir: &Path, base_us: u64, floor: u32) -> EpochStore {
+        EpochStore::open_and_register(dir, base_us, &|| Ok(Some(floor))).unwrap()
+    }
+
+    #[test]
+    fn a_lost_epochs_file_does_not_restart_run_numbering() {
+        // `boot_counter` попадает в имя каждого сегмента, а порядок имён
+        // объявлен временным. Начать нумерацию заново поверх сегментов,
+        // переживших потерю файла эпох, значило бы поставить новые записи в
+        // историю ПЕРЕД старыми: ротация принялась бы за свежее, а читатель
+        // отдал бы историю вперемешку.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Первый запуск: номер ноль, файл эпох создан.
+        assert_eq!(store(dir.path(), 1_000).current_run().boot_counter, 0);
+        // Второй помнит первый.
+        assert_eq!(store(dir.path(), 2_000).current_run().boot_counter, 1);
+
+        // Файл эпох потерян (порча увела бы его в карантин — тот же исход).
+        std::fs::remove_file(dir.path().join(EPOCHS_FILE)).unwrap();
+
+        // Без границы нумерация началась бы заново; с ней — продолжается за
+        // тем номером, который виден на именах сегментов.
+        assert_eq!(store(dir.path(), 3_000).current_run().boot_counter, 0);
+        std::fs::remove_file(dir.path().join(EPOCHS_FILE)).unwrap();
+        assert_eq!(
+            store_with_floor(dir.path(), 4_000, 1)
+                .current_run()
+                .boot_counter,
+            2,
+            "нумерация продолжается за последним запуском, чьи сегменты живы"
+        );
+    }
+
+    #[test]
+    fn an_intact_epochs_file_is_never_second_guessed_by_the_disk() {
+        // Граница спрашивается лениво: обход имён при тысячах неймспейсов
+        // стоит дороже, чем экономит, и целому файлу эпох он не нужен —
+        // его максимум и так покрывает всё, что лежит на диске.
+        let dir = tempfile::tempdir().unwrap();
+        store(dir.path(), 1_000);
+
+        let asked = std::cell::Cell::new(false);
+        let next = EpochStore::open_and_register(dir.path(), 2_000, &|| {
+            asked.set(true);
+            Ok(Some(1_000_000))
+        })
+        .unwrap();
+        assert!(!asked.get(), "целый файл эпох не требует обхода диска");
+        assert_eq!(next.current_run().boot_counter, 1);
     }
 
     /// Момент времени из миллисекунд эпохи — короче, чем разбирать дату.
