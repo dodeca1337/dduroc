@@ -271,21 +271,49 @@ impl SegmentCursor {
         item
     }
 
-    /// Пропустить блоки, целиком лежащие раньше `from`.
+    /// Отбросить блоки, целиком лежащие вне окна.
     ///
-    /// Границы блока известны из footer'а, поэтому отбрасывание идёт без
-    /// чтения тел — ради этого footer и существует.
-    pub fn seek_from(&mut self, from: Micros) {
-        if self.reverse {
+    /// Границы блоков известны из footer'а, поэтому отбор идёт без чтения тел
+    /// — ради этого footer и существует.
+    ///
+    /// Обе границы и оба направления. Прежде пропуск работал только по нижней
+    /// границе и только в прямом порядке, а порядок по умолчанию у запроса —
+    /// [`crate::Order::Newest`]: индекс блоков не работал в самом частом
+    /// сценарии вовсе, и «последние сто записей» читали сегмент целиком.
+    ///
+    /// Вызывается один раз, до начала обхода: окно вырезается из списка
+    /// смещений, а не запоминается отдельным состоянием.
+    pub fn seek_bounds(&mut self, from: Option<Micros>, to: Option<Micros>) {
+        debug_assert_eq!(self.next_block, 0, "окно вырезается до начала обхода");
+        if from.is_none() && to.is_none() {
             return;
         }
         let Some(footer) = self.reader.footer() else {
             return;
         };
-        // Ищем последний блок с базой <= from: записи с нужным временем
-        // могут начинаться внутри него.
-        let start = footer.block_for_time(from).unwrap_or(0);
-        self.next_block = self.next_block.max(start);
+        let total = footer.blocks.len();
+        debug_assert_eq!(total, self.offsets.len(), "смещения взяты из footer'а");
+
+        // Нижняя граница: блок, который МОЖЕТ содержать `from`, — последний с
+        // базой не позже него; всё, что перед ним, целиком в прошлом.
+        let lo = from.map_or(0, |t| footer.block_for_time(t).unwrap_or(0));
+        // Верхняя: база блока — время его первой записи, поэтому блок,
+        // начавшийся позже `to`, состоит из записей ещё более поздних.
+        let hi = to.map_or(total, |t| footer.blocks.partition_point(|b| b.base <= t));
+
+        if lo >= hi {
+            self.offsets.clear();
+            return;
+        }
+        // При обратном обходе `offsets` уже развёрнут: окно [lo, hi) прямого
+        // порядка — это [total - hi, total - lo) в порядке обхода.
+        let (head, tail) = if self.reverse {
+            (total - hi, total - lo)
+        } else {
+            (lo, hi)
+        };
+        self.offsets.truncate(tail);
+        self.offsets.drain(..head);
     }
 
     /// Загрузить следующий блок. `false` — блоков больше нет.
@@ -599,10 +627,10 @@ impl ChannelCursor {
                     {
                         continue;
                     }
-                    // Нижняя граница — в шкале того запуска, которому
-                    // принадлежит сегмент.
-                    if let Some(from) = self.bounds.for_boot(c.boot()).and_then(|b| b.from) {
-                        c.seek_from(from);
+                    // Границы — в шкале того запуска, которому принадлежит
+                    // сегмент: микросекунды разных запусков не сравнимы.
+                    if let Some(run) = self.bounds.for_boot(c.boot()) {
+                        c.seek_bounds(run.from, run.to);
                     }
                     self.current = Some(c);
                     return true;
@@ -797,6 +825,95 @@ mod tests {
             vec![100, 900, 50]
         );
         assert!(unanchored.is_empty());
+    }
+
+    /// Запечатанный сегмент, в котором каждый блок — одна запись с указанным
+    /// временем. Блоки нужны поштучно: проверяется именно отбор блоков.
+    fn sealed_segment(dir: &Path, times: &[u64]) -> PathBuf {
+        use dduroc_engine::segment::SegmentWriter;
+        use dduroc_format::block::BlockBuilder;
+        use dduroc_format::record::Message;
+        use dduroc_format::segment::SegmentHeader;
+        use dduroc_format::{Compression, EventId, FooterBuilder, ProtocolVersion, Record};
+
+        let base = Micros(times[0]);
+        let header = SegmentHeader {
+            protocol_version: ProtocolVersion(1),
+            boot: BootCounter(0),
+            base,
+            store_id: 0,
+        };
+        let mut seg = SegmentWriter::create(dir, header, 1 << 20).unwrap();
+        let mut footer = FooterBuilder::new();
+        let mut builder = BlockBuilder::new();
+        let mut out = Vec::new();
+        for &t in times {
+            builder
+                .push(
+                    Micros(t),
+                    &Record::Message(Message {
+                        event: EventId(1),
+                        span: None,
+                        payload: &[],
+                    }),
+                )
+                .unwrap();
+            out.clear();
+            let h = builder
+                .finish(seg.next_seq(), Compression::None, &mut out)
+                .unwrap();
+            let offset = seg.append_block(&out).unwrap();
+            footer.add_block(offset, &h, Micros(t));
+        }
+        seg.seal(&footer.build()).unwrap();
+        dir.join(SegmentName::new(BootCounter(0), base).to_string())
+    }
+
+    #[test]
+    fn the_block_index_works_in_both_directions_and_on_both_bounds() {
+        // Порядок по умолчанию у запроса — `Order::Newest`, а пропуск блоков
+        // по footer'у работал только по нижней границе и только в прямом
+        // обходе. То есть индекс, ради которого footer и существует, в самом
+        // частом сценарии не работал вовсе: «последние сто записей» читали
+        // сегмент целиком, блок за блоком.
+        let dir = tempfile::tempdir().unwrap();
+        let times: Vec<u64> = (0..20).map(|i| 100 + i * 10).collect();
+        let path = sealed_segment(dir.path(), &times);
+
+        let read = |reverse: bool, from: Option<u64>, to: Option<u64>| -> Vec<u64> {
+            let mut c = SegmentCursor::open(&path, reverse, None, None).unwrap();
+            assert_eq!(c.offsets.len(), times.len(), "иначе тест не про отбор");
+            c.seek_bounds(from.map(Micros), to.map(Micros));
+            std::iter::from_fn(|| c.next_entry())
+                .map(|e| e.at.at.0)
+                .collect()
+        };
+
+        // Окно [150, 200] — шесть блоков из двадцати, и ни одного лишнего.
+        // Курсор не фильтрует записи по времени: всё, что он отдал, он и
+        // прочитал с диска.
+        assert_eq!(
+            read(false, Some(150), Some(200)),
+            vec![150, 160, 170, 180, 190, 200]
+        );
+        assert_eq!(
+            read(true, Some(150), Some(200)),
+            vec![200, 190, 180, 170, 160, 150]
+        );
+
+        // Одна граница из двух — тоже граница.
+        assert_eq!(read(true, None, Some(120)), vec![120, 110, 100]);
+        assert_eq!(read(true, Some(270), None), vec![290, 280, 270]);
+
+        // Окно внутри одного блока оставляет ровно его: база — время ПЕРВОЙ
+        // записи блока, и что лежит дальше внутри него, без чтения не узнать.
+        // Отбросить его значило бы потерять записи, а не сэкономить чтение.
+        assert_eq!(read(true, Some(151), Some(159)), vec![150]);
+        assert_eq!(read(false, Some(1_000), None), vec![290]);
+        // А вот окно, кончающееся раньше первого блока, не оставляет ничего.
+        assert!(read(true, None, Some(50)).is_empty());
+        // Без границ обход полный.
+        assert_eq!(read(true, None, None).len(), times.len());
     }
 
     #[test]

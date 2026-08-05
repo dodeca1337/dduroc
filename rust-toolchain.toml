@@ -6,3 +6,9 @@ components = ["rustfmt", "clippy"]
 # `cargo test` требовала бы его скачивания. Для кросс-сборки один раз:
 #   rustup target add armv7-unknown-linux-gnueabihf
 #   cargo zigbuild --release --target armv7-unknown-linux-gnueabihf
+#
+# Тип-чек под 32-битной целью линковщика не требует и потому доступен сразу
+# после `rustup target add` — в CI он отдельной работой (.github/workflows):
+#   cargo check --workspace --all-targets --target armv7-unknown-linux-gnueabihf
+# Допущения про ширину usize на x86-64 не проявляются вовсе, а на приборе
+# оборачиваются паникой «capacity overflow» на чужом файле.

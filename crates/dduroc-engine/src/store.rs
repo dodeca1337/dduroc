@@ -53,8 +53,34 @@ pub struct StoreConfig {
     /// предупреждения, а просто оставляла класс с настройками по умолчанию.
     /// Критические данные при этом молча получали политику обычного канала.
     pub channels: HashMap<StorageClass, ChannelConfig>,
-    /// Бюджет по умолчанию на канал неймспейса.
+    /// Бюджет по умолчанию **на канал** неймспейса.
+    ///
+    /// Именно на канал, а не на хранилище: каждый неймспейс получает столько
+    /// на каждый свой класс хранения. Сотня неймспейсов по три канала при
+    /// умолчании в 64 МиБ — это девятнадцать гигабайт, и число это растёт с
+    /// каждым поднятым неймспейсом. Носитель об этом ничего не знает, поэтому
+    /// потолок хранилища задаётся отдельно — [`StoreConfig::total_budget_bytes`].
     pub default_budget_bytes: u64,
+    /// Потолок на **всё** хранилище: суммарный размер файлов сегментов во всех
+    /// каналах всех неймспейсов. `None` — потолка нет.
+    ///
+    /// Поканальный бюджет отвечает на вопрос «сколько истории хранить у этого
+    /// класса»; ответить им на вопрос «сколько места занять на носителе»
+    /// нельзя — число каналов заранее неизвестно и растёт по ходу работы.
+    /// Разъезд этих двух вопросов и есть причина, по которой прибор
+    /// обнаруживает исчерпание носителя раньше, чем срабатывает хоть одна
+    /// ротация.
+    ///
+    /// При превышении вытесняется **самый старый сегмент хранилища целиком**,
+    /// в каком бы канале он ни лежал: молчащий канал не должен держать место,
+    /// которого не хватает шумному.
+    ///
+    /// Потолок не может быть меньше того, что занимают активные сегменты:
+    /// в них пишут, и их преаллокация — та самая гарантия, ради которой она
+    /// делается. Практический предел числа одновременно пишущих каналов равен
+    /// `total_budget_bytes / segment_bytes`; попытка выйти за него видна в
+    /// [`crate::stats::Stats::over_budget`].
+    pub total_budget_bytes: Option<u64>,
     /// Ёмкости очередей записи. Выделяются целиком при открытии хранилища.
     pub queues: QueueSizes,
 }
@@ -66,12 +92,24 @@ impl StoreConfig {
             root: root.into(),
             channels: HashMap::new(),
             default_budget_bytes: 64 * 1024 * 1024,
+            total_budget_bytes: None,
             queues: QueueSizes::default(),
         }
     }
 
+    /// Бюджет **одного канала одного неймспейса**.
+    ///
+    /// Не бюджет хранилища: столько получает каждый класс хранения каждого
+    /// поднятого неймспейса, и суммарная занятость растёт с их числом. Чтобы
+    /// ограничить хранилище целиком, есть [`StoreConfig::with_total_budget`].
     pub fn with_budget(mut self, bytes: u64) -> Self {
         self.default_budget_bytes = bytes;
+        self
+    }
+
+    /// Потолок на всё хранилище — см. [`StoreConfig::total_budget_bytes`].
+    pub fn with_total_budget(mut self, bytes: u64) -> Self {
+        self.total_budget_bytes = Some(bytes);
         self
     }
 
@@ -121,15 +159,31 @@ impl StoreConfig {
     /// меньше двух сегментов — ротация съедала бы единственный сегмент сразу
     /// после запечатывания, и канал не хранил бы ничего.
     fn validate(&self) -> Result<()> {
+        let mut widest = 0;
         for config in self.channels.values() {
             config.validate()?;
+            widest = widest.max(config.segment_bytes);
         }
         for class in [
             StorageClass::DEFAULT,
             StorageClass::CRITICAL,
             StorageClass::TELEMETRY,
         ] {
-            self.config_for(class).validate()?;
+            let config = self.config_for(class);
+            config.validate()?;
+            widest = widest.max(config.segment_bytes);
+        }
+        // Потолок хранилища ниже пары сегментов невыполним по построению:
+        // активный сегмент вытеснять нельзя, значит один-единственный
+        // пишущий канал уже выходил бы за него — и не переставал бы.
+        if let Some(total) = self.total_budget_bytes
+            && total < widest.saturating_mul(2)
+        {
+            return Err(Error::BadChannel {
+                name: "<хранилище>".to_owned(),
+                reason: "суммарный потолок меньше двух сегментов: активный сегмент \
+                         вытеснить нельзя, и хранилище не влезло бы в него никогда",
+            });
         }
         Ok(())
     }
@@ -193,7 +247,11 @@ impl Store {
         );
 
         let counters = Arc::new(Counters::default());
-        let writer = Writer::spawn(Arc::clone(&counters), config.queues)?;
+        let writer = Writer::spawn(
+            Arc::clone(&counters),
+            config.queues,
+            config.total_budget_bytes,
+        )?;
 
         let store = Arc::new(Self {
             root: config.root.clone(),

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Версия и компоненты берутся из rust-toolchain.toml.
+      - name: Toolchain
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo doc --workspace --no-deps
+
+  # Цель устройств 32-битная, а разработка идёт на x86-64: допущения про
+  # ширину usize (ёмкости по счётчикам из файла, размеры буферов, арифметика
+  # смещений) на хосте не проявляются вовсе. Проверка компиляции ловит их
+  # раньше, чем прибор.
+  #
+  # Именно `check`, а не `build`: линковка потребовала бы кросс-тулчейна, а
+  # проверять надо тип-чек, а не компоновщик. Тесты под целью не гоняются —
+  # для этого нужен эмулятор, и это отдельная задача.
+  armv7:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add armv7-unknown-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: armv7
+      - run: cargo check --workspace --all-targets --target armv7-unknown-linux-gnueabihf

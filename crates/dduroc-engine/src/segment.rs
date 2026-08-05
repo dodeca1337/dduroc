@@ -109,13 +109,20 @@ impl SegmentWriter {
     /// прочитал бы их как блок. В худшем случае уцелевший старый блок сошёлся
     /// бы по CRC, и в лог вернулись бы записи из уже отброшенного хвоста
     /// с временами, нарушающими монотонность.
-    pub fn reopen(path: &Path, expect_store: Option<u64>) -> Result<Self> {
+    ///
+    /// `capacity` — до какого размера довести преаллокацию. `None` означает
+    /// «оставить как есть»: восстановление после аварии не имеет права
+    /// требовать места, которого может не быть. Отпущенный по бездействию
+    /// сегмент, наоборот, обрезан до данных и просит вернуть ему полный
+    /// размер — иначе первая же запись сочла бы его переполненным.
+    pub fn reopen(path: &Path, expect_store: Option<u64>, capacity: Option<u64>) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .ctx_path("открытие сегмента", path)?;
-        let capacity = file.metadata().ctx_path("stat", path)?.len();
+        let on_disk = file.metadata().ctx_path("stat", path)?.len();
+        let capacity = capacity.unwrap_or(on_disk).max(on_disk);
 
         let scan = Scan::run(&file, capacity, path)?;
         scan.check_store(expect_store, path)?;
@@ -225,6 +232,10 @@ impl SegmentWriter {
 /// Преаллокация — не оптимизация, а способ получить ENOSPC один раз, при
 /// создании сегмента, а не посреди записи критического события.
 fn grow_to(file: &File, capacity: u64, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if fault::take_no_space() {
+        return Err(Error::NoSpace(path.to_owned()));
+    }
     match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, capacity) {
         Ok(()) => Ok(()),
         // Часть ФС (tmpfs на старых ядрах, некоторые overlay) не умеет
@@ -235,6 +246,38 @@ fn grow_to(file: &File, capacity: u64, path: &Path) -> Result<()> {
         }
         Err(rustix::io::Errno::NOSPC) => Err(Error::NoSpace(path.to_owned())),
         Err(e) => Err(e).ctx_path("fallocate", path),
+    }
+}
+
+/// Отказ по месту — только для тестов движка.
+///
+/// ENOSPC — единственное, ради чего делается преаллокация, и воспроизвести его
+/// на настоящей файловой системе, не будучи root'ом, нельзя: нужен свой
+/// носитель или своё монтирование. Оставить этот путь непроверенным значило бы
+/// проверить всё, кроме того, ради чего всё и построено, — поэтому здесь стоит
+/// заглушка ровно на ту точку, где отказ приходит на самом деле.
+///
+/// Счётчик потоковый: writer живёт в своём потоке, и тест, управляющий его
+/// циклом напрямую, не должен ронять запись в соседних тестах.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NO_SPACE: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Следующие `n` попыток зарезервировать место отказывают.
+    pub(crate) fn no_space_for(n: u32) {
+        NO_SPACE.with(|c| c.set(n));
+    }
+
+    pub(crate) fn take_no_space() -> bool {
+        NO_SPACE.with(|c| {
+            let left = c.get();
+            c.set(left.saturating_sub(1));
+            left > 0
+        })
     }
 }
 
@@ -805,7 +848,7 @@ mod tests {
         // Файл преаллоцирован — размер больше, чем данных.
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 64 * 1024);
 
-        let w2 = SegmentWriter::reopen(&path, None).unwrap();
+        let w2 = SegmentWriter::reopen(&path, None, None).unwrap();
         assert_eq!(w2.data_end(), end, "позиция конца данных восстановлена");
         assert_eq!(w2.header(), header(1_000));
         assert_eq!(w2.next_seq(), 1, "нумерация блоков продолжается");
@@ -852,7 +895,7 @@ mod tests {
         assert_eq!(scan.data_end, good_end, "конец данных — до битого блока");
 
         // Продолжение записи с восстановленной позиции затирает битый хвост.
-        let mut w = SegmentWriter::reopen(&path, None).unwrap();
+        let mut w = SegmentWriter::reopen(&path, None, None).unwrap();
         assert_eq!(w.data_end(), good_end);
         assert_eq!(w.next_seq(), 1);
         append(&mut w, 3_000, 4);
@@ -883,7 +926,7 @@ mod tests {
             f.write_all_at(&[0xFF; 8], good_end + 4).unwrap();
         }
 
-        let mut w = SegmentWriter::reopen(&path, None).unwrap();
+        let mut w = SegmentWriter::reopen(&path, None, None).unwrap();
         assert_eq!(w.data_end(), good_end);
 
         // Проверяем, что область прежнего длинного блока обнулена.
@@ -938,13 +981,13 @@ mod tests {
         let path = w.path().to_owned();
         drop(w);
 
-        let err = SegmentWriter::reopen(&path, Some(0x1111_2222_3333_4444)).unwrap_err();
+        let err = SegmentWriter::reopen(&path, Some(0x1111_2222_3333_4444), None).unwrap_err();
         assert!(
             matches!(err, Error::ForeignSegment { .. }),
             "сегмент чужого хранилища обязан отвергаться: {err}"
         );
         // Со своим идентификатором открывается штатно.
-        SegmentWriter::reopen(&path, Some(0xAAAA_BBBB_CCCC_DDDD)).unwrap();
+        SegmentWriter::reopen(&path, Some(0xAAAA_BBBB_CCCC_DDDD), None).unwrap();
     }
 
     #[test]
