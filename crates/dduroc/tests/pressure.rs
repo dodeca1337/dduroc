@@ -1,4 +1,4 @@
-//! Сквозные проверки под нагрузкой: ротация по бюджету, потолок хранилища,
+//! Сквозные проверки под нагрузкой: общий бюджет класса, личные квоты,
 //! обратное давление критической очереди, многопоточная запись и чтение
 //! живого хранилища.
 //!
@@ -9,7 +9,7 @@
 //! режим работы библиотеки.
 
 use dduroc::prelude::*;
-use dduroc::{ChannelConfig, QueueSizes, StoreConfig};
+use dduroc::{ChannelConfig, NsQuota, QueueSizes, StorageClass, StoreConfig};
 use dduroc_read::{EntryKind, Order, Query, Reader};
 use std::path::Path;
 use std::sync::Arc;
@@ -85,12 +85,11 @@ fn sequence(root: &Path) -> Vec<u64> {
 }
 
 #[test]
-fn rotation_drops_the_oldest_and_keeps_the_channel_inside_its_budget() {
-    // Ротация проверялась только на инвентаре: файлы из нулей, `enforce_budget`
-    // вызывался тестом напрямую. Заставить writer действительно выйти за
-    // бюджет не пробовал никто — а именно там сходятся преаллокация, учёт
-    // размера после запечатывания и защита активного сегмента.
-    const BUDGET: u64 = 16 << 20;
+fn rotation_drops_the_oldest_and_keeps_the_class_inside_its_budget() {
+    // Бюджет объявлен на класс; здесь класс представлен одним неймспейсом —
+    // и именно тут сходятся преаллокация, учёт размера после запечатывания
+    // и защита активного сегмента.
+    const BUDGET: u64 = 32 << 20;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget(BUDGET)).unwrap();
     let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
@@ -143,18 +142,22 @@ fn rotation_drops_the_oldest_and_keeps_the_channel_inside_its_budget() {
 }
 
 #[test]
-fn the_store_ceiling_holds_when_channel_budgets_do_not_add_up() {
-    // Поканальный бюджет — не бюджет носителя: неймспейсов на приборе тысячи,
-    // и сумма их бюджетов кратно больше любой карты. Здесь два неймспейса, у
-    // каждого бюджет во весь потолок хранилища: по отдельности ротация в них
-    // не сработает почти никогда, а вместе они обязаны уложиться в потолок.
+fn the_class_budget_is_shared_across_namespaces() {
+    // Бюджет — свойство класса, а не неймспейса: «все логи — столько-то».
+    // Два неймспейса пишут в один класс и вместе обязаны уложиться в его
+    // бюджет; вытесняется старейшее по классу, в чьём бы каталоге оно ни
+    // лежало.
     const CEILING: u64 = 12 << 20;
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(
-        StoreConfig::new(dir.path())
-            .with_budget(CEILING)
-            .with_total_budget(CEILING),
-    )
+    let store = Store::open(StoreConfig::new(dir.path()).channel(
+        StorageClass::Default,
+        ChannelConfig {
+            // Сегмент поменьше: двум активным сегментам положено влезать
+            // в бюджет с запасом на историю.
+            segment_bytes: 4 << 20,
+            ..ChannelConfig::new(CEILING)
+        },
+    ))
     .unwrap();
 
     let chunk = noise(64 << 10);
@@ -174,12 +177,12 @@ fn the_store_ceiling_holds_when_channel_budgets_do_not_add_up() {
     let occupied = bytes_under(dir.path());
     assert!(
         occupied > 0 && occupied <= CEILING,
-        "хранилище занимает {occupied} при потолке {CEILING}"
+        "класс занимает {occupied} при бюджете {CEILING}"
     );
     assert_eq!(
         store.stats().over_budget,
         0,
-        "потолок выполним: активных сегментов всего два"
+        "бюджет класса выполним: активных сегментов всего два"
     );
     // Оба неймспейса участвовали — вытеснение шло по возрасту, а не по
     // принципу «кто последний писал».
@@ -349,24 +352,146 @@ fn reading_a_live_store_never_takes_back_what_it_already_showed() {
 }
 
 #[test]
-fn a_ceiling_below_a_single_segment_is_refused_at_open() {
-    // Потолок ниже пары сегментов невыполним по построению: активный сегмент
-    // вытеснить нельзя. Узнать об этом при открытии — единственный момент,
-    // когда это ещё поправимо.
+fn a_class_budget_below_two_segments_is_refused_at_open() {
+    // Бюджет класса ниже пары сегментов невыполним по построению: активный
+    // сегмент вытеснить нельзя. Узнать об этом при открытии — единственный
+    // момент, когда это ещё поправимо.
     let dir = tempfile::tempdir().unwrap();
-    let segment = ChannelConfig::segment_size_for(64 << 20);
-    let err = Store::open(
-        StoreConfig::new(dir.path())
-            .with_budget(64 << 20)
-            .with_total_budget(segment),
-    )
-    .expect_err("невыполнимый потолок обязан быть отвергнут");
+    let segment = ChannelConfig::new(0).segment_bytes;
+    let err = Store::open(StoreConfig::new(dir.path()).with_budget(segment))
+        .expect_err("невыполнимый бюджет обязан быть отвергнут");
     assert!(matches!(err, dduroc::Error::BadChannel { .. }), "{err}");
 
-    Store::open(
-        StoreConfig::new(dir.path())
-            .with_budget(64 << 20)
-            .with_total_budget(segment * 2),
-    )
-    .expect("двух сегментов уже достаточно");
+    Store::open(StoreConfig::new(dir.path()).with_budget(segment * 2))
+        .expect("двух сегментов уже достаточно");
+}
+
+#[test]
+fn a_namespace_quota_rotates_inside_the_shared_class_budget() {
+    // Личная квота — необязательный предел ВНУТРИ общего бюджета класса:
+    // прожорливый сервис ротируется в её рамках, не дожидаясь, пока класс
+    // упрётся в свой бюджет, — и не выедает соседей.
+    const QUOTA: u64 = 16 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget(256 << 20)).unwrap();
+
+    let hog = store
+        .namespace_with(
+            "orc-hog",
+            pressure::SCHEMA,
+            NsQuota::new().class(StorageClass::Default, QUOTA),
+        )
+        .unwrap();
+    let bulk = hog.series(pressure::metrics::Bulk).unwrap();
+    let chunk = noise(64 << 10);
+    let rounds = (QUOTA / chunk.len() as u64) * 3;
+    for i in 0..rounds {
+        bulk.sample(&chunk[..]);
+        if i % 32 == 0 {
+            hog.sync().unwrap();
+        }
+    }
+    hog.sync().unwrap();
+    store.shutdown();
+    let stats = store.stats();
+    // Блокировка корня снимается вместе с последней ручкой: ряд и неймспейс
+    // держат хранилище живым.
+    drop(bulk);
+    drop(hog);
+    drop(store);
+
+    let occupied = bytes_under(&dir.path().join("orc-hog"));
+    assert!(
+        occupied > 0 && occupied <= QUOTA,
+        "неймспейс занимает {occupied} при квоте {QUOTA}"
+    );
+    assert!(
+        stats.segments_rotated > 0,
+        "квота обязана была сработать: {stats:?}"
+    );
+
+    // Квота меньше двух сегментов бессмысленна и отвергается при открытии.
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget(256 << 20)).unwrap();
+    let err = store
+        .namespace_with(
+            "orc-tiny",
+            pressure::SCHEMA,
+            NsQuota::new().class(StorageClass::Default, 1 << 20),
+        )
+        .expect_err("квота в один сегмент бессмысленна");
+    assert!(matches!(err, dduroc::Error::BadChannel { .. }), "{err}");
+    store.shutdown();
+}
+
+#[test]
+fn a_class_can_live_on_its_own_root() {
+    // Критические данные должны уметь жить на своём носителе (защищённый
+    // раздел вроде jffs2): классу задаётся собственный корень, раскладка
+    // внутри него та же — `<корень>/<неймспейс>/<класс>/`.
+    let main = tempfile::tempdir().unwrap();
+    let vault = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(StoreConfig::new(main.path()).with_budget(16 << 20).channel(
+            StorageClass::Critical,
+            ChannelConfig {
+                root: Some(vault.path().to_path_buf()),
+                ..ChannelConfig::critical(16 << 20)
+            },
+        ))
+        .unwrap();
+        let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
+        ns.log(pressure::events::Mark {});
+        ns.log(pressure::events::Alarm {});
+        ns.sync().unwrap();
+        assert!(store.stats().is_clean(), "{:?}", store.stats());
+        store.shutdown();
+    }
+
+    // Сегменты легли по своим носителям.
+    assert!(
+        bytes_under(&vault.path().join("orc-0").join("critical")) > 0,
+        "критический канал живёт на своём разделе"
+    );
+    assert!(
+        !main.path().join("orc-0").join("critical").exists(),
+        "в основном корне критического каталога нет"
+    );
+    assert!(
+        bytes_under(&main.path().join("orc-0").join("default")) > 0,
+        "обычный канал остался в основном корне"
+    );
+
+    // Читатель собирает оба дерева, когда ему назвали оба корня.
+    let reader = Reader::open(main.path(), &[pressure::SCHEMA])
+        .unwrap()
+        .with_extra_root(vault.path());
+    let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
+    assert!(result.is_complete(), "{:?}", result.damaged);
+    let kinds: Vec<u16> = result
+        .entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::Message { event, .. } => Some(event.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(kinds, [1, 2], "видны и обычное, и критическое");
+    let listing = reader.namespaces().unwrap();
+    assert_eq!(
+        listing.namespaces[0].channels,
+        ["critical", "default"],
+        "перечисление сливает каналы обоих корней"
+    );
+
+    // Без второго корня критики не видно — дамп такого хранилища копируется
+    // двумя деревьями, и вьюеру называют оба.
+    let partial = Reader::open(main.path(), &[pressure::SCHEMA]).unwrap();
+    let result = partial.query(&Query::new().order(Order::Oldest)).unwrap();
+    assert!(
+        result
+            .entries
+            .iter()
+            .all(|e| !matches!(&e.kind, EntryKind::Message { event, .. } if event.0 == 2)),
+        "критический канал в другом дереве"
+    );
 }

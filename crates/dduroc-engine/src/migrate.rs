@@ -264,17 +264,16 @@ pub struct MigrationReport {
 /// Прогнать все каналы неймспейса. Возвращает суммарный отчёт; штамп меты —
 /// забота вызывающего (`Namespace::migrate`), у него и файл, и атомик.
 pub(crate) fn run_namespace(
-    dir: &Path,
     schema: &Schema,
     store_id: u64,
     writer: &Writer,
     ns: NsId,
-    channels: &[&str],
+    channel_dirs: &[std::path::PathBuf],
 ) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
-    for (idx, channel) in channels.iter().enumerate() {
+    for (idx, channel_dir) in channel_dirs.iter().enumerate() {
         run_channel(
-            &dir.join(channel),
+            channel_dir,
             schema,
             store_id,
             writer,

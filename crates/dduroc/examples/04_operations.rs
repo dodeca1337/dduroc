@@ -1,4 +1,5 @@
-//! Эксплуатация: политика каналов, ротация, потолок хранилища, учёт потерь.
+//! Эксплуатация: политика классов, общий бюджет класса, свой носитель у
+//! критики, учёт потерь.
 //!
 //! Запуск: `cargo run -p dduroc --example 04_operations`
 //!
@@ -44,17 +45,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rotation(&base.join("rotation"))?;
     ceiling(&base.join("ceiling"))?;
     losses(&base.join("losses"))?;
+    vault(&base.join("vault"), &base.join("vault-critical"))?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 1. Ротация в бюджете канала. Бюджет — это ответ на вопрос «сколько истории
-// хранить»: канал пишет по кругу, старейший сегмент уходит целиком, свежие
-// данные не отвергаются никогда.
+// 1. Ротация в бюджете класса. Бюджет — ответ на вопрос «сколько истории
+// хранить у ВСЕЙ телеметрии»: класс пишет по кругу, старейший сегмент уходит
+// целиком, свежие данные не отвергаются никогда.
 // ---------------------------------------------------------------------------
 fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("— ротация в бюджете канала —");
-    let store = Store::open(StoreConfig::new(root).with_budget(16 << 20).channel(
+    println!("— ротация в бюджете класса —");
+    let store = Store::open(StoreConfig::new(root).channel(
         StorageClass::Telemetry,
         ChannelConfig {
             // Слепки уже плотные — сжатие только жгло бы CPU.
@@ -62,6 +64,7 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             // Телеметрия терпит минуту незаписанного — реже fdatasync.
             sync_interval: std::time::Duration::from_secs(60),
             // 12 МиБ бюджета при сегменте 4 МиБ: живут три сегмента.
+            segment_bytes: 4 << 20,
             ..ChannelConfig::new(12 << 20)
         },
     ))?;
@@ -107,26 +110,22 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Потолок хранилища. Бюджет канала не отвечает на вопрос «сколько занять
-// на носителе»: неймспейсов много, их число растёт, и сумма бюджетов носителю
-// не по карману. `with_total_budget` — потолок на всё хранилище; при
-// превышении вытесняется старейший сегмент ХРАНИЛИЩА, в чьём бы канале он ни
-// лежал: молчащий сервис не держит место, которого не хватает шумному.
+// 2. Бюджет класса — общий на все неймспейсы. Число сервисов растёт, а
+// бюджет «всей телеметрии» — нет: каналы черпают из него вместе, и при
+// превышении вытесняется старейший сегмент КЛАССА, в чьём бы неймспейсе он
+// ни лежал — молчащий сервис не держит место, которого не хватает шумному.
+// (Личный предел прожорливому сервису — `store.namespace_with` + NsQuota.)
 // ---------------------------------------------------------------------------
 fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("— потолок на всё хранилище —");
-    let store = Store::open(
-        StoreConfig::new(root)
-            .with_budget(16 << 20)
-            .with_total_budget(12 << 20)
-            .channel(
-                StorageClass::Telemetry,
-                ChannelConfig {
-                    compression: Compression::None,
-                    ..ChannelConfig::new(16 << 20)
-                },
-            ),
-    )?;
+    println!("— общий бюджет класса на все неймспейсы —");
+    let store = Store::open(StoreConfig::new(root).channel(
+        StorageClass::Telemetry,
+        ChannelConfig {
+            compression: Compression::None,
+            segment_bytes: 4 << 20,
+            ..ChannelConfig::new(12 << 20)
+        },
+    ))?;
 
     // Тихий сервис записал 6 МиБ и замолчал.
     let quiet = store.namespace("orc-quiet", probe::SCHEMA)?;
@@ -164,8 +163,8 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         println!("  {}: занято {} КиБ", ns.name, ns.bytes >> 10);
     }
     println!(
-        "  тихий писал 6 МиБ — его голову вытеснил чужой поток; \
-         поверх потолка не вылезли ни разу (over_budget: {})\n",
+        "  тихий писал 6 МиБ — его голову вытеснил чужой поток того же класса; \
+         поверх бюджета не вылезли ни разу (over_budget: {})\n",
         stats.over_budget
     );
     Ok(())
@@ -249,5 +248,57 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("  объявлено в потоке: {announced} (отметок: {marks}) — сходится с учётом");
     assert_eq!(announced, stats.dropped);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 4. Свой носитель у класса. Критические данные пишутся на защищённый раздел
+// (jffs2 и подобное): классу задаётся собственный корень, раскладка внутри
+// та же — `<корень>/<неймспейс>/<класс>/`. Дамп такого хранилища — два
+// дерева, и вьюеру называют оба.
+// ---------------------------------------------------------------------------
+fn vault(
+    root: &std::path::Path,
+    vault: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("— критика на своём разделе —");
+    {
+        let store = Store::open(StoreConfig::new(root).with_budget(16 << 20).channel(
+            StorageClass::Critical,
+            ChannelConfig {
+                root: Some(vault.to_path_buf()),
+                ..ChannelConfig::critical(16 << 20)
+            },
+        ))?;
+        let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
+        ns.log(probe::events::Ping { seq: 1 });
+        ns.log(probe::events::Fault { code: 3 });
+        ns.sync()?;
+        store.shutdown();
+    }
+    println!(
+        "  основной корень: {:?}\n  раздел критики:  {:?}",
+        std::fs::read_dir(root.join("orc-probe-0"))?
+            .filter_map(|e| e
+                .ok()
+                .map(|e| e.file_name().into_string().unwrap_or_default()))
+            .collect::<Vec<_>>(),
+        std::fs::read_dir(vault.join("orc-probe-0"))?
+            .filter_map(|e| e
+                .ok()
+                .map(|e| e.file_name().into_string().unwrap_or_default()))
+            .collect::<Vec<_>>(),
+    );
+
+    // Читатель сливает деревья, когда ему назвали оба корня.
+    let reader = Reader::open(root, &[probe::SCHEMA])?.with_extra_root(vault);
+    let read = reader.query(&Query::new().kinds(KindFilter::LOGS).order(Order::Oldest))?;
+    for e in &read.entries {
+        println!(
+            "  [{}] {}",
+            e.channel,
+            reader.render(e, "ru").unwrap_or_default()
+        );
+    }
     Ok(())
 }

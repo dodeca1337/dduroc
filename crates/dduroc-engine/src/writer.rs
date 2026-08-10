@@ -194,14 +194,34 @@ pub(crate) enum MigrationCommit {
 #[derive(Debug)]
 pub struct NsSetup {
     pub name: String,
-    pub dir: PathBuf,
     pub protocol_version: ProtocolVersion,
     pub store_id: u64,
     pub boot: BootCounter,
-    /// Каналы вместе с именами каталогов. Writer классов хранения не знает:
-    /// его дело — каталоги и политики, имя приходит снаружи готовым.
-    pub channels: Vec<(String, ChannelConfig)>,
+    pub channels: Vec<ChannelSpec>,
     pub drops: Arc<DropCounters>,
+}
+
+/// Один канал неймспейса глазами writer'а. Классов хранения writer не знает:
+/// его дело — каталог, политика, группа бюджета и личная квота.
+#[derive(Debug)]
+pub struct ChannelSpec {
+    /// Полный путь каталога канала — уже с учётом корня класса.
+    pub dir: PathBuf,
+    /// Бюджетная группа (индекс в списке групп writer'а).
+    pub group: usize,
+    /// Личная квота неймспейса в группе. `None` — канал черпает из общего
+    /// бюджета группы без индивидуального предела.
+    pub quota: Option<u64>,
+    pub config: ChannelConfig,
+}
+
+/// Бюджетная группа: общий предел суммарного размера сегментов её каналов.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupBudget {
+    pub budget_bytes: u64,
+    /// Ключ носителя: группы с одним `root_key` живут на одном разделе и
+    /// делят давление ENOSPC.
+    pub root_key: u8,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -233,12 +253,13 @@ pub struct Writer {
 impl Writer {
     /// Запустить writer-поток.
     ///
-    /// `total_budget` — потолок на всё хранилище; `None` означает, что
-    /// ограничивать занятость носителя не просили.
+    /// `groups` — бюджетные группы (по одной на класс хранения): writer не
+    /// знает классов, ему достаточно «каналы такой-то группы делят такой-то
+    /// бюджет на таком-то носителе».
     pub fn spawn(
         counters: Arc<Counters>,
         queues: QueueSizes,
-        total_budget: Option<u64>,
+        groups: Vec<GroupBudget>,
     ) -> Result<Arc<Self>> {
         let queues = queues.sanitized();
         let (normal_tx, normal_rx) = crossbeam_channel::bounded(queues.normal);
@@ -252,9 +273,9 @@ impl Writer {
             batch: Vec::new(),
             drops_seen: 0,
             active: Vec::new(),
-            total_budget,
+            groups,
             segments_seen: 0,
-            space_pressure: false,
+            pressured_roots: 0,
         };
 
         let handle = std::thread::Builder::new()
@@ -487,6 +508,13 @@ struct SegmentIdentity {
 struct ChannelState {
     config: ChannelConfig,
     dir: PathBuf,
+    /// Бюджетная группа канала (класс хранения глазами writer'а).
+    group: usize,
+    /// Ключ носителя группы — копия [`GroupBudget::root_key`], чтобы путь
+    /// ошибки не ходил по таблице групп.
+    root_key: u8,
+    /// Личная квота неймспейса. `None` — только общий бюджет группы.
+    quota: Option<u64>,
     /// Свой номер и счётчики потерь неймспейса: потерю, обнаруженную уже в
     /// writer'е, надо отметить там же, где образовалась дыра, — иначе она не
     /// попадёт в поток отдельной записью.
@@ -538,13 +566,19 @@ struct ChannelState {
 
 impl ChannelState {
     fn new(
-        dir: PathBuf,
-        config: ChannelConfig,
+        spec: ChannelSpec,
+        root_key: u8,
         identity: SegmentIdentity,
         index: ChannelIdx,
         drops: Arc<DropCounters>,
         counters: &Counters,
     ) -> Result<Self> {
+        let ChannelSpec {
+            dir,
+            group,
+            quota,
+            config,
+        } = spec;
         // След прерванной миграции: обрыв до rename оставляет `*.tmp`, чьё
         // содержимое уже никем не адресуется. Подмести обязан тот, кто первым
         // приходит в каталог, — то есть регистрация канала.
@@ -560,6 +594,9 @@ impl ChannelState {
             builder: BlockBuilder::new(),
             config,
             dir,
+            group,
+            root_key,
+            quota,
             index,
             drops,
             identity,
@@ -698,10 +735,11 @@ struct WriterLoop {
     /// обороте цикла съел бы процессор впустую. Пишущих в любой момент —
     /// единицы.
     active: Vec<(usize, usize)>,
-    /// Потолок на всё хранилище — см. [`crate::store::StoreConfig::total_budget_bytes`].
-    total_budget: Option<u64>,
+    /// Бюджетные группы: по одной на класс хранения. Индекс группы несут
+    /// каналы ([`ChannelState::group`]); писателю не нужны имена классов.
+    groups: Vec<GroupBudget>,
     /// Значение [`Counters::segments_opened`] на момент последней проверки
-    /// суммарного бюджета.
+    /// бюджетов групп.
     ///
     /// Сторож полного прохода по флоту, как `drops_seen` у отметок о потерях:
     /// суммарная занятость растёт **только** когда канал берёт сегмент в
@@ -709,13 +747,15 @@ struct WriterLoop {
     /// отпускание и вытеснение её уменьшают. Поэтому неизменившийся счётчик
     /// доказывает, что считать нечего.
     segments_seen: u64,
-    /// Носитель отказал по месту с прошлого обхода.
+    /// Битовая маска корней ([`GroupBudget::root_key`]), отказавших по месту
+    /// с прошлого обхода.
     ///
-    /// Освобождать надо там, где место занято, а не там, где оно понадобилось:
-    /// ротация внутри канала, упёршегося в ENOSPC, оставляет молчащему каналу
-    /// его преаллокацию нетронутой. Флаг снимает обход, который видит всё
-    /// хранилище целиком.
-    space_pressure: bool,
+    /// Освобождать надо там, где место занято, а не там, где оно
+    /// понадобилось: ротация внутри канала, упёршегося в ENOSPC, оставляет
+    /// молчащему каналу его преаллокацию нетронутой. И именно на **том же
+    /// носителе**: классы могут жить на разных разделах, и вытеснение на
+    /// одном не освобождает байт на другом.
+    pressured_roots: u8,
 }
 
 impl WriterLoop {
@@ -886,9 +926,11 @@ impl WriterLoop {
                 // дальше, ошибка видна через `Stats::io_errors`.
                 Counters::bump(&self.counters.io_errors);
                 // Кончилось место: канал уже попробовал освободить его у себя
-                // и не смог. Дальше нужен взгляд на всё хранилище, а он есть
+                // и не смог. Дальше нужен взгляд на весь носитель, а он есть
                 // только у обхода — см. `enforce_limits`.
-                self.space_pressure |= e.is_no_space();
+                if e.is_no_space() {
+                    self.note_pressure(item.ns.0 as usize, item.channel.0 as usize);
+                }
             }
         }
         self.batch = batch;
@@ -900,6 +942,7 @@ impl WriterLoop {
         // fdatasync — секунды записи и лишний износ флеша там, где хватает
         // одного обращения к носителю.
         let counters = Arc::clone(&self.counters);
+        let mut pressured = 0u8;
         for &(ns_idx, ch_idx) in &self.active {
             let Some(ch) = self
                 .namespaces
@@ -914,10 +957,13 @@ impl WriterLoop {
                     .and_then(|()| Self::sync_channel(ch, &counters));
                 if let Err(e) = done {
                     Counters::bump(&counters.io_errors);
-                    self.space_pressure |= e.is_no_space();
+                    if e.is_no_space() {
+                        pressured |= 1 << ch.root_key.min(7);
+                    }
                 }
             }
         }
+        self.pressured_roots |= pressured;
     }
 
     fn push(&mut self, item: &Staged) -> Result<()> {
@@ -1310,12 +1356,14 @@ impl WriterLoop {
             .or(ch.parked)
     }
 
-    /// Удалить старые сегменты, пока канал не влезет в бюджет.
+    /// Удержать канал в личной квоте неймспейса, если она задана.
+    ///
+    /// Без квоты поканальной ротации нет вовсе: предел держит бюджет группы,
+    /// и старейшее вытесняется по всему классу (`enforce_groups`).
     fn rotate(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
+        let Some(quota) = ch.quota else { return Ok(()) };
         let active = Self::live_segment(ch);
-        let removed = ch
-            .inventory
-            .enforce_budget(&ch.dir, ch.config.budget_bytes, active)?;
+        let removed = ch.inventory.enforce_budget(&ch.dir, quota, active)?;
         Counters::add(&counters.segments_rotated, removed as u64);
         Ok(())
     }
@@ -1336,38 +1384,57 @@ impl WriterLoop {
         Ok(true)
     }
 
-    /// Суммарная занятость носителя: все сегменты всех каналов.
+    /// Занятость каждой группы: один проход по флоту.
     ///
-    /// Полный проход по флоту — поэтому вызывается только тогда, когда сумма
-    /// действительно могла вырасти (см. `segments_seen`), а не на каждом
-    /// обороте цикла.
-    fn store_bytes(&self) -> u64 {
-        self.namespaces
+    /// Полный проход дорог при десятках тысяч каналов — поэтому вызывается
+    /// только когда сумма действительно могла вырасти (см. `segments_seen`),
+    /// а не на каждом обороте цикла.
+    fn group_totals(&self) -> Vec<u64> {
+        let mut totals = vec![0u64; self.groups.len()];
+        for ch in self
+            .namespaces
             .iter()
             .flatten()
             .flat_map(|ns| ns.channels.iter())
-            .map(|ch| ch.inventory.total_bytes())
-            .sum()
+        {
+            if let Some(t) = totals.get_mut(ch.group) {
+                *t += ch.inventory.total_bytes();
+            }
+        }
+        totals
     }
 
-    /// Самый крупный сегмент, который может понадобиться какому-либо каналу.
+    /// Самый крупный сегмент среди каналов носителя `root`.
     ///
     /// Мера того, сколько надо освободить, чтобы попытка записи имела шанс:
     /// сегмент выделяется целиком, и половина его — не помощь.
-    fn widest_segment(&self) -> u64 {
+    fn widest_segment_on(&self, root: u8) -> u64 {
         self.namespaces
             .iter()
             .flatten()
             .flat_map(|ns| ns.channels.iter())
+            .filter(|ch| ch.root_key == root)
             .map(|ch| ch.config.segment_bytes)
             .max()
             .unwrap_or(0)
     }
 
-    /// Удалить самый старый сегмент **хранилища**, в каком бы канале он ни
-    /// лежал. Возвращает освободившиеся байты; `None` — вытеснять нечего.
+    /// Отметить отказ носителя по месту у канала `(ns, канал)`.
+    fn note_pressure(&mut self, ns_idx: usize, ch_idx: usize) {
+        if let Some(ch) = self
+            .namespaces
+            .get(ns_idx)
+            .and_then(|n| n.as_ref())
+            .and_then(|n| n.channels.get(ch_idx))
+        {
+            self.pressured_roots |= 1 << ch.root_key.min(7);
+        }
+    }
+
+    /// Удалить самый старый сегмент среди каналов, прошедших отбор `pick`.
+    /// Возвращает освободившиеся байты; `None` — вытеснять нечего.
     ///
-    /// Порядок здесь глобальный по построению: имя сегмента — это пара
+    /// Порядок глобальный по построению: имя сегмента — это пара
     /// `(номер запуска, микросекунды от его старта)`, а номер запуска один на
     /// всё хранилище. Поэтому «самый старый» имеет смысл и через границу
     /// канала, и через границу неймспейса.
@@ -1375,11 +1442,14 @@ impl WriterLoop {
     /// Живой сегмент неприкосновенен — и открытый, и отпущенный по
     /// бездействию: в первый пишут, второй продолжат, и преаллокация обоих
     /// есть та единственная гарантия, ради которой она делается.
-    fn evict_oldest(&mut self) -> Option<u64> {
+    fn evict_oldest_where(&mut self, pick: impl Fn(&ChannelState) -> bool) -> Option<u64> {
         let mut victim: Option<(usize, usize, SegmentEntry)> = None;
         for (ns_idx, slot) in self.namespaces.iter().enumerate() {
             let Some(ns) = slot.as_ref() else { continue };
             for (ch_idx, ch) in ns.channels.iter().enumerate() {
+                if !pick(ch) {
+                    continue;
+                }
                 let Some(oldest) = ch.inventory.oldest() else {
                     continue;
                 };
@@ -1413,7 +1483,7 @@ impl WriterLoop {
     /// до того как вытеснение примется за чью-то историю.
     ///
     /// Полный проход по флоту, поэтому зовётся только под давлением: когда
-    /// место кончилось или потолок не выдержан.
+    /// место кончилось или бюджет группы не выдержан.
     fn park_idle(&mut self, quiet_for: Duration) -> usize {
         let now = Instant::now();
         let counters = Arc::clone(&self.counters);
@@ -1440,63 +1510,79 @@ impl WriterLoop {
 
     /// Удержать хранилище в объявленных пределах.
     ///
-    /// Обе причины сюда попадать редки, и обе требуют взгляда на всё
-    /// хранилище: поканальная ротация по построению не видит, что место
-    /// занято соседом.
+    /// Обе причины сюда попадать редки, и обе требуют взгляда шире одного
+    /// канала: поканальная квота по построению не видит, что место занято
+    /// соседом.
     fn enforce_limits(&mut self) {
-        let pressure = std::mem::take(&mut self.space_pressure);
-        if pressure {
+        let pressured = std::mem::take(&mut self.pressured_roots);
+        if pressured != 0 {
             // Место на носителе кончилось. Ротация внутри канала, который в
             // него упёрся, уже испробована и не помогла — освобождаем там, где
-            // место действительно занято: сперва непрописанные хвосты
-            // преаллокации у молчащих каналов, потом старейшая история.
+            // место действительно занято, и на ТОМ ЖЕ носителе: сперва
+            // непрописанные хвосты преаллокации у молчащих каналов, потом
+            // старейшая история.
             //
             // Освобождать надо не «что-нибудь», а хотя бы целый сегмент:
             // меньшего не хватит на следующую попытку, и каждый оборот стоил
             // бы ещё одной потерянной записи.
             self.park_idle(RELEASE_AFTER);
-            let need = self.widest_segment();
-            let mut freed = 0;
-            while freed < need {
-                let Some(f) = self.evict_oldest() else { break };
-                freed += f;
+            for root in 0..8u8 {
+                if pressured & (1 << root) == 0 {
+                    continue;
+                }
+                let need = self.widest_segment_on(root);
+                let mut freed = 0;
+                while freed < need {
+                    let Some(f) = self.evict_oldest_where(|ch| ch.root_key == root) else {
+                        break;
+                    };
+                    freed += f;
+                }
             }
         }
 
-        if self.total_budget.is_none() {
-            return;
-        }
         // Сумма растёт только когда канал берёт сегмент в работу; пока счётчик
         // не сдвинулся, обходить флот незачем.
         let opened = self
             .counters
             .segments_opened
             .load(std::sync::atomic::Ordering::Relaxed);
-        if opened == self.segments_seen && !pressure {
+        if opened == self.segments_seen && pressured == 0 {
             return;
         }
         self.segments_seen = opened;
-        self.enforce_ceiling();
+        self.enforce_groups();
     }
 
-    /// Вернуть хранилище под суммарный потолок — без сторожа, безусловно.
-    fn enforce_ceiling(&mut self) {
-        let Some(cap) = self.total_budget else { return };
-        let mut total = self.evict_down_to(cap, self.store_bytes());
-        if total > cap && self.park_idle(RELEASE_AFTER) > 0 {
-            total = self.evict_down_to(cap, self.store_bytes());
-        }
-        if total > cap {
-            // Всё, что осталось, — активные сегменты: вытеснить их нельзя, и
-            // потолок в этой конфигурации попросту невыполним.
-            Counters::bump(&self.counters.over_budget);
+    /// Вернуть каждую группу под её бюджет — без сторожа, безусловно.
+    fn enforce_groups(&mut self) {
+        let mut totals = self.group_totals();
+        let mut parked = false;
+        for g in 0..self.groups.len() {
+            let cap = self.groups[g].budget_bytes;
+            totals[g] = self.evict_group_down_to(g, cap, totals[g]);
+            if totals[g] > cap && !parked {
+                // Вытеснять больше нечего, но остались непрописанные хвосты
+                // преаллокации у молчащих каналов — отдать их дешевле, чем
+                // объявлять бюджет невыполнимым.
+                parked = true;
+                if self.park_idle(RELEASE_AFTER) > 0 {
+                    totals = self.group_totals();
+                    totals[g] = self.evict_group_down_to(g, cap, totals[g]);
+                }
+            }
+            if totals[g] > cap {
+                // Всё, что осталось, — живые сегменты: вытеснить их нельзя, и
+                // бюджет группы в этой конфигурации попросту невыполним.
+                Counters::bump(&self.counters.over_budget);
+            }
         }
     }
 
-    /// Вытеснять старейшее, пока сумма не влезет в потолок.
-    fn evict_down_to(&mut self, cap: u64, mut total: u64) -> u64 {
+    /// Вытеснять старейшее в группе, пока её сумма не влезет в бюджет.
+    fn evict_group_down_to(&mut self, group: usize, cap: u64, mut total: u64) -> u64 {
         while total > cap {
-            let Some(freed) = self.evict_oldest() else {
+            let Some(freed) = self.evict_oldest_where(|ch| ch.group == group) else {
                 break;
             };
             total = total.saturating_sub(freed);
@@ -1539,6 +1625,7 @@ impl WriterLoop {
 
         let now = Instant::now();
         let counters = Arc::clone(&self.counters);
+        let mut pressured = 0u8;
         let active = std::mem::take(&mut self.active);
         for &(ns_idx, ch_idx) in &active {
             let Some(ch) = self
@@ -1554,13 +1641,17 @@ impl WriterLoop {
                 && let Err(e) = Self::flush_block(ch, &counters)
             {
                 Counters::bump(&counters.io_errors);
-                self.space_pressure |= e.is_no_space();
+                if e.is_no_space() {
+                    pressured |= 1 << ch.root_key.min(7);
+                }
             }
             if ch.sync_deadline().is_some_and(|d| d <= now)
                 && let Err(e) = Self::sync_channel(ch, &counters)
             {
                 Counters::bump(&counters.io_errors);
-                self.space_pressure |= e.is_no_space();
+                if e.is_no_space() {
+                    pressured |= 1 << ch.root_key.min(7);
+                }
             }
 
             // Канал остаётся в списке, только пока ему есть что обслуживать:
@@ -1606,6 +1697,7 @@ impl WriterLoop {
             }
         }
 
+        self.pressured_roots |= pressured;
         // В самом конце: и обслуживание дедлайнов, и запечатывание по
         // бездействию только что меняли занятость носителя.
         self.enforce_limits();
@@ -1811,12 +1903,16 @@ impl WriterLoop {
             boot: setup.boot,
         };
         let mut channels = Vec::with_capacity(setup.channels.len());
-        for (i, (name, cfg)) in setup.channels.into_iter().enumerate() {
-            let dir = setup.dir.join(&name);
-            crate::fsutil::create_dir_all_synced(&dir)?;
+        for (i, spec) in setup.channels.into_iter().enumerate() {
+            crate::fsutil::create_dir_all_synced(&spec.dir)?;
+            let root_key = self
+                .groups
+                .get(spec.group)
+                .map(|g| g.root_key)
+                .unwrap_or_default();
             channels.push(ChannelState::new(
-                dir,
-                cfg,
+                spec,
+                root_key,
                 identity,
                 ChannelIdx(i as u16),
                 Arc::clone(&setup.drops),
@@ -1921,9 +2017,9 @@ impl WriterLoop {
 
         // Остановка — единственный момент, когда занятость носителя точно
         // окончательна: активных сегментов больше нет, преаллокация обрезана.
-        // Оставить хранилище над потолком именно здесь значило бы оставить его
-        // над потолком до следующего запуска.
-        self.enforce_ceiling();
+        // Оставить группу над бюджетом именно здесь значило бы оставить её
+        // над бюджетом до следующего запуска.
+        self.enforce_groups();
     }
 }
 
@@ -1985,8 +2081,13 @@ mod tests {
         let counters = Counters::default();
         let drops = Arc::new(DropCounters::new(1));
         let mut ch = ChannelState::new(
-            dir.path().to_path_buf(),
-            ChannelConfig::new(64 * 1024 * 1024),
+            ChannelSpec {
+                dir: dir.path().to_path_buf(),
+                group: 0,
+                quota: None,
+                config: ChannelConfig::new(64 * 1024 * 1024),
+            },
+            0,
             SegmentIdentity {
                 protocol_version: ProtocolVersion(1),
                 store_id: 0,
@@ -2051,7 +2152,8 @@ mod tests {
         assert_eq!(counters.snapshot().blocks_written, 2);
     }
 
-    fn empty_loop(total_budget: Option<u64>) -> WriterLoop {
+    /// Цикл с единственной бюджетной группой. `None` — бюджет «без предела».
+    fn empty_loop(group_budget: Option<u64>) -> WriterLoop {
         WriterLoop {
             namespaces: Vec::new(),
             counters: Arc::new(Counters::default()),
@@ -2059,9 +2161,12 @@ mod tests {
             batch: Vec::new(),
             drops_seen: 0,
             active: Vec::new(),
-            total_budget,
+            groups: vec![GroupBudget {
+                budget_bytes: group_budget.unwrap_or(u64::MAX),
+                root_key: 0,
+            }],
             segments_seen: 0,
-            space_pressure: false,
+            pressured_roots: 0,
         }
     }
 
@@ -2074,14 +2179,19 @@ mod tests {
     ) -> NsId {
         let drops = Arc::new(DropCounters::new(channels.len()));
         // Имена каталогов в тестах синтетические: writer безразличен к ним.
+        // Все каналы — в группе 0, без личных квот.
         let channels = channels
             .into_iter()
             .enumerate()
-            .map(|(i, c)| (format!("ch{i}"), c))
+            .map(|(i, c)| ChannelSpec {
+                dir: dir.join(format!("ch{i}")),
+                group: 0,
+                quota: None,
+                config: c,
+            })
             .collect();
         w.register(NsSetup {
             name: name.to_owned(),
-            dir: dir.to_path_buf(),
             protocol_version: ProtocolVersion(1),
             store_id: 0,
             boot: BootCounter(boot),
@@ -2228,7 +2338,7 @@ mod tests {
             .path()
             .to_owned();
         let full = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(full, 4 << 20, "файл преаллоцирован на весь сегмент");
+        assert_eq!(full, 8 << 20, "файл преаллоцирован на весь сегмент");
         assert_eq!(
             open_fds_under(dir.path()),
             1,
@@ -2391,9 +2501,9 @@ mod tests {
         }
         w.apply_batch();
         assert!(
-            w.store_bytes() > CAP,
+            w.group_totals().iter().sum::<u64>() > CAP,
             "иначе вытеснять нечего и тест пуст: {}",
-            w.store_bytes()
+            w.group_totals().iter().sum::<u64>()
         );
 
         w.tick();
@@ -2404,9 +2514,9 @@ mod tests {
              понадобилось соседу"
         );
         assert!(
-            w.store_bytes() <= CAP,
+            w.group_totals().iter().sum::<u64>() <= CAP,
             "хранилище обязано влезть в объявленный потолок: {} против {CAP}",
-            w.store_bytes()
+            w.group_totals().iter().sum::<u64>()
         );
         assert!(
             open_segment_path(&w, noisy).exists(),
@@ -2591,24 +2701,28 @@ mod tests {
         assert_eq!(w.park_idle(RELEASE_AFTER), 1, "сегмент отпущен");
 
         // Потолок — ровно по текущей занятости.
-        let cap = w.store_bytes();
-        w.total_budget = Some(cap);
+        let cap = w.group_totals().iter().sum::<u64>();
+        w.groups[0].budget_bytes = cap;
         w.tick();
-        assert_eq!(w.store_bytes(), cap, "пока всё на своих местах");
+        assert_eq!(
+            w.group_totals().iter().sum::<u64>(),
+            cap,
+            "пока всё на своих местах"
+        );
 
         // Тихий просыпается: преаллокация возвращается, потолок пробит.
         w.batch.push(blob(quiet, 2, 8));
         w.apply_batch();
         assert!(
-            w.store_bytes() > cap,
+            w.group_totals().iter().sum::<u64>() > cap,
             "иначе тест пуст: пробуждение обязано занять место"
         );
 
         w.tick();
         assert!(
-            w.store_bytes() <= cap,
+            w.group_totals().iter().sum::<u64>() <= cap,
             "потолок обязан быть восстановлен: {} против {cap}",
-            w.store_bytes()
+            w.group_totals().iter().sum::<u64>()
         );
     }
 
@@ -2709,7 +2823,8 @@ mod tests {
         // ни отметки, ни ответа вызывающему — то есть ровно та неотличимая от
         // тишины дыра, против которой заведён весь учёт потерь.
         let counters = Arc::new(Counters::default());
-        let writer = Writer::spawn(Arc::clone(&counters), QueueSizes::default(), None).unwrap();
+        let writer =
+            Writer::spawn(Arc::clone(&counters), QueueSizes::default(), Vec::new()).unwrap();
         let drops = DropCounters::new(1);
         let item = Staged {
             ns: NsId(0),

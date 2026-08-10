@@ -47,6 +47,16 @@ impl StorageClass {
             StorageClass::Telemetry => "telemetry",
         }
     }
+
+    /// Позиция в [`StorageClass::ALL`] — стабильный индекс для таблиц
+    /// по классам (группы бюджетов, квоты).
+    pub const fn index(self) -> usize {
+        match self {
+            StorageClass::Default => 0,
+            StorageClass::Critical => 1,
+            StorageClass::Telemetry => 2,
+        }
+    }
 }
 
 /// Код языка шаблонов (`"en"`, `"ru"`, `"ja"`…).

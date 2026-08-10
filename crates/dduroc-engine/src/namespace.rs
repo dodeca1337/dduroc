@@ -117,8 +117,11 @@ struct NamespaceInner {
     _store: Arc<dyn std::any::Any + Send + Sync>,
     id: NsId,
     name: String,
-    /// Каталог неймспейса — прогону миграции нужны его каналы.
+    /// Каталог неймспейса — здесь живёт `ns-meta`.
     dir: std::path::PathBuf,
+    /// Каталоги каналов в порядке `classes`: классы могут жить на разных
+    /// носителях, и прогону миграции пути нужны готовыми.
+    channel_dirs: Vec<std::path::PathBuf>,
     /// Идентичность хранилища: прогон не трогает сегменты чужих приборов.
     store_id: u64,
     schema: Schema,
@@ -154,6 +157,7 @@ impl Namespace {
         id: NsId,
         name: String,
         dir: std::path::PathBuf,
+        channel_dirs: Vec<std::path::PathBuf>,
         store_id: u64,
         schema: Schema,
         classes: Vec<StorageClass>,
@@ -171,6 +175,7 @@ impl Namespace {
                 id,
                 name,
                 dir,
+                channel_dirs,
                 store_id,
                 schema,
                 classes,
@@ -263,14 +268,12 @@ impl Namespace {
             return Err(Error::MigrationBusy(self.inner.name.clone()));
         };
 
-        let channels: Vec<&str> = self.inner.classes.iter().map(|c| c.as_str()).collect();
         let report = crate::migrate::run_namespace(
-            &self.inner.dir,
             &self.inner.schema,
             self.inner.store_id,
             &self.inner.writer,
             self.inner.id,
-            &channels,
+            &self.inner.channel_dirs,
         )?;
 
         // Штамп — только после того, как КАЖДЫЙ сегмент оказался либо
@@ -1028,7 +1031,7 @@ mod tests {
     }
 
     fn open_store(dir: &Path) -> Arc<Store> {
-        Store::open(StoreConfig::new(dir).with_budget(8 * 1024 * 1024)).unwrap()
+        Store::open(StoreConfig::new(dir).with_budget(16 * 1024 * 1024)).unwrap()
     }
 
     #[test]

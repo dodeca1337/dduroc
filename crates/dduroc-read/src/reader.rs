@@ -315,6 +315,18 @@ impl EntryStream<'_> {
     }
 }
 
+/// Неймспейс, найденный сканом корней: каналы вместе с их каталогами.
+///
+/// Каталог у каждого канала свой: класс мог быть вынесен на отдельный
+/// носитель, и путь не восстановить из одного корня.
+#[derive(Debug)]
+struct NsScan {
+    name: String,
+    schema_name: String,
+    protocol_version: u16,
+    channels: Vec<(String, PathBuf)>,
+}
+
 /// Открытые под запрос курсоры вместе с разрешёнными схемами.
 #[derive(Debug)]
 struct OpenedCursors {
@@ -360,6 +372,10 @@ impl NamespaceListing {
 #[derive(Debug)]
 pub struct Reader {
     root: PathBuf,
+    /// Дополнительные корни: классы хранения могут жить на своих носителях
+    /// (критический — на защищённом разделе), и их деревья `<ns>/<канал>`
+    /// сливаются с основным при чтении.
+    extra_roots: Vec<PathBuf>,
     /// Схемы приложения по имени: без них записи остаются идентификаторами.
     schemas: HashMap<String, Schema>,
     epochs: Epochs,
@@ -385,11 +401,22 @@ impl Reader {
         let store_id = read_store_id(&root);
         Ok(Self {
             root,
+            extra_roots: Vec::new(),
             schemas: schemas.iter().map(|s| (s.name.to_owned(), *s)).collect(),
             epochs,
             store_id,
             schema_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Добавить корень, в котором живут каналы вынесенных классов хранения.
+    ///
+    /// Хранилище с критическим классом на своём разделе — это два дерева;
+    /// дамп такого хранилища копируется целиком, и вьюеру называют оба корня.
+    /// Идентичность неймспейсов (`ns-meta`) и эпохи живут в основном корне.
+    pub fn with_extra_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.extra_roots.push(root.into());
+        self
     }
 
     /// Не проверять принадлежность сегментов этому хранилищу.
@@ -469,14 +496,18 @@ impl Reader {
         let mut namespaces = Vec::with_capacity(dirs.len());
         for ns in dirs {
             let mut bytes = 0;
-            for channel in &ns.channels {
-                if let Ok(inv) = dduroc_engine::rotation::Inventory::scan(
-                    &self.root.join(&ns.name).join(channel),
-                ) {
+            for (_, dir) in &ns.channels {
+                if let Ok(inv) = dduroc_engine::rotation::Inventory::scan(dir) {
                     bytes += inv.total_bytes();
                 }
             }
-            namespaces.push(NamespaceInfo { bytes, ..ns });
+            namespaces.push(NamespaceInfo {
+                name: ns.name,
+                schema_name: ns.schema_name,
+                protocol_version: ns.protocol_version,
+                channels: ns.channels.into_iter().map(|(n, _)| n).collect(),
+                bytes,
+            });
         }
         Ok(NamespaceListing {
             namespaces,
@@ -493,10 +524,8 @@ impl Reader {
 
     /// Неймспейсы и их каналы — без обращения к размерам файлов.
     ///
-    /// `bytes` в результате всегда нулевой: на пути запроса он не нужен, а
-    /// стоил бы `stat` на каждый сегмент. Каталоги с нечитаемой метой
-    /// накапливаются в `unreadable`.
-    fn namespace_dirs(&self, unreadable: &mut Vec<PathBuf>) -> Result<Vec<NamespaceInfo>> {
+    /// Каталоги с нечитаемой метой накапливаются в `unreadable`.
+    fn namespace_dirs(&self, unreadable: &mut Vec<PathBuf>) -> Result<Vec<NsScan>> {
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(e) => e,
@@ -528,26 +557,33 @@ impl Reader {
                 continue;
             };
 
-            let mut channels = Vec::new();
-            if let Ok(dir) = std::fs::read_dir(&path) {
+            // Каналы неймспейса собираются по всем корням: класс мог быть
+            // вынесен на свой носитель, и его каталог живёт не рядом с
+            // ns-meta. Имя канала уникально в пределах неймспейса — класс
+            // живёт ровно в одном корне.
+            let mut channels: Vec<(String, PathBuf)> = Vec::new();
+            for root in std::iter::once(&self.root).chain(self.extra_roots.iter()) {
+                let ns_dir = root.join(name);
+                let Ok(dir) = std::fs::read_dir(&ns_dir) else {
+                    continue;
+                };
                 for ch in dir.flatten() {
                     let ch_path = ch.path();
                     if !ch_path.is_dir() {
                         continue;
                     }
                     if let Some(ch_name) = ch_path.file_name().and_then(|n| n.to_str()) {
-                        channels.push(ch_name.to_owned());
+                        channels.push((ch_name.to_owned(), ch_path));
                     }
                 }
             }
             channels.sort();
 
-            out.push(NamespaceInfo {
+            out.push(NsScan {
                 name: name.to_owned(),
                 schema_name: meta.schema_name,
                 protocol_version: meta.protocol_version,
                 channels,
-                bytes: 0,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -785,13 +821,12 @@ impl Reader {
             };
             adjust(&mut scope);
 
-            for channel in &ns.channels {
+            for (channel, dir) in &ns.channels {
                 if !q.channels.is_empty() && !q.channels.contains(channel) {
                     continue;
                 }
-                let dir = self.root.join(&ns.name).join(channel);
                 cursors.push(ChannelCursor::open(
-                    &dir,
+                    dir,
                     std::sync::Arc::clone(&ns_name),
                     std::sync::Arc::from(channel.as_str()),
                     &scope,
@@ -2053,7 +2088,7 @@ mod tests {
     fn utc_is_resolved_when_anchor_exists() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+            let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
             let store = Store::open(cfg.clone()).unwrap();
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
             ns.log_raw(EventId(1), &[1], None);
@@ -2086,7 +2121,7 @@ mod tests {
         // Иначе граница «с 12:00» врала бы ровно на ошибку конверсии.
         let dir = tempfile::tempdir().unwrap();
         {
-            let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+            let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
             let store = Store::open(cfg.clone()).unwrap();
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
             store

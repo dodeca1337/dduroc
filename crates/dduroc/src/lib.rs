@@ -62,13 +62,12 @@
 //!
 //! let store = dduroc::Store::open(
 //!     dduroc::StoreConfig::new("/data/logs")
-//!         // Сколько истории хранить у КАЖДОГО канала КАЖДОГО неймспейса...
-//!         .with_budget(256 << 20)
-//!         // ...и сколько всего занять на носителе. Второе — не сумма
-//!         // первых: неймспейсов на приборе тысячи, и их бюджеты кратно
-//!         // превышают любую карту. Без потолка прибор упирается в
-//!         // кончившееся место раньше, чем срабатывает хоть одна ротация.
-//!         .with_total_budget(20 << 30),
+//!         // Бюджет КЛАССА на всё хранилище: «вся телеметрия — столько-то,
+//!         // все логи — столько-то». Каналы всех неймспейсов класса черпают
+//!         // из общего бюджета, вытесняется старейший сегмент класса — в
+//!         // чьём бы неймспейсе он ни лежал. with_budget задаёт бюджет
+//!         // каждому классу, не названному в .channel() явно.
+//!         .with_budget(4 << 30),
 //! )?;
 //!
 //! // Экземпляр микросервиса поднимает свой неймспейс.
@@ -168,7 +167,7 @@ pub use dduroc_engine::schema::{
 };
 pub use dduroc_engine::staged::{OwnedValue, Payload};
 pub use dduroc_engine::stats::Stats;
-pub use dduroc_engine::store::{Store, StoreConfig};
+pub use dduroc_engine::store::{NsQuota, Store, StoreConfig};
 pub use dduroc_engine::writer::QueueSizes;
 pub use dduroc_engine::{Clock, Error, Result};
 pub use dduroc_format::{
@@ -673,7 +672,7 @@ mod tests {
         use dduroc_read::{KindFilter, Order, Query, Reader};
 
         let dir = tempfile::tempdir().unwrap();
-        let config = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+        let config = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
         {
             let store = Store::open(config.clone()).unwrap();
             let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
@@ -809,7 +808,8 @@ mod tests {
         // Пределы, которые не выразить данными: замыкание с захваченным
         // контекстом берёт диагноз на себя целиком и снимается обратно.
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024)).unwrap();
+        let store =
+            Store::open(StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024)).unwrap();
         let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
 
         let hw_max = 40.0;
@@ -843,7 +843,7 @@ mod tests {
         use dduroc_read::{EntryKind, KindFilter, Order, Query, Reader};
 
         let dir = tempfile::tempdir().unwrap();
-        let config = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+        let config = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
         {
             let store = Store::open(config.clone()).unwrap();
             let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();

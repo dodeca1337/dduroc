@@ -9,7 +9,7 @@ use crate::namespace::{Namespace, NsMeta};
 use crate::schema::{Schema, StorageClass};
 use crate::staged::{DropCounters, NsId};
 use crate::stats::{Counters, Stats};
-use crate::writer::{NsSetup, QueueSizes, Writer};
+use crate::writer::{ChannelSpec, GroupBudget, NsSetup, QueueSizes, Writer};
 use chrono::{DateTime, Utc};
 use dduroc_format::BootTime;
 use serde::{Deserialize, Serialize};
@@ -44,70 +44,49 @@ pub struct StoreMeta {
 #[must_use = "настройки строятся цепочкой: результат метода и есть настройки"]
 pub struct StoreConfig {
     pub root: PathBuf,
-    /// Конфигурации каналов по классу хранения. Класс, которого здесь нет,
-    /// получает настройки по умолчанию для своего бюджета.
+    /// Конфигурации классов хранения. Класс, которого здесь нет, получает
+    /// настройки по умолчанию с бюджетом [`StoreConfig::default_budget_bytes`].
     ///
     /// Ключ — [`StorageClass`], перечисление: класс с опечаткой непредставим,
     /// а имя каталога канала — производная от класса, второго источника имени
     /// не существует.
     pub channels: HashMap<StorageClass, ChannelConfig>,
-    /// Бюджет по умолчанию **на канал** неймспейса.
+    /// Бюджет по умолчанию **на класс** — для классов, не названных в
+    /// [`StoreConfig::channels`].
     ///
-    /// Именно на канал, а не на хранилище: каждый неймспейс получает столько
-    /// на каждый свой класс хранения. Сотня неймспейсов по три канала при
-    /// умолчании в 64 МиБ — это девятнадцать гигабайт, и число это растёт с
-    /// каждым поднятым неймспейсом. Носитель об этом ничего не знает, поэтому
-    /// потолок хранилища задаётся отдельно — [`StoreConfig::total_budget_bytes`].
+    /// Бюджет класса — общий на всё хранилище: «вся телеметрия — столько-то».
+    /// Каналы всех неймспейсов класса черпают из него, и при превышении
+    /// вытесняется старейший сегмент класса, в чьём бы неймспейсе он ни
+    /// лежал. Сумма бюджетов классов и есть потолок занятости; отдельной
+    /// ручки «потолок хранилища» нет — при классах на разных носителях
+    /// (см. [`ChannelConfig::root`]) общий потолок не имел бы смысла.
+    ///
+    /// Потолок класса не может быть меньше того, что держат активные
+    /// сегменты: их преаллокация — гарантия ENOSPC. Практический предел
+    /// одновременно пишущих каналов класса — `budget_bytes / segment_bytes`;
+    /// попытка выйти за него видна в [`crate::stats::Stats::over_budget`].
     pub default_budget_bytes: u64,
-    /// Потолок на **всё** хранилище: суммарный размер файлов сегментов во всех
-    /// каналах всех неймспейсов. `None` — потолка нет.
-    ///
-    /// Поканальный бюджет отвечает на вопрос «сколько истории хранить у этого
-    /// класса»; ответить им на вопрос «сколько места занять на носителе»
-    /// нельзя — число каналов заранее неизвестно и растёт по ходу работы.
-    /// Разъезд этих двух вопросов и есть причина, по которой прибор
-    /// обнаруживает исчерпание носителя раньше, чем срабатывает хоть одна
-    /// ротация.
-    ///
-    /// При превышении вытесняется **самый старый сегмент хранилища целиком**,
-    /// в каком бы канале он ни лежал: молчащий канал не должен держать место,
-    /// которого не хватает шумному.
-    ///
-    /// Потолок не может быть меньше того, что занимают активные сегменты:
-    /// в них пишут, и их преаллокация — та самая гарантия, ради которой она
-    /// делается. Практический предел числа одновременно пишущих каналов равен
-    /// `total_budget_bytes / segment_bytes`; попытка выйти за него видна в
-    /// [`crate::stats::Stats::over_budget`].
-    pub total_budget_bytes: Option<u64>,
     /// Ёмкости очередей записи. Выделяются целиком при открытии хранилища.
     pub queues: QueueSizes,
 }
 
 impl StoreConfig {
-    /// Настройки с общим бюджетом на канал.
+    /// Настройки с общим бюджетом на каждый класс.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
             channels: HashMap::new(),
             default_budget_bytes: 64 * 1024 * 1024,
-            total_budget_bytes: None,
             queues: QueueSizes::default(),
         }
     }
 
-    /// Бюджет **одного канала одного неймспейса**.
+    /// Бюджет класса по умолчанию — см. [`StoreConfig::default_budget_bytes`].
     ///
-    /// Не бюджет хранилища: столько получает каждый класс хранения каждого
-    /// поднятого неймспейса, и суммарная занятость растёт с их числом. Чтобы
-    /// ограничить хранилище целиком, есть [`StoreConfig::with_total_budget`].
+    /// Столько получает каждый класс, не названный в
+    /// [`StoreConfig::channel`] явно.
     pub fn with_budget(mut self, bytes: u64) -> Self {
         self.default_budget_bytes = bytes;
-        self
-    }
-
-    /// Потолок на всё хранилище — см. [`StoreConfig::total_budget_bytes`].
-    pub fn with_total_budget(mut self, bytes: u64) -> Self {
-        self.total_budget_bytes = Some(bytes);
         self
     }
 
@@ -146,11 +125,9 @@ impl StoreConfig {
     /// Отказать при открытии — единственный момент, когда это ещё поправимо.
     ///
     /// Проверяются и **синтезированные** конфигурации — те, что получит класс,
-    /// для которого приложение ничего не задавало. Их большинство, и они тоже
-    /// выводятся из внешнего числа: размер сегмента зажат снизу четырьмя
-    /// мебибайтами, поэтому `default_budget_bytes` меньше восьми даёт бюджет
-    /// меньше двух сегментов — ротация съедала бы единственный сегмент сразу
-    /// после запечатывания, и канал не хранил бы ничего.
+    /// для которого приложение ничего не задавало: `default_budget_bytes`
+    /// меньше двух сегментов (16 МиБ при умолчаниях) даёт класс, у которого
+    /// вытеснение съедало бы единственный сегмент сразу после запечатывания.
     fn validate(&self) -> Result<()> {
         // Немедленная синхронизация — определение критического класса, а не
         // настройка: канал, ради которого приложение готово ждать очередь,
@@ -164,25 +141,39 @@ impl StoreConfig {
             });
         }
 
-        let mut widest = 0;
         for class in StorageClass::ALL {
             let config = self.config_for(class);
             config.validate(class.as_str())?;
-            widest = widest.max(config.segment_bytes);
-        }
-        // Потолок хранилища ниже пары сегментов невыполним по построению:
-        // активный сегмент вытеснять нельзя, значит один-единственный
-        // пишущий канал уже выходил бы за него — и не переставал бы.
-        if let Some(total) = self.total_budget_bytes
-            && total < widest.saturating_mul(2)
-        {
-            return Err(Error::BadChannel {
-                name: "<хранилище>".to_owned(),
-                reason: "суммарный потолок меньше двух сегментов: активный сегмент \
-                         вытеснить нельзя, и хранилище не влезло бы в него никогда",
-            });
         }
         Ok(())
+    }
+}
+
+/// Личные квоты неймспейса внутри бюджетов классов.
+///
+/// Необязательны — и это умолчание осмысленно: обычный канал черпает из
+/// общего бюджета своего класса и поканальной ротации не имеет вовсе. Квота
+/// нужна, когда конкретный сервис нельзя пускать к общему бюджету без
+/// предела: его каналы ротируются в рамках квоты, не дожидаясь, пока класс
+/// упрётся в свой бюджет.
+#[derive(Debug, Clone, Default)]
+pub struct NsQuota {
+    slots: [Option<u64>; StorageClass::ALL.len()],
+}
+
+impl NsQuota {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ограничить каналы класса `class` этого неймспейса `bytes` байтами.
+    pub fn class(mut self, class: StorageClass, bytes: u64) -> Self {
+        self.slots[class.index()] = Some(bytes);
+        self
+    }
+
+    fn get(&self, class: StorageClass) -> Option<u64> {
+        self.slots[class.index()]
     }
 }
 
@@ -190,6 +181,11 @@ impl StoreConfig {
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
+    /// Базовый каталог каждого класса (индекс — [`StorageClass::index`]):
+    /// либо общий корень, либо собственный носитель класса.
+    class_roots: Vec<PathBuf>,
+    /// Все различные корни — для обходов имён (эпохи, уборка).
+    scan_roots: Vec<PathBuf>,
     meta: StoreMeta,
     /// Версия контейнера, с которой поднято хранилище, если она была старее
     /// текущей. Приложению стоит записать это в журнал: часть накопленной
@@ -227,6 +223,31 @@ impl Store {
 
         let (meta, upgraded_from) = load_or_create_meta(&config.root)?;
 
+        // Корни классов и бюджетные группы. Ключ носителя — по фактическому
+        // совпадению путей: классы на одном разделе делят давление ENOSPC,
+        // классы на разных не мешают друг другу.
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let mut keys: Vec<PathBuf> = vec![canon(&config.root)];
+        let mut class_roots = Vec::with_capacity(StorageClass::ALL.len());
+        let mut scan_roots = vec![config.root.clone()];
+        let mut groups = Vec::with_capacity(StorageClass::ALL.len());
+        for class in StorageClass::ALL {
+            let cfg = config.config_for(class);
+            let base = cfg.root.clone().unwrap_or_else(|| config.root.clone());
+            fsutil::create_dir_all_synced(&base)?;
+            let c = canon(&base);
+            let key = keys.iter().position(|k| *k == c).unwrap_or_else(|| {
+                keys.push(c);
+                scan_roots.push(base.clone());
+                keys.len() - 1
+            });
+            groups.push(GroupBudget {
+                budget_bytes: cfg.budget_bytes,
+                root_key: key as u8,
+            });
+            class_roots.push(base);
+        }
+
         // База часов и запись в epochs.bin берут одно и то же значение
         // BOOTTIME: расхождение между ними уехало бы в конверсию в UTC.
         let base_us = boottime_us();
@@ -234,9 +255,10 @@ impl Store {
         // именах сегментов: файл эпох мог не пережить порчу или чистку, а
         // сегменты пережили, и повторно выданный номер увёл бы новые записи в
         // прошлое (см. `EpochStore::open_and_register`). Обход имён делается
-        // лениво — только когда файла эпох не осталось.
+        // лениво — только когда файла эпох не осталось; обходятся ВСЕ корни:
+        // история класса может целиком жить на своём носителе.
         let epochs = EpochStore::open_and_register(&config.root, base_us, &|| {
-            Ok(live_boots(&config.root)?.into_iter().next_back())
+            Ok(live_boots(&scan_roots)?.into_iter().next_back())
         })?;
         let clock = Clock::with_base(
             dduroc_format::BootCounter(epochs.current_run().boot_counter),
@@ -244,14 +266,12 @@ impl Store {
         );
 
         let counters = Arc::new(Counters::default());
-        let writer = Writer::spawn(
-            Arc::clone(&counters),
-            config.queues,
-            config.total_budget_bytes,
-        )?;
+        let writer = Writer::spawn(Arc::clone(&counters), config.queues, groups)?;
 
         let store = Arc::new(Self {
             root: config.root.clone(),
+            class_roots,
+            scan_roots,
             meta,
             upgraded_from,
             config,
@@ -305,7 +325,20 @@ impl Store {
     /// их приходилось передавать вторым экземпляром (`Store::open(config.clone())`
     /// плюс `namespace(.., &config)`), и ничто не мешало передать сюда другие —
     /// каналы получили бы бюджет, о котором хранилище не знает.
+    ///
+    /// Каналы черпают из общих бюджетов своих классов; неймспейсу, которому
+    /// положен личный предел, есть [`Store::namespace_with`].
     pub fn namespace(self: &Arc<Self>, name: &str, schema: Schema) -> Result<Namespace> {
+        self.namespace_with(name, schema, NsQuota::default())
+    }
+
+    /// Поднять неймспейс с личными квотами — см. [`NsQuota`].
+    pub fn namespace_with(
+        self: &Arc<Self>,
+        name: &str,
+        schema: Schema,
+        quota: NsQuota,
+    ) -> Result<Namespace> {
         validate_component(name).map_err(|reason| Error::BadNamespace {
             name: name.to_owned(),
             reason,
@@ -349,25 +382,41 @@ impl Store {
         let meta = NsMeta::open(&dir, name, &schema)?;
 
         let classes = schema.classes();
-        // Имя канала — производная от класса; конфиг несёт только политику.
-        let channel_configs: Vec<(String, ChannelConfig)> = classes
-            .iter()
-            .map(|c| (c.as_str().to_owned(), self.config.config_for(*c)))
-            .collect();
-        for (name, c) in &channel_configs {
-            c.validate(name)?;
+        // Канал живёт в каталоге своего класса — возможно, на другом
+        // носителе; группа бюджета и есть класс.
+        let mut specs = Vec::with_capacity(classes.len());
+        for class in &classes {
+            let config = self.config.config_for(*class);
+            let personal = quota.get(*class);
+            if let Some(q) = personal
+                && q < config.segment_bytes.saturating_mul(2)
+            {
+                return Err(Error::BadChannel {
+                    name: format!("{name}/{}", class.as_str()),
+                    reason: "квота меньше двух сегментов — ротация съедала бы \
+                             данные сразу после запечатывания",
+                });
+            }
+            specs.push(ChannelSpec {
+                dir: self.class_roots[class.index()]
+                    .join(name)
+                    .join(class.as_str()),
+                group: class.index(),
+                quota: personal,
+                config,
+            });
         }
+        let channel_dirs: Vec<PathBuf> = specs.iter().map(|s| s.dir.clone()).collect();
 
-        let drops = Arc::new(DropCounters::new(channel_configs.len()));
+        let drops = Arc::new(DropCounters::new(specs.len()));
         let boot = dduroc_format::BootCounter(self.boot_counter());
 
         let id = self.writer.register(NsSetup {
             name: name.to_owned(),
-            dir: dir.clone(),
             protocol_version: schema.version,
             store_id: self.meta.store_id,
             boot,
-            channels: channel_configs,
+            channels: specs,
             drops: Arc::clone(&drops),
         })?;
 
@@ -383,6 +432,7 @@ impl Store {
             id,
             name.to_owned(),
             dir,
+            channel_dirs,
             self.meta.store_id,
             schema,
             classes,
@@ -441,7 +491,7 @@ impl Store {
     /// тысячах неймспейсов не бесплатен, а лишняя запись об эпохе стоит
     /// десятки байт. Приложение вправе позвать уборку и само.
     pub fn compact_epochs(&self) -> Result<usize> {
-        let live = live_boots(&self.root)?;
+        let live = live_boots(&self.scan_roots)?;
         let mut epochs = self.locked_epochs();
         let before = epochs.epochs().runs.len();
         epochs.retain_runs(&|boot| live.contains(&boot))?;
@@ -575,7 +625,7 @@ const EPOCH_COMPACT_THRESHOLD: usize = 1024;
 /// Вход с недопустимым именем не может содержать сегментов **этого**
 /// хранилища, поэтому в него не заходят вовсе — до всякого `read_dir`.
 /// Всё, что прошло проверку имени, обходится строго.
-fn live_boots(root: &Path) -> Result<std::collections::BTreeSet<u32>> {
+fn live_boots(roots: &[PathBuf]) -> Result<std::collections::BTreeSet<u32>> {
     use crate::channel::validate_component;
     use dduroc_format::segment::SegmentName;
 
@@ -603,11 +653,13 @@ fn live_boots(root: &Path) -> Result<std::collections::BTreeSet<u32>> {
     }
 
     let mut out = std::collections::BTreeSet::new();
-    for ns in entries(root)?.iter().filter(|e| ours(e)) {
-        for ch in entries(&ns.path())?.iter().filter(|e| ours(e)) {
-            for seg in entries(&ch.path())? {
-                if let Some(name) = seg.file_name().to_str().and_then(SegmentName::parse) {
-                    out.insert(name.boot.0);
+    for root in roots {
+        for ns in entries(root)?.iter().filter(|e| ours(e)) {
+            for ch in entries(&ns.path())?.iter().filter(|e| ours(e)) {
+                for seg in entries(&ch.path())? {
+                    if let Some(name) = seg.file_name().to_str().and_then(SegmentName::parse) {
+                        out.insert(name.boot.0);
+                    }
                 }
             }
         }
@@ -929,7 +981,7 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+        let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
 
         // Три запуска, каждый оставляет свой сегмент.
         for _ in 0..3 {
@@ -1015,7 +1067,7 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024);
+        let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
 
         // Запуск 0 оставляет после себя сегмент.
         {

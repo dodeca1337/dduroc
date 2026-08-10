@@ -81,7 +81,7 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
 
     let dir = tempfile::tempdir().unwrap();
     let channel = dir.path().join("orc-0").join("default");
-    let segment_bytes = ChannelConfig::segment_size_for(16 << 20);
+    let segment_bytes = ChannelConfig::new(0).segment_bytes;
 
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -187,7 +187,7 @@ fn record_larger_than_a_segment_is_refused_not_written_past_it() {
     // за её границу эту гарантию отменяет, поэтому блок, который не помещается
     // даже в свежий сегмент, отбрасывается — и объявляется потерянным.
     let dir = tempfile::tempdir().unwrap();
-    let segment_bytes = ChannelConfig::segment_size_for(64 << 20);
+    let segment_bytes = ChannelConfig::new(0).segment_bytes;
     let store = Store::open(StoreConfig::new(dir.path()).with_budget(64 << 20)).unwrap();
     let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
 
