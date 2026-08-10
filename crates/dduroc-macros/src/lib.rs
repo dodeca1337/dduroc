@@ -22,7 +22,17 @@
 //!     }
 //!
 //!     metrics {
-//!         Temp = 0x01 { vtype: f32, unit: "°C", tags: [sensor] },
+//!         // Диапазоны НОРМЫ — данные: рисуемы, обновляемы в рантайме.
+//!         Temp = 0x01 { type: f32, unit: "°C", tags: [sensor],
+//!                       warn: -40.0..=70.0, alarm: -40.0..=85.0 },
+//!         // Форма, которую диапазоном не выразить, — предикат
+//!         // СРАБАТЫВАНИЯ (`v` — значение): полярность обратная, поэтому
+//!         // и ключ другой.
+//!         Vswr = 0x02 { type: f32, warn_if: v > 1.5,
+//!                       alarm_if: v > 3.0 || v < 1.0 },
+//!         // Перечисление: важность — префиксом, без неё состояние
+//!         // нормальное.
+//!         Link = 0x03 { states: [alarm Los = 0, warn Sync = 1, Lock = 2] },
 //!     }
 //!
 //!     spans {
@@ -100,12 +110,15 @@ struct MetricDef {
     store: Option<Ident>,
     kind: Option<Ident>,
     states: Vec<StateDef>,
-    /// Диапазоны допустимых значений: вне них — соответствующая важность.
+    /// Диапазоны нормы: вне них — соответствующая важность.
     warn: Option<syn::ExprRange>,
     alarm: Option<syn::ExprRange>,
+    /// Предикаты срабатывания (`v` — значение): истина — уровень достигнут.
+    warn_if: Option<syn::Expr>,
+    alarm_if: Option<syn::Expr>,
 }
 
-/// Одно состояние метрики-перечисления: `Los = 0: alarm`.
+/// Одно состояние метрики-перечисления: `alarm Los = 0`.
 #[derive(Clone)]
 struct StateDef {
     name: Ident,
@@ -477,8 +490,9 @@ fn parse_event(input: ParseStream) -> syn::Result<EventDef> {
     })
 }
 
-/// Разобрать список состояний: `[Los = 0: alarm, Sync = 1: warn, Lock = 2]`.
+/// Разобрать список состояний: `[alarm Los = 0, warn Sync = 1, Lock = 2]`.
 ///
+/// Важность стоит префиксом и читается как строка журнала: «авария — Los».
 /// Коды **обязательно** явные: позиционная нумерация сдвинулась бы при вставке
 /// состояния в середину списка, и уже записанные сегменты стали бы читаться
 /// неверно, без единого признака ошибки.
@@ -487,7 +501,13 @@ fn parse_states(input: ParseStream) -> syn::Result<Vec<StateDef>> {
     bracketed!(content in input);
     let mut out = Vec::new();
     while !content.is_empty() {
-        let name: Ident = content.parse()?;
+        // Два идентификатора подряд — первый из них важность.
+        let first: Ident = content.parse()?;
+        let (severity, name) = if content.peek(Ident) {
+            (Some(first), content.parse::<Ident>()?)
+        } else {
+            (None, first)
+        };
         content.parse::<Token![=]>().map_err(|_| {
             syn::Error::new(
                 name.span(),
@@ -500,13 +520,14 @@ fn parse_states(input: ParseStream) -> syn::Result<Vec<StateDef>> {
         })?;
         let lit: LitInt = content.parse()?;
         let code = lit.base10_parse::<u64>()?;
-        // Важность необязательна: без неё состояние считается нормальным.
-        let severity = if content.peek(Token![:]) {
+        if content.peek(Token![:]) {
             content.parse::<Token![:]>()?;
-            Some(content.parse::<Ident>()?)
-        } else {
-            None
-        };
+            let sev: Ident = content.parse()?;
+            return Err(syn::Error::new(
+                sev.span(),
+                format!("важность пишется префиксом: `{sev} {name} = {code}`"),
+            ));
+        }
         out.push(StateDef {
             name,
             code,
@@ -531,19 +552,37 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     let mut states = Vec::new();
     let mut warn = None;
     let mut alarm = None;
+    let mut warn_if = None;
+    let mut alarm_if = None;
 
     while !content.is_empty() {
-        let key: Ident = content.parse()?;
+        // `type` — ключевое слово Rust, обычным `Ident` его не разобрать.
+        let key: Ident = if content.peek(Token![type]) {
+            let t = content.parse::<Token![type]>()?;
+            Ident::new("type", t.span)
+        } else {
+            content.parse()?
+        };
         content.parse::<Token![:]>()?;
         match key.to_string().as_str() {
-            "vtype" => vtype = Some(content.parse::<Ident>()?),
+            "type" => vtype = Some(content.parse::<Ident>()?),
             "unit" => unit = Some(content.parse::<LitStr>()?),
             "tags" => tags = parse_ident_list(&content)?,
             "store" => store = Some(content.parse::<Ident>()?),
             "kind" => kind = Some(content.parse::<Ident>()?),
             "states" => states = parse_states(&content)?,
-            "warn" => warn = Some(content.parse::<syn::ExprRange>()?),
-            "alarm" => alarm = Some(content.parse::<syn::ExprRange>()?),
+            "warn" => warn = Some(parse_norm_range(&content, &key)?),
+            "alarm" => alarm = Some(parse_norm_range(&content, &key)?),
+            // Предикат срабатывания: у него полярность обратная диапазону,
+            // поэтому и ключ другой — перепутать их молча невозможно.
+            "warn_if" => warn_if = Some(content.parse::<syn::Expr>()?),
+            "alarm_if" => alarm_if = Some(content.parse::<syn::Expr>()?),
+            "vtype" => {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "ключ называется `type`: приставка `v` не несла смысла",
+                ));
+            }
             // Подсказка вместо «неизвестный ключ»: пара warn/critical —
             // естественная догадка, а слово занято классом хранения.
             "critical" => {
@@ -558,13 +597,37 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
-                        "у метрики неизвестный ключ `{other}`: ожидались vtype, unit, \
-                         tags, store, kind, states, warn, alarm"
+                        "у метрики неизвестный ключ `{other}`: ожидались type, unit, \
+                         tags, store, kind, states, warn, alarm, warn_if, alarm_if"
                     ),
                 ));
             }
         }
         let _ = content.parse::<Token![,]>();
+    }
+
+    // Диапазон и предикат одного уровня вместе неоднозначны: у них
+    // противоположная полярность (норма против срабатывания), и объединять
+    // их молча значило бы гадать за пользователя.
+    for (range, predicate, key) in [(&warn, &warn_if, "warn"), (&alarm, &alarm_if, "alarm")] {
+        if range.is_some() && predicate.is_some() {
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "у метрики `{name}` заданы и `{key}:`, и `{key}_if:`: диапазон \
+                     описывает норму, предикат — срабатывание; выберите одну форму"
+                ),
+            ));
+        }
+    }
+    if !states.is_empty() && (warn_if.is_some() || alarm_if.is_some()) {
+        return Err(syn::Error::new(
+            name.span(),
+            format!(
+                "у перечисления `{name}` предикаты не имеют смысла: важность \
+                 задаётся самим состояниям — `alarm Los = 0`"
+            ),
+        ));
     }
 
     // Тип перечисления выводится: код состояния — целое.
@@ -575,8 +638,16 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         return Err(syn::Error::new(
             name.span(),
             format!(
-                "у метрики `{name}` не задан `vtype:` (у перечисления он выводится \
+                "у метрики `{name}` не задан `type:` (у перечисления он выводится \
                  из `states:`)"
+            ),
+        ));
+    }
+    if vtype.as_ref().is_some_and(|t| t == "blob") && (warn_if.is_some() || alarm_if.is_some()) {
+        return Err(syn::Error::new(
+            name.span(),
+            format!(
+                "у метрики `{name}` тип blob: он не приводится к числу, и предикату нечего проверять"
             ),
         ));
     }
@@ -593,7 +664,26 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         states,
         warn,
         alarm,
+        warn_if,
+        alarm_if,
     })
+}
+
+/// Диапазон нормы `warn:`/`alarm:` — с подсказкой, если написано условие.
+///
+/// Перепутать формы легко, а ошибка парсера про «ожидался диапазон» не
+/// объясняет главного: у форм противоположная полярность.
+fn parse_norm_range(input: ParseStream, key: &Ident) -> syn::Result<syn::ExprRange> {
+    match input.parse::<syn::Expr>()? {
+        syn::Expr::Range(r) => Ok(r),
+        other => Err(syn::Error::new_spanned(
+            &other,
+            format!(
+                "`{key}:` принимает диапазон НОРМЫ (`{key}: -40.0..=70.0`); условие \
+                 срабатывания пишется предикатом: `{key}_if: v > 70.0`"
+            ),
+        )),
+    }
 }
 
 /// Разобрать затронутые шагом типы: `{ events: [A, B], metrics: [Temp] }`.
@@ -1227,6 +1317,29 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         let warn = range_tokens(m.warn.as_ref())?;
         let alarm = range_tokens(m.alarm.as_ref())?;
 
+        // Предикаты срабатывания компилируются в обычные fn схемного модуля:
+        // указатель на них лежит в дескрипторе, и читатель пользуется ими так
+        // же, как диапазонами, — дамп со своей схемой раскрашивается одинаково
+        // на приборе и во вьюере.
+        let mut predicate = |suffix: &str, expr: Option<&syn::Expr>| match expr {
+            None => quote!(::core::option::Option::None),
+            Some(expr) => {
+                let fn_name = quote::format_ident!("__{}_{}", suffix, name_str.to_lowercase());
+                // Двустороннее условие естественно пишется `v > a || v < b`,
+                // а clippy предлагает переписать его диапазоном — ровно той
+                // формой, вместо которой предикат и выбран.
+                state_statics.push(quote! {
+                    #[allow(clippy::manual_range_contains)]
+                    fn #fn_name(v: f64) -> bool {
+                        #expr
+                    }
+                });
+                quote!(::core::option::Option::Some(#fn_name))
+            }
+        };
+        let warn_if = predicate("warn_if", m.warn_if.as_ref());
+        let alarm_if = predicate("alarm_if", m.alarm_if.as_ref());
+
         // Константа несёт тип значения: `Metric<f32>` не даст записать в эту
         // метрику целое, а `Metric<LinkState>` — состояние чужой метрики.
         // Имя занимает пространство значений, поэтому перечисление состояний
@@ -1334,6 +1447,8 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 kind: #kind,
                 states: #states_ref,
                 thresholds: ::dduroc::Thresholds { warn: #warn, alarm: #alarm },
+                warn_if: #warn_if,
+                alarm_if: #alarm_if,
             }
         });
     }
@@ -1878,6 +1993,8 @@ fn clone_metric(m: &MetricDef) -> MetricDef {
         states: m.states.clone(),
         warn: m.warn.clone(),
         alarm: m.alarm.clone(),
+        warn_if: m.warn_if.clone(),
+        alarm_if: m.alarm_if.clone(),
     }
 }
 
@@ -1978,7 +2095,7 @@ mod tests {
     const GOOD: &str = r#"
         name: radio, version: 1, languages: [en, ru],
         events { PowerSet = 0x01 { level: Info, en: "power {dbm}", ru: "мощность {dbm}", dbm: f32 } }
-        metrics { Temp = 0x01 { vtype: f32 } }
+        metrics { Temp = 0x01 { type: f32 } }
         spans { Cal = 0x01 }
     "#;
 
@@ -2100,13 +2217,68 @@ mod tests {
         assert!(e.contains("u16"), "{e}");
     }
 
+    #[test]
+    fn the_new_metric_forms_parse() {
+        // Предикаты срабатывания и префиксная важность состояний.
+        check(
+            r#"name: radio, version: 1, languages: [en],
+               metrics {
+                   Vswr = 0x01 { type: f32, warn_if: v > 1.5,
+                                 alarm_if: v > 3.0 || v < 1.0 },
+                   Link = 0x02 { states: [alarm Los = 0, warn Sync = 1, Lock = 2] },
+               }"#,
+        )
+        .expect("новые формы компилируются");
+    }
+
+    #[test]
+    fn old_metric_spellings_get_pointed_at_the_new_ones() {
+        // Прежнее имя ключа — подсказка, а не «неизвестный ключ».
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               metrics { Temp = 0x01 { vtype: f32 } }"#);
+        assert!(e.contains("`type`"), "{e}");
+
+        // Условие на месте диапазона: у форм противоположная полярность,
+        // и об этом сказано прямо.
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               metrics { Temp = 0x01 { type: f32, warn: v > 70.0 } }"#);
+        assert!(e.contains("warn_if"), "{e}");
+        assert!(e.contains("НОРМЫ"), "{e}");
+
+        // Суффиксная важность состояния переехала в префикс.
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               metrics { Link = 0x01 { states: [Los = 0: alarm] } }"#);
+        assert!(e.contains("префиксом"), "{e}");
+        assert!(e.contains("alarm Los = 0"), "{e}");
+    }
+
+    #[test]
+    fn a_range_and_a_predicate_of_one_level_are_mutually_exclusive() {
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               metrics { Temp = 0x01 { type: f32, warn: ..=70.0, warn_if: v > 70.0 } }"#);
+        assert!(e.contains("одну форму"), "{e}");
+    }
+
+    #[test]
+    fn predicates_are_refused_where_a_number_never_comes() {
+        // У перечисления важность носят состояния.
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               metrics { Link = 0x01 { states: [Lock = 0], warn_if: v > 1.0 } }"#);
+        assert!(e.contains("состояни"), "{e}");
+
+        // Blob к числу не приводится.
+        let e = err(r#"name: radio, version: 1, languages: [en],
+               metrics { Spec = 0x01 { type: blob, alarm_if: v > 1.0 } }"#);
+        assert!(e.contains("blob"), "{e}");
+    }
+
     // ── history и типизированные правила ─────────────────────────────────
 
     /// Заготовка схемы v2 с history и одним типизированным шагом.
     const MIGRATING: &str = r#"
         name: radio, version: 2, languages: [en],
         events { PowerSet = 0x01 { level: Info, en: "power {dbm}", dbm: f32 } }
-        metrics { Temp = 0x01 { vtype: f32 }, TempPa = 0x02 { vtype: f32 } }
+        metrics { Temp = 0x01 { type: f32 }, TempPa = 0x02 { type: f32 } }
         history { 1 { events { PowerSet = 0x01 { dbm: i8 } } } }
         migrations {
             1 => {
@@ -2185,7 +2357,7 @@ mod tests {
         // только drop и ремап. Замыкание здесь — ошибка объявления.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
-               metrics { Temp = 0x01 { vtype: f32 } }
+               metrics { Temp = 0x01 { type: f32 } }
                migrations { 1 => { metrics::Temp: |v| v } }"#);
         assert!(e.contains("не преобразуются"), "{e}");
     }
@@ -2195,13 +2367,13 @@ mod tests {
         // Событие не превратить в метрику и наоборот: разные виды записей.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
-               metrics { Temp = 0x01 { vtype: f32 } }
+               metrics { Temp = 0x01 { type: f32 } }
                migrations { 1 => { events::E: metrics::Temp } }"#);
         assert!(e.contains("разные виды"), "{e}");
 
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
-               metrics { Temp = 0x01 { vtype: f32 } }
+               metrics { Temp = 0x01 { type: f32 } }
                migrations { 1 => { metrics::Temp: events::E } }"#);
         assert!(e.contains("разные виды"), "{e}");
     }

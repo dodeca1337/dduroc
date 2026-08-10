@@ -26,8 +26,8 @@ dduroc::schema! {
     }
 
     metrics {
-        Seq = 0x01 { vtype: u64 },
-        Bulk = 0x02 { vtype: blob },
+        Seq = 0x01 { type: u64 },
+        Bulk = 0x02 { type: blob },
     }
 }
 

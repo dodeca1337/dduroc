@@ -38,16 +38,16 @@
 //!         // Непрерывная величина с пределами: вне `warn` — тревога,
 //!         // вне `alarm` — авария. Верхняя граница включительная,
 //!         // поэтому `..=`.
-//!         TempPa = 0x01 { vtype: f32, unit: "°C", tags: [thermal],
+//!         TempPa = 0x01 { type: f32, unit: "°C", tags: [thermal],
 //!                         warn: ..=70.0, alarm: ..=85.0 },
 //!         // Второй датчик — отдельная метрика, а не размерность первой:
 //!         // рантайм-тэгов нет, и различающий признак не занимает места
 //!         // в каждом отсчёте.
-//!         TempLna = 0x02 { vtype: f32, unit: "°C", tags: [thermal] },
+//!         TempLna = 0x02 { type: f32, unit: "°C", tags: [thermal] },
 //!         // Конечный автомат как временной ряд. Коды явные: позиционная
 //!         // нумерация сдвинулась бы при вставке состояния в середину.
 //!         LinkState = 0x03 {
-//!             states: [Los = 0: alarm, Sync = 1: warn, Lock = 2],
+//!             states: [alarm Los = 0, warn Sync = 1, Lock = 2],
 //!             tags: [rf],
 //!         },
 //!     }
@@ -158,7 +158,7 @@ pub use serde_json;
 pub use dduroc_engine::MigrationReport;
 pub use dduroc_engine::channel::{ChannelConfig, Durability};
 pub use dduroc_engine::epochs::SyncSource;
-pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, StateStatus};
+pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, SeverityFn, StateStatus};
 pub use dduroc_engine::metric::{Blob, Metric, MetricState, MetricValue, Untyped};
 pub use dduroc_engine::namespace::{Namespace, Series, SpanGuard};
 pub use dduroc_engine::schema::{
@@ -275,6 +275,10 @@ pub trait NamespaceExt {
     /// То же с ответом об исходе. `Err` различается двумя предикатами:
     /// [`Error::loses_record`] — запись не дошла до носителя,
     /// [`Error::breaks_contract`] — событие не из этой схемы.
+    ///
+    /// Вердикт — вызывающему целиком: нарушение контракта здесь не попадает
+    /// в счётчики и не объявляется в журнале, это делает «тихий» [`NamespaceExt::log`].
+    /// Отдать обработанный отказ движку — [`Namespace::note_failure`].
     fn try_log<E: Event>(&self, event: E) -> Result<()>;
 
     /// То же для события в спане.
@@ -383,16 +387,21 @@ mod tests {
         }
 
         metrics {
-            Temp = 0x01 { vtype: f32, unit: "°C", tags: [thermal],
+            Temp = 0x01 { type: f32, unit: "°C", tags: [thermal],
                           warn: ..=70.0, alarm: ..=85.0 },
-            Spectrum = 0x02 { vtype: blob, store: telemetry },
+            Spectrum = 0x02 { type: blob, store: telemetry },
             LinkState = 0x03 {
-                states: [Los = 0: alarm, Sync = 1: warn, Lock = 2],
+                states: [alarm Los = 0, warn Sync = 1, Lock = 2],
                 tags: [rf],
             },
             Locked = 0x04 {
-                vtype: bool,
-                states: [Unlocked = 0: alarm, Locked = 1],
+                type: bool,
+                states: [alarm Unlocked = 0, Locked = 1],
+            },
+            Vswr = 0x05 {
+                type: f32,
+                warn_if: v > 1.5,
+                alarm_if: v > 3.0 || v < 1.0,
             },
         }
 
@@ -422,7 +431,7 @@ mod tests {
         }
 
         metrics {
-            Temp = 0x01 { vtype: f32 },
+            Temp = 0x01 { type: f32 },
         }
 
         // Ключ — версия, ИЗ которой мигрируем: цепочка обязана быть
@@ -575,7 +584,7 @@ mod tests {
         assert_eq!(testing::SCHEMA.name, "testing");
         assert_eq!(testing::SCHEMA.version, ProtocolVersion(1));
         assert_eq!(testing::SCHEMA.events.len(), 3);
-        assert_eq!(testing::SCHEMA.metrics.len(), 4);
+        assert_eq!(testing::SCHEMA.metrics.len(), 5);
         assert_eq!(testing::SCHEMA.spans.len(), 2);
     }
 
@@ -760,6 +769,59 @@ mod tests {
         assert!(spec.thresholds.is_unset());
         assert!(spec.states.is_empty());
         assert_eq!(spec.kind, MetricKind::Gauge);
+    }
+
+    #[test]
+    fn predicate_limits_are_compiled_into_the_descriptor() {
+        // `warn_if`/`alarm_if` — условия срабатывания: КСВ аварийно и сверху,
+        // и снизу единицы, что диапазоном нормы не выразить. Макрос компилирует
+        // выражение в fn дескриптора, и им пользуется каждый, кто спрашивает
+        // важность, — включая читателя дампа с этой же схемой.
+        use dduroc_format::Value;
+        let vswr = testing::SCHEMA.metric(MetricId(5)).unwrap();
+        assert!(vswr.thresholds.is_unset(), "данных нет — только предикаты");
+        assert_eq!(vswr.severity_of(&Value::F32(1.2)), Severity::Normal);
+        assert_eq!(vswr.severity_of(&Value::F32(2.0)), Severity::Warn);
+        assert_eq!(vswr.severity_of(&Value::F32(3.5)), Severity::Alarm);
+        assert_eq!(
+            vswr.severity_of(&Value::F32(0.5)),
+            Severity::Alarm,
+            "срабатывание снизу — ради него предикат и нужен"
+        );
+    }
+
+    #[test]
+    fn a_severity_fn_with_captured_context_overrides_everything() {
+        // Пределы, которые не выразить данными: замыкание с захваченным
+        // контекстом берёт диагноз на себя целиком и снимается обратно.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path()).with_budget(8 * 1024 * 1024)).unwrap();
+        let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
+
+        let hw_max = 40.0;
+        ns.set_severity_fn(testing::metrics::Temp, move |v| {
+            if v > hw_max {
+                Severity::Alarm
+            } else {
+                Severity::Normal
+            }
+        })
+        .unwrap();
+        let hot = OwnedValue::F32(75.0);
+        assert_eq!(
+            ns.severity_of(testing::metrics::Temp, &hot),
+            Severity::Alarm,
+            "по схеме было бы Warn: замыкание победило"
+        );
+        assert!(ns.limits(testing::metrics::Temp).unwrap().custom_fn);
+
+        ns.clear_severity_fn(testing::metrics::Temp).unwrap();
+        assert_eq!(
+            ns.severity_of(testing::metrics::Temp, &hot),
+            Severity::Warn,
+            "снятие возвращает схемные диапазоны"
+        );
+        store.shutdown();
     }
 
     #[test]

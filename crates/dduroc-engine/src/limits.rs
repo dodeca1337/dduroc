@@ -81,10 +81,12 @@ impl MetricLimits {
             }
             return desc.state(code).map_or(Severity::Normal, |s| s.severity);
         }
+        // Переопределяются только диапазоны; схемные предикаты продолжают
+        // действовать — это разные оси одного диагноза.
         let thresholds = self.thresholds.unwrap_or(desc.thresholds);
         value
             .as_f64()
-            .map_or(Severity::Normal, |v| thresholds.severity_of(v))
+            .map_or(Severity::Normal, |v| desc.numeric_severity(&thresholds, v))
     }
 }
 
@@ -110,16 +112,41 @@ pub struct EffectiveLimits {
     pub states: Vec<StateStatus>,
     /// Отличается ли действующее от объявленного в схеме.
     pub overridden: bool,
+    /// Диагноз целиком взят рантайм-замыканием
+    /// ([`crate::namespace::Namespace::set_severity_fn`]): числа выше
+    /// описывают то, что оно перекрывает, и полосы по ним рисовать нельзя.
+    pub custom_fn: bool,
 }
+
+/// Замыкание, целиком берущее диагноз метрики на себя.
+///
+/// Получает значение числом (код состояния — как число) и отвечает важностью;
+/// побеждает и схему, и переопределения данных. Это люк для правил, которые
+/// данными не выразить: гистерезис, зависимость от захваченного контекста.
+pub type SeverityFn = Box<dyn Fn(f64) -> Severity + Send + Sync>;
 
 /// Пределы всех метрик неймспейса.
 ///
 /// Индексируется позицией метрики в [`Schema::metrics`], а не хеш-таблицей:
 /// метрик единицы-сотни, позиция уже находится бинарным поиском по схеме, и
 /// лишняя хеш-таблица тут была бы дороже самого доступа.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct LimitsRegistry {
     slots: RwLock<Vec<Option<MetricLimits>>>,
+    /// Рантайм-замыкания — отдельно от данных: у них другой жизненный цикл
+    /// (их нельзя ни сравнить, ни показать) и другой приоритет.
+    fns: RwLock<Vec<Option<SeverityFn>>>,
+}
+
+impl std::fmt::Debug for LimitsRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
+        let fns = self.fns.read().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("LimitsRegistry")
+            .field("overrides", &slots.iter().flatten().count())
+            .field("fns", &fns.iter().flatten().count())
+            .finish()
+    }
 }
 
 impl LimitsRegistry {
@@ -187,13 +214,46 @@ impl LimitsRegistry {
         Ok(())
     }
 
+    /// Выставить рантайм-замыкание диагноза. `None` — снять.
+    ///
+    /// Blob отвергается: его не привести к числу, и замыкание никогда бы не
+    /// вызвалось — молча принять такую настройку значило бы соврать оператору.
+    pub fn set_fn(
+        &self,
+        schema: &Schema,
+        metric: MetricId,
+        check: Option<SeverityFn>,
+    ) -> Result<()> {
+        let (index, desc) = resolve(schema, metric)?;
+        if check.is_some() && desc.value_type == dduroc_format::ValueType::Blob {
+            return Err(Error::BadLimits {
+                metric: desc.name,
+                reason: "замыкание диагноза у blob-метрики: значение не приводится \
+                         к числу, и вызвать его было бы не с чем",
+            });
+        }
+        let mut fns = self.fns.write().unwrap_or_else(|e| e.into_inner());
+        if fns.len() < schema.metrics.len() {
+            fns.resize_with(schema.metrics.len(), || None);
+        }
+        fns[index] = check;
+        Ok(())
+    }
+
     /// Действующие пределы метрики.
     pub fn effective(&self, schema: &Schema, metric: MetricId) -> Result<EffectiveLimits> {
         let (index, desc) = resolve(schema, metric)?;
         let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         let over = slots.get(index).and_then(|o| o.as_ref());
+        let custom_fn = self
+            .fns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index)
+            .is_some_and(Option::is_some);
 
         Ok(EffectiveLimits {
+            custom_fn,
             metric: desc.id,
             name: desc.name,
             unit: desc.unit,
@@ -227,6 +287,16 @@ impl LimitsRegistry {
         let Ok((index, desc)) = resolve(schema, metric) else {
             return Severity::Normal;
         };
+        // Замыкание побеждает всё: оно и ставится ради того, чтобы взять
+        // диагноз на себя целиком.
+        {
+            let fns = self.fns.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(check) = fns.get(index).and_then(|o| o.as_ref())
+                && let Some(v) = value.as_f64()
+            {
+                return check(v);
+            }
+        }
         let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         match slots.get(index).and_then(|o| o.as_ref()) {
             Some(over) => over.severity_of(desc, value),
@@ -284,6 +354,8 @@ mod tests {
 
     static METRICS: &[MetricDesc] = &[
         MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(1),
             name: "temp",
             value_type: ValueType::F32,
@@ -304,6 +376,8 @@ mod tests {
             },
         },
         MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(2),
             name: "link",
             value_type: ValueType::U64,
@@ -492,8 +566,156 @@ mod tests {
     }
 
     #[test]
+    fn schema_predicates_join_ranges_by_the_heavier_diagnosis() {
+        // Форма, которую диапазоном нормы не выразить: КСВ аварийно и сверху,
+        // и снизу единицы, а тревожно только сверху. Предикат — условие
+        // срабатывания, полярность обратна диапазону.
+        fn warn_hit(v: f64) -> bool {
+            v > 1.5
+        }
+        #[allow(clippy::manual_range_contains)]
+        fn alarm_hit(v: f64) -> bool {
+            v > 3.0 || v < 1.0
+        }
+        static VSWR: &[MetricDesc] = &[MetricDesc {
+            warn_if: Some(warn_hit),
+            alarm_if: Some(alarm_hit),
+            id: MetricId(1),
+            name: "vswr",
+            value_type: ValueType::F32,
+            class: StorageClass::TELEMETRY,
+            unit: "",
+            tags: &[],
+            kind: MetricKind::Gauge,
+            states: &[],
+            thresholds: Thresholds::NONE,
+        }];
+        let s = Schema {
+            metrics: VSWR,
+            ..schema()
+        };
+        let r = registry();
+        let sev = |v: f32| r.severity_of(&s, MetricId(1), &Value::F32(v));
+        assert_eq!(sev(1.2), Severity::Normal);
+        assert_eq!(sev(2.0), Severity::Warn);
+        assert_eq!(sev(3.5), Severity::Alarm);
+        assert_eq!(
+            sev(0.5),
+            Severity::Alarm,
+            "срабатывание снизу — ради него всё"
+        );
+
+        // Рантайм-переопределение данных подменяет диапазоны, но предикаты
+        // схемы продолжают действовать: это разные оси одного диагноза.
+        r.set(
+            &s,
+            MetricId(1),
+            Some(MetricLimits::numeric(Thresholds {
+                warn: Range {
+                    min: Some(1.05),
+                    max: None,
+                },
+                alarm: Range::NONE,
+            })),
+        )
+        .unwrap();
+        assert_eq!(sev(1.02), Severity::Warn, "новый диапазон действует");
+        assert_eq!(sev(0.5), Severity::Alarm, "предикат схемы не отменён");
+    }
+
+    #[test]
+    fn severity_fn_takes_the_diagnosis_over_entirely() {
+        let (s, r) = (schema(), registry());
+        // Контекст, которого нет ни в схеме, ни в данных: предел из модели
+        // железа плюс запертое состояние после первой аварии (гистерезис).
+        let latched = std::sync::atomic::AtomicBool::new(false);
+        let hw_max = 42.0;
+        r.set_fn(
+            &s,
+            MetricId(1),
+            Some(Box::new(move |v| {
+                use std::sync::atomic::Ordering;
+                if v > hw_max {
+                    latched.store(true, Ordering::Relaxed);
+                }
+                if latched.load(Ordering::Relaxed) {
+                    Severity::Alarm
+                } else {
+                    Severity::Normal
+                }
+            })),
+        )
+        .unwrap();
+
+        let sev = |v: f32| r.severity_of(&s, MetricId(1), &Value::F32(v));
+        assert_eq!(sev(90.0), Severity::Alarm, "схемные 85 больше не при чём");
+        assert_eq!(
+            sev(20.0),
+            Severity::Alarm,
+            "замыкание помнит контекст: авария заперта"
+        );
+        assert!(r.effective(&s, MetricId(1)).unwrap().custom_fn);
+
+        // Состоянию замыкание тоже доступно: код приходит числом.
+        r.set_fn(
+            &s,
+            MetricId(2),
+            Some(Box::new(|code| {
+                if code == 0.0 {
+                    Severity::Warn
+                } else {
+                    Severity::Normal
+                }
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            r.severity_of(&s, MetricId(2), &Value::U64(0)),
+            Severity::Warn,
+            "схема считала Los аварией"
+        );
+
+        // Снятие возвращает обычный порядок: данные и схема.
+        r.set_fn(&s, MetricId(1), None).unwrap();
+        assert_eq!(sev(90.0), Severity::Alarm, "теперь по схемным диапазонам");
+        assert_eq!(sev(20.0), Severity::Normal);
+        assert!(!r.effective(&s, MetricId(1)).unwrap().custom_fn);
+    }
+
+    #[test]
+    fn severity_fn_on_a_blob_metric_is_refused() {
+        static BLOBBY: &[MetricDesc] = &[MetricDesc {
+            warn_if: None,
+            alarm_if: None,
+            id: MetricId(1),
+            name: "spectrum",
+            value_type: ValueType::Blob,
+            class: StorageClass::TELEMETRY,
+            unit: "",
+            tags: &[],
+            kind: MetricKind::Gauge,
+            states: &[],
+            thresholds: Thresholds::NONE,
+        }];
+        let s = Schema {
+            metrics: BLOBBY,
+            ..schema()
+        };
+        let r = registry();
+        let err = r
+            .set_fn(&s, MetricId(1), Some(Box::new(|_| Severity::Alarm)))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BadLimits { .. }),
+            "blob не привести к числу, замыкание не вызвалось бы никогда: {err}"
+        );
+    }
+
+    #[test]
     fn metric_without_limits_is_always_normal() {
         static PLAIN: &[MetricDesc] = &[MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(1),
             name: "count",
             value_type: ValueType::U64,

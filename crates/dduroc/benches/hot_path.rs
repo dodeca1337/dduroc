@@ -44,7 +44,7 @@ dduroc::schema! {
     }
 
     metrics {
-        Temp = 0x01 { vtype: f32, unit: "°C", tags: [thermal] },
+        Temp = 0x01 { type: f32, unit: "°C", tags: [thermal] },
     }
 
     spans {

@@ -36,9 +36,9 @@ dduroc::schema! {
     }
 
     metrics {
-        TempPa = 0x01 { vtype: f32, unit: "°C", tags: [thermal],
+        TempPa = 0x01 { type: f32, unit: "°C", tags: [thermal],
                         warn: ..=70.0, alarm: ..=85.0 },
-        LinkState = 0x02 { states: [Los = 0: alarm, Sync = 1: warn, Lock = 2] },
+        LinkState = 0x02 { states: [alarm Los = 0, warn Sync = 1, Lock = 2] },
     }
 }
 
@@ -84,12 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         temp.sample(52.0);
         temp.sample(88.5);
         ns.log(radio::events::Overheat { t: 88.5 });
-        ns.log_text(
-            Level::Warn,
-            std::sync::Arc::from("app"),
-            "мощность сброшена до безопасной",
-            None,
-        );
+        ns.log_text(Level::Warn, "app", "мощность сброшена до безопасной", None);
         ns.log(radio::events::PowerSet { dbm: 5.0 });
         ns.sync()?;
         store.shutdown();
@@ -146,18 +141,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {}", line(&reader, e));
     }
 
-    println!("\n— события с тэгом thermal —");
-    // Тэги, конкретные типы и спаны задаются полями фильтра напрямую.
-    // Тэг несут схемные сообщения и отсчёты; у свободного текста тэгов нет,
-    // и фильтром по тэгам он не отсеивается — поэтому здесь только messages.
-    let mut by_tag = Query::new()
-        .kinds(KindFilter {
-            text: false,
-            ..KindFilter::LOGS
-        })
-        .order(Order::Oldest);
-    by_tag.filter.any_tags = vec!["thermal".to_owned()];
-    for e in &reader.query(&by_tag)?.entries {
+    println!("\n— всё с тэгом thermal —");
+    // Тэг несут сообщения и отсчёты (у метрик — свои тэги); свободный текст
+    // и спаны не несут и пройти такой фильтр не могут — они исключаются, а
+    // не просачиваются.
+    for e in &reader
+        .query(&Query::new().any_tag("thermal").order(Order::Oldest))?
+        .entries
+    {
         println!("  {}", line(&reader, e));
     }
 
@@ -311,12 +302,17 @@ fn line(reader: &Reader, e: &dduroc::read::Entry) -> String {
         .utc
         .map(|t| t.format("%H:%M:%S%.3f UTC").to_string())
         .unwrap_or_else(|| "--:--:--".to_owned());
-    format!(
-        "{} | {clock} | {:9} | {}",
-        e.at,
-        e.level().map(|l| l.as_str()).unwrap_or(""),
-        reader
+    let what = match &e.kind {
+        EntryKind::Sample {
+            metric_name, value, ..
+        } => format!("{} = {value:?}", metric_name.unwrap_or("?")),
+        _ => reader
             .render(e, "ru")
             .unwrap_or_else(|| format!("{:?}", e.kind)),
+    };
+    format!(
+        "{} | {clock} | {:9} | {what}",
+        e.at,
+        e.level().map(|l| l.as_str()).unwrap_or(""),
     )
 }

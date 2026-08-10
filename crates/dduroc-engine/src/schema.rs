@@ -295,6 +295,16 @@ pub struct MetricDesc {
     /// Пределы по умолчанию. Установка вправе переопределить их в рантайме
     /// (см. `Namespace::set_limits`) — например узнав модель железа.
     pub thresholds: Thresholds,
+    /// Предикат срабатывания тревоги: истина — значение тревожно.
+    ///
+    /// Для форм, которые диапазоном нормы не выразить. Полярность обратна
+    /// [`MetricDesc::thresholds`] — поэтому в схеме это отдельные ключи
+    /// `warn_if:`/`alarm_if:`. С диапазонами предикат складывается по правилу
+    /// «тяжелейший диагноз побеждает»; интроспекции у него нет, полосы на
+    /// графике рисуются только по диапазонам.
+    pub warn_if: Option<fn(f64) -> bool>,
+    /// Предикат срабатывания аварии — см. [`MetricDesc::warn_if`].
+    pub alarm_if: Option<fn(f64) -> bool>,
 }
 
 impl MetricDesc {
@@ -323,9 +333,22 @@ impl MetricDesc {
                 .and_then(|c| self.state(c))
                 .map_or(Severity::Normal, |s| s.severity);
         }
-        value
-            .as_f64()
-            .map_or(Severity::Normal, |v| self.thresholds.severity_of(v))
+        value.as_f64().map_or(Severity::Normal, |v| {
+            self.numeric_severity(&self.thresholds, v)
+        })
+    }
+
+    /// Важность числа по диапазонам и предикатам; диапазоны могут быть
+    /// рантайм-переопределением, предикаты всегда схемные.
+    pub(crate) fn numeric_severity(&self, thresholds: &Thresholds, v: f64) -> Severity {
+        let by_predicate = if self.alarm_if.is_some_and(|hit| hit(v)) {
+            Severity::Alarm
+        } else if self.warn_if.is_some_and(|hit| hit(v)) {
+            Severity::Warn
+        } else {
+            Severity::Normal
+        };
+        thresholds.severity_of(v).max(by_predicate)
     }
 }
 
@@ -669,6 +692,12 @@ impl Schema {
                      важность задаётся на состояние",
                 ));
             }
+            if m.warn_if.is_some() || m.alarm_if.is_some() {
+                return Err(bad(
+                    "предикаты у перечисления: его значения не упорядочены, \
+                     важность задаётся на состояние",
+                ));
+            }
             for (i, s) in m.states.iter().enumerate() {
                 if m.states[..i].iter().any(|p| p.code == s.code) {
                     return Err(SchemaError::DuplicateStateCode {
@@ -704,6 +733,13 @@ impl Schema {
                  оказалось бы критическим, не будучи тревожным",
             )
         })?;
+
+        if m.value_type == ValueType::Blob && (m.warn_if.is_some() || m.alarm_if.is_some()) {
+            return Err(bad(
+                "предикат у blob-метрики: значение не приводится к числу, и \
+                 проверять ему нечего",
+            ));
+        }
 
         Ok(())
     }
@@ -915,6 +951,8 @@ mod tests {
         // отказывали бы — то есть механизм, заведённый против тишины, сам бы
         // и молчал.
         static METRICS: &[MetricDesc] = &[MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(1),
             name: "Spectrum",
             unit: "",
@@ -1080,6 +1118,8 @@ mod tests {
         thresholds: Thresholds,
     ) -> MetricDesc {
         MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(1),
             name: "m",
             value_type,
@@ -1366,10 +1406,14 @@ mod tests {
         // массиве, иначе пределы применились бы к чужой метрике.
         static M: &[MetricDesc] = &[
             MetricDesc {
+                warn_if: None,
+                alarm_if: None,
                 id: MetricId(1),
                 ..metric(ValueType::F32, MetricKind::Gauge, &[], Thresholds::NONE)
             },
             MetricDesc {
+                warn_if: None,
+                alarm_if: None,
                 id: MetricId(9),
                 name: "second",
                 ..metric(ValueType::U64, MetricKind::Counter, &[], Thresholds::NONE)

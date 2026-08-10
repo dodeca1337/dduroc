@@ -40,7 +40,7 @@ mod yesterday {
 
         metrics {
             // Температуру решили переименовать и перевесить на новый id.
-            Temp = 0x07 { vtype: f32, unit: "°C" },
+            Temp = 0x07 { type: f32, unit: "°C" },
         }
     }
 }
@@ -61,7 +61,7 @@ mod today {
         }
 
         metrics {
-            TempPa = 0x08 { vtype: f32, unit: "°C" },
+            TempPa = 0x08 { type: f32, unit: "°C" },
         }
 
         // Раскладки прошлых версий — те, что потребляют шаги. Перечисляются

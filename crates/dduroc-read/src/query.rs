@@ -220,11 +220,19 @@ impl NsSelect {
 /// Уровни и тэги — статические свойства типов, поэтому фильтрация по ним
 /// не требует чтения записей: она сводится к вычислению множества
 /// идентификаторов по схеме **до** сканирования.
+///
+/// Контентный фильтр (тэги, типы, имена) применяется к записям, у которых
+/// такое свойство есть, и **исключает** записи, которые не могут ему
+/// удовлетворить: свободный текст и спаны не несут ни тэгов, ни типа события
+/// и при таком фильтре выпадают. Тэги есть у сообщений и отсчётов (у метрик —
+/// свои), типы — только у сообщений. `min_level` — иное: уровень есть у
+/// сообщений и текста, а телеметрия и спаны вне шкалы уровней и по нему не
+/// отсеиваются.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     /// Минимальный уровень (включительно).
     pub min_level: Option<Level>,
-    /// Требуемые тэги: событие должно нести хотя бы один из них.
+    /// Требуемые тэги: запись должна нести хотя бы один из них.
     pub any_tags: Vec<String>,
     /// Конкретные типы событий.
     pub events: Option<HashSet<EventId>>,
@@ -372,6 +380,39 @@ impl Query {
 
     pub fn min_level(mut self, level: Level) -> Self {
         self.filter.min_level = Some(level);
+        self
+    }
+
+    /// Только записи с этим тэгом. Несколько вызовов — «хотя бы один из».
+    ///
+    /// Тэг несут сообщения и отсчёты; текст и спаны при таком фильтре
+    /// выпадают — см. [`Filter`].
+    pub fn any_tag(mut self, tag: impl Into<String>) -> Self {
+        self.filter.any_tags.push(tag.into());
+        self
+    }
+
+    /// Только события этого типа. Несколько вызовов — «любой из названных».
+    pub fn event(mut self, id: EventId) -> Self {
+        self.filter
+            .events
+            .get_or_insert_with(HashSet::new)
+            .insert(id);
+        self
+    }
+
+    /// Только события с этим именем (резолвится по схеме).
+    pub fn event_name(mut self, name: impl Into<String>) -> Self {
+        self.filter.event_names.push(name.into());
+        self
+    }
+
+    /// Только записи, привязанные к этому спану.
+    pub fn span(mut self, id: SpanId) -> Self {
+        self.filter
+            .spans
+            .get_or_insert_with(HashSet::new)
+            .insert(id);
         self
     }
 

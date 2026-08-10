@@ -56,19 +56,25 @@ dduroc::schema! {
     }
 
     metrics {
-        // Непрерывная величина. Пределы — range-выражения: вне `warn` —
-        // тревога, вне `alarm` — авария; верхняя граница включительная.
-        TempPa = 0x01 { vtype: f32, unit: "°C", tags: [thermal],
+        // Непрерывная величина. `warn:`/`alarm:` — диапазоны НОРМЫ (данные:
+        // по ним рисуются полосы, их можно переопределить в рантайме):
+        // вне `warn` — тревога, вне `alarm` — авария.
+        TempPa = 0x01 { type: f32, unit: "°C", tags: [thermal],
                         warn: ..=70.0, alarm: ..=85.0 },
+        // Форма, которую диапазоном не выразить, — предикат СРАБАТЫВАНИЯ
+        // (`v` — значение, полярность обратная, поэтому и ключ другой):
+        // КСВ аварийно и сверху, и снизу единицы, тревожно только сверху.
+        Vswr = 0x04 { type: f32, warn_if: v > 1.5,
+                      alarm_if: v > 3.0 || v < 1.0 },
         // Конечный автомат как временной ряд: на диск идёт только код,
         // имя состояния и его важность читатель возьмёт из схемы.
         // Коды явные: позиционная нумерация сдвинулась бы при вставке.
         LinkState = 0x02 {
-            states: [Los = 0: alarm, Sync = 1: warn, Lock = 2],
+            states: [alarm Los = 0, warn Sync = 1, Lock = 2],
             tags: [rf],
         },
         // Бинарный слепок (спектр, дамп регистров) — в канал телеметрии.
-        Spectrum = 0x03 { vtype: blob, store: telemetry },
+        Spectrum = 0x03 { type: blob, store: telemetry },
     }
 
     spans {
@@ -158,6 +164,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ns.log(radio::events::Overheat { t: 65.0, sensor: 0 });
     }
 
+    // Предикаты из схемы работают везде, где спрашивают важность, — и здесь,
+    // и у читателя дампа.
+    println!(
+        "КСВ 0.5 (обрыв фидера): {:?} — диапазоном нормы такое не выразить",
+        ns.severity_of(radio::metrics::Vswr, &OwnedValue::F32(0.5))
+    );
+
+    // Крайняя форма пределов — замыкание с захваченным контекстом: оно
+    // берёт диагноз на себя целиком (побеждает и схему, и set_thresholds),
+    // пока его не снимут. Например, защёлка: после первого перегрева —
+    // тревога до сброса, какой бы ни была температура сейчас.
+    let tripped = std::sync::atomic::AtomicBool::new(false);
+    ns.set_severity_fn(radio::metrics::TempPa, move |v| {
+        use std::sync::atomic::Ordering;
+        if v > 60.0 {
+            tripped.store(true, Ordering::Relaxed);
+        }
+        if tripped.load(Ordering::Relaxed) {
+            Severity::Alarm
+        } else {
+            Severity::Normal
+        }
+    })?;
+    let _ = ns.severity_of(radio::metrics::TempPa, &OwnedValue::F32(65.0)); // защёлкнулось
+    println!(
+        "36.6 °C после перегрева: {:?} — замыкание помнит контекст",
+        ns.severity_of(radio::metrics::TempPa, &OwnedValue::F32(36.6))
+    );
+    ns.clear_severity_fn(radio::metrics::TempPa)?; // снова действуют данные
+
     // -----------------------------------------------------------------------
     // Спаны — отрезки работы. Конец пишется при уничтожении стража, в том
     // числе при панике: незакрытый спан читатель показывает как оборванный.
@@ -181,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     ns.log_text(
         Level::Warn,
-        std::sync::Arc::from("app"),
+        "app",
         "конфигурация усилителя устарела, взят профиль по умолчанию",
         None,
     );

@@ -24,7 +24,7 @@ mod was {
         }
 
         metrics {
-            Temp = 0x07 { vtype: f32 },
+            Temp = 0x07 { type: f32 },
         }
     }
 }
@@ -43,7 +43,7 @@ mod now {
         }
 
         metrics {
-            TempPa = 0x08 { vtype: f32 },
+            TempPa = 0x08 { type: f32 },
         }
 
         history {

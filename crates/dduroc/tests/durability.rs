@@ -21,7 +21,7 @@ dduroc::schema! {
     }
 
     metrics {
-        Spectrum = 0x01 { vtype: blob },
+        Spectrum = 0x01 { type: blob },
     }
 
     spans {

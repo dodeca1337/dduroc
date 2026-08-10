@@ -348,7 +348,7 @@ impl Namespace {
         if self.inner.announced.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
             // Само объявление идёт обычным путём и может быть потеряно под
             // нагрузкой; повторять его незачем — счётчик остаётся.
-            let _ = self.try_log_text(Level::Error, Arc::from("dduroc"), e.to_string(), None);
+            let _ = self.try_log_text(Level::Error, "dduroc", e.to_string(), None);
         }
     }
 
@@ -389,6 +389,12 @@ impl Namespace {
     /// [`Error::loses_record`] — запись не дошла до носителя (диск отстаёт),
     /// [`Error::breaks_contract`] — событие не из этой схемы, то есть дефект
     /// сборки.
+    ///
+    /// Вердикт — вызывающему целиком: нарушение контракта здесь **не**
+    /// попадает в счётчики и не объявляется в журнале (это делают «тихие»
+    /// методы). Обработали отказ — он ваш; отдать его движку —
+    /// [`Namespace::note_failure`]. Потери диска учтены в любом случае:
+    /// их считает сам writer.
     pub fn try_log_payload(
         &self,
         event: EventId,
@@ -419,10 +425,14 @@ impl Namespace {
     }
 
     /// Записать свободный текст без схемы: мост из `tracing`, panic-handler.
+    ///
+    /// `target` — источник строки (`"app"`, имя модуля); он интернируется
+    /// (`Arc<str>`), потому что у моста один и тот же target повторяется
+    /// тысячами, но на месте вызова достаточно строкового литерала.
     pub fn log_text(
         &self,
         level: Level,
-        target: Arc<str>,
+        target: impl Into<Arc<str>>,
         text: impl Into<Box<str>>,
         span: Option<SpanId>,
     ) {
@@ -433,10 +443,11 @@ impl Namespace {
     pub fn try_log_text(
         &self,
         level: Level,
-        target: Arc<str>,
+        target: impl Into<Arc<str>>,
         text: impl Into<Box<str>>,
         span: Option<SpanId>,
     ) -> Result<()> {
+        let target = target.into();
         // Свободный текст не объявлен в схеме, поэтому и класса хранения у
         // него нет. Ошибочный уровень просится в критический канал, но схема
         // не обязана его объявлять: отказать значило бы промолчать ровно там,
@@ -553,6 +564,31 @@ impl Namespace {
         self.inner
             .limits
             .set(&self.inner.schema, metric.into(), None)
+    }
+
+    /// Взять диагноз метрики целиком на себя: замыкание вместо диапазонов.
+    ///
+    /// Для правил, которые данными не выразить, — гистерезис, зависимость от
+    /// захваченного контекста (модель железа, режим работы). Побеждает и
+    /// схему, и [`Namespace::set_limits`]; значение приходит числом (код
+    /// состояния — как число), blob-метрике замыкание не поставить. Как и
+    /// остальные пределы, на диск не пишется — читатель дампа его не увидит.
+    pub fn set_severity_fn(
+        &self,
+        metric: impl Into<MetricId>,
+        check: impl Fn(f64) -> Severity + Send + Sync + 'static,
+    ) -> Result<()> {
+        self.inner
+            .limits
+            .set_fn(&self.inner.schema, metric.into(), Some(Box::new(check)))
+    }
+
+    /// Снять замыкание диагноза: снова действуют данные — переопределения и
+    /// схема.
+    pub fn clear_severity_fn(&self, metric: impl Into<MetricId>) -> Result<()> {
+        self.inner
+            .limits
+            .set_fn(&self.inner.schema, metric.into(), None)
     }
 
     /// Действующие пределы метрики: схема плюс переопределения.
@@ -905,6 +941,8 @@ mod tests {
     ];
     static METRICS: &[MetricDesc] = &[
         MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(1),
             name: "temp",
             value_type: ValueType::F32,
@@ -925,6 +963,8 @@ mod tests {
             },
         },
         MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(2),
             name: "link",
             value_type: ValueType::U64,

@@ -26,7 +26,7 @@ dduroc::schema! {
 
     metrics {
         // Бинарные слепки — самый тяжёлый поток, ему канал телеметрии.
-        Chunk = 0x01 { vtype: blob, store: telemetry },
+        Chunk = 0x01 { type: blob, store: telemetry },
     }
 }
 

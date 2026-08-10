@@ -825,6 +825,14 @@ impl Reader {
         q: &Query,
     ) -> Option<Entry> {
         let kinds = q.filter.kinds;
+        // Фильтры, говорящие о содержимом. Запись, у которой такого свойства
+        // нет (текст без тэгов, спан без типа события), удовлетворить им не
+        // может и исключается — иначе фильтр «только с тэгом rf» пропускал бы
+        // то, у чего тэгов не бывает. `min_level` сюда не входит: уровень есть
+        // у сообщений и текста, а телеметрия и спаны вне шкалы уровней.
+        let content_filtered = !q.filter.any_tags.is_empty()
+            || q.filter.events.is_some()
+            || !q.filter.event_names.is_empty();
         let (kind, span) = match &raw.record {
             OwnedRecord::Message {
                 event,
@@ -886,7 +894,7 @@ impl Reader {
                 target,
                 text,
             } => {
-                if !kinds.text {
+                if !kinds.text || content_filtered {
                     return None;
                 }
                 if let Some(min) = q.filter.min_level
@@ -904,7 +912,7 @@ impl Reader {
                 )
             }
             OwnedRecord::SpanStart { span, kind, parent } => {
-                if !kinds.spans {
+                if !kinds.spans || content_filtered {
                     return None;
                 }
                 (
@@ -917,13 +925,13 @@ impl Reader {
                 )
             }
             OwnedRecord::SpanEnd { span } => {
-                if !kinds.spans {
+                if !kinds.spans || content_filtered {
                     return None;
                 }
                 (EntryKind::SpanEnd { span: *span }, Some(*span))
             }
             OwnedRecord::Sample { metric, value } => {
-                if !kinds.samples {
+                if !kinds.samples || q.filter.events.is_some() || !q.filter.event_names.is_empty() {
                     return None;
                 }
                 // Идентичность ряда лежит в самой записи: метрика и есть ряд.
@@ -931,6 +939,18 @@ impl Reader {
                 // поведение между отсчётами — резолвится по схеме и на диске
                 // места не занимает.
                 let desc = schema.and_then(|s| s.metric(*metric));
+                // Тэги у отсчёта есть — метрики: фильтр по ним применяется.
+                if !q.filter.any_tags.is_empty() {
+                    let tags = desc.map(|d| d.tags).unwrap_or(&[]);
+                    if !q
+                        .filter
+                        .any_tags
+                        .iter()
+                        .any(|want| tags.iter().any(|t| t == want))
+                    {
+                        return None;
+                    }
+                }
                 let code = match value {
                     OwnedSampleValue::U64(v) => Some(*v),
                     OwnedSampleValue::I64(v) if *v >= 0 => Some(*v as u64),
@@ -951,12 +971,17 @@ impl Reader {
                     None,
                 )
             }
-            OwnedRecord::Ext { bytes } => (
-                EntryKind::Ext {
-                    bytes: bytes.clone(),
-                },
-                None,
-            ),
+            OwnedRecord::Ext { bytes } => {
+                if content_filtered {
+                    return None;
+                }
+                (
+                    EntryKind::Ext {
+                        bytes: bytes.clone(),
+                    },
+                    None,
+                )
+            }
         };
 
         // Записи вне спанов отбрасываются вместе со всеми, чей спан не
@@ -1025,10 +1050,40 @@ fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilte
             }
             true
         }
-        dduroc_format::Record::Text(t) => kinds.text && min_level.is_none_or(|min| t.level >= min),
-        dduroc_format::Record::SpanStart(_) | dduroc_format::Record::SpanEnd { .. } => kinds.spans,
-        dduroc_format::Record::Sample(_) => kinds.samples,
-        dduroc_format::Record::Ext { .. } => true,
+        // Контентные фильтры исключают записи, которые не могут им
+        // удовлетворить: у текста и спанов нет ни тэгов, ни типа события,
+        // и «прошёл фильтр по тэгу» для них было бы ложью. Уровень — не
+        // контентный фильтр: у текста он есть и проверяется, телеметрия и
+        // спаны вне шкалы уровней и им не отсеиваются.
+        dduroc_format::Record::Text(t) => {
+            kinds.text
+                && min_level.is_none_or(|min| t.level >= min)
+                && any_tags.is_empty()
+                && events.is_none()
+                && event_names.is_empty()
+        }
+        dduroc_format::Record::SpanStart(_) | dduroc_format::Record::SpanEnd { .. } => {
+            kinds.spans && any_tags.is_empty() && events.is_none() && event_names.is_empty()
+        }
+        dduroc_format::Record::Sample(s) => {
+            if !kinds.samples || events.is_some() || !event_names.is_empty() {
+                return false;
+            }
+            // Тэги у отсчёта есть — метрики: фильтр по ним применяется.
+            if !any_tags.is_empty() {
+                let tags = schema
+                    .and_then(|sc| sc.metric(s.metric))
+                    .map(|d| d.tags)
+                    .unwrap_or(&[]);
+                if !any_tags.iter().any(|want| tags.iter().any(|t| t == want)) {
+                    return false;
+                }
+            }
+            true
+        }
+        dduroc_format::Record::Ext { .. } => {
+            any_tags.is_empty() && events.is_none() && event_names.is_empty()
+        }
     })
 }
 
@@ -1122,6 +1177,8 @@ mod tests {
     ];
     static METRICS: &[MetricDesc] = &[
         MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(1),
             name: "temp",
             value_type: ValueType::F32,
@@ -1142,6 +1199,8 @@ mod tests {
             },
         },
         MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(2),
             name: "link",
             value_type: ValueType::U64,
@@ -1349,6 +1408,71 @@ mod tests {
     }
 
     #[test]
+    fn content_filters_skip_records_that_cannot_match_them() {
+        // Фильтр «только с тэгом rf» не имеет права пропустить свободный
+        // текст: у текста тэгов нет, и совпадением это не было бы. Раньше
+        // текст и спаны проходили любой фильтр по тэгам и типам — отметки о
+        // потерях всплывали посреди ответа «только события подсистемы rf».
+        // Тэги при этом есть не только у событий: отсчёт несёт тэги своей
+        // метрики, и по ним фильтр обязан работать.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store =
+                Store::open(StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024)).unwrap();
+            let ns = store.namespace("orc-radio-0", schema()).unwrap();
+            ns.log_raw(EventId(1), &[7], None); // PowerSet, тэг rf
+            ns.log_raw(EventId(2), &[1], None); // Alarm, тэг fault
+            ns.log_text(Level::Warn, "app", "свободный текст без тэгов", None);
+            ns.series(TEMP).unwrap().sample(21.0); // метрика temp, тэг thermal
+            ns.series_untyped(MetricId(2))
+                .unwrap()
+                .sample_raw(dduroc_engine::staged::OwnedValue::U64(1)); // link, тэг rf
+            {
+                let cal = ns.span(SpanKindId(1));
+                cal.log_raw(EventId(1), &[8]); // rf, внутри спана
+            }
+            ns.sync().unwrap();
+            store.shutdown();
+        }
+        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+
+        let rf = reader
+            .query(&Query::new().any_tag("rf").order(Order::Oldest))
+            .unwrap();
+        assert!(rf.is_complete());
+        let mut messages = 0;
+        let mut samples = 0;
+        for e in &rf.entries {
+            match &e.kind {
+                EntryKind::Message { .. } => messages += 1,
+                EntryKind::Sample { .. } => samples += 1,
+                other => panic!("{other:?} не несёт тэга и не мог пройти фильтр"),
+            }
+        }
+        assert_eq!(messages, 2, "PowerSet сам по себе и внутри спана");
+        assert_eq!(samples, 1, "отсчёт link прошёл по тэгу своей метрики");
+
+        // Фильтр по типу события: отсчёты, текст и спаны событиями не
+        // являются и удовлетворить ему не могут.
+        let alarms = reader
+            .query(&Query::new().event(EventId(2)).order(Order::Oldest))
+            .unwrap();
+        assert_eq!(alarms.entries.len(), 1, "{:?}", alarms.entries);
+        assert!(matches!(
+            &alarms.entries[0].kind,
+            EntryKind::Message {
+                name: Some("Alarm"),
+                ..
+            }
+        ));
+
+        let by_name = reader
+            .query(&Query::new().event_name("PowerSet").order(Order::Oldest))
+            .unwrap();
+        assert_eq!(by_name.entries.len(), 2, "{:?}", by_name.entries);
+    }
+
+    #[test]
     fn telemetry_keeps_identity_in_newest_order() {
         // Определение серии пишется в тело один раз, перед первым сэмплом.
         // При обратном обходе — режиме по умолчанию — сэмпл встречается
@@ -1468,6 +1592,8 @@ mod tests {
         // ряда: метрика номер 2 у «radio» — конечный автомат, у «modem» —
         // обычная непрерывная величина, и подписывать её состояниями нельзя.
         static OTHER_METRICS: &[MetricDesc] = &[MetricDesc {
+            warn_if: None,
+            alarm_if: None,
             id: MetricId(2), // тот же номер, другая величина
             name: "voltage",
             value_type: ValueType::F32,
