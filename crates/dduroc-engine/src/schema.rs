@@ -15,23 +15,37 @@
 
 use dduroc_format::{EventId, Level, MetricId, ProtocolVersion, SpanKindId, ValueType};
 
-/// Класс хранения: имя канала, в который попадают записи этого типа.
+/// Класс хранения: канал, в который попадают записи этого типа.
 ///
 /// Канал определяет политику долговечности и бюджет. Значимые данные
-/// объявляют [`StorageClass::CRITICAL`], остальные — [`StorageClass::DEFAULT`].
+/// объявляют [`StorageClass::Critical`], остальные — [`StorageClass::Default`].
+///
+/// Перечисление, а не имя строкой: множество классов закрыто (его знает и
+/// макрос схемы, и настройка хранилища), и класс, которого не существует,
+/// не должен быть представим — со строкой опечатка в конфигурации молча
+/// заводила бы канал-сироту со своей политикой. Имя каталога канала — это
+/// [`StorageClass::as_str`], производная от класса, а не второй источник.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StorageClass(pub &'static str);
+pub enum StorageClass {
+    /// Батчи с отложенной синхронизацией.
+    Default,
+    /// Синхронизация сразу (group commit) — устойчивость к потере питания.
+    Critical,
+    /// Отдельный канал под телеметрию: обычно самый большой бюджет.
+    Telemetry,
+}
 
 impl StorageClass {
-    /// Батчи с отложенной синхронизацией.
-    pub const DEFAULT: Self = Self("default");
-    /// Синхронизация сразу (group commit) — устойчивость к потере питания.
-    pub const CRITICAL: Self = Self("critical");
-    /// Отдельный канал под телеметрию: обычно самый большой бюджет.
-    pub const TELEMETRY: Self = Self("telemetry");
+    /// Все классы — для настройки и проверки каждого.
+    pub const ALL: [StorageClass; 3] = [Self::Default, Self::Critical, Self::Telemetry];
 
+    /// Имя каталога канала.
     pub const fn as_str(self) -> &'static str {
-        self.0
+        match self {
+            StorageClass::Default => "default",
+            StorageClass::Critical => "critical",
+            StorageClass::Telemetry => "telemetry",
+        }
     }
 }
 
@@ -112,7 +126,7 @@ impl EventDesc {
 /// температура нормальна для одного усилителя и аварийна для другого.
 ///
 /// Слово `critical` здесь намеренно **не** используется: оно занято классом
-/// хранения ([`StorageClass::CRITICAL`] — устойчивость к потере питания). Это
+/// хранения ([`StorageClass::Critical`] — устойчивость к потере питания). Это
 /// разные оси: класс хранения говорит, *как записать*, важность — *что
 /// значение означает*, а в объявлении метрики они стоят рядом. Пара
 /// `warn` → `alarm` привычна в промышленной телеметрии и не путается.
@@ -800,7 +814,7 @@ impl Schema {
         //
         // Пустой канал не стоит почти ничего: каталог создаётся при подъёме,
         // а сегмент — только первой записью.
-        let mut out: Vec<StorageClass> = vec![StorageClass::DEFAULT];
+        let mut out: Vec<StorageClass> = vec![StorageClass::Default];
         let all = self
             .events
             .iter()
@@ -909,7 +923,7 @@ mod tests {
                 id: EventId(1),
                 name: "PowerSet",
                 level: Level::Info,
-                class: StorageClass::CRITICAL,
+                class: StorageClass::Critical,
                 tags: &["rf"],
                 templates: &["power {dbm}", "мощность {dbm}"],
                 fields: &[],
@@ -919,7 +933,7 @@ mod tests {
                 id: EventId(2),
                 name: "Failed",
                 level: Level::Error,
-                class: StorageClass::DEFAULT,
+                class: StorageClass::Default,
                 tags: &[],
                 templates: &["failed", "сбой"],
                 fields: &[],
@@ -932,9 +946,11 @@ mod tests {
         assert!(s.event(EventId(99)).is_none());
         assert_eq!(s.language_index("ru"), Some(1));
         assert_eq!(s.language_index("ja"), None);
+        // Порядок — как в объявлении перечисления: он определяет индексы
+        // каналов в рантайме, на диске каналы живут под именами.
         assert_eq!(
             s.classes(),
-            vec![StorageClass::CRITICAL, StorageClass::DEFAULT]
+            vec![StorageClass::Default, StorageClass::Critical]
         );
         assert_eq!(
             s.event(EventId(1)).unwrap().template(1),
@@ -959,7 +975,7 @@ mod tests {
             tags: &[],
             value_type: ValueType::Blob,
             kind: MetricKind::Gauge,
-            class: StorageClass::TELEMETRY,
+            class: StorageClass::Telemetry,
             states: &[],
             thresholds: Thresholds::NONE,
         }];
@@ -975,7 +991,7 @@ mod tests {
         s.validate().expect("схема корректна");
         assert_eq!(
             s.classes(),
-            vec![StorageClass::DEFAULT, StorageClass::TELEMETRY],
+            vec![StorageClass::Default, StorageClass::Telemetry],
             "обычный канал есть всегда"
         );
     }
@@ -987,7 +1003,7 @@ mod tests {
                 id: EventId(5),
                 name: "A",
                 level: Level::Info,
-                class: StorageClass::DEFAULT,
+                class: StorageClass::Default,
                 tags: &[],
                 templates: &["a", "а"],
                 fields: &[],
@@ -997,7 +1013,7 @@ mod tests {
                 id: EventId(5),
                 name: "B",
                 level: Level::Info,
-                class: StorageClass::DEFAULT,
+                class: StorageClass::Default,
                 tags: &[],
                 templates: &["b", "б"],
                 fields: &[],
@@ -1025,7 +1041,7 @@ mod tests {
             id: EventId(1),
             name: "Only",
             level: Level::Info,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             tags: &[],
             templates: &["english only"],
             fields: &[],
@@ -1123,7 +1139,7 @@ mod tests {
             id: MetricId(1),
             name: "m",
             value_type,
-            class: StorageClass::TELEMETRY,
+            class: StorageClass::Telemetry,
             unit: "",
             tags: &[],
             kind,

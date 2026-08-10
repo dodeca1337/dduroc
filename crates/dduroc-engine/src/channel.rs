@@ -37,11 +37,13 @@ impl Durability {
     }
 }
 
-/// Настройки канала.
+/// Настройки канала — только политика.
+///
+/// Имени здесь нет намеренно: канал живёт в каталоге своего класса хранения
+/// ([`crate::schema::StorageClass::as_str`]), и второй источник того же имени
+/// в конфигурации мог бы только разойтись с первым.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelConfig {
-    /// Имя канала = имя поддиректории.
-    pub name: String,
     /// Бюджет ротации: суммарный размер сегментов канала.
     pub budget_bytes: u64,
     /// Размер одного сегмента (он же — шаг преаллокации).
@@ -56,9 +58,8 @@ pub struct ChannelConfig {
 
 impl ChannelConfig {
     /// Разумные умолчания под указанный бюджет.
-    pub fn new(name: impl Into<String>, budget_bytes: u64) -> Self {
+    pub fn new(budget_bytes: u64) -> Self {
         Self {
-            name: name.into(),
             budget_bytes,
             segment_bytes: Self::segment_size_for(budget_bytes),
             block_max_bytes: 64 * 1024,
@@ -72,13 +73,13 @@ impl ChannelConfig {
     ///
     /// Сжатие на критическом канале вредно: оно заставляет копить данные ради
     /// эффективности, а копить — ровно то, чего критический канал избегает.
-    pub fn critical(name: impl Into<String>, budget_bytes: u64) -> Self {
+    pub fn critical(budget_bytes: u64) -> Self {
         Self {
             durability: Durability::Immediate,
             compression: Compression::None,
             block_max_bytes: 8 * 1024,
             flush_interval: Duration::from_millis(50),
-            ..Self::new(name, budget_bytes)
+            ..Self::new(budget_bytes)
         }
     }
 
@@ -95,13 +96,12 @@ impl ChannelConfig {
         (budget_bytes / 256).clamp(MIN, MAX)
     }
 
-    /// Проверить и нормализовать конфигурацию.
-    pub fn validate(&self) -> Result<()> {
-        validate_component(&self.name).map_err(|reason| Error::BadChannel {
-            name: self.name.clone(),
+    /// Проверить конфигурацию; `name` — чьё это имя в сообщении об ошибке.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        let bad = |reason| Error::BadChannel {
+            name: name.to_owned(),
             reason,
-        })?;
-
+        };
         // Бюджет меньше двух сегментов означает, что при запечатывании
         // единственного сегмента ротация немедленно удалила бы его — канал
         // не хранил бы ничего.
@@ -110,22 +110,19 @@ impl ChannelConfig {
         // приложения, и обычное переполнило бы u64 паникой в debug там, где
         // ответ очевиден — такой бюджет заведомо мал.
         if self.budget_bytes < self.segment_bytes.saturating_mul(2) {
-            return Err(Error::BadChannel {
-                name: self.name.clone(),
-                reason: "бюджет меньше двух сегментов — ротация съедала бы данные сразу",
-            });
+            return Err(bad(
+                "бюджет меньше двух сегментов — ротация съедала бы данные сразу",
+            ));
         }
         if self.block_max_bytes < 512 {
-            return Err(Error::BadChannel {
-                name: self.name.clone(),
-                reason: "слишком маленький блок: накладные расходы съедят экономию",
-            });
+            return Err(bad(
+                "слишком маленький блок: накладные расходы съедят экономию",
+            ));
         }
         if (self.block_max_bytes as u64) * 2 > self.segment_bytes {
-            return Err(Error::BadChannel {
-                name: self.name.clone(),
-                reason: "блок сопоставим с сегментом — сегмент не вместит и пары блоков",
-            });
+            return Err(bad(
+                "блок сопоставим с сегментом — сегмент не вместит и пары блоков",
+            ));
         }
         Ok(())
     }
@@ -175,45 +172,48 @@ mod tests {
     #[test]
     fn defaults_scale_with_budget() {
         // 20 ГБ → 80 МБ сегменты, 256 файлов.
-        let c = ChannelConfig::new("default", 20 * 1024 * 1024 * 1024);
+        let c = ChannelConfig::new(20 * 1024 * 1024 * 1024);
         assert_eq!(c.segment_bytes, 80 * 1024 * 1024);
         assert_eq!(c.max_segments(), 256);
-        c.validate().unwrap();
+        c.validate("ch").unwrap();
 
         // Маленький бюджет упирается в нижнюю границу сегмента.
-        let c = ChannelConfig::new("small", 64 * 1024 * 1024);
+        let c = ChannelConfig::new(64 * 1024 * 1024);
         assert_eq!(c.segment_bytes, 4 * 1024 * 1024);
         assert_eq!(c.max_segments(), 16);
-        c.validate().unwrap();
+        c.validate("ch").unwrap();
 
         // Огромный — в верхнюю.
-        let c = ChannelConfig::new("big", 500 * 1024 * 1024 * 1024);
+        let c = ChannelConfig::new(500 * 1024 * 1024 * 1024);
         assert_eq!(c.segment_bytes, 256 * 1024 * 1024);
-        c.validate().unwrap();
+        c.validate("ch").unwrap();
     }
 
     #[test]
     fn critical_channel_avoids_buffering() {
-        let c = ChannelConfig::critical("critical", 256 * 1024 * 1024);
+        let c = ChannelConfig::critical(256 * 1024 * 1024);
         assert_eq!(c.durability, Durability::Immediate);
         assert_eq!(c.compression, Compression::None);
         assert!(c.flush_interval < Duration::from_secs(1));
-        c.validate().unwrap();
+        c.validate("ch").unwrap();
     }
 
     #[test]
     fn degenerate_configs_rejected() {
-        let mut c = ChannelConfig::new("x", 64 * 1024 * 1024);
+        let mut c = ChannelConfig::new(64 * 1024 * 1024);
         c.budget_bytes = c.segment_bytes; // ровно один сегмент
-        assert!(c.validate().is_err(), "бюджет в один сегмент бессмыслен");
+        assert!(
+            c.validate("ch").is_err(),
+            "бюджет в один сегмент бессмыслен"
+        );
 
-        let mut c = ChannelConfig::new("x", 64 * 1024 * 1024);
+        let mut c = ChannelConfig::new(64 * 1024 * 1024);
         c.block_max_bytes = 16;
-        assert!(c.validate().is_err());
+        assert!(c.validate("ch").is_err());
 
-        let mut c = ChannelConfig::new("x", 64 * 1024 * 1024);
+        let mut c = ChannelConfig::new(64 * 1024 * 1024);
         c.block_max_bytes = c.segment_bytes as usize;
-        assert!(c.validate().is_err());
+        assert!(c.validate("ch").is_err());
     }
 
     #[test]

@@ -419,7 +419,7 @@ impl Namespace {
         };
         self.inner.writer.write(
             item,
-            desc.class == StorageClass::CRITICAL,
+            desc.class == StorageClass::Critical,
             &self.inner.drops,
         )
     }
@@ -459,11 +459,11 @@ impl Namespace {
         // ожидание места ради доставки в канал с отложенной синхронизацией
         // было бы платой без гарантии.
         let (channel, critical) = match level >= Level::Error {
-            true => match self.channel_of(StorageClass::CRITICAL) {
+            true => match self.channel_of(StorageClass::Critical) {
                 Ok(idx) => (idx, true),
-                Err(_) => (self.channel_of(StorageClass::DEFAULT)?, false),
+                Err(_) => (self.channel_of(StorageClass::Default)?, false),
             },
-            false => (self.channel_of(StorageClass::DEFAULT)?, false),
+            false => (self.channel_of(StorageClass::Default)?, false),
         };
         let item = Staged {
             ns: self.inner.id,
@@ -497,7 +497,7 @@ impl Namespace {
             ns: self.clone(),
             metric: id,
             channel: self.channel_of(desc.class)?,
-            critical: desc.class == StorageClass::CRITICAL,
+            critical: desc.class == StorageClass::Critical,
             value_type: desc.value_type,
             desc,
             _value: std::marker::PhantomData,
@@ -515,7 +515,7 @@ impl Namespace {
             ns: self.clone(),
             metric,
             channel: self.channel_of(desc.class)?,
-            critical: desc.class == StorageClass::CRITICAL,
+            critical: desc.class == StorageClass::Critical,
             value_type: desc.value_type,
             desc,
             _value: std::marker::PhantomData,
@@ -629,7 +629,7 @@ impl Namespace {
             .inner
             .schema
             .span(kind)
-            .map_or(StorageClass::DEFAULT, |d| d.class);
+            .map_or(StorageClass::Default, |d| d.class);
         let channel = match self.channel_of(class) {
             Ok(c) => c,
             Err(e) => {
@@ -637,7 +637,7 @@ impl Namespace {
                 ChannelIdx(0)
             }
         };
-        let critical = class == StorageClass::CRITICAL;
+        let critical = class == StorageClass::Critical;
 
         if self.inner.schema.span(kind).is_none() {
             self.report(Err(Error::UnknownSpanKind {
@@ -905,7 +905,7 @@ mod tests {
             id: EventId(1),
             name: "PowerSet",
             level: Level::Info,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             tags: &["rf"],
             templates: &["power {dbm}", "мощность {dbm}"],
             fields: &[],
@@ -915,7 +915,7 @@ mod tests {
             id: EventId(2),
             name: "Alarm",
             level: Level::Error,
-            class: StorageClass::CRITICAL,
+            class: StorageClass::Critical,
             tags: &[],
             templates: &["alarm", "авария"],
             fields: &[],
@@ -946,7 +946,7 @@ mod tests {
             id: MetricId(1),
             name: "temp",
             value_type: ValueType::F32,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             unit: "°C",
             tags: &["thermal"],
             kind: MetricKind::Gauge,
@@ -968,7 +968,7 @@ mod tests {
             id: MetricId(2),
             name: "link",
             value_type: ValueType::U64,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             unit: "",
             tags: &["rf"],
             kind: MetricKind::State,
@@ -1012,7 +1012,7 @@ mod tests {
     static SPANS: &[SpanDesc] = &[SpanDesc {
         id: SpanKindId(1),
         name: "Calibration",
-        class: StorageClass::DEFAULT,
+        class: StorageClass::Default,
     }];
 
     fn schema() -> Schema {

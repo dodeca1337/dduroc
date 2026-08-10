@@ -55,14 +55,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("— ротация в бюджете канала —");
     let store = Store::open(StoreConfig::new(root).with_budget(16 << 20).channel(
-        StorageClass::TELEMETRY,
+        StorageClass::Telemetry,
         ChannelConfig {
             // Слепки уже плотные — сжатие только жгло бы CPU.
             compression: Compression::None,
             // Телеметрии хватает fdatasync при запечатывании сегмента.
             durability: Durability::Relaxed,
             // 12 МиБ бюджета при сегменте 4 МиБ: живут три сегмента.
-            ..ChannelConfig::new("telemetry", 12 << 20)
+            ..ChannelConfig::new(12 << 20)
         },
     ))?;
     let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
@@ -120,10 +120,10 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             .with_budget(16 << 20)
             .with_total_budget(12 << 20)
             .channel(
-                StorageClass::TELEMETRY,
+                StorageClass::Telemetry,
                 ChannelConfig {
                     compression: Compression::None,
-                    ..ChannelConfig::new("telemetry", 16 << 20)
+                    ..ChannelConfig::new(16 << 20)
                 },
             ),
     )?;

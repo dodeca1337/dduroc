@@ -919,12 +919,12 @@ fn level_path(level: &Ident) -> syn::Result<TokenStream2> {
 
 fn class_path(store: Option<&Ident>) -> syn::Result<TokenStream2> {
     let Some(store) = store else {
-        return Ok(quote!(::dduroc::StorageClass::DEFAULT));
+        return Ok(quote!(::dduroc::StorageClass::Default));
     };
     Ok(match store.to_string().as_str() {
-        "default" => quote!(::dduroc::StorageClass::DEFAULT),
-        "critical" => quote!(::dduroc::StorageClass::CRITICAL),
-        "telemetry" => quote!(::dduroc::StorageClass::TELEMETRY),
+        "default" => quote!(::dduroc::StorageClass::Default),
+        "critical" => quote!(::dduroc::StorageClass::Critical),
+        "telemetry" => quote!(::dduroc::StorageClass::Telemetry),
         // Неизвестное имя — ошибка, а не новый класс. Раньше любой
         // идентификатор молча превращался в `StorageClass("…")`: описка в
         // `critical` давала канал с другим именем, другой политикой

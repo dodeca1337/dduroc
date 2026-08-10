@@ -99,13 +99,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // тысячи, сумма их бюджетов носителю не по карману. При
             // превышении вытесняется самый старый сегмент хранилища.
             .with_total_budget(256 << 20)
-            // Политику канала можно переопределить по классу хранения.
-            // Имя каталога берётся из класса, не из конфига.
+            // Политику канала можно переопределить по классу хранения;
+            // имя каталога — сам класс, в конфиге только политика.
             .channel(
-                StorageClass::TELEMETRY,
+                StorageClass::Telemetry,
                 ChannelConfig {
                     durability: Durability::Relaxed, // sync при запечатывании
-                    ..ChannelConfig::new("telemetry", 16 << 20)
+                    ..ChannelConfig::new(16 << 20)
                 },
             ),
     )?;

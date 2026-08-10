@@ -197,7 +197,9 @@ pub struct NsSetup {
     pub protocol_version: ProtocolVersion,
     pub store_id: u64,
     pub boot: BootCounter,
-    pub channels: Vec<ChannelConfig>,
+    /// Каналы вместе с именами каталогов. Writer классов хранения не знает:
+    /// его дело — каталоги и политики, имя приходит снаружи готовым.
+    pub channels: Vec<(String, ChannelConfig)>,
     pub drops: Arc<DropCounters>,
 }
 
@@ -1811,10 +1813,11 @@ impl WriterLoop {
             boot: setup.boot,
         };
         let mut channels = Vec::with_capacity(setup.channels.len());
-        for (i, cfg) in setup.channels.into_iter().enumerate() {
-            crate::fsutil::create_dir_all_synced(&setup.dir.join(&cfg.name))?;
+        for (i, (name, cfg)) in setup.channels.into_iter().enumerate() {
+            let dir = setup.dir.join(&name);
+            crate::fsutil::create_dir_all_synced(&dir)?;
             channels.push(ChannelState::new(
-                setup.dir.join(&cfg.name),
+                dir,
                 cfg,
                 identity,
                 ChannelIdx(i as u16),
@@ -1985,7 +1988,7 @@ mod tests {
         let drops = Arc::new(DropCounters::new(1));
         let mut ch = ChannelState::new(
             dir.path().to_path_buf(),
-            ChannelConfig::new("default", 64 * 1024 * 1024),
+            ChannelConfig::new(64 * 1024 * 1024),
             SegmentIdentity {
                 protocol_version: ProtocolVersion(1),
                 store_id: 0,
@@ -2072,6 +2075,12 @@ mod tests {
         boot: u32,
     ) -> NsId {
         let drops = Arc::new(DropCounters::new(channels.len()));
+        // Имена каталогов в тестах синтетические: writer безразличен к ним.
+        let channels = channels
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| (format!("ch{i}"), c))
+            .collect();
         w.register(NsSetup {
             name: name.to_owned(),
             dir: dir.to_path_buf(),
@@ -2112,10 +2121,8 @@ mod tests {
         // повторное выделение буфера блока со scratch'ем на каждой аварийной
         // записи — ровно на том пути, ради скорости которого канал и заведён.
         let dir = tempfile::tempdir().unwrap();
-        let (mut w, ns) = loop_with_one_channel(
-            dir.path(),
-            ChannelConfig::critical("critical", 16 * 1024 * 1024),
-        );
+        let (mut w, ns) =
+            loop_with_one_channel(dir.path(), ChannelConfig::critical(16 * 1024 * 1024));
 
         w.batch.push(Staged {
             ns,
@@ -2197,8 +2204,7 @@ mod tests {
         // — притом что пишущих в любой момент единицы. Простояв отведённое,
         // канал обязан отдать и файл, и дескриптор.
         let dir = tempfile::tempdir().unwrap();
-        let (mut w, ns) =
-            loop_with_one_channel(dir.path(), ChannelConfig::new("default", 16 * 1024 * 1024));
+        let (mut w, ns) = loop_with_one_channel(dir.path(), ChannelConfig::new(16 * 1024 * 1024));
         assert_eq!(
             open_fds_under(dir.path()),
             0,
@@ -2307,12 +2313,12 @@ mod tests {
 
     /// Канал с мелкими сегментами и без сжатия: тесту нужно, чтобы сегменты
     /// действительно кончались, а не сжимались до нуля.
-    fn dense_channel(name: &str, channel_budget: u64) -> ChannelConfig {
+    fn dense_channel(channel_budget: u64) -> ChannelConfig {
         ChannelConfig {
             segment_bytes: 1 << 20,
             block_max_bytes: 64 << 10,
             compression: dduroc_format::Compression::None,
-            ..ChannelConfig::new(name, channel_budget)
+            ..ChannelConfig::new(channel_budget)
         }
     }
 
@@ -2356,13 +2362,13 @@ mod tests {
             &mut w,
             "quiet",
             quiet_dir.path(),
-            vec![dense_channel("default", 64 << 20)],
+            vec![dense_channel(64 << 20)],
         );
         let noisy = add_namespace(
             &mut w,
             "noisy",
             noisy_dir.path(),
-            vec![dense_channel("default", 64 << 20)],
+            vec![dense_channel(64 << 20)],
         );
 
         // Молчащий пишет первым и замолкает: его сегмент — самый старый в
@@ -2424,12 +2430,7 @@ mod tests {
         // запуск: восстановление и так обходит файл, чтобы найти конец данных.
         let dir = tempfile::tempdir().unwrap();
         let mut w = empty_loop(None);
-        let ns = add_namespace(
-            &mut w,
-            "ns",
-            dir.path(),
-            vec![dense_channel("default", 64 << 20)],
-        );
+        let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
         w.batch.push(blob(ns, 1, 64));
         w.apply_batch();
         let path = open_segment_path(&w, ns);
@@ -2463,7 +2464,7 @@ mod tests {
             &mut next,
             "ns",
             dir.path(),
-            vec![dense_channel("default", 64 << 20)],
+            vec![dense_channel(64 << 20)],
             1,
         );
 
@@ -2497,13 +2498,13 @@ mod tests {
             &mut w,
             "hoarder",
             hoard_dir.path(),
-            vec![dense_channel("default", 64 << 20)],
+            vec![dense_channel(64 << 20)],
         );
         let newcomer = add_namespace(
             &mut w,
             "newcomer",
             new_dir.path(),
-            vec![dense_channel("default", 64 << 20)],
+            vec![dense_channel(64 << 20)],
         );
 
         // Сосед набил несколько сегментов и в свой бюджет прекрасно влезает:
@@ -2568,13 +2569,13 @@ mod tests {
             &mut w,
             "quiet",
             quiet_dir.path(),
-            vec![dense_channel("default", 64 << 20)],
+            vec![dense_channel(64 << 20)],
         );
         let noisy = add_namespace(
             &mut w,
             "noisy",
             noisy_dir.path(),
-            vec![dense_channel("default", 64 << 20)],
+            vec![dense_channel(64 << 20)],
         );
 
         w.batch.push(blob(quiet, 1, 8));
@@ -2622,12 +2623,7 @@ mod tests {
         // из-под записи и не сделать вид, что всё в порядке.
         let dir = tempfile::tempdir().unwrap();
         let mut w = empty_loop(Some(64 << 10));
-        let ns = add_namespace(
-            &mut w,
-            "ns",
-            dir.path(),
-            vec![dense_channel("default", 64 << 20)],
-        );
+        let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
 
         w.batch.push(blob(ns, 1, 8));
         w.apply_batch();
@@ -2654,8 +2650,7 @@ mod tests {
         // `Ok`. Отбрасывает только `shutdown`, и только потому, что после
         // него записывать некому.
         let dir = tempfile::tempdir().unwrap();
-        let (mut w, ns) =
-            loop_with_one_channel(dir.path(), ChannelConfig::new("default", 16 * 1024 * 1024));
+        let (mut w, ns) = loop_with_one_channel(dir.path(), ChannelConfig::new(16 * 1024 * 1024));
 
         // Один проход забирает не больше DRAIN_LIMIT записей, поэтому очередь
         // на одну запись длиннее заведомо не разбирается за отведённый

@@ -1146,7 +1146,7 @@ mod tests {
             id: EventId(1),
             name: "PowerSet",
             level: Level::Info,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             tags: &["rf"],
             templates: &["power set", "мощность задана"],
             fields: &[],
@@ -1156,7 +1156,7 @@ mod tests {
             id: EventId(2),
             name: "Alarm",
             level: Level::Error,
-            class: StorageClass::CRITICAL,
+            class: StorageClass::Critical,
             tags: &["fault"],
             templates: &["alarm", "авария"],
             fields: &[],
@@ -1182,7 +1182,7 @@ mod tests {
             id: MetricId(1),
             name: "temp",
             value_type: ValueType::F32,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             unit: "°C",
             tags: &["thermal"],
             kind: MetricKind::Gauge,
@@ -1204,7 +1204,7 @@ mod tests {
             id: MetricId(2),
             name: "link",
             value_type: ValueType::U64,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             unit: "",
             tags: &["rf"],
             kind: MetricKind::State,
@@ -1215,7 +1215,7 @@ mod tests {
     static SPANS: &[SpanDesc] = &[SpanDesc {
         id: SpanKindId(1),
         name: "Calibration",
-        class: StorageClass::DEFAULT,
+        class: StorageClass::Default,
     }];
 
     fn schema() -> Schema {
@@ -1597,7 +1597,7 @@ mod tests {
             id: MetricId(2), // тот же номер, другая величина
             name: "voltage",
             value_type: ValueType::F32,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             unit: "V",
             tags: &[],
             kind: MetricKind::Gauge,

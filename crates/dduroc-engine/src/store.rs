@@ -47,11 +47,9 @@ pub struct StoreConfig {
     /// Конфигурации каналов по классу хранения. Класс, которого здесь нет,
     /// получает настройки по умолчанию для своего бюджета.
     ///
-    /// Ключ — сам [`StorageClass`], а не его имя строкой. Со строковым ключом
-    /// имя канала жило в двух местах — в ключе и в `ChannelConfig::name`, — и
-    /// они могли разойтись: описка в одном из них не давала ни ошибки, ни
-    /// предупреждения, а просто оставляла класс с настройками по умолчанию.
-    /// Критические данные при этом молча получали политику обычного канала.
+    /// Ключ — [`StorageClass`], перечисление: класс с опечаткой непредставим,
+    /// а имя каталога канала — производная от класса, второго источника имени
+    /// не существует.
     pub channels: HashMap<StorageClass, ChannelConfig>,
     /// Бюджет по умолчанию **на канал** неймспейса.
     ///
@@ -124,12 +122,7 @@ impl StoreConfig {
     }
 
     /// Задать настройки канала указанного класса хранения.
-    ///
-    /// Имя канала (и его каталога) берётся из класса, а не из переданного
-    /// конфига: два источника одного имени неизбежно расходятся, и расхождение
-    /// здесь стоило бы классу его политики долговечности.
-    pub fn channel(mut self, class: StorageClass, mut config: ChannelConfig) -> Self {
-        config.name = class.as_str().to_owned();
+    pub fn channel(mut self, class: StorageClass, config: ChannelConfig) -> Self {
         self.channels.insert(class, config);
         self
     }
@@ -138,10 +131,10 @@ impl StoreConfig {
         if let Some(c) = self.channels.get(&class) {
             return c.clone();
         }
-        if class == StorageClass::CRITICAL {
-            ChannelConfig::critical(class.as_str(), self.default_budget_bytes)
+        if class == StorageClass::Critical {
+            ChannelConfig::critical(self.default_budget_bytes)
         } else {
-            ChannelConfig::new(class.as_str(), self.default_budget_bytes)
+            ChannelConfig::new(self.default_budget_bytes)
         }
     }
 
@@ -160,17 +153,9 @@ impl StoreConfig {
     /// после запечатывания, и канал не хранил бы ничего.
     fn validate(&self) -> Result<()> {
         let mut widest = 0;
-        for config in self.channels.values() {
-            config.validate()?;
-            widest = widest.max(config.segment_bytes);
-        }
-        for class in [
-            StorageClass::DEFAULT,
-            StorageClass::CRITICAL,
-            StorageClass::TELEMETRY,
-        ] {
+        for class in StorageClass::ALL {
             let config = self.config_for(class);
-            config.validate()?;
+            config.validate(class.as_str())?;
             widest = widest.max(config.segment_bytes);
         }
         // Потолок хранилища ниже пары сегментов невыполним по построению:
@@ -352,10 +337,13 @@ impl Store {
         let meta = NsMeta::open(&dir, name, &schema)?;
 
         let classes = schema.classes();
-        let channel_configs: Vec<ChannelConfig> =
-            classes.iter().map(|c| self.config.config_for(*c)).collect();
-        for c in &channel_configs {
-            c.validate()?;
+        // Имя канала — производная от класса; конфиг несёт только политику.
+        let channel_configs: Vec<(String, ChannelConfig)> = classes
+            .iter()
+            .map(|c| (c.as_str().to_owned(), self.config.config_for(*c)))
+            .collect();
+        for (name, c) in &channel_configs {
+            c.validate(name)?;
         }
 
         let drops = Arc::new(DropCounters::new(channel_configs.len()));
@@ -912,7 +900,7 @@ mod tests {
             id: EventId(1),
             name: "Tick",
             level: Level::Info,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             tags: &[],
             templates: &["tick"],
             fields: &[],
@@ -998,7 +986,7 @@ mod tests {
             id: EventId(1),
             name: "Tick",
             level: Level::Info,
-            class: StorageClass::DEFAULT,
+            class: StorageClass::Default,
             tags: &[],
             templates: &["tick"],
             fields: &[],

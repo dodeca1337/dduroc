@@ -516,19 +516,17 @@ mod tests {
         // самим. `Compression` не был реэкспортирован, и настроить сжатие
         // канала, не добавив в проект `dduroc-engine` вручную, было нельзя —
         // при том, что поле в `ChannelConfig` публичное.
-        // Заодно проверяется, что имя канала берётся из класса, а не из
-        // конфига: два источника одного имени расходятся, и расхождение здесь
-        // увело бы записи класса в чужой каталог с чужой политикой. Имя в
-        // конфиге намеренно неверное.
+        // Имя каталога — производная от класса: в конфиге имени нет вовсе,
+        // и увести записи класса в чужой каталог опиской стало непредставимо.
         let dir = tempfile::tempdir().unwrap();
         let config = StoreConfig::new(dir.path())
             .with_budget(16 * 1024 * 1024)
             .channel(
-                StorageClass::TELEMETRY,
+                StorageClass::Telemetry,
                 ChannelConfig {
                     compression: Compression::None,
                     durability: Durability::Relaxed,
-                    ..ChannelConfig::new("opechatka", 16 * 1024 * 1024)
+                    ..ChannelConfig::new(16 * 1024 * 1024)
                 },
             );
         {
@@ -551,10 +549,6 @@ mod tests {
             channels.iter().any(|c| c == "telemetry"),
             "каталог назван классом: {channels:?}"
         );
-        assert!(
-            !channels.iter().any(|c| c == "opechatka"),
-            "и только им: {channels:?}"
-        );
     }
 
     #[test]
@@ -564,11 +558,11 @@ mod tests {
         // ротация съедала единственный сегмент сразу после запечатывания.
         let dir = tempfile::tempdir().unwrap();
         let broken = StoreConfig::new(dir.path()).channel(
-            StorageClass::DEFAULT,
+            StorageClass::Default,
             ChannelConfig {
                 budget_bytes: 4 * 1024 * 1024,
                 segment_bytes: 4 * 1024 * 1024,
-                ..ChannelConfig::new("default", 4 * 1024 * 1024)
+                ..ChannelConfig::new(4 * 1024 * 1024)
             },
         );
         let err = Store::open(broken).expect_err("бюджет в один сегмент бессмыслен");
@@ -591,15 +585,15 @@ mod tests {
     #[test]
     fn storage_class_comes_from_declaration() {
         let overheat = testing::SCHEMA.event(EventId(2)).unwrap();
-        assert_eq!(overheat.class, StorageClass::CRITICAL);
+        assert_eq!(overheat.class, StorageClass::Critical);
         assert_eq!(overheat.level, Level::Error);
 
         let power = testing::SCHEMA.event(EventId(1)).unwrap();
-        assert_eq!(power.class, StorageClass::DEFAULT);
+        assert_eq!(power.class, StorageClass::Default);
         assert_eq!(power.tags, &["rf"]);
 
         let spectrum = testing::SCHEMA.metric(MetricId(2)).unwrap();
-        assert_eq!(spectrum.class, StorageClass::TELEMETRY);
+        assert_eq!(spectrum.class, StorageClass::Telemetry);
         assert_eq!(spectrum.value_type, ValueType::Blob);
     }
 
