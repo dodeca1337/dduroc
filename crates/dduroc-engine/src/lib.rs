@@ -34,7 +34,7 @@ pub mod stats;
 pub mod store;
 pub mod writer;
 
-pub use channel::{ChannelConfig, Durability};
+pub use channel::ChannelConfig;
 pub use clock::Clock;
 pub use epochs::{EpochStore, Epochs, SyncSource};
 pub use error::{Error, Result};

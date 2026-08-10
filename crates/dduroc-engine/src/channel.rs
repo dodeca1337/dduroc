@@ -9,34 +9,6 @@ use crate::error::{Error, Result};
 use dduroc_format::Compression;
 use std::time::Duration;
 
-/// Политика синхронизации с диском.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Durability {
-    /// `fdatasync` при первой же возможности после записи.
-    ///
-    /// Это **group commit**, а не sync на событие: writer забирает из очереди
-    /// всё накопившееся, пишет одним блоком и синхронизирует один раз. Всплеск
-    /// из сотни критических событий стоит одного `fdatasync` (~1–10 мс на
-    /// eMMC), а не сотни.
-    Immediate,
-    /// Не чаще указанного интервала. Окно потери при обрыве питания равно
-    /// интервалу.
-    Interval(Duration),
-    /// Только при запечатывании сегмента и завершении работы.
-    Relaxed,
-}
-
-impl Durability {
-    /// Минимальный интервал между `fdatasync`.
-    pub fn min_interval(self) -> Option<Duration> {
-        match self {
-            Durability::Immediate => Some(Duration::ZERO),
-            Durability::Interval(d) => Some(d),
-            Durability::Relaxed => None,
-        }
-    }
-}
-
 /// Настройки канала — только политика.
 ///
 /// Имени здесь нет намеренно: канал живёт в каталоге своего класса хранения
@@ -52,7 +24,18 @@ pub struct ChannelConfig {
     pub block_max_bytes: usize,
     /// Максимальная задержка выталкивания неполного блока.
     pub flush_interval: Duration,
-    pub durability: Durability,
+    /// Не чаще этого интервала — `fdatasync`. Окно потери при обрыве питания
+    /// равно интервалу; синхронизация при запечатывании сегмента и на
+    /// завершении происходит в любом случае.
+    ///
+    /// `ZERO` — синхронизировать сразу после каждой групповой фиксации.
+    /// Это group commit, а не sync на запись: writer забирает из очереди всё
+    /// накопившееся, пишет одним блоком и синхронизирует один раз — всплеск
+    /// из сотни событий стоит одного `fdatasync` (~1–10 мс на eMMC). Так
+    /// работает критический канал, и для него это не настройка, а
+    /// определение: ненулевой интервал у критического класса отвергается при
+    /// открытии хранилища.
+    pub sync_interval: Duration,
     pub compression: Compression,
 }
 
@@ -64,7 +47,7 @@ impl ChannelConfig {
             segment_bytes: Self::segment_size_for(budget_bytes),
             block_max_bytes: 64 * 1024,
             flush_interval: Duration::from_secs(1),
-            durability: Durability::Interval(Duration::from_secs(10)),
+            sync_interval: Duration::from_secs(10),
             compression: Compression::Lz4,
         }
     }
@@ -75,7 +58,7 @@ impl ChannelConfig {
     /// эффективности, а копить — ровно то, чего критический канал избегает.
     pub fn critical(budget_bytes: u64) -> Self {
         Self {
-            durability: Durability::Immediate,
+            sync_interval: Duration::ZERO,
             compression: Compression::None,
             block_max_bytes: 8 * 1024,
             flush_interval: Duration::from_millis(50),
@@ -192,7 +175,11 @@ mod tests {
     #[test]
     fn critical_channel_avoids_buffering() {
         let c = ChannelConfig::critical(256 * 1024 * 1024);
-        assert_eq!(c.durability, Durability::Immediate);
+        assert_eq!(
+            c.sync_interval,
+            Duration::ZERO,
+            "немедленность — определение критического канала"
+        );
         assert_eq!(c.compression, Compression::None);
         assert!(c.flush_interval < Duration::from_secs(1));
         c.validate("ch").unwrap();
@@ -244,15 +231,5 @@ mod tests {
         }
         assert!(validate_component(&"x".repeat(64)).is_ok());
         assert!(validate_component(&"x".repeat(65)).is_err());
-    }
-
-    #[test]
-    fn durability_intervals() {
-        assert_eq!(Durability::Immediate.min_interval(), Some(Duration::ZERO));
-        assert_eq!(
-            Durability::Interval(Duration::from_secs(5)).min_interval(),
-            Some(Duration::from_secs(5))
-        );
-        assert_eq!(Durability::Relaxed.min_interval(), None);
     }
 }

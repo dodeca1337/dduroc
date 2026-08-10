@@ -27,7 +27,7 @@
 //! самоблок при заполненной очереди. Вся диагностика — атомарные счётчики
 //! ([`crate::stats`]) и отметки, вставляемые прямо в поток записей.
 
-use crate::channel::{ChannelConfig, Durability};
+use crate::channel::ChannelConfig;
 use crate::error::{Error, IoContext, Result};
 use crate::rotation::{Inventory, SegmentEntry};
 use crate::segment::SegmentWriter;
@@ -100,8 +100,9 @@ const DRAIN_ROUNDS: usize = 64;
 
 /// Сколько канал должен простоять без дела, прежде чем отдаст буферы.
 ///
-/// Мгновенный возврат неверен: канал с [`Durability::Immediate`] оказывается
-/// «без дела» после **каждой** групповой фиксации — блок вытолкнут,
+/// Мгновенный возврат неверен: канал с немедленной синхронизацией
+/// (`sync_interval == 0` — критический) оказывается «без дела» после
+/// **каждой** групповой фиксации — блок вытолкнут,
 /// синхронизировать нечего, — и отдавал бы буфер блока со scratch'ем на
 /// каждом батче, чтобы тут же выделить их снова. Это ровно горячий путь
 /// критических записей. Пауза его не касается, а настоящее бездействие от
@@ -654,10 +655,7 @@ impl ChannelState {
         if !self.dirty_since_sync {
             return None;
         }
-        self.config
-            .durability
-            .min_interval()
-            .map(|d| self.last_sync + d)
+        Some(self.last_sync + self.config.sync_interval)
     }
 }
 
@@ -911,7 +909,7 @@ impl WriterLoop {
             else {
                 continue;
             };
-            if ch.config.durability == Durability::Immediate && ch.dirty_since_sync {
+            if ch.config.sync_interval == Duration::ZERO && ch.dirty_since_sync {
                 let done = Self::flush_block(ch, &counters)
                     .and_then(|()| Self::sync_channel(ch, &counters));
                 if let Err(e) = done {

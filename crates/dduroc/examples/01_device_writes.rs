@@ -9,7 +9,7 @@
 //! же схеме (пример 02).
 
 use dduroc::prelude::*;
-use dduroc::{ChannelConfig, Durability, StorageClass};
+use dduroc::{ChannelConfig, StorageClass};
 
 // ---------------------------------------------------------------------------
 // Схема — единственный источник правды о том, что пишет этот сервис.
@@ -104,7 +104,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .channel(
                 StorageClass::Telemetry,
                 ChannelConfig {
-                    durability: Durability::Relaxed, // sync при запечатывании
+                    // Телеметрия терпит минуту незаписанного — реже fdatasync.
+                    sync_interval: std::time::Duration::from_secs(60),
                     ..ChannelConfig::new(16 << 20)
                 },
             ),

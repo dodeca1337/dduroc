@@ -152,6 +152,18 @@ impl StoreConfig {
     /// меньше двух сегментов — ротация съедала бы единственный сегмент сразу
     /// после запечатывания, и канал не хранил бы ничего.
     fn validate(&self) -> Result<()> {
+        // Немедленная синхронизация — определение критического класса, а не
+        // настройка: канал, ради которого приложение готово ждать очередь,
+        // не имеет права отставать от носителя. Молча перекрыть интервал
+        // нельзя — оператор считал бы, что настройка действует.
+        if self.config_for(StorageClass::Critical).sync_interval != std::time::Duration::ZERO {
+            return Err(Error::BadChannel {
+                name: StorageClass::Critical.as_str().to_owned(),
+                reason: "критический канал синхронизируется сразу — в этом его \
+                         смысл; настраивайте его от ChannelConfig::critical",
+            });
+        }
+
         let mut widest = 0;
         for class in StorageClass::ALL {
             let config = self.config_for(class);

@@ -156,7 +156,7 @@ pub use serde;
 pub use serde_json;
 
 pub use dduroc_engine::MigrationReport;
-pub use dduroc_engine::channel::{ChannelConfig, Durability};
+pub use dduroc_engine::channel::ChannelConfig;
 pub use dduroc_engine::epochs::SyncSource;
 pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, SeverityFn, StateStatus};
 pub use dduroc_engine::metric::{Blob, Metric, MetricState, MetricValue, Untyped};
@@ -525,7 +525,7 @@ mod tests {
                 StorageClass::Telemetry,
                 ChannelConfig {
                     compression: Compression::None,
-                    durability: Durability::Relaxed,
+                    sync_interval: std::time::Duration::from_secs(60),
                     ..ChannelConfig::new(16 * 1024 * 1024)
                 },
             );
@@ -570,6 +570,26 @@ mod tests {
             matches!(err, Error::BadChannel { .. }),
             "отказ пришёл именно от проверки настроек канала: {err}"
         );
+    }
+
+    #[test]
+    fn a_lagging_critical_channel_is_refused_at_open() {
+        // Немедленная синхронизация — определение критического класса, а не
+        // настройка: канал, ради которого вызывающий готов ждать очередь, не
+        // имеет права отставать от носителя. Интервал у критического — ошибка
+        // конфигурации, и молча перекрыть его нельзя: оператор считал бы, что
+        // настройка действует.
+        let dir = tempfile::tempdir().unwrap();
+        let lagging = StoreConfig::new(dir.path()).channel(
+            StorageClass::Critical,
+            ChannelConfig {
+                sync_interval: std::time::Duration::from_secs(10),
+                ..ChannelConfig::critical(16 * 1024 * 1024)
+            },
+        );
+        let err = Store::open(lagging).expect_err("критический канал не может отставать");
+        assert!(matches!(err, Error::BadChannel { .. }), "{err}");
+        assert!(err.to_string().contains("критический"), "{err}");
     }
 
     #[test]

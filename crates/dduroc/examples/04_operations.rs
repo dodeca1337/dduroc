@@ -9,7 +9,7 @@
 
 use dduroc::prelude::*;
 use dduroc::read::{EntryKind, KindFilter, Order, OwnedSampleValue, Query, Reader};
-use dduroc::{ChannelConfig, Compression, Durability, EventId, QueueSizes, StorageClass};
+use dduroc::{ChannelConfig, Compression, EventId, QueueSizes, StorageClass};
 
 dduroc::schema! {
     name: probe,
@@ -59,8 +59,8 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         ChannelConfig {
             // Слепки уже плотные — сжатие только жгло бы CPU.
             compression: Compression::None,
-            // Телеметрии хватает fdatasync при запечатывании сегмента.
-            durability: Durability::Relaxed,
+            // Телеметрия терпит минуту незаписанного — реже fdatasync.
+            sync_interval: std::time::Duration::from_secs(60),
             // 12 МиБ бюджета при сегменте 4 МиБ: живут три сегмента.
             ..ChannelConfig::new(12 << 20)
         },

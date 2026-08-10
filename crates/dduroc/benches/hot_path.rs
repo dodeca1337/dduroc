@@ -11,7 +11,7 @@
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use dduroc::prelude::*;
-use dduroc::{ChannelConfig, Durability, StorageClass};
+use dduroc::{ChannelConfig, StorageClass};
 use dduroc_format::block::{BlockBuilder, Compression};
 use dduroc_format::record::{Message, Sample};
 use dduroc_format::{EventId, MetricId, Micros, Record, Value, varint};
@@ -73,14 +73,14 @@ fn store_config(root: &std::path::Path) -> StoreConfig {
         .channel(
             StorageClass::Default,
             ChannelConfig {
-                durability: Durability::Relaxed,
+                sync_interval: std::time::Duration::from_secs(3600),
                 ..ChannelConfig::new(256 * 1024 * 1024)
             },
         )
         .channel(
             StorageClass::Critical,
             ChannelConfig {
-                durability: Durability::Relaxed,
+                sync_interval: std::time::Duration::from_secs(3600),
                 ..ChannelConfig::critical(64 * 1024 * 1024)
             },
         )
