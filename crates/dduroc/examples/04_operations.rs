@@ -1,0 +1,253 @@
+//! Эксплуатация: политика каналов, ротация, потолок хранилища, учёт потерь.
+//!
+//! Запуск: `cargo run -p dduroc --example 04_operations`
+//!
+//! Журнал на приборе живёт годами без присмотра, поэтому у движка нет
+//! состояния «место кончилось, дальше никак»: история ротируется в рамках
+//! бюджетов, потери учитываются и объявляются, нарушение контракта схемы
+//! отличается от отставания диска. Пример показывает эти механизмы по одному.
+
+use dduroc::prelude::*;
+use dduroc::read::{EntryKind, KindFilter, Order, OwnedSampleValue, Query, Reader};
+use dduroc::{ChannelConfig, Compression, Durability, EventId, QueueSizes, StorageClass};
+
+dduroc::schema! {
+    name: probe,
+    version: 1,
+    languages: [ru],
+
+    events {
+        Ping = 0x01 { level: Debug, ru: "пинг {seq}", seq: u32 },
+        // Критическое — в свой канал: fdatasync сразу после записи (group
+        // commit), без сжатия, и очередь, в которой при переполнении
+        // вызывающий ЖДЁТ места, а не теряет запись.
+        Fault = 0x02 { level: Error, store: critical, ru: "авария {code}", code: u8 },
+    }
+
+    metrics {
+        // Бинарные слепки — самый тяжёлый поток, ему канал телеметрии.
+        Chunk = 0x01 { vtype: blob, store: telemetry },
+    }
+}
+
+/// Слепок с номером в первых байтах — по нему видно, что именно выжило.
+fn chunk(index: u64) -> Vec<u8> {
+    let mut bytes = vec![0u8; 4096];
+    bytes[..8].copy_from_slice(&index.to_le_bytes());
+    bytes
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let base = std::env::temp_dir().join("dduroc-examples").join("04");
+    let _ = std::fs::remove_dir_all(&base);
+
+    rotation(&base.join("rotation"))?;
+    ceiling(&base.join("ceiling"))?;
+    losses(&base.join("losses"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 1. Ротация в бюджете канала. Бюджет — это ответ на вопрос «сколько истории
+// хранить»: канал пишет по кругу, старейший сегмент уходит целиком, свежие
+// данные не отвергаются никогда.
+// ---------------------------------------------------------------------------
+fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    println!("— ротация в бюджете канала —");
+    let store = Store::open(StoreConfig::new(root).with_budget(16 << 20).channel(
+        StorageClass::TELEMETRY,
+        ChannelConfig {
+            // Слепки уже плотные — сжатие только жгло бы CPU.
+            compression: Compression::None,
+            // Телеметрии хватает fdatasync при запечатывании сегмента.
+            durability: Durability::Relaxed,
+            // 12 МиБ бюджета при сегменте 4 МиБ: живут три сегмента.
+            ..ChannelConfig::new("telemetry", 12 << 20)
+        },
+    ))?;
+    let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
+    let chunks = ns.series(probe::metrics::Chunk)?;
+
+    // 16 МиБ слепков в 12 МиБ бюджета: голова истории обязана уйти.
+    // Периодический sync даёт диску догнать — телеметрия реального прибора
+    // приходит с частотой датчика, а не циклом while.
+    for i in 0..4096u64 {
+        chunks.sample(chunk(i));
+        if i % 512 == 511 {
+            ns.sync()?;
+        }
+    }
+    ns.sync()?;
+
+    let stats = store.stats();
+    println!(
+        "  сегментов создано {}, запечатано {}, ротировано {}; потеряно записей {}",
+        stats.segments_created, stats.segments_sealed, stats.segments_rotated, stats.dropped
+    );
+    assert!(stats.segments_rotated > 0, "{stats:?}");
+    store.shutdown();
+
+    // Что выжило: самый старый доступный слепок — уже не нулевой.
+    let reader = Reader::open(root, &[probe::SCHEMA])?;
+    let oldest = reader.query(
+        &Query::new()
+            .kinds(KindFilter::TELEMETRY)
+            .order(Order::Oldest)
+            .limit(1),
+    )?;
+    if let Some(EntryKind::Sample {
+        value: OwnedSampleValue::Blob(bytes),
+        ..
+    }) = oldest.entries.first().map(|e| &e.kind)
+    {
+        let index = u64::from_le_bytes(bytes[..8].try_into()?);
+        println!("  старейший выживший слепок: №{index} из 4096 — голова вытеснена\n");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 2. Потолок хранилища. Бюджет канала не отвечает на вопрос «сколько занять
+// на носителе»: неймспейсов много, их число растёт, и сумма бюджетов носителю
+// не по карману. `with_total_budget` — потолок на всё хранилище; при
+// превышении вытесняется старейший сегмент ХРАНИЛИЩА, в чьём бы канале он ни
+// лежал: молчащий сервис не держит место, которого не хватает шумному.
+// ---------------------------------------------------------------------------
+fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    println!("— потолок на всё хранилище —");
+    let store = Store::open(
+        StoreConfig::new(root)
+            .with_budget(16 << 20)
+            .with_total_budget(12 << 20)
+            .channel(
+                StorageClass::TELEMETRY,
+                ChannelConfig {
+                    compression: Compression::None,
+                    ..ChannelConfig::new("telemetry", 16 << 20)
+                },
+            ),
+    )?;
+
+    // Тихий сервис записал 6 МиБ и замолчал.
+    let quiet = store.namespace("orc-quiet", probe::SCHEMA)?;
+    let series = quiet.series(probe::metrics::Chunk)?;
+    for i in 0..1536u64 {
+        series.sample(chunk(i));
+        if i % 512 == 511 {
+            quiet.sync()?;
+        }
+    }
+    quiet.sync()?;
+
+    // Шумный пишет 10 МиБ: вдвоём в потолок они не помещаются.
+    let noisy = store.namespace("orc-noisy", probe::SCHEMA)?;
+    let series = noisy.series(probe::metrics::Chunk)?;
+    for i in 0..2560u64 {
+        series.sample(chunk(i));
+        if i % 512 == 511 {
+            noisy.sync()?;
+        }
+    }
+    noisy.sync()?;
+
+    // Заодно: уборка реестра эпох. Записи о запусках, от которых не осталось
+    // ни одного сегмента, вычищаются (при подъёме хранилища — автоматически).
+    let removed = store.compact_epochs()?;
+    println!("  эпох вычищено: {removed}");
+
+    let stats = store.stats();
+    store.shutdown();
+
+    let reader = Reader::open(root, &[probe::SCHEMA])?;
+    let listing = reader.namespaces()?;
+    for ns in &listing.namespaces {
+        println!("  {}: занято {} КиБ", ns.name, ns.bytes >> 10);
+    }
+    println!(
+        "  тихий писал 6 МиБ — его голову вытеснил чужой поток; \
+         поверх потолка не вылезли ни разу (over_budget: {})\n",
+        stats.over_budget
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 3. Потери и контракт. Запись не возвращает Result не потому, что исход
+// не важен, а потому, что с ним нечего делать на месте вызова. Исход не
+// исчезает: потери считаются и ОБЪЯВЛЯЮТСЯ в самом потоке записей, чужие
+// схеме записи считаются отдельно — это дефект сборки, а не отставание диска.
+// ---------------------------------------------------------------------------
+fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    println!("— потери учтены и объявлены —");
+    // Крошечные очереди делают переполнение воспроизводимым в примере.
+    let store = Store::open(StoreConfig::new(root).with_budget(16 << 20).with_queues(
+        QueueSizes {
+            normal: 4,
+            critical: 4,
+        },
+    ))?;
+    let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
+
+    // Обычный канал: очередь полна — запись теряется, отказ считается.
+    let mut refused = 0u64;
+    for seq in 0..20_000u32 {
+        if let Err(e) = ns.try_log(probe::events::Ping { seq }) {
+            assert!(e.loses_record());
+            refused += 1;
+        }
+    }
+
+    // Критический канал: очередь полна — вызывающий ждёт места. Медленнее,
+    // зато авария не потеряется.
+    for code in 0..2_000u32 {
+        ns.try_log(probe::events::Fault { code: code as u8 })
+            .expect("критическая запись не теряется");
+    }
+
+    // Запись типа, которого нет в схеме, — нарушение контракта, дефект
+    // сборки. `try_*` отдаёт вердикт вызывающему и на этом умывает руки:
+    let contract = ns
+        .try_log_raw(EventId(0xEE), &[], None)
+        .expect_err("id не из схемы");
+    assert!(contract.breaks_contract() && !contract.loses_record());
+    // …а «тихий» путь учитывает отказ сам: счётчик `rejected` плюс
+    // однократное объявление в журнале — дефект найдут, а не будут искать
+    // причину тишины.
+    ns.log_raw(EventId(0xEE), &[], None);
+
+    store.shutdown();
+    let stats = store.stats();
+    println!(
+        "  отказов на обычной очереди: {refused}; учтено потерь: {}; \
+         ожиданий на критической: {}; нарушений контракта: {}",
+        stats.dropped, stats.backpressure_waits, stats.rejected
+    );
+    assert_eq!(stats.dropped, refused);
+
+    // Дыра, о которой нигде не сказано, неотличима от тишины: потери
+    // объявлены отметками в самом потоке, и их сумма равна счётчику.
+    let reader = Reader::open(root, &[probe::SCHEMA])?;
+    let mut announced = 0u64;
+    let mut marks = 0usize;
+    for e in reader.stream(&Query::new().kinds(KindFilter {
+        text: true,
+        ..KindFilter::TELEMETRY
+    }))? {
+        let EntryKind::Text { text, .. } = &e.kind else {
+            continue;
+        };
+        if let Some(rest) = text.strip_prefix("потеряно записей: ") {
+            marks += 1;
+            announced += rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else {
+            println!("  объявление в журнале: «{text}»");
+        }
+    }
+    println!("  объявлено в потоке: {announced} (отметок: {marks}) — сходится с учётом");
+    assert_eq!(announced, stats.dropped);
+    Ok(())
+}
