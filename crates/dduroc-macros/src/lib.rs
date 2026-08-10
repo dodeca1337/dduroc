@@ -28,6 +28,26 @@
 //!     spans {
 //!         Calibration = 0x01,
 //!     }
+//!
+//!     // Раскладки прежних версий — их потребляют шаги миграции.
+//!     history {
+//!         1 { events { PowerSet = 0x01 { dbm: i8 } } }
+//!     }
+//!
+//!     // Шаг N приводит записи версии N к версии N+1.
+//!     migrations {
+//!         1 => {
+//!             // Типизированное правило: декод старой раскладки, энкод новой
+//!             // и диспетчер генерируются, затронутые типы выводятся из
+//!             // ключей — разойтись с фактическим поведением им не из чего.
+//!             v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) },
+//!             event(0x05): drop,               // тип удалён — имени больше нет
+//!             metric(0x07): metrics::Temp,     // ремап id, payload как был
+//!         },
+//!         // Люк: сырой fn. Затронутые типы объявляются руками; не объявлены
+//!         // — шаг считается затрагивающим всё.
+//!         2 => migrate_v2,
+//!     }
 //! }
 //! ```
 //!
@@ -56,6 +76,7 @@ struct SchemaInput {
     metrics: Vec<MetricDef>,
     spans: Vec<SpanDef>,
     migrations: Vec<MigrationDef>,
+    history: Vec<HistoryDef>,
 }
 
 struct EventDef {
@@ -101,11 +122,23 @@ struct SpanDef {
 
 struct MigrationDef {
     from: u16,
-    func: syn::Path,
-    /// Типы, затронутые шагом. `None` — не объявлены, значит шаг считается
-    /// затрагивающим **всё**: пропустить сегмент молча хуже, чем переписать
-    /// лишний.
-    touches: Option<Touches>,
+    step: StepDef,
+}
+
+/// Тело шага миграции.
+enum StepDef {
+    /// Сырой fn — люк для того, что правилами не выразить.
+    Raw {
+        func: syn::Path,
+        /// Типы, затронутые шагом. `None` — не объявлены, значит шаг
+        /// считается затрагивающим **всё**: пропустить сегмент молча хуже,
+        /// чем переписать лишний.
+        touches: Option<Touches>,
+    },
+    /// Типизированные правила: диспетчер, декод и энкод генерирует макрос, а
+    /// затронутые типы **выводятся** из ключей — разойтись с фактическим
+    /// поведением им не из чего.
+    Rules(Vec<RuleDef>),
 }
 
 /// Затронутые шагом миграции типы.
@@ -113,6 +146,65 @@ struct MigrationDef {
 struct Touches {
     events: Vec<Ident>,
     metrics: Vec<Ident>,
+}
+
+/// Одно правило типизированного шага: `ключ: действие`.
+struct RuleDef {
+    key: RuleKey,
+    action: RuleAction,
+}
+
+/// Что правило отбирает — по идентификатору В ТОЙ версии, которую шаг читает.
+enum RuleKey {
+    /// `v1::PowerSet` — раскладка из history: и старый id, и тип для декода.
+    HistoryEvent { version: u16, name: Ident },
+    /// `events::PowerSet` — текущая раскладка (чистка значений, drop).
+    CurrentEvent { name: Ident },
+    /// `event(0x05)` — голый id: тип удалён из схемы, имени больше нет.
+    RawEvent { id: u16, span: proc_macro2::Span },
+    /// `metrics::Temp` — текущая метрика.
+    CurrentMetric { name: Ident },
+    /// `metric(0x07)` — голый id метрики.
+    RawMetric { id: u16, span: proc_macro2::Span },
+}
+
+impl RuleKey {
+    fn span(&self) -> proc_macro2::Span {
+        match self {
+            RuleKey::HistoryEvent { name, .. }
+            | RuleKey::CurrentEvent { name }
+            | RuleKey::CurrentMetric { name } => name.span(),
+            RuleKey::RawEvent { span, .. } | RuleKey::RawMetric { span, .. } => *span,
+        }
+    }
+}
+
+/// Что правило делает с записью.
+enum RuleAction {
+    /// `drop` — запись удаляется.
+    Drop,
+    /// Замыкание или функция: декод старой раскладки → новый payload.
+    Map(syn::Expr),
+    /// `events::New` — сменить id, payload байт в байт.
+    RemapEvent(Ident),
+    /// `metrics::New` — сменить метрику отсчёта.
+    RemapMetric(Ident),
+}
+
+/// Раскладки изменившихся типов, как они были в версии `version`, — то, что
+/// потребляют шаги миграции. Порождает `pub mod v<N>` с Deserialize-типами.
+struct HistoryDef {
+    version: u16,
+    span: proc_macro2::Span,
+    events: Vec<HistoryEvent>,
+}
+
+/// Старое событие: только id и поля — уровень, шаблоны и тэги на диске не
+/// живут, и старой раскладке они не нужны.
+struct HistoryEvent {
+    name: Ident,
+    id: u16,
+    fields: Vec<(Ident, Type)>,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -146,6 +238,7 @@ impl Parse for SchemaInput {
         let mut metrics = Vec::new();
         let mut spans = Vec::new();
         let mut migrations = Vec::new();
+        let mut history = Vec::new();
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -196,17 +289,31 @@ impl Parse for SchemaInput {
                     while !content.is_empty() {
                         let lit: LitInt = content.parse()?;
                         content.parse::<Token![=>]>()?;
-                        let func: syn::Path = content.parse()?;
-                        let touches = if content.peek(syn::token::Brace) {
-                            Some(parse_touches(&content)?)
+                        // Скобки сразу после `=>` — типизированные правила;
+                        // иначе путь к сырому fn с необязательными touches.
+                        let step = if content.peek(syn::token::Brace) {
+                            StepDef::Rules(parse_rules(&content)?)
                         } else {
-                            None
+                            let func: syn::Path = content.parse()?;
+                            let touches = if content.peek(syn::token::Brace) {
+                                Some(parse_touches(&content)?)
+                            } else {
+                                None
+                            };
+                            StepDef::Raw { func, touches }
                         };
                         migrations.push(MigrationDef {
                             from: lit.base10_parse()?,
-                            func,
-                            touches,
+                            step,
                         });
+                        let _ = content.parse::<Token![,]>();
+                    }
+                }
+                "history" => {
+                    let content;
+                    braced!(content in input);
+                    while !content.is_empty() {
+                        history.push(parse_history(&content)?);
                         let _ = content.parse::<Token![,]>();
                     }
                 }
@@ -215,7 +322,7 @@ impl Parse for SchemaInput {
                         key.span(),
                         format!(
                             "неизвестная секция `{other}`: ожидались name, version, \
-                             languages, events, metrics, spans, migrations"
+                             languages, events, metrics, spans, history, migrations"
                         ),
                     ));
                 }
@@ -241,6 +348,7 @@ impl Parse for SchemaInput {
             metrics,
             spans,
             migrations,
+            history,
         })
     }
 }
@@ -519,6 +627,155 @@ fn parse_touches(input: ParseStream) -> syn::Result<Touches> {
         let _ = content.parse::<Token![,]>();
     }
     Ok(out)
+}
+
+/// Разобрать типизированные правила шага: `{ ключ: действие, ... }`.
+fn parse_rules(input: ParseStream) -> syn::Result<Vec<RuleDef>> {
+    let content;
+    braced!(content in input);
+    let mut out = Vec::new();
+    while !content.is_empty() {
+        let key = parse_rule_key(&content)?;
+        content.parse::<Token![:]>()?;
+        let action = parse_rule_action(&content)?;
+        out.push(RuleDef { key, action });
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(out)
+}
+
+/// Ключ правила: `v1::PowerSet`, `events::X`, `metrics::X`,
+/// `event(0x05)`, `metric(0x07)`.
+fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
+    if input.peek(Ident) && input.peek2(syn::token::Paren) {
+        let kind: Ident = input.parse()?;
+        let content;
+        syn::parenthesized!(content in input);
+        let lit: LitInt = content.parse()?;
+        let id = lit.base10_parse::<u16>()?;
+        return match kind.to_string().as_str() {
+            "event" => Ok(RuleKey::RawEvent {
+                id,
+                span: lit.span(),
+            }),
+            "metric" => Ok(RuleKey::RawMetric {
+                id,
+                span: lit.span(),
+            }),
+            other => Err(syn::Error::new(
+                kind.span(),
+                format!("неизвестный вид ключа `{other}(..)`: ожидались event, metric"),
+            )),
+        };
+    }
+
+    let path: syn::Path = input.parse()?;
+    let bad = |msg: &str| Err(syn::Error::new_spanned(&path, msg.to_owned()));
+    if path.segments.len() != 2 {
+        return bad(
+            "ключ правила — путь из двух сегментов: `v1::Тип`, `events::Тип`, \
+             `metrics::Метрика`, либо голый id: `event(0x05)`, `metric(0x07)`",
+        );
+    }
+    let head = path.segments[0].ident.to_string();
+    let name = path.segments[1].ident.clone();
+    if head == "events" {
+        return Ok(RuleKey::CurrentEvent { name });
+    }
+    if head == "metrics" {
+        return Ok(RuleKey::CurrentMetric { name });
+    }
+    if let Some(digits) = head.strip_prefix('v')
+        && let Ok(version) = digits.parse::<u16>()
+    {
+        return Ok(RuleKey::HistoryEvent { version, name });
+    }
+    bad("первый сегмент ключа — `v<N>` (раскладка из history), `events` или `metrics`")
+}
+
+/// Действие правила: `drop`, путь-ремап или замыкание/функция.
+fn parse_rule_action(input: ParseStream) -> syn::Result<RuleAction> {
+    let expr: syn::Expr = input.parse()?;
+    if let syn::Expr::Path(p) = &expr {
+        let segs = &p.path.segments;
+        if segs.len() == 1 && segs[0].ident == "drop" {
+            return Ok(RuleAction::Drop);
+        }
+        if segs.len() == 2 {
+            let head = segs[0].ident.to_string();
+            let name = segs[1].ident.clone();
+            if head == "events" {
+                return Ok(RuleAction::RemapEvent(name));
+            }
+            if head == "metrics" {
+                return Ok(RuleAction::RemapMetric(name));
+            }
+        }
+    }
+    Ok(RuleAction::Map(expr))
+}
+
+/// Разобрать одну запись history: `N { events { Имя = 0xID { поле: тип } } }`.
+fn parse_history(input: ParseStream) -> syn::Result<HistoryDef> {
+    let lit: LitInt = input.parse()?;
+    let version = lit.base10_parse::<u16>()?;
+    let content;
+    braced!(content in input);
+
+    let mut events = Vec::new();
+    while !content.is_empty() {
+        let key: Ident = content.parse()?;
+        match key.to_string().as_str() {
+            "events" => {
+                let inner;
+                braced!(inner in content);
+                while !inner.is_empty() {
+                    events.push(parse_history_event(&inner)?);
+                    let _ = inner.parse::<Token![,]>();
+                }
+            }
+            // У отсчётов и спанов payload-раскладки нет: их идентификаторы
+            // ремапятся правилами напрямую, объявлять в history нечего.
+            other => {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!(
+                        "в history объявляются только `events`, получено `{other}`: \
+                         у отсчётов и спанов нет payload-раскладки"
+                    ),
+                ));
+            }
+        }
+        let _ = content.parse::<Token![,]>();
+    }
+    if events.is_empty() {
+        return Err(syn::Error::new(
+            lit.span(),
+            format!("history {version} пуста: раз раскладки не изменились, запись не нужна"),
+        ));
+    }
+    Ok(HistoryDef {
+        version,
+        span: lit.span(),
+        events,
+    })
+}
+
+/// Старое событие: `Имя = 0xID { поле: тип, ... }`. Только поля — уровень,
+/// шаблоны и тэги на диск не пишутся, и старой раскладке они не нужны.
+fn parse_history_event(input: ParseStream) -> syn::Result<HistoryEvent> {
+    let name: Ident = input.parse()?;
+    let id = parse_id(input)?;
+    let content;
+    braced!(content in input);
+    let mut fields = Vec::new();
+    while !content.is_empty() {
+        let field: Ident = content.parse()?;
+        content.parse::<Token![:]>()?;
+        fields.push((field, content.parse::<Type>()?));
+        let _ = content.parse::<Token![,]>();
+    }
+    Ok(HistoryEvent { name, id, fields })
 }
 
 fn parse_span(input: ParseStream) -> syn::Result<SpanDef> {
@@ -806,6 +1063,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         metrics: input.metrics.iter().map(clone_metric).collect(),
         spans: input.spans.iter().map(clone_span).collect(),
         migrations: input.migrations.iter().map(clone_migration).collect(),
+        history: input.history.iter().map(clone_history).collect(),
     };
     input.events.sort_by_key(|e| e.id);
     input.metrics.sort_by_key(|m| m.id);
@@ -1100,59 +1358,9 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         });
     }
 
-    // ── миграции ─────────────────────────────────────────────────────────
-    //
-    // Затронутые типы решают, переписывать ли сегмент: множества их
-    // идентификаторов лежат в footer'е, и незатронутый сегмент не тратит
-    // цикла записи флеша. Не объявлены — значит `touches_all`, то есть
-    // переписывается всё: молча пропустить историю хуже, чем переписать её.
-    let migration_descs: Vec<TokenStream2> = input
-        .migrations
-        .iter()
-        .map(|m| {
-            let from = m.from;
-            let func = &m.func;
-            let (all, events, metrics) = match &m.touches {
-                None => (quote!(true), Vec::new(), Vec::new()),
-                Some(t) => {
-                    let events = t
-                        .events
-                        .iter()
-                        .map(|name| {
-                            let id = lookup_id(
-                                name,
-                                input.events.iter().map(|e| (&e.name, e.id)),
-                                "событие",
-                            )?;
-                            Ok(quote!(::dduroc::EventId(#id)))
-                        })
-                        .collect::<syn::Result<Vec<_>>>()?;
-                    let metrics = t
-                        .metrics
-                        .iter()
-                        .map(|name| {
-                            let id = lookup_id(
-                                name,
-                                input.metrics.iter().map(|m| (&m.name, m.id)),
-                                "метрику",
-                            )?;
-                            Ok(quote!(::dduroc::MetricId(#id)))
-                        })
-                        .collect::<syn::Result<Vec<_>>>()?;
-                    (quote!(false), events, metrics)
-                }
-            };
-            Ok(quote! {
-                ::dduroc::Migration {
-                    from: #from,
-                    touches_all: #all,
-                    events: &[#(#events),*],
-                    metrics: &[#(#metrics),*],
-                    migrate: #func,
-                }
-            })
-        })
-        .collect::<syn::Result<Vec<_>>>()?;
+    // ── history и миграции ───────────────────────────────────────────────
+    let history_mods = codegen_history(input)?;
+    let (migration_descs, migration_fns) = codegen_migrations(input)?;
 
     let mod_name = &input.name;
 
@@ -1181,6 +1389,9 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 #(#span_consts)*
             }
 
+            #(#history_mods)*
+            #(#migration_fns)*
+
             #(#state_statics)*
 
             static EVENTS: &[::dduroc::EventDesc] = &[#(#event_descs),*];
@@ -1202,6 +1413,445 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             };
         }
     })
+}
+
+/// Породить модули `v<N>` со старыми раскладками.
+///
+/// Каждый тип — обычная serde-структура плюс `EventShape` со **старым** id:
+/// правило `v1::PowerSet` получает и то, и другое из одного объявления.
+/// `Serialize` тоже выводится: тесты миграций пишут фикстуры старых версий, и
+/// собирать их байты руками значило бы дублировать раскладку в тесте.
+fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
+    let mut seen_versions: HashMap<u16, proc_macro2::Span> = HashMap::new();
+    let mut out = Vec::new();
+    for h in &input.history {
+        if h.version == 0 || h.version >= input.version {
+            return Err(syn::Error::new(
+                h.span,
+                format!(
+                    "history описывает прошлое: версия {} обязана быть в 1..{} \
+                     (текущая версия схемы — {})",
+                    h.version, input.version, input.version
+                ),
+            ));
+        }
+        if seen_versions.insert(h.version, h.span).is_some() {
+            return Err(syn::Error::new(
+                h.span,
+                format!("history {} объявлена дважды", h.version),
+            ));
+        }
+        check_unique(
+            "событие history",
+            &h.events
+                .iter()
+                .map(|e| (e.id, e.name.clone()))
+                .collect::<Vec<_>>(),
+        )?;
+        let mut names: HashMap<String, &Ident> = HashMap::new();
+        for e in &h.events {
+            if let Some(prev) = names.insert(e.name.to_string(), &e.name) {
+                return Err(syn::Error::new(
+                    e.name.span(),
+                    format!("тип `{prev}` в history {} объявлен дважды", h.version),
+                ));
+            }
+        }
+
+        let mod_ident = format_ident!("v{}", h.version);
+        let structs: Vec<TokenStream2> = h
+            .events
+            .iter()
+            .map(|e| {
+                let name = &e.name;
+                let id = e.id;
+                let fields: Vec<TokenStream2> =
+                    e.fields.iter().map(|(n, t)| quote!(pub #n: #t)).collect();
+                quote! {
+                    #[derive(
+                        Debug, Clone, PartialEq,
+                        ::dduroc::serde::Serialize, ::dduroc::serde::Deserialize,
+                    )]
+                    #[serde(crate = "::dduroc::serde")]
+                    pub struct #name {
+                        #(#fields,)*
+                    }
+
+                    impl ::dduroc::EventShape for #name {
+                        const SHAPE_ID: ::dduroc::EventId = ::dduroc::EventId(#id);
+                    }
+                }
+            })
+            .collect();
+        let doc = format!(
+            "Раскладки версии {}: их потребляют шаги миграции, текущему коду \
+             они не нужны.",
+            h.version
+        );
+        out.push(quote! {
+            #[doc = #doc]
+            pub mod #mod_ident {
+                use super::*;
+                #(#structs)*
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Разрешённое правило: старый идентификатор и тело match-ветки.
+struct ResolvedRule {
+    old_id: u16,
+    arm: TokenStream2,
+}
+
+/// Породить дескрипторы шагов и функции-диспетчеры типизированных правил.
+fn codegen_migrations(input: &SchemaInput) -> syn::Result<(Vec<TokenStream2>, Vec<TokenStream2>)> {
+    // Каждая history-запись обязана быть кем-то использована: мёртвое
+    // объявление — почти наверняка забытое правило, и молчать о нём значит
+    // оставить историю без преобразования.
+    let mut used_history: HashMap<(u16, String), bool> = input
+        .history
+        .iter()
+        .flat_map(|h| {
+            h.events
+                .iter()
+                .map(|e| ((h.version, e.name.to_string()), false))
+        })
+        .collect();
+
+    let mut descs = Vec::new();
+    let mut fns = Vec::new();
+    for m in &input.migrations {
+        match &m.step {
+            StepDef::Raw { func, touches } => {
+                descs.push(codegen_raw_step(input, m.from, func, touches)?);
+            }
+            StepDef::Rules(rules) => {
+                let (desc, f) = codegen_rules_step(input, m.from, rules, &mut used_history)?;
+                descs.push(desc);
+                fns.push(f);
+            }
+        }
+    }
+
+    for h in &input.history {
+        for e in &h.events {
+            if !used_history[&(h.version, e.name.to_string())] {
+                return Err(syn::Error::new(
+                    e.name.span(),
+                    format!(
+                        "раскладка v{}::{} объявлена, но ни одно правило её не \
+                         использует: либо шаг забыт, либо запись лишняя",
+                        h.version, e.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok((descs, fns))
+}
+
+/// Сырой fn: как и раньше — сам fn плюс необязательные touches.
+///
+/// Затронутые типы решают, переписывать ли сегмент, И какие записи шаг
+/// увидит: множества — связывающий фильтр. Не объявлены — `touches_all`:
+/// шаг видит всё, а переписывается каждый сегмент. Молча пропустить историю
+/// хуже, чем переписать лишнюю.
+fn codegen_raw_step(
+    input: &SchemaInput,
+    from: u16,
+    func: &syn::Path,
+    touches: &Option<Touches>,
+) -> syn::Result<TokenStream2> {
+    let (all, events, metrics) = match touches {
+        None => (quote!(true), Vec::new(), Vec::new()),
+        Some(t) => {
+            let events = t
+                .events
+                .iter()
+                .map(|name| {
+                    let id = lookup_id(
+                        name,
+                        input.events.iter().map(|e| (&e.name, e.id)),
+                        "событие",
+                    )?;
+                    Ok(quote!(::dduroc::EventId(#id)))
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
+            let metrics = t
+                .metrics
+                .iter()
+                .map(|name| {
+                    let id = lookup_id(
+                        name,
+                        input.metrics.iter().map(|m| (&m.name, m.id)),
+                        "метрику",
+                    )?;
+                    Ok(quote!(::dduroc::MetricId(#id)))
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
+            (quote!(false), events, metrics)
+        }
+    };
+    Ok(quote! {
+        ::dduroc::Migration {
+            from: #from,
+            touches_all: #all,
+            events: &[#(#events),*],
+            metrics: &[#(#metrics),*],
+            migrate: #func,
+        }
+    })
+}
+
+/// Типизированные правила: диспетчер по старым id, декод старой раскладки,
+/// энкод результата — всё генерируется, а затронутые типы **выводятся** из
+/// ключей. Расхождению объявленного с фактическим взяться неоткуда.
+fn codegen_rules_step(
+    input: &SchemaInput,
+    from: u16,
+    rules: &[RuleDef],
+    used_history: &mut HashMap<(u16, String), bool>,
+) -> syn::Result<(TokenStream2, TokenStream2)> {
+    if rules.is_empty() {
+        return Err(syn::Error::new(
+            input.name.span(),
+            format!("шаг {from} пуст: ни одного правила — такой шаг ничего не делает"),
+        ));
+    }
+
+    let mut event_rules: Vec<ResolvedRule> = Vec::new();
+    let mut metric_rules: Vec<ResolvedRule> = Vec::new();
+    for rule in rules {
+        resolve_rule(
+            input,
+            rule,
+            &mut event_rules,
+            &mut metric_rules,
+            used_history,
+        )?;
+    }
+    // Два правила на один старый id — неоднозначность, а не приоритет.
+    for (what, list) in [("событие", &event_rules), ("метрику", &metric_rules)] {
+        let mut seen: HashMap<u16, ()> = HashMap::new();
+        for r in list {
+            if seen.insert(r.old_id, ()).is_some() {
+                return Err(syn::Error::new(
+                    input.name.span(),
+                    format!(
+                        "шаг {from}: два правила на {what} с id {:#x} — какое из них \
+                         применять, неоднозначно",
+                        r.old_id
+                    ),
+                ));
+            }
+        }
+    }
+
+    let fn_name = format_ident!("__migrate_from_{}", from);
+    let event_ids: Vec<TokenStream2> = event_rules
+        .iter()
+        .map(|r| {
+            let id = r.old_id;
+            quote!(::dduroc::EventId(#id))
+        })
+        .collect();
+    let metric_ids: Vec<TokenStream2> = metric_rules
+        .iter()
+        .map(|r| {
+            let id = r.old_id;
+            quote!(::dduroc::MetricId(#id))
+        })
+        .collect();
+    let event_arms: Vec<TokenStream2> = event_rules.iter().map(|r| r.arm.clone()).collect();
+    let metric_arms: Vec<TokenStream2> = metric_rules.iter().map(|r| r.arm.clone()).collect();
+
+    let desc = quote! {
+        ::dduroc::Migration {
+            from: #from,
+            touches_all: false,
+            events: &[#(#event_ids),*],
+            metrics: &[#(#metric_ids),*],
+            migrate: #fn_name,
+        }
+    };
+    let f = quote! {
+        #[doc(hidden)]
+        pub fn #fn_name(
+            __r: ::dduroc::MigratedRecord<'_>,
+        ) -> ::core::result::Result<
+            ::core::option::Option<::dduroc::OwnedRecord>,
+            ::dduroc::DecodeError,
+        > {
+            if let ::core::option::Option::Some(__ev) = __r.event_id() {
+                return match __ev.0 {
+                    #(#event_arms)*
+                    _ => ::core::result::Result::Ok(::core::option::Option::Some(
+                        ::dduroc::OwnedRecord::AsIs,
+                    )),
+                };
+            }
+            if let ::core::option::Option::Some(__m) = __r.metric_id() {
+                return match __m.0 {
+                    #(#metric_arms)*
+                    _ => ::core::result::Result::Ok(::core::option::Option::Some(
+                        ::dduroc::OwnedRecord::AsIs,
+                    )),
+                };
+            }
+            ::core::result::Result::Ok(::core::option::Option::Some(
+                ::dduroc::OwnedRecord::AsIs,
+            ))
+        }
+    };
+    Ok((desc, f))
+}
+
+/// Разрешить одно правило: найти старый id, проверить сочетаемость ключа с
+/// действием и породить ветку диспетчера.
+fn resolve_rule(
+    input: &SchemaInput,
+    rule: &RuleDef,
+    event_rules: &mut Vec<ResolvedRule>,
+    metric_rules: &mut Vec<ResolvedRule>,
+    used_history: &mut HashMap<(u16, String), bool>,
+) -> syn::Result<()> {
+    let span = rule.key.span();
+    let err = |msg: String| Err(syn::Error::new(span, msg));
+
+    // Ключ → старый id + тип для декода (если раскладка известна).
+    enum Kind {
+        Event { decode: Option<TokenStream2> },
+        Metric,
+    }
+    let (old_id, kind) = match &rule.key {
+        RuleKey::HistoryEvent { version, name } => {
+            let Some(h) = input.history.iter().find(|h| h.version == *version) else {
+                return err(format!(
+                    "history версии {version} не объявлена — раскладку `v{version}::{name}` \
+                     взять неоткуда"
+                ));
+            };
+            let Some(e) = h.events.iter().find(|e| e.name == *name) else {
+                return err(format!("в history {version} нет типа `{name}`"));
+            };
+            used_history.insert((*version, name.to_string()), true);
+            let mod_ident = format_ident!("v{}", version);
+            (
+                e.id,
+                Kind::Event {
+                    decode: Some(quote!(#mod_ident::#name)),
+                },
+            )
+        }
+        RuleKey::CurrentEvent { name } => {
+            let id = lookup_id(
+                name,
+                input.events.iter().map(|e| (&e.name, e.id)),
+                "событие",
+            )?;
+            (
+                id,
+                Kind::Event {
+                    decode: Some(quote!(events::#name)),
+                },
+            )
+        }
+        RuleKey::RawEvent { id, .. } => (*id, Kind::Event { decode: None }),
+        RuleKey::CurrentMetric { name } => (
+            lookup_id(
+                name,
+                input.metrics.iter().map(|m| (&m.name, m.id)),
+                "метрику",
+            )?,
+            Kind::Metric,
+        ),
+        RuleKey::RawMetric { id, .. } => (*id, Kind::Metric),
+    };
+
+    match (kind, &rule.action) {
+        (Kind::Event { .. }, RuleAction::Drop) => {
+            event_rules.push(ResolvedRule {
+                old_id,
+                arm: quote!(#old_id => ::core::result::Result::Ok(::core::option::Option::None),),
+            });
+        }
+        (Kind::Event { decode: Some(ty) }, RuleAction::Map(expr)) => {
+            event_rules.push(ResolvedRule {
+                old_id,
+                // Вызов через хелпер, а не `(#expr)(__old)`: тело замыкания
+                // проверяется раньше, чем немедленный вызов подсказал бы тип
+                // параметра, и `|old| old.dbm` не компилировалось бы.
+                arm: quote! {
+                    #old_id => {
+                        let __old: #ty = __r.decode()?;
+                        ::dduroc::__migrate_map(#expr, __old)
+                    }
+                },
+            });
+        }
+        (Kind::Event { decode: None }, RuleAction::Map(_)) => {
+            return err(format!(
+                "у `event({old_id:#x})` нет раскладки — декодировать нечем: объявите тип \
+                 в history и напишите `v<N>::Тип`, либо используйте drop или ремап"
+            ));
+        }
+        (Kind::Event { .. }, RuleAction::RemapEvent(target)) => {
+            let target_id = lookup_id(
+                target,
+                input.events.iter().map(|e| (&e.name, e.id)),
+                "событие",
+            )?;
+            event_rules.push(ResolvedRule {
+                old_id,
+                arm: quote! {
+                    #old_id => ::core::result::Result::Ok(::core::option::Option::Some(
+                        ::dduroc::OwnedRecord::Message {
+                            event: ::dduroc::EventId(#target_id),
+                            payload: __r.payload().unwrap_or(&[]).to_vec(),
+                        },
+                    )),
+                },
+            });
+        }
+        (Kind::Event { .. }, RuleAction::RemapMetric(_)) => {
+            return err("событие не превратить в метрику: у них разные виды записей".to_owned());
+        }
+        (Kind::Metric, RuleAction::Drop) => {
+            metric_rules.push(ResolvedRule {
+                old_id,
+                arm: quote!(#old_id => ::core::result::Result::Ok(::core::option::Option::None),),
+            });
+        }
+        (Kind::Metric, RuleAction::RemapMetric(target)) => {
+            let target_id = lookup_id(
+                target,
+                input.metrics.iter().map(|m| (&m.name, m.id)),
+                "метрику",
+            )?;
+            metric_rules.push(ResolvedRule {
+                old_id,
+                arm: quote! {
+                    #old_id => ::core::result::Result::Ok(::core::option::Option::Some(
+                        ::dduroc::OwnedRecord::SampleMetric(::dduroc::MetricId(#target_id)),
+                    )),
+                },
+            });
+        }
+        (Kind::Metric, RuleAction::Map(_)) => {
+            return err(
+                "значения отсчётов правилами не преобразуются — метрике доступны \
+                 только drop и ремап (`metrics::Другая`); преобразование значений \
+                 выразимо сырым fn, но и ему пока недоступно"
+                    .to_owned(),
+            );
+        }
+        (Kind::Metric, RuleAction::RemapEvent(_)) => {
+            return err("метрику не превратить в событие: у них разные виды записей".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn clone_event(e: &EventDef) -> EventDef {
@@ -1242,8 +1892,61 @@ fn clone_span(s: &SpanDef) -> SpanDef {
 fn clone_migration(m: &MigrationDef) -> MigrationDef {
     MigrationDef {
         from: m.from,
-        func: m.func.clone(),
-        touches: m.touches.clone(),
+        step: match &m.step {
+            StepDef::Raw { func, touches } => StepDef::Raw {
+                func: func.clone(),
+                touches: touches.clone(),
+            },
+            StepDef::Rules(rules) => StepDef::Rules(
+                rules
+                    .iter()
+                    .map(|r| RuleDef {
+                        key: match &r.key {
+                            RuleKey::HistoryEvent { version, name } => RuleKey::HistoryEvent {
+                                version: *version,
+                                name: name.clone(),
+                            },
+                            RuleKey::CurrentEvent { name } => {
+                                RuleKey::CurrentEvent { name: name.clone() }
+                            }
+                            RuleKey::RawEvent { id, span } => RuleKey::RawEvent {
+                                id: *id,
+                                span: *span,
+                            },
+                            RuleKey::CurrentMetric { name } => {
+                                RuleKey::CurrentMetric { name: name.clone() }
+                            }
+                            RuleKey::RawMetric { id, span } => RuleKey::RawMetric {
+                                id: *id,
+                                span: *span,
+                            },
+                        },
+                        action: match &r.action {
+                            RuleAction::Drop => RuleAction::Drop,
+                            RuleAction::Map(e) => RuleAction::Map(e.clone()),
+                            RuleAction::RemapEvent(i) => RuleAction::RemapEvent(i.clone()),
+                            RuleAction::RemapMetric(i) => RuleAction::RemapMetric(i.clone()),
+                        },
+                    })
+                    .collect(),
+            ),
+        },
+    }
+}
+
+fn clone_history(h: &HistoryDef) -> HistoryDef {
+    HistoryDef {
+        version: h.version,
+        span: h.span,
+        events: h
+            .events
+            .iter()
+            .map(|e| HistoryEvent {
+                name: e.name.clone(),
+                id: e.id,
+                fields: e.fields.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1395,5 +2098,190 @@ mod tests {
         let e = err(r#"name: radio, version: 1, languages: [en],
                events { Boom = 70000 { level: Error, en: "x" } }"#);
         assert!(e.contains("u16"), "{e}");
+    }
+
+    // ── history и типизированные правила ─────────────────────────────────
+
+    /// Заготовка схемы v2 с history и одним типизированным шагом.
+    const MIGRATING: &str = r#"
+        name: radio, version: 2, languages: [en],
+        events { PowerSet = 0x01 { level: Info, en: "power {dbm}", dbm: f32 } }
+        metrics { Temp = 0x01 { vtype: f32 }, TempPa = 0x02 { vtype: f32 } }
+        history { 1 { events { PowerSet = 0x01 { dbm: i8 } } } }
+        migrations {
+            1 => {
+                v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) },
+                event(0x05): drop,
+                metric(0x07): metrics::TempPa,
+            },
+        }
+    "#;
+
+    #[test]
+    fn history_with_typed_rules_compiles() {
+        check(MIGRATING).expect("образцовая миграция");
+    }
+
+    #[test]
+    fn a_history_version_not_in_the_past_is_refused() {
+        // history описывает прошлое: текущая версия и версии из будущего в
+        // ней бессмысленны, а ноль не существует — нумерация с единицы.
+        for v in ["2", "3", "0"] {
+            let e = err(&format!(
+                r#"name: radio, version: 2, languages: [en],
+                   events {{ E = 0x01 {{ level: Info, en: "x" }} }}
+                   history {{ {v} {{ events {{ E = 0x01 {{ }} }} }} }}
+                   migrations {{ 1 => {{ v{v}::E: drop }} }}"#
+            ));
+            assert!(e.contains("history"), "{v}: {e}");
+        }
+    }
+
+    #[test]
+    fn an_unused_history_entry_is_refused() {
+        // Мёртвая раскладка — почти наверняка забытое правило: молчать о ней
+        // значит оставить историю без преобразования.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               history { 1 { events { E = 0x01 { n: u8 } } } }
+               migrations { 1 => { event(0x09): drop } }"#);
+        assert!(e.contains("не") && e.contains("использует"), "{e}");
+    }
+
+    #[test]
+    fn a_rule_for_an_undeclared_history_version_is_refused() {
+        let e = err(r#"name: radio, version: 3, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               history { 1 { events { E = 0x01 { n: u8 } } } }
+               migrations {
+                   1 => { v1::E: drop },
+                   2 => { v2::E: drop },
+               }"#);
+        assert!(e.contains("v2") || e.contains("версии 2"), "{e}");
+    }
+
+    #[test]
+    fn a_rule_for_a_type_missing_from_history_is_refused() {
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               history { 1 { events { E = 0x01 { n: u8 } } } }
+               migrations { 1 => { v1::Ghost: drop, v1::E: drop } }"#);
+        assert!(e.contains("Ghost"), "{e}");
+    }
+
+    #[test]
+    fn a_raw_id_cannot_be_mapped_because_it_has_no_shape() {
+        // У голого id нет раскладки — декодировать нечем. Подсказка обязана
+        // называть выход: объявить тип в history.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               migrations { 1 => { event(0x05): |old| old } }"#);
+        assert!(e.contains("history"), "{e}");
+    }
+
+    #[test]
+    fn metric_values_cannot_be_mapped() {
+        // Значения отсчётов правилами не преобразуются: метрике доступны
+        // только drop и ремап. Замыкание здесь — ошибка объявления.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               metrics { Temp = 0x01 { vtype: f32 } }
+               migrations { 1 => { metrics::Temp: |v| v } }"#);
+        assert!(e.contains("не преобразуются"), "{e}");
+    }
+
+    #[test]
+    fn kinds_do_not_cross() {
+        // Событие не превратить в метрику и наоборот: разные виды записей.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               metrics { Temp = 0x01 { vtype: f32 } }
+               migrations { 1 => { events::E: metrics::Temp } }"#);
+        assert!(e.contains("разные виды"), "{e}");
+
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               metrics { Temp = 0x01 { vtype: f32 } }
+               migrations { 1 => { metrics::Temp: events::E } }"#);
+        assert!(e.contains("разные виды"), "{e}");
+    }
+
+    #[test]
+    fn two_rules_for_one_old_id_are_ambiguous() {
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               history { 1 { events { E = 0x01 { n: u8 } } } }
+               migrations { 1 => { v1::E: drop, events::E: drop } }"#);
+        assert!(e.contains("неоднозначно"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_rules_step_is_refused() {
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               migrations { 1 => { } }"#);
+        assert!(e.contains("пуст"), "{e}");
+    }
+
+    #[test]
+    fn a_duplicate_history_version_is_refused() {
+        let e = err(r#"name: radio, version: 3, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               history {
+                   1 { events { E = 0x01 { n: u8 } } }
+                   1 { events { E = 0x01 { n: u16 } } }
+               }
+               migrations { 1 => { v1::E: drop }, 2 => { event(0x09): drop } }"#);
+        assert!(e.contains("дважды"), "{e}");
+    }
+
+    #[test]
+    fn history_declares_events_only() {
+        // У отсчётов payload-раскладки нет — объявлять в history нечего, и
+        // попытка обязана быть названа, а не молча проглочена.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               history { 1 { metrics { Temp = 0x01 { } } } }
+               migrations { 1 => { event(0x09): drop } }"#);
+        assert!(e.contains("events"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_history_entry_is_refused() {
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               history { 1 { events { } } }
+               migrations { 1 => { event(0x09): drop } }"#);
+        assert!(e.contains("пуста"), "{e}");
+    }
+
+    #[test]
+    fn the_raw_fn_escape_hatch_still_parses() {
+        // Люк остаётся люком: сырой fn с touches и без, вперемешку с
+        // типизированными шагами.
+        check(
+            r#"name: radio, version: 4, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               history { 1 { events { E = 0x01 { n: u8 } } } }
+               migrations {
+                   1 => { v1::E: |old| events::E { } },
+                   2 => migrate_v2,
+                   3 => migrate_v3 { events: [E] },
+               }"#,
+        )
+        .expect("смешанное объявление законно");
+    }
+
+    #[test]
+    fn rule_keys_are_validated_syntactically() {
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               migrations { 1 => { foo::E: drop } }"#);
+        assert!(e.contains("v<N>") || e.contains("events"), "{e}");
+
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               migrations { 1 => { span(0x01): drop } }"#);
+        assert!(e.contains("event, metric"), "{e}");
     }
 }

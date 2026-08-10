@@ -12,6 +12,8 @@
 
 use crate::error::{ReadError, Result};
 use crate::query::{Bounds, Fit};
+use dduroc_engine::migrate::{self, Chained};
+use dduroc_engine::schema::{Migration, Schema};
 use dduroc_engine::segment::{SegmentReader, parse_block};
 use dduroc_format::segment::SegmentName;
 use dduroc_format::{BootCounter, BootTime, Micros, Record};
@@ -128,6 +130,34 @@ fn own(record: &Record<'_>) -> OwnedRecord {
     }
 }
 
+/// Версия схемы и её шаги — всё, что нужно курсору, чтобы привести записи
+/// старых сегментов к текущей раскладке.
+///
+/// Не целая [`Schema`]: курсору не нужны ни декодеры, ни имена — только
+/// версия и цепочка, и оба поля `'static`, так что контекст копируется.
+#[derive(Debug, Clone, Copy)]
+pub struct MigrationCtx {
+    pub current: u16,
+    pub steps: &'static [Migration],
+}
+
+impl MigrationCtx {
+    pub fn of(schema: &Schema) -> Self {
+        Self {
+            current: schema.version.0,
+            steps: schema.migrations,
+        }
+    }
+}
+
+/// Что курсор делает с записями этого сегмента.
+enum MigrationState {
+    /// Ничего: сегмент текущей версии либо не затронут ни одним шагом.
+    None,
+    /// Прогонять каждую запись через цепочку.
+    Chain(Vec<&'static Migration>),
+}
+
 /// Курсор по записям одного сегмента.
 pub struct SegmentCursor {
     reader: SegmentReader,
@@ -144,6 +174,8 @@ pub struct SegmentCursor {
     reverse: bool,
     /// Отбор до материализации.
     prefilter: Option<Prefilter>,
+    /// Приведение записей к текущей версии схемы.
+    migration: MigrationState,
     /// Блоки, которые не удалось прочитать.
     damaged: Vec<Damage>,
 }
@@ -162,6 +194,7 @@ impl SegmentCursor {
         reverse: bool,
         expect_store: Option<u64>,
         prefilter: Option<Prefilter>,
+        migrations: Option<MigrationCtx>,
     ) -> Result<Self> {
         let reader = SegmentReader::open(path).map_err(ReadError::Engine)?;
         if let Some(id) = expect_store
@@ -174,6 +207,52 @@ impl SegmentCursor {
             });
         }
         let mut damaged = Vec::new();
+
+        // Сегмент старой версии читается через цепочку шагов миграции: без
+        // неё текущие декодеры разобрали бы старую раскладку молча и неверно
+        // (postcard не самоописуем — i8 читается как хвост f32, без ошибки).
+        // Сегмент, который цепочка не затрагивает (по footer'у), идёт как
+        // есть; сегмент версии НОВЕЕ схемы не читается вовсе — раскладку из
+        // будущего разбирать нечем, и молчание здесь выглядело бы как «прибор
+        // ничего не писал».
+        let seg_version = reader.header().protocol_version.0;
+        let mut migration = MigrationState::None;
+        if let Some(ctx) = migrations {
+            if seg_version > ctx.current {
+                damaged.push(Damage {
+                    path: path.to_owned(),
+                    offset: 0,
+                    reason: format!(
+                        "версия протокола {seg_version} новее схемы ({}): записи этой \
+                         раскладки этому билду не разобрать",
+                        ctx.current
+                    ),
+                });
+                return Ok(Self::empty(reader, path, reverse, damaged));
+            }
+            if seg_version < ctx.current {
+                match migrate::chain_between(ctx.steps, seg_version, ctx.current) {
+                    Ok(steps) => {
+                        let untouched = reader
+                            .footer()
+                            .is_some_and(|f| !migrate::chain_touches(&steps, &f));
+                        if !untouched {
+                            migration = MigrationState::Chain(steps);
+                        }
+                    }
+                    Err(e) => {
+                        // Дыра в цепочке: читать старую раскладку текущими
+                        // декодерами нельзя, а привести её нечем.
+                        damaged.push(Damage {
+                            path: path.to_owned(),
+                            offset: 0,
+                            reason: format!("сегмент версии {seg_version} не прочитать: {e}"),
+                        });
+                        return Ok(Self::empty(reader, path, reverse, damaged));
+                    }
+                }
+            }
+        }
         // Запечатанный сегмент отдаёт смещения блоков из footer'а; иначе —
         // скан заголовков. Обрыв скана — обычное следствие потери питания:
         // уже найденные блоки остаются в выборке, о месте обрыва сообщается
@@ -211,8 +290,26 @@ impl SegmentCursor {
             pos: 0,
             reverse,
             prefilter,
+            migration,
             damaged,
         })
+    }
+
+    /// Курсор, который не отдаст ни записи, — для сегментов, которые нельзя
+    /// разбирать. Повреждения при этом доносятся как обычно.
+    fn empty(reader: SegmentReader, path: &Path, reverse: bool, damaged: Vec<Damage>) -> Self {
+        Self {
+            reader,
+            path: path.to_owned(),
+            offsets: Vec::new(),
+            next_block: 0,
+            buffered: Vec::new(),
+            pos: 0,
+            reverse,
+            prefilter: None,
+            migration: MigrationState::None,
+            damaged,
+        }
     }
 
     pub fn boot(&self) -> BootCounter {
@@ -245,6 +342,13 @@ impl SegmentCursor {
         &self,
         wanted: &std::collections::HashSet<dduroc_format::MetricId>,
     ) -> Option<bool> {
+        // Сегмент, который переписывает цепочка миграций, по footer'у не
+        // судится: множества описывают ДОмиграционные идентификаторы, а
+        // `wanted` — текущие. Ремапнутая метрика лежала бы в сегменте под
+        // старым номером, и ответ «нет» отбросил бы сегмент вместе с ней.
+        if matches!(self.migration, MigrationState::Chain(_)) {
+            return None;
+        }
         let footer = self.reader.footer()?;
         Some(
             wanted
@@ -355,12 +459,33 @@ impl SegmentCursor {
             self.buffered.clear();
             self.pos = 0;
             let mut broken = None;
+            // Отказы миграции копятся на блок, а не сыплются по записи:
+            // они систематические (весь блок одной раскладки), и тысяча
+            // одинаковых записей о повреждении хуже одной со счётчиком.
+            let mut unmigrated: u32 = 0;
+            let mut first_chain_error = None;
             for item in block.records() {
                 match item {
                     Ok((at, record)) => {
-                        // Служебных записей в блоке больше нет: всё, что
-                        // прочитано, выдаётся наружу как есть.
-                        //
+                        // Запись старого сегмента сперва приводится к текущей
+                        // раскладке: фильтры и владеющая копия обязаны видеть
+                        // то, что увидит вызывающий, а не сырьё с диска.
+                        let migrated = match &self.migration {
+                            MigrationState::None => Chained::Same(record),
+                            MigrationState::Chain(steps) => match migrate::apply(steps, record) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    unmigrated += 1;
+                                    first_chain_error.get_or_insert(e);
+                                    continue;
+                                }
+                            },
+                        };
+                        let Some(record) = migrated.record() else {
+                            // Запись удалена шагом — это решение схемы, а не
+                            // потеря: в отчёте о повреждениях ей не место.
+                            continue;
+                        };
                         // Отбор до владеющей копии: отброшенная запись не
                         // должна стоить аллокации своего payload'а.
                         if let Some(f) = &self.prefilter
@@ -378,6 +503,14 @@ impl SegmentCursor {
                         break;
                     }
                 }
+            }
+            if unmigrated > 0 {
+                let e = first_chain_error.expect("счётчик растёт вместе с ошибкой");
+                self.damaged.push(Damage {
+                    path: self.path.clone(),
+                    offset,
+                    reason: format!("{e}: записей не приведено к текущей версии: {unmigrated}"),
+                });
             }
             if let Some(reason) = broken {
                 self.damaged.push(Damage {
@@ -409,6 +542,7 @@ pub struct ChannelCursor {
     expect_store: Option<u64>,
     prefilter: Option<Prefilter>,
     require_metrics: Option<Arc<std::collections::HashSet<dduroc_format::MetricId>>>,
+    migrations: Option<MigrationCtx>,
     damaged: Vec<Damage>,
     /// Запуски, чьи сегменты пришлось пропустить: окно настенное, якоря нет.
     unanchored: Vec<BootCounter>,
@@ -438,6 +572,9 @@ pub struct ChannelScope {
     /// Пропускать запечатанные сегменты, в которых нет ни одной из этих
     /// метрик. Проверка идёт по множеству из footer'а, без чтения блоков.
     pub require_metrics: Option<Arc<std::collections::HashSet<dduroc_format::MetricId>>>,
+    /// Версия схемы и шаги миграции: сегменты прежних версий читаются через
+    /// цепочку. `None` — схема неизвестна, записи идут как есть.
+    pub migrations: Option<MigrationCtx>,
 }
 
 /// Отобрать сегменты, которые могут содержать записи из окна.
@@ -536,6 +673,7 @@ impl ChannelCursor {
             expect_store,
             prefilter: scope.prefilter.clone(),
             require_metrics: scope.require_metrics.clone(),
+            migrations: scope.migrations,
             damaged: Vec::new(),
             unanchored,
             namespace,
@@ -617,6 +755,7 @@ impl ChannelCursor {
                 self.reverse,
                 self.expect_store,
                 self.prefilter.clone(),
+                self.migrations,
             ) {
                 Ok(mut c) => {
                     // Сегмент, в котором заведомо нет нужных метрик, не
@@ -829,6 +968,43 @@ mod tests {
 
     /// Запечатанный сегмент, в котором каждый блок — одна запись с указанным
     /// временем. Блоки нужны поштучно: проверяется именно отбор блоков.
+    /// Запечатанный сегмент указанной версии из готовых записей: одна запись
+    /// — один блок, footer собирается как у writer'а (типы вместе с блоком).
+    fn sealed_versioned(dir: &Path, version: u16, records: &[(u64, Record<'_>)]) -> PathBuf {
+        use dduroc_engine::segment::SegmentWriter;
+        use dduroc_format::block::BlockBuilder;
+        use dduroc_format::segment::SegmentHeader;
+        use dduroc_format::{Compression, FooterBuilder, ProtocolVersion};
+
+        let base = Micros(records[0].0);
+        let header = SegmentHeader {
+            protocol_version: ProtocolVersion(version),
+            boot: BootCounter(0),
+            base,
+            store_id: 0,
+        };
+        let mut seg = SegmentWriter::create(dir, header, 1 << 20).unwrap();
+        let mut footer = FooterBuilder::new();
+        let mut builder = BlockBuilder::new();
+        let mut out = Vec::new();
+        for (t, rec) in records {
+            match rec {
+                Record::Message(m) => footer.add_event(m.event),
+                Record::Sample(s) => footer.add_metric(s.metric),
+                _ => {}
+            }
+            builder.push(Micros(*t), rec).unwrap();
+            out.clear();
+            let h = builder
+                .finish(seg.next_seq(), Compression::None, &mut out)
+                .unwrap();
+            let offset = seg.append_block(&out).unwrap();
+            footer.add_block(offset, &h, Micros(*t));
+        }
+        seg.seal(&footer.build()).unwrap();
+        dir.join(SegmentName::new(BootCounter(0), base).to_string())
+    }
+
     fn sealed_segment(dir: &Path, times: &[u64]) -> PathBuf {
         use dduroc_engine::segment::SegmentWriter;
         use dduroc_format::block::BlockBuilder;
@@ -870,6 +1046,238 @@ mod tests {
     }
 
     #[test]
+    fn an_old_segment_is_read_through_the_migration_chain() {
+        // Сегмент v1 при схеме v2: изменённый тип перекодируется, удалённый
+        // выпадает, ремапнутая метрика меняет номер, нетронутый тип идёт
+        // байт в байт. Без цепочки текущие декодеры разобрали бы старую
+        // раскладку молча и неверно — postcard не самоописуем.
+        use dduroc_engine::schema::{DecodeError, MigratedRecord, OwnedRecord as Out};
+        use dduroc_format::record::{Message, Sample};
+        use dduroc_format::{EventId, MetricId, Value};
+
+        fn step1(r: MigratedRecord<'_>) -> std::result::Result<Option<Out>, DecodeError> {
+            match (r.event_id(), r.metric_id()) {
+                (Some(EventId(1)), _) => {
+                    let old: (u8,) = r.decode()?;
+                    Ok(Some(Out::Message {
+                        event: EventId(1),
+                        payload: postcard::to_allocvec(&(u16::from(old.0) * 2,)).unwrap(),
+                    }))
+                }
+                (Some(EventId(2)), _) => Ok(None),
+                (_, Some(MetricId(0x10))) => Ok(Some(Out::SampleMetric(MetricId(0x20)))),
+                _ => Ok(Some(Out::AsIs)),
+            }
+        }
+        static STEPS: &[Migration] = &[Migration {
+            from: 1,
+            touches_all: false,
+            events: &[EventId(1), EventId(2)],
+            metrics: &[MetricId(0x10)],
+            migrate: step1,
+        }];
+        let ctx = MigrationCtx {
+            current: 2,
+            steps: STEPS,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let changed = postcard::to_allocvec(&(21u8,)).unwrap();
+        let path = sealed_versioned(
+            dir.path(),
+            1,
+            &[
+                (
+                    100,
+                    Record::Message(Message {
+                        event: EventId(1),
+                        span: None,
+                        payload: &changed,
+                    }),
+                ),
+                (
+                    200,
+                    Record::Message(Message {
+                        event: EventId(2),
+                        span: None,
+                        payload: &[7],
+                    }),
+                ),
+                (
+                    300,
+                    Record::Message(Message {
+                        event: EventId(3),
+                        span: None,
+                        payload: &[9],
+                    }),
+                ),
+                (
+                    400,
+                    Record::Sample(Sample {
+                        metric: MetricId(0x10),
+                        value: Value::U64(555),
+                    }),
+                ),
+            ],
+        );
+
+        let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx)).unwrap();
+        let got: Vec<RawEntry> = std::iter::from_fn(|| c.next_entry()).collect();
+        assert!(c.damaged().is_empty(), "{:?}", c.damaged());
+
+        assert_eq!(got.len(), 3, "удалённый тип выпал: {got:?}");
+        match &got[0].record {
+            OwnedRecord::Message { event, payload, .. } => {
+                assert_eq!(*event, EventId(1));
+                let v: (u16,) = postcard::from_bytes(payload).unwrap();
+                assert_eq!(v.0, 42, "payload перекодирован из старой раскладки");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &got[1].record {
+            OwnedRecord::Message { event, payload, .. } => {
+                assert_eq!(*event, EventId(3));
+                assert_eq!(payload, &[9], "нетронутый тип — байт в байт");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &got[2].record {
+            OwnedRecord::Sample { metric, value } => {
+                assert_eq!(*metric, MetricId(0x20), "метрика ремапнута");
+                assert_eq!(*value, OwnedSampleValue::U64(555), "значение исходное");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Тот же сегмент, записанный текущей версией, цепочку не проходит:
+        // payload события 1 остаётся в НОВОЙ раскладке как есть.
+        let dir2 = tempfile::tempdir().unwrap();
+        let fresh = postcard::to_allocvec(&(42u16,)).unwrap();
+        let path = sealed_versioned(
+            dir2.path(),
+            2,
+            &[(
+                100,
+                Record::Message(Message {
+                    event: EventId(1),
+                    span: None,
+                    payload: &fresh,
+                }),
+            )],
+        );
+        let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx)).unwrap();
+        match &c.next_entry().unwrap().record {
+            OwnedRecord::Message { payload, .. } => {
+                assert_eq!(payload, &fresh, "текущая версия не трогается");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_segment_from_the_future_is_named_not_misread() {
+        // Дамп с прибора с новой прошивкой в старом вьюере: раскладку из
+        // будущего разбирать нечем, и прочитать её текущими декодерами
+        // значило бы показать мусор за данные. Сегмент выпадает целиком — с
+        // объявлением, а не молча.
+        use dduroc_format::EventId;
+        use dduroc_format::record::Message;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_versioned(
+            dir.path(),
+            5,
+            &[(
+                100,
+                Record::Message(Message {
+                    event: EventId(1),
+                    span: None,
+                    payload: &[1],
+                }),
+            )],
+        );
+
+        let ctx = MigrationCtx {
+            current: 2,
+            steps: &[],
+        };
+        let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx)).unwrap();
+        assert!(c.next_entry().is_none(), "записей из будущего не выдаётся");
+        let damaged = c.damaged();
+        assert_eq!(damaged.len(), 1);
+        assert!(
+            damaged[0].reason.contains("новее схемы"),
+            "причина названа: {}",
+            damaged[0].reason
+        );
+
+        // Без контекста миграций (схемы нет вовсе) поведение прежнее: записи
+        // выдаются как есть — их разбирает тот, у кого схема есть.
+        let mut c = SegmentCursor::open(&path, false, None, None, None).unwrap();
+        assert!(c.next_entry().is_some());
+    }
+
+    #[test]
+    fn a_step_that_cannot_decode_reports_one_damage_per_block() {
+        // Отказ шага — систематический: весь блок одной раскладки. Тысяча
+        // одинаковых записей о повреждении хуже одной со счётчиком — но и
+        // молчание недопустимо: запись выпала из ответа.
+        use dduroc_engine::schema::{DecodeError, MigratedRecord, OwnedRecord as Out};
+        use dduroc_format::EventId;
+        use dduroc_format::record::Message;
+
+        fn broken(r: MigratedRecord<'_>) -> std::result::Result<Option<Out>, DecodeError> {
+            let _: (u64, u64, u64, u64) = r.decode()?;
+            Ok(Some(Out::AsIs))
+        }
+        static STEPS: &[Migration] = &[Migration {
+            from: 1,
+            touches_all: false,
+            events: &[EventId(1)],
+            metrics: &[],
+            migrate: broken,
+        }];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = sealed_versioned(
+            dir.path(),
+            1,
+            &[
+                (
+                    100,
+                    Record::Message(Message {
+                        event: EventId(1),
+                        span: None,
+                        payload: &[1],
+                    }),
+                ),
+                (
+                    200,
+                    Record::Message(Message {
+                        event: EventId(9),
+                        span: None,
+                        payload: &[2],
+                    }),
+                ),
+            ],
+        );
+        let ctx = MigrationCtx {
+            current: 2,
+            steps: STEPS,
+        };
+        let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx)).unwrap();
+        let got: Vec<RawEntry> = std::iter::from_fn(|| c.next_entry()).collect();
+        assert_eq!(got.len(), 1, "уцелевшая запись читается");
+        let damaged = c.damaged();
+        assert_eq!(damaged.len(), 1, "одна запись о повреждении: {damaged:?}");
+        assert!(
+            damaged[0].reason.contains("шаг миграции 1 → 2") && damaged[0].reason.contains(": 1"),
+            "виновник и счётчик названы: {}",
+            damaged[0].reason
+        );
+    }
+
+    #[test]
     fn the_block_index_works_in_both_directions_and_on_both_bounds() {
         // Порядок по умолчанию у запроса — `Order::Newest`, а пропуск блоков
         // по footer'у работал только по нижней границе и только в прямом
@@ -881,7 +1289,7 @@ mod tests {
         let path = sealed_segment(dir.path(), &times);
 
         let read = |reverse: bool, from: Option<u64>, to: Option<u64>| -> Vec<u64> {
-            let mut c = SegmentCursor::open(&path, reverse, None, None).unwrap();
+            let mut c = SegmentCursor::open(&path, reverse, None, None, None).unwrap();
             assert_eq!(c.offsets.len(), times.len(), "иначе тест не про отбор");
             c.seek_bounds(from.map(Micros), to.map(Micros));
             std::iter::from_fn(|| c.next_entry())

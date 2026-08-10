@@ -84,13 +84,14 @@ impl NsMeta {
                     }
                 }
                 // `protocol_version` в мете — версия последней **завершённой**
-                // миграции, и переписывать её здесь нельзя: физического
-                // прогона ещё нет, сегменты остались в прежней раскладке.
-                // Проштамповав мету, этот билд объявил бы неймспейс
-                // мигрированным, и будущая миграция обошла бы старые сегменты
+                // миграции, и переписывать её здесь нельзя: подъём — не
+                // прогон, сегменты остались в прежней раскладке. Проштамповав
+                // мету, этот билд объявил бы неймспейс мигрированным, и
+                // будущий `Namespace::migrate` обошёл бы старые сегменты
                 // стороной — их разобрали бы декодерами новой версии, молча и
                 // неверно. Смешанное состояние легально: версию несёт
-                // заголовок каждого сегмента, и она у них своя.
+                // заголовок каждого сегмента, и она у них своя. Штампует мету
+                // только успешный прогон.
                 Ok(meta)
             }
         }
@@ -116,6 +117,10 @@ struct NamespaceInner {
     _store: Arc<dyn std::any::Any + Send + Sync>,
     id: NsId,
     name: String,
+    /// Каталог неймспейса — прогону миграции нужны его каналы.
+    dir: std::path::PathBuf,
+    /// Идентичность хранилища: прогон не трогает сегменты чужих приборов.
+    store_id: u64,
     schema: Schema,
     /// Классы хранения в том же порядке, в каком зарегистрированы каналы.
     classes: Vec<StorageClass>,
@@ -124,6 +129,13 @@ struct NamespaceInner {
     drops: Arc<DropCounters>,
     next_span: Arc<AtomicU32>,
     meta: NsMeta,
+    /// Версия последней завершённой миграции — живое значение.
+    ///
+    /// В `meta` лежит то, что было прочитано при открытии; успешный
+    /// `Namespace::migrate` двигает версию, не переоткрывая неймспейс.
+    migrated_to: std::sync::atomic::AtomicU16,
+    /// Прогон единоличен: два одновременных переписывали бы одни файлы.
+    migrate_lock: std::sync::Mutex<()>,
     /// Пределы значений: дефолты схемы плюс то, что выставила установка.
     /// Живут в памяти и **не пишутся на диск** — см. [`crate::limits`].
     limits: LimitsRegistry,
@@ -141,6 +153,8 @@ impl Namespace {
         store: Arc<dyn std::any::Any + Send + Sync>,
         id: NsId,
         name: String,
+        dir: std::path::PathBuf,
+        store_id: u64,
         schema: Schema,
         classes: Vec<StorageClass>,
         writer: Arc<Writer>,
@@ -150,11 +164,14 @@ impl Namespace {
         meta: NsMeta,
     ) -> Self {
         let limits = LimitsRegistry::new();
+        let migrated_to = std::sync::atomic::AtomicU16::new(meta.protocol_version);
         Self {
             inner: Arc::new(NamespaceInner {
                 _store: store,
                 id,
                 name,
+                dir,
+                store_id,
                 schema,
                 classes,
                 writer,
@@ -162,6 +179,8 @@ impl Namespace {
                 drops,
                 next_span,
                 meta,
+                migrated_to,
+                migrate_lock: std::sync::Mutex::new(()),
                 limits,
                 announced: std::sync::atomic::AtomicU8::new(0),
             }),
@@ -180,8 +199,18 @@ impl Namespace {
         &self.inner.schema
     }
 
-    pub fn meta(&self) -> &NsMeta {
-        &self.inner.meta
+    /// Метаданные неймспейса — с живой версией протокола.
+    ///
+    /// По значению, а не ссылкой: успешный [`Namespace::migrate`] двигает
+    /// версию, и снимок обязан это отражать.
+    pub fn meta(&self) -> NsMeta {
+        NsMeta {
+            schema_name: self.inner.meta.schema_name.clone(),
+            protocol_version: self
+                .inner
+                .migrated_to
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
     }
 
     pub fn protocol_version(&self) -> ProtocolVersion {
@@ -192,17 +221,74 @@ impl Namespace {
     ///
     /// `Some` означает, что в каталоге лежат сегменты прежней раскладки:
     /// схема этого билда новее, чем версия последней завершённой миграции.
-    /// Данные читаются — версию несёт заголовок каждого сегмента, — но пока
-    /// физический прогон миграций не написан, привести их к текущему виду
-    /// нечем. Стоит записать это событие в журнал: молчание превратило бы
-    /// отложенную работу в забытую.
+    /// Читаются они правильно — сегмент прежней версии проходит через шаги
+    /// прямо при чтении, — но каждое чтение платит за преобразование, а
+    /// история лежит в раскладке, которой больше ни один билд не пишет.
+    /// Привести её физически — [`Namespace::migrate`]; когда его звать,
+    /// решает приложение: прогон жжёт ресурс флеша и занимает носитель.
     ///
     /// Новые сегменты пишутся текущей версией схемы; смешанное состояние
     /// каталога легально и ожидаемо.
     pub fn pending_migration(&self) -> Option<(u16, u16)> {
-        let stored = self.inner.meta.protocol_version;
+        let stored = self
+            .inner
+            .migrated_to
+            .load(std::sync::atomic::Ordering::Acquire);
         let current = self.inner.schema.version.0;
         (stored < current).then_some((stored, current))
+    }
+
+    /// Привести сегменты неймспейса к текущей версии схемы.
+    ///
+    /// Явный вызов, а не автоматика при открытии: прогон читает и переписывает
+    /// историю целиком — минуты на гигабайтах — и жжёт ресурс флеша. Когда
+    /// прибору это позволительно, знает только приложение (после старта, в
+    /// тихий час); долг тем временем виден в [`Namespace::pending_migration`],
+    /// а читается всё правильно и без прогона — шаги применяются при чтении.
+    ///
+    /// Тяжёлая работа идёт на потоке вызывающего; writer участвует только в
+    /// фиксации каждого сегмента (rename поверх старого имени), поэтому запись
+    /// не останавливается. Прогон идемпотентен и возобновляем: обрыв на любом
+    /// месте оставляет каждый сегмент либо прежним, либо уже переписанным, и
+    /// следующий вызов продолжит с оставшихся.
+    ///
+    /// Сегменты, которые ни один шаг не затрагивает, не переписываются и
+    /// сохраняют прежнюю версию в заголовке — это легально: незатронутость и
+    /// означает, что текущие декодеры читают их верно.
+    pub fn migrate(&self) -> Result<crate::migrate::MigrationReport> {
+        let Some((_, to)) = self.pending_migration() else {
+            return Ok(crate::migrate::MigrationReport::default());
+        };
+        let Ok(_guard) = self.inner.migrate_lock.try_lock() else {
+            return Err(Error::MigrationBusy(self.inner.name.clone()));
+        };
+
+        let channels: Vec<&str> = self.inner.classes.iter().map(|c| c.as_str()).collect();
+        let report = crate::migrate::run_namespace(
+            &self.inner.dir,
+            &self.inner.schema,
+            self.inner.store_id,
+            &self.inner.writer,
+            self.inner.id,
+            &channels,
+        )?;
+
+        // Штамп — только после того, как КАЖДЫЙ сегмент оказался либо
+        // текущим, либо переписанным, либо доказуемо незатронутым: мета
+        // означает «завершено», и объявить это раньше значило бы, что
+        // будущие прогоны обойдут недоделанное стороной.
+        let meta = NsMeta {
+            schema_name: self.inner.meta.schema_name.clone(),
+            protocol_version: to,
+        };
+        fsutil::write_atomic(
+            &self.inner.dir.join(NS_META),
+            &postcard::to_allocvec(&meta)?,
+        )?;
+        self.inner
+            .migrated_to
+            .store(to, std::sync::atomic::Ordering::Release);
+        Ok(report)
     }
 
     /// Текущий момент — в тех же координатах, в каких его вернёт читатель.
@@ -1150,6 +1236,177 @@ mod tests {
             vec![1, 2],
             "старый сегмент сохранил свою версию, новый получил текущую"
         );
+    }
+
+    #[test]
+    fn migrate_rewrites_history_and_stamps_the_meta() {
+        // Полный цикл физического прогона: запись v1 → подъём v2 →
+        // `Namespace::migrate` — старый сегмент переписан по шагу, активный
+        // не тронут, мета заштампована, повтор пуст. Всё это на живом
+        // хранилище с работающим writer'ом: фиксация идёт через него.
+        use crate::migrate::MigrationReport;
+        use crate::schema::{DecodeError, MigratedRecord, Migration, OwnedRecord};
+
+        fn step(r: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+            match (r.event_id(), r.metric_id()) {
+                // PowerSet перекодируется в фиксированный новый payload.
+                (Some(EventId(1)), _) => Ok(Some(OwnedRecord::Message {
+                    event: EventId(1),
+                    payload: vec![0xAA, 0xBB],
+                })),
+                // Отсчёты temp удаляются целиком.
+                (_, Some(MetricId(1))) => Ok(None),
+                _ => Ok(Some(OwnedRecord::AsIs)),
+            }
+        }
+        static STEPS: &[Migration] = &[Migration {
+            from: 1,
+            touches_all: false,
+            events: &[EventId(1)],
+            metrics: &[MetricId(1)],
+            migrate: step,
+        }];
+
+        let dir = tempfile::tempdir().unwrap();
+        // Запуск 1: история версии 1 — событие, отсчёт и спан.
+        {
+            let store = open_store(dir.path());
+            let ns = store.namespace("orc-radio-0", schema()).unwrap();
+            ns.log_raw(EventId(1), &[1, 2, 3], None);
+            ns.series(TEMP).unwrap().sample(36.6);
+            ns.log_raw(EventId(1), &[4, 5], None);
+            ns.sync().unwrap();
+            store.shutdown();
+        }
+
+        let v2 = Schema {
+            version: ProtocolVersion(2),
+            migrations: STEPS,
+            ..schema()
+        };
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", v2).unwrap();
+        assert_eq!(ns.pending_migration(), Some((1, 2)));
+
+        // Живой сегмент версии 2 — прогон обязан пройти мимо него.
+        ns.log_raw(EventId(1), &[9], None);
+        ns.sync().unwrap();
+
+        let report = ns.migrate().expect("прогон проходит");
+        assert_eq!(report.rewritten, 1, "{report:?}");
+        assert_eq!(report.already_current, 1, "активный сегмент не тронут");
+        assert_eq!(report.records_rewritten, 2, "два PowerSet пережили шаг");
+        assert_eq!(report.records_dropped, 1, "отсчёт temp удалён");
+        assert_eq!(report.skipped_untouched + report.emptied, 0, "{report:?}");
+
+        assert_eq!(ns.pending_migration(), None, "долга больше нет");
+        assert_eq!(ns.meta().protocol_version, 2, "мета заштампована в памяти");
+        let raw = std::fs::read(dir.path().join("orc-radio-0").join(NS_META)).unwrap();
+        let meta: NsMeta = postcard::from_bytes(&raw).unwrap();
+        assert_eq!(meta.protocol_version, 2, "и на диске");
+
+        // Переписанный сегмент: версия текущая, footer есть, содержимое — по
+        // шагу: payload'ы заменены, отсчётов не осталось.
+        let seg_dir = dir.path().join("orc-radio-0").join("default");
+        let mut rewritten_payloads = Vec::new();
+        let mut samples = 0;
+        for entry in std::fs::read_dir(&seg_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|x| x != "seg") {
+                continue;
+            }
+            let reader = crate::segment::SegmentReader::open(&path).unwrap();
+            assert_eq!(
+                reader.header().protocol_version.0,
+                2,
+                "прежних версий на диске не осталось: {path:?}"
+            );
+            let mut buf = Vec::new();
+            for offset in reader.scan_block_offsets().0 {
+                reader.read_block_at(offset, &mut buf).unwrap();
+                let block = crate::segment::parse_block(&buf).unwrap().unwrap();
+                for item in block.records() {
+                    match item.unwrap().1 {
+                        dduroc_format::Record::Message(m) => {
+                            rewritten_payloads.push(m.payload.to_vec());
+                        }
+                        dduroc_format::Record::Sample(_) => samples += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        rewritten_payloads.sort();
+        assert_eq!(
+            rewritten_payloads,
+            vec![vec![9], vec![0xAA, 0xBB], vec![0xAA, 0xBB]],
+            "старые payload'ы переписаны шагом, новый — как был"
+        );
+        assert_eq!(samples, 0, "удалённые шагом отсчёты не воскресают");
+
+        // Повторный прогон — честный no-op.
+        assert_eq!(ns.migrate().unwrap(), MigrationReport::default());
+        store.shutdown();
+    }
+
+    #[test]
+    fn an_untouched_segment_is_skipped_and_keeps_its_version() {
+        // Сегмент, в котором нет ни одного затронутого типа, не тратит цикла
+        // записи флеша: он не переписывается и сохраняет прежнюю версию в
+        // заголовке — при заштампованной мете. Это легально: незатронутость
+        // и означает, что текущие декодеры читают его верно.
+        use crate::schema::{DecodeError, MigratedRecord, Migration, OwnedRecord};
+
+        fn nope(_: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+            Ok(Some(OwnedRecord::Message {
+                event: EventId(2),
+                payload: vec![0xEE],
+            }))
+        }
+        static STEPS: &[Migration] = &[Migration {
+            from: 1,
+            touches_all: false,
+            // Шаг затрагивает только Alarm — его в истории не будет.
+            events: &[EventId(2)],
+            metrics: &[],
+            migrate: nope,
+        }];
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = open_store(dir.path());
+            let ns = store.namespace("orc-radio-0", schema()).unwrap();
+            ns.log_raw(EventId(1), &[7], None);
+            ns.sync().unwrap();
+            store.shutdown();
+        }
+
+        let v2 = Schema {
+            version: ProtocolVersion(2),
+            migrations: STEPS,
+            ..schema()
+        };
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", v2).unwrap();
+        let report = ns.migrate().unwrap();
+        assert_eq!(report.skipped_untouched, 1, "{report:?}");
+        assert_eq!(report.rewritten, 0, "флеш не тронут");
+        assert_eq!(ns.pending_migration(), None, "мета заштампована");
+
+        let seg_dir = dir.path().join("orc-radio-0").join("default");
+        let old = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "seg"))
+            .unwrap();
+        let reader = crate::segment::SegmentReader::open(&old).unwrap();
+        assert_eq!(
+            reader.header().protocol_version.0,
+            1,
+            "незатронутый сегмент остаётся при своей версии — и это легально"
+        );
+        store.shutdown();
     }
 
     #[test]

@@ -779,6 +779,9 @@ impl Reader {
                 prefilter: Some(build_prefilter(q, schema)),
                 max_segments: None,
                 require_metrics: None,
+                // Сегменты прежних версий приводятся к текущей прямо при
+                // чтении: корректность ответа не ждёт физического прогона.
+                migrations: schema.as_ref().map(crate::cursor::MigrationCtx::of),
             };
             adjust(&mut scope);
 

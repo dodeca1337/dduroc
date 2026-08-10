@@ -24,6 +24,7 @@ mod error;
 mod fsutil;
 pub mod limits;
 pub mod metric;
+pub mod migrate;
 pub mod namespace;
 pub mod rotation;
 pub mod schema;
@@ -38,6 +39,7 @@ pub use clock::Clock;
 pub use epochs::{EpochStore, Epochs, SyncSource};
 pub use error::{Error, Result};
 pub use limits::{EffectiveLimits, MetricLimits, StateStatus};
+pub use migrate::MigrationReport;
 pub use namespace::{Namespace, Series, SpanGuard};
 pub use rotation::Inventory;
 pub use schema::{

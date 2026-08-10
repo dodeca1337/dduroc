@@ -363,7 +363,7 @@ impl Store {
 
         let id = self.writer.register(NsSetup {
             name: name.to_owned(),
-            dir,
+            dir: dir.clone(),
             protocol_version: schema.version,
             store_id: self.meta.store_id,
             boot,
@@ -382,6 +382,8 @@ impl Store {
             }),
             id,
             name.to_owned(),
+            dir,
+            self.meta.store_id,
             schema,
             classes,
             Arc::clone(&self.writer),

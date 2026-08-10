@@ -65,8 +65,16 @@ impl SegmentWriter {
     /// Создать новый сегмент ёмкостью `capacity` байт.
     pub fn create(dir: &Path, header: SegmentHeader, capacity: u64) -> Result<Self> {
         let name = SegmentName::new(header.boot, header.base);
-        let path = dir.join(name.to_string());
+        Self::create_at(&dir.join(name.to_string()), header, capacity)
+    }
 
+    /// То же по явному пути — для файлов, чьё имя не равно имени сегмента.
+    ///
+    /// Нужно миграции: она собирает новый сегмент во временном файле рядом со
+    /// старым и подменяет его атомарным `rename` только после `fdatasync`.
+    /// Писать сразу в конечное имя нельзя — оно занято оригиналом, который
+    /// обязан пережить любой обрыв до последнего момента.
+    pub fn create_at(path: &Path, header: SegmentHeader, capacity: u64) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -74,24 +82,24 @@ impl SegmentWriter {
             // иначе мы затёрли бы чужие данные тем же (boot, время) ключом.
             .create_new(true)
             .mode(fsutil::FILE_MODE)
-            .open(&path)
-            .ctx_path("создание сегмента", &path)?;
+            .open(path)
+            .ctx_path("создание сегмента", path)?;
 
         let capacity = capacity.max(SegmentHeader::SIZE as u64 + BlockHeader::SIZE as u64);
-        if let Err(e) = grow_to(&file, capacity, &path) {
+        if let Err(e) = grow_to(&file, capacity, path) {
             // Файл без места бесполезен и мешает следующей попытке.
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path);
             return Err(e);
         }
 
         file.write_all_at(&header.to_bytes(), 0)
-            .ctx_path("запись заголовка", &path)?;
-        fsutil::sync_data(&file, &path)?;
-        fsutil::sync_dir(dir)?;
+            .ctx_path("запись заголовка", path)?;
+        fsutil::sync_data(&file, path)?;
+        fsutil::sync_dir(path.parent().unwrap_or(Path::new(".")))?;
 
         Ok(Self {
             file,
-            path,
+            path: path.to_owned(),
             end: SegmentHeader::SIZE as u64,
             capacity,
             header,

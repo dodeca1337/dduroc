@@ -28,7 +28,7 @@
 //! ([`crate::stats`]) и отметки, вставляемые прямо в поток записей.
 
 use crate::channel::{ChannelConfig, Durability};
-use crate::error::{Error, Result};
+use crate::error::{Error, IoContext, Result};
 use crate::rotation::{Inventory, SegmentEntry};
 use crate::segment::SegmentWriter;
 use crate::staged::{ChannelIdx, DropCounters, NsId, Staged, StagedRecord};
@@ -156,8 +156,37 @@ enum Control {
     Release(NsId),
     /// Вытолкнуть и синхронизировать всё накопленное неймспейсом.
     Sync(Option<NsId>, Sender<Result<()>>),
+    /// Подменить сегмент результатом миграции (или удалить опустевший).
+    ///
+    /// Тяжёлая работа миграции — чтение, преобразование, запись временного
+    /// файла — идёт на потоке вызывающего; сюда приходит только **фиксация**:
+    /// rename поверх старого имени и правка инвентаря. Делать её мимо writer'а
+    /// нельзя — он единственный владелец инвентаря и ротации, и внешняя
+    /// подмена файла гонялась бы с удалением этого же файла ротацией.
+    CommitMigration {
+        ns: NsId,
+        channel: ChannelIdx,
+        name: SegmentName,
+        commit: MigrationCommit,
+        /// `Ok(false)` — сегмента больше нет (ротирован), фиксировать нечего.
+        reply: Sender<Result<bool>>,
+    },
     /// Запечатать активные сегменты и завершить работу.
     Shutdown(Sender<()>),
+}
+
+/// Чем закончилась миграция одного сегмента.
+#[derive(Debug)]
+pub(crate) enum MigrationCommit {
+    /// Подменить файл сегмента временным (он уже записан и синхронизирован).
+    Replace {
+        tmp: PathBuf,
+        /// Размер нового файла — инвентарь обязан узнать его сразу, а не при
+        /// следующем скане: по суммам ходит ротация и потолок хранилища.
+        size: u64,
+    },
+    /// Удалить сегмент: все его записи удалены шагами миграции.
+    Remove,
 }
 
 /// Параметры регистрации неймспейса.
@@ -373,6 +402,27 @@ impl Writer {
         rx.recv().map_err(|_| Error::WriterDead)?
     }
 
+    /// Зафиксировать миграцию сегмента. `Ok(false)` — сегмент уже ротирован.
+    pub(crate) fn commit_migration(
+        &self,
+        ns: NsId,
+        channel: ChannelIdx,
+        name: SegmentName,
+        commit: MigrationCommit,
+    ) -> Result<bool> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.control
+            .send(Control::CommitMigration {
+                ns,
+                channel,
+                name,
+                commit,
+                reply: tx,
+            })
+            .map_err(|_| Error::WriterDead)?;
+        rx.recv().map_err(|_| Error::WriterDead)?
+    }
+
     /// Завершить работу: дописать, запечатать, дождаться потока.
     pub fn shutdown(&self) {
         // Флаг ставится ДО команды: между вычерпыванием очереди в потоке и
@@ -492,6 +542,10 @@ impl ChannelState {
         drops: Arc<DropCounters>,
         counters: &Counters,
     ) -> Result<Self> {
+        // След прерванной миграции: обрыв до rename оставляет `*.tmp`, чьё
+        // содержимое уже никем не адресуется. Подмести обязан тот, кто первым
+        // приходит в каталог, — то есть регистрация канала.
+        crate::fsutil::sweep_tmp(&dir)?;
         let mut inventory = Inventory::scan(&dir)?;
         Self::recover_orphan(&dir, &mut inventory, identity, counters);
         let now = Instant::now();
@@ -1664,6 +1718,16 @@ impl WriterLoop {
                 self.release(ns);
                 ControlOutcome::Continue
             }
+            Control::CommitMigration {
+                ns,
+                channel,
+                name,
+                commit,
+                reply,
+            } => {
+                let _ = reply.send(self.commit_migration(ns, channel, name, commit));
+                ControlOutcome::Continue
+            }
             Control::Sync(ns, reply) => {
                 // Сначала записи, потом отчёт: иначе `sync` подтвердил бы
                 // сохранность того, что ещё стоит в очереди.
@@ -1690,6 +1754,54 @@ impl WriterLoop {
                 ControlOutcome::Stop
             }
         }
+    }
+
+    /// Выполнить фиксацию миграции сегмента на потоке writer'а.
+    ///
+    /// Здесь, а не на потоке вызывающего, потому что инвентарь и ротация
+    /// живут только тут: подмена файла мимо writer'а гонялась бы с его же
+    /// `unlink` этого файла. Сама фиксация — rename и правка числа в
+    /// инвентаре, микросекунды: writer не задерживается.
+    fn commit_migration(
+        &mut self,
+        ns: NsId,
+        channel: ChannelIdx,
+        name: SegmentName,
+        commit: MigrationCommit,
+    ) -> Result<bool> {
+        let Some(ch) = self
+            .namespaces
+            .get_mut(ns.0 as usize)
+            .and_then(|n| n.as_mut())
+            .and_then(|n| n.channels.get_mut(channel.0 as usize))
+        else {
+            // Неймспейс уже отпущен — фиксировать не во что.
+            return Ok(false);
+        };
+        // Сегмент мог быть ротирован, пока его переписывали: тогда его
+        // история уже выброшена, и воскрешать её из временного файла нельзя —
+        // бюджет про неё забыл.
+        if !ch.inventory.iter().any(|e| e.name == name) {
+            return Ok(false);
+        }
+        debug_assert_ne!(
+            Some(name),
+            Self::live_segment(ch),
+            "мигрируют только сегменты прежних версий, живой всегда текущей"
+        );
+        let path = ch.dir.join(name.to_string());
+        match commit {
+            MigrationCommit::Replace { tmp, size } => {
+                std::fs::rename(&tmp, &path).ctx_path("подмена сегмента", &path)?;
+                crate::fsutil::sync_dir(&ch.dir)?;
+                ch.inventory.update_size(name, size);
+            }
+            MigrationCommit::Remove => {
+                crate::fsutil::remove_synced(&path)?;
+                ch.inventory.remove(name);
+            }
+        }
+        Ok(true)
     }
 
     fn register(&mut self, setup: NsSetup) -> Result<NsId> {

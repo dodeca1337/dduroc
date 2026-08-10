@@ -139,6 +139,7 @@ pub use serde;
 #[doc(hidden)]
 pub use serde_json;
 
+pub use dduroc_engine::MigrationReport;
 pub use dduroc_engine::channel::{ChannelConfig, Durability};
 pub use dduroc_engine::epochs::SyncSource;
 pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, StateStatus};
@@ -181,6 +182,64 @@ pub trait Event: serde::Serialize {
     const LEVEL: Level;
     /// Имя типа для интерфейсов.
     const NAME: &'static str;
+}
+
+/// Payload события какой-то версии схемы — то, что умеет лечь в запись.
+///
+/// Реализуется генерируемым кодом для событий **текущей** версии (через
+/// [`Event`]) и для типов из `history {}` — раскладок прежних версий. Шаг
+/// миграции возвращает любой из них: обычно текущий тип, а в длинной цепочке
+/// — раскладку следующей версии, которую доведёт до текущей следующий шаг.
+pub trait EventShape: serde::Serialize {
+    /// Идентификатор события в той версии, которой принадлежит раскладка.
+    const SHAPE_ID: EventId;
+}
+
+impl<E: Event> EventShape for E {
+    const SHAPE_ID: EventId = E::ID;
+}
+
+/// Исход типизированного правила миграции.
+///
+/// Замыкание правила возвращает либо payload ([`EventShape`] — запись
+/// перекодируется), либо `Option` от него (`None` — запись удаляется).
+/// Трейт существует, чтобы генерируемый код принимал и то, и другое, не
+/// заставляя каждое правило писать `Some(...)`.
+pub trait MigrateOutcome {
+    /// Превратить исход в запись миграции.
+    fn into_outcome(self) -> std::result::Result<Option<OwnedRecord>, DecodeError>;
+}
+
+impl<E: EventShape> MigrateOutcome for E {
+    fn into_outcome(self) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+        Ok(Some(OwnedRecord::Message {
+            event: E::SHAPE_ID,
+            payload: postcard::to_allocvec(&self).map_err(|_| DecodeError)?,
+        }))
+    }
+}
+
+impl<E: EventShape> MigrateOutcome for Option<E> {
+    fn into_outcome(self) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+        match self {
+            Some(e) => e.into_outcome(),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Вызвать преобразование типизированного правила. Только для макроса.
+///
+/// Существует из-за порядка вывода типов у замыканий: `(|old| old.dbm)(x)`
+/// не компилируется — тело проверяется раньше, чем немедленный вызов успел
+/// подсказать тип параметра. Ожидание `impl FnOnce(T)` сообщает его до
+/// проверки тела, и правило пишется без аннотации: `|old| ...`.
+#[doc(hidden)]
+pub fn __migrate_map<T, O: MigrateOutcome>(
+    map: impl FnOnce(T) -> O,
+    old: T,
+) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+    map(old).into_outcome()
 }
 
 /// Расширение [`Namespace`] типизированной записью.

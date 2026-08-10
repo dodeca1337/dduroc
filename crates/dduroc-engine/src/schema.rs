@@ -385,6 +385,48 @@ pub struct MigratedRecord<'a> {
     pub record: dduroc_format::Record<'a>,
 }
 
+impl MigratedRecord<'_> {
+    /// Тип сообщения. `None` — запись не сообщение.
+    pub fn event_id(&self) -> Option<EventId> {
+        match &self.record {
+            dduroc_format::Record::Message(m) => Some(m.event),
+            _ => None,
+        }
+    }
+
+    /// Метрика отсчёта. `None` — запись не отсчёт.
+    pub fn metric_id(&self) -> Option<MetricId> {
+        match &self.record {
+            dduroc_format::Record::Sample(s) => Some(s.metric),
+            _ => None,
+        }
+    }
+
+    /// Сырой payload сообщения. `None` — запись не сообщение.
+    ///
+    /// Нужен ремапу id: тип меняет номер, байты полей едут как есть.
+    pub fn payload(&self) -> Option<&[u8]> {
+        match &self.record {
+            dduroc_format::Record::Message(m) => Some(m.payload),
+            _ => None,
+        }
+    }
+
+    /// Разобрать payload сообщения в старую раскладку.
+    ///
+    /// `T` — структура с полями той версии, из которой мигрирует шаг (при
+    /// объявленной `history` её генерирует макрос). Ошибка и для записи,
+    /// которая не сообщение: у остальных видов payload'а в этом смысле нет.
+    pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, DecodeError> {
+        match &self.record {
+            dduroc_format::Record::Message(m) => {
+                postcard::from_bytes(m.payload).map_err(|_| DecodeError)
+            }
+            _ => Err(DecodeError),
+        }
+    }
+}
+
 /// Результат преобразования: владеющая форма, так как шаг миграции обычно
 /// перекодирует payload.
 #[derive(Debug, Clone, PartialEq)]
@@ -779,6 +821,31 @@ fn check_unique(
         seen.push((id, name));
     }
     Ok(())
+}
+
+/// Конструкторы схем для тестов соседних модулей.
+///
+/// Не `mod tests`: тем нужен готовый экземпляр, а не проверки этого модуля.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// Минимальная валидная схема с шагами миграции.
+    pub(crate) fn minimal_schema_with_migrations(
+        version: u16,
+        migrations: &'static [Migration],
+    ) -> Schema {
+        static LANGS: &[Language] = &[Language("en")];
+        Schema {
+            name: "probe",
+            version: ProtocolVersion(version),
+            languages: LANGS,
+            events: &[],
+            metrics: &[],
+            spans: &[],
+            migrations,
+        }
+    }
 }
 
 #[cfg(test)]
