@@ -190,6 +190,9 @@ pub mod prelude {
 /// Тип события, объявленный макросом [`schema!`].
 ///
 /// Реализуется генерируемым кодом; вручную реализовывать не нужно.
+///
+/// Событие без полей — unit-структура: `ns.log(events::Started)`, без пустых
+/// фигурных скобок.
 pub trait Event: serde::Serialize {
     /// Идентификатор в пределах схемы.
     const ID: EventId;
@@ -653,7 +656,7 @@ mod tests {
 
     #[test]
     fn event_without_fields_renders_template_as_is() {
-        let payload = encode(&testing::events::Started {}).unwrap();
+        let payload = encode(&testing::events::Started).unwrap();
         assert!(payload.is_empty(), "у события без полей payload пуст");
         let d = testing::SCHEMA
             .event(EventId(0x10))

@@ -73,7 +73,7 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
         let store = Store::open(StoreConfig::new(&root).with_budget_per_class(16 << 20)).unwrap();
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
         for _ in 0..3 {
-            ns.log(durability::events::Tick {});
+            ns.log(durability::events::Tick);
         }
         ns.sync().unwrap();
         std::process::abort();
@@ -106,7 +106,7 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
         let store =
             Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
-        ns.log(durability::events::Tick {});
+        ns.log(durability::events::Tick);
         ns.sync().unwrap();
         assert_eq!(
             store.stats().truncated_tails,
@@ -144,7 +144,7 @@ fn crashed_segment_gets_a_footer_so_migration_can_see_it() {
     if let Ok(root) = std::env::var(CRASH_ROOT) {
         let store = Store::open(StoreConfig::new(&root).with_budget_per_class(16 << 20)).unwrap();
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
-        ns.log(durability::events::Tick {});
+        ns.log(durability::events::Tick);
         ns.series(durability::metrics::Spectrum)
             .unwrap()
             .sample(&[1u8, 2, 3][..]);
@@ -195,7 +195,7 @@ fn record_larger_than_a_segment_is_refused_not_written_past_it() {
     ns.series(durability::metrics::Spectrum)
         .unwrap()
         .sample(&noise(segment_bytes as usize * 2)[..]);
-    ns.log(durability::events::Tick {});
+    ns.log(durability::events::Tick);
     ns.sync().unwrap();
     store.shutdown();
 
@@ -235,7 +235,7 @@ fn reopened_namespace_does_not_leave_a_second_state_on_the_directory() {
     for round in 0..4 {
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
         for _ in 0..50 {
-            ns.log(durability::events::Tick {});
+            ns.log(durability::events::Tick);
         }
         ns.sync().unwrap();
         drop(ns);
@@ -279,7 +279,7 @@ fn records_enqueued_before_the_handle_is_dropped_still_land() {
     {
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
         for _ in 0..2_000 {
-            while ns.try_log(durability::events::Tick {}).is_err() {
+            while ns.try_log(durability::events::Tick).is_err() {
                 std::thread::yield_now();
             }
             accepted += 1;

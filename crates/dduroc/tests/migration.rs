@@ -110,7 +110,7 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
         let store = Store::open(cfg.clone()).unwrap();
         let ns = store.namespace("orc-0", was::probe::SCHEMA).unwrap();
         ns.log(was::probe::events::PowerSet { dbm: -3 });
-        ns.log(was::probe::events::Legacy {});
+        ns.log(was::probe::events::Legacy);
         ns.log(was::probe::events::Note { n: 7 });
         ns.series(was::probe::metrics::Temp).unwrap().sample(36.5);
         ns.sync().unwrap();

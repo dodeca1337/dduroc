@@ -215,7 +215,7 @@ fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
     let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
 
     for _ in 0..N {
-        ns.try_log(pressure::events::Alarm {})
+        ns.try_log(pressure::events::Alarm)
             .expect("критическая запись не имеет права быть отвергнутой");
     }
     ns.sync().unwrap();
@@ -444,8 +444,8 @@ fn a_class_can_live_on_its_own_root() {
         )
         .unwrap();
         let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
-        ns.log(pressure::events::Mark {});
-        ns.log(pressure::events::Alarm {});
+        ns.log(pressure::events::Mark);
+        ns.log(pressure::events::Alarm);
         ns.sync().unwrap();
         assert!(store.stats().is_clean(), "{:?}", store.stats());
         store.shutdown();

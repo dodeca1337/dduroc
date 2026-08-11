@@ -19,6 +19,8 @@
 //!             ru: "мощность {dbm} дБм",
 //!             dbm: f32,
 //!         },
+//!         // Без полей — unit-структура: `ns.log(events::Started)`.
+//!         Started = 0x02 { level: Info, en: "started", ru: "запущено" },
 //!     }
 //!
 //!     metrics {
@@ -1204,6 +1206,14 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
 
         let field_decls: Vec<TokenStream2> =
             ev.fields.iter().map(|(n, t)| quote!(pub #n: #t)).collect();
+        // Событие без полей — unit-структура, а не пустые фигурные скобки:
+        // `ns.log(events::Started)` вместо `ns.log(events::Started {})`. На
+        // проводе разницы нет — postcard кодирует и то, и другое нулём байт.
+        let struct_decl = if ev.fields.is_empty() {
+            quote!(pub struct #name;)
+        } else {
+            quote!(pub struct #name { #(#field_decls,)* })
+        };
         let field_descs: Vec<TokenStream2> = ev
             .fields
             .iter()
@@ -1251,9 +1261,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         event_structs.push(quote! {
             #[derive(Debug, Clone, PartialEq, ::dduroc::serde::Serialize, ::dduroc::serde::Deserialize)]
             #[serde(crate = "::dduroc::serde")]
-            pub struct #name {
-                #(#field_decls,)*
-            }
+            #struct_decl
 
             impl ::dduroc::Event for #name {
                 const ID: ::dduroc::EventId = ::dduroc::EventId(#id);
@@ -1586,15 +1594,19 @@ fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
                 let id = e.id;
                 let fields: Vec<TokenStream2> =
                     e.fields.iter().map(|(n, t)| quote!(pub #n: #t)).collect();
+                // Как и у текущих раскладок: без полей — unit-структура.
+                let decl = if e.fields.is_empty() {
+                    quote!(pub struct #name;)
+                } else {
+                    quote!(pub struct #name { #(#fields,)* })
+                };
                 quote! {
                     #[derive(
                         Debug, Clone, PartialEq,
                         ::dduroc::serde::Serialize, ::dduroc::serde::Deserialize,
                     )]
                     #[serde(crate = "::dduroc::serde")]
-                    pub struct #name {
-                        #(#fields,)*
-                    }
+                    #decl
 
                     impl ::dduroc::EventShape for #name {
                         const SHAPE_ID: ::dduroc::EventId = ::dduroc::EventId(#id);
@@ -2179,6 +2191,27 @@ mod tests {
                events { Boom = 0x01 { level: Error, en: "код {ru}", ru: u8 } }"#,
         )
         .expect("поле с именем языка — это поле");
+    }
+
+    #[test]
+    fn an_event_without_fields_is_a_unit_struct() {
+        // `ns.log(events::Started)` — писать `Started {}` ради структуры,
+        // у которой нечего заполнять, значит платить синтаксисом за пустоту.
+        let src = r#"name: radio, version: 1, languages: [en],
+               events {
+                   Started = 0x01 { level: Info, en: "started" },
+                   PowerSet = 0x02 { level: Info, en: "power {dbm}", dbm: f32 }
+               }"#;
+        let parsed: SchemaInput = syn::parse_str(src).expect("образцовое объявление");
+        let out = codegen(&parsed).expect("кодогенерация").to_string();
+        assert!(
+            out.contains("pub struct Started ;"),
+            "событие без полей обязано быть unit-структурой: {out}"
+        );
+        assert!(
+            out.contains("pub struct PowerSet { pub dbm : f32 , }"),
+            "событие с полями остаётся структурой с полями: {out}"
+        );
     }
 
     #[test]

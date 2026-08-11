@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = Store::open(cfg.clone())?;
         boot_first = store.boot_counter();
         let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
-        ns.log(radio::events::Started {});
+        ns.log(radio::events::Started);
         ns.log(radio::events::PowerSet { dbm: 27.5 });
         ns.series(radio::metrics::TempPa)?.sample(36.6);
         ns.series(radio::metrics::LinkState)?
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = Store::open(cfg)?;
         boot_second = store.boot_counter();
         let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
-        ns.log(radio::events::Started {});
+        ns.log(radio::events::Started);
 
         // Якорь ретроактивен на всю загрузку железа: настенное время получат
         // и записи ПЕРВОГО запуска — процесс перезапускался, прибор нет.
@@ -282,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let store = Store::open(StoreConfig::new(&lone).with_budget_per_class(16 << 20))?;
         let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
-        ns.log(radio::events::Started {});
+        ns.log(radio::events::Started);
         ns.sync()?;
         store.shutdown(); // record_sync не звали: якоря нет
     }

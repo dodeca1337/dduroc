@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let store = Store::open(cfg.clone())?;
         let ns = store.namespace("orc-radio-0", yesterday::radio::SCHEMA)?;
         ns.log(yesterday::radio::events::PowerSet { dbm: -3 });
-        ns.log(yesterday::radio::events::LegacyPing {});
+        ns.log(yesterday::radio::events::LegacyPing);
         ns.log(yesterday::radio::events::Note { n: 7 });
         ns.series(yesterday::radio::metrics::Temp)?.sample(36.5);
         ns.sync()?;
