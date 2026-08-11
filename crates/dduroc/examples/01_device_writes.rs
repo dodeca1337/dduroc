@@ -155,20 +155,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // решает приложение. Спросить важность значения можно в любой момент.
     // 65 °C по схемным пределам (warn до 70) — норма, по действующим
     // (warn до 60) — уже тревога.
-    let hot = OwnedValue::F32(65.0);
+    // Значение — то же, что принял бы отсчёт: собирать его вручную не нужно,
+    // тип берётся из той же константы метрики, что открывает ряд.
     println!(
         "65.0 °C по действующим пределам: {:?} (по схемным было бы Normal)",
-        ns.severity_of(radio::metrics::TempPa, &hot)
+        ns.severity_of(radio::metrics::TempPa, 65.0)
     );
-    if ns.severity_of(radio::metrics::TempPa, &hot) >= Severity::Warn {
+    if temp.severity_of(65.0) >= Severity::Warn {
         ns.log(radio::events::Overheat { t: 65.0, sensor: 0 });
     }
+
+    // У ряда метрика уже известна — спрашивать можно прямо у него, и
+    // состояния при этом называются именами, а не кодами.
+    println!(
+        "состояние {:?}: {:?}",
+        radio::metrics::LinkState::Los,
+        link.severity_of(radio::metrics::LinkState::Los)
+    );
 
     // Предикаты из схемы работают везде, где спрашивают важность, — и здесь,
     // и у читателя дампа.
     println!(
         "КСВ 0.5 (обрыв фидера): {:?} — диапазоном нормы такое не выразить",
-        ns.severity_of(radio::metrics::Vswr, &OwnedValue::F32(0.5))
+        ns.severity_of(radio::metrics::Vswr, 0.5)
     );
 
     // Крайняя форма пределов — замыкание с захваченным контекстом: оно
@@ -187,10 +196,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Severity::Normal
         }
     })?;
-    let _ = ns.severity_of(radio::metrics::TempPa, &OwnedValue::F32(65.0)); // защёлкнулось
+    let _ = ns.severity_of(radio::metrics::TempPa, 65.0); // защёлкнулось
     println!(
         "36.6 °C после перегрева: {:?} — замыкание помнит контекст",
-        ns.severity_of(radio::metrics::TempPa, &OwnedValue::F32(36.6))
+        ns.severity_of(radio::metrics::TempPa, 36.6)
     );
     ns.clear_severity_fn(radio::metrics::TempPa)?; // снова действуют данные
 

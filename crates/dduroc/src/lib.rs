@@ -829,9 +829,8 @@ mod tests {
             }
         })
         .unwrap();
-        let hot = OwnedValue::F32(75.0);
         assert_eq!(
-            ns.severity_of(testing::metrics::Temp, &hot),
+            ns.severity_of(testing::metrics::Temp, 75.0),
             Severity::Alarm,
             "по схеме было бы Warn: замыкание победило"
         );
@@ -839,7 +838,7 @@ mod tests {
 
         ns.clear_severity_fn(testing::metrics::Temp).unwrap();
         assert_eq!(
-            ns.severity_of(testing::metrics::Temp, &hot),
+            ns.severity_of(testing::metrics::Temp, 75.0),
             Severity::Warn,
             "снятие возвращает схемные диапазоны"
         );

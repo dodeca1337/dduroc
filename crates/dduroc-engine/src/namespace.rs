@@ -613,7 +613,28 @@ impl Namespace {
     /// Сама запись пределов не касается: движок не решает за приложение, что
     /// делать с выходом за границы, и не порождает событий сам. Метод — для
     /// того, кто хочет проверить значение (и, например, записать событие).
-    pub fn severity_of(&self, metric: impl Into<MetricId>, value: &OwnedValue) -> Severity {
+    ///
+    /// Значение принимается ровно то же, что принял бы отсчёт: `65.0` у
+    /// метрики, объявленной `type: f32`, состояние — у перечисления. Тип
+    /// сверяет компилятор — по той же константе метрики, что открывает ряд:
+    ///
+    /// ```ignore
+    /// ns.severity_of(radio::metrics::TempPa, 65.0);
+    /// ns.severity_of(radio::metrics::LinkState, radio::metrics::LinkState::Los);
+    /// ```
+    ///
+    /// Метрику, известную только в рантайме, обслуживает
+    /// [`Namespace::severity_of_raw`].
+    #[inline]
+    pub fn severity_of<T, V: MetricValue<T>>(&self, metric: Metric<T>, value: V) -> Severity {
+        self.severity_of_raw(metric, &value.into_owned())
+    }
+
+    /// То же для метрики и значения, собранных в рантайме.
+    ///
+    /// Путь веб-слоя и вьюера: метрика пришла строкой из запроса, типа на
+    /// этапе компиляции нет. Прикладному коду нужен [`Namespace::severity_of`].
+    pub fn severity_of_raw(&self, metric: impl Into<MetricId>, value: &OwnedValue) -> Severity {
         self.inner
             .limits
             .severity_of(&self.inner.schema, metric.into(), &value.as_value())
@@ -753,9 +774,12 @@ impl<M> Series<M> {
             .write(item, self.critical, &self.ns.inner.drops)
     }
 
-    /// Важность значения по действующим пределам.
-    pub fn severity_of(&self, value: &OwnedValue) -> Severity {
-        self.ns.severity_of(self.metric, value)
+    /// Важность значения, собранного в рантайме.
+    ///
+    /// Единственная форма для [`Series<Untyped>`]; типизированному ряду нужен
+    /// [`Series::severity_of`].
+    pub fn severity_of_raw(&self, value: &OwnedValue) -> Severity {
+        self.ns.severity_of_raw(self.metric, value)
     }
 }
 
@@ -775,6 +799,17 @@ impl<M> Series<M> {
     #[inline]
     pub fn try_sample<V: MetricValue<M>>(&self, value: V) -> Result<()> {
         self.try_sample_raw(self.coerce(value.into_owned()))
+    }
+
+    /// Важность значения по действующим пределам.
+    ///
+    /// Принимает то же, что и [`Series::sample`], — метрика уже известна ряду,
+    /// а её тип известен компилятору: `link.severity_of(LinkState::Los)`.
+    /// Проверить значение перед отсчётом можно, не собирая его вручную.
+    #[inline]
+    pub fn severity_of<V: MetricValue<M>>(&self, value: V) -> Severity {
+        self.ns
+            .severity_of_raw(self.metric, &self.coerce(value.into_owned()))
     }
 
     /// Привести значение к объявленному представлению.
@@ -1740,7 +1775,7 @@ mod tests {
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         // Дефолты схемы.
-        let sev = |v: f32| ns.severity_of(MetricId(1), &OwnedValue::F32(v));
+        let sev = |v: f32| ns.severity_of(TEMP, v);
         assert_eq!(sev(36.6), Severity::Normal);
         assert_eq!(sev(75.0), Severity::Warn);
         assert_eq!(sev(90.0), Severity::Alarm);
@@ -1760,9 +1795,18 @@ mod tests {
         assert_eq!(link.states.len(), 3);
         assert_eq!(link.states[0].name, "Los");
         assert_eq!(link.states[0].severity, Severity::Alarm);
+        assert_eq!(ns.severity_of(LINK, LinkState::Los), Severity::Alarm);
+
+        // Ряд знает метрику: важность спрашивается тем же значением, что и
+        // отсчёт, — без сборки OwnedValue руками и без повторения метрики.
+        let link_series = ns.series(LINK).unwrap();
+        assert_eq!(link_series.severity_of(LinkState::Los), Severity::Alarm);
+        assert_eq!(link_series.severity_of(LinkState::Sync), Severity::Warn);
+        assert_eq!(link_series.severity_of(LinkState::Lock), Severity::Normal);
         assert_eq!(
-            ns.severity_of(MetricId(2), &OwnedValue::U64(0)),
-            Severity::Alarm
+            link_series.severity_of(LinkState::Los),
+            link_series.severity_of_raw(&OwnedValue::U64(0)),
+            "типизированный путь обязан отвечать то же, что рантаймовый"
         );
 
         // Пределы не попадают в поток записей.
@@ -1793,12 +1837,9 @@ mod tests {
 
         a.set_thresholds(TEMP, ..=10.0, ..).unwrap();
 
+        assert_eq!(a.severity_of(TEMP, 20.0), Severity::Warn);
         assert_eq!(
-            a.severity_of(MetricId(1), &OwnedValue::F32(20.0)),
-            Severity::Warn
-        );
-        assert_eq!(
-            b.severity_of(MetricId(1), &OwnedValue::F32(20.0)),
+            b.severity_of(TEMP, 20.0),
             Severity::Normal,
             "сосед сохранил свои пределы"
         );
