@@ -30,7 +30,7 @@ pub struct Counters {
     /// Ошибки ввода-вывода в writer'е.
     pub io_errors: AtomicU64,
     /// Повреждённые хвосты, отброшенные при восстановлении.
-    pub recovered_tails: AtomicU64,
+    pub truncated_tails: AtomicU64,
     /// Сколько раз канал брал сегмент в работу: создавал новый **или**
     /// возвращал отпущенный по бездействию.
     ///
@@ -49,7 +49,7 @@ pub struct Counters {
     /// Поэтому потолок обязан быть больше, чем `segment_bytes` × число
     /// одновременно пишущих каналов; иначе он невыполним, и об этом лучше
     /// узнать по счётчику, чем по кончившемуся месту.
-    pub over_budget: AtomicU64,
+    pub budget_overruns: AtomicU64,
 }
 
 impl Counters {
@@ -95,8 +95,8 @@ impl Counters {
             rejected: g(&self.rejected),
             backpressure_waits: g(&self.backpressure_waits),
             io_errors: g(&self.io_errors),
-            recovered_tails: g(&self.recovered_tails),
-            over_budget: g(&self.over_budget),
+            truncated_tails: g(&self.truncated_tails),
+            budget_overruns: g(&self.budget_overruns),
         }
     }
 }
@@ -117,10 +117,10 @@ pub struct Stats {
     pub rejected: u64,
     pub backpressure_waits: u64,
     pub io_errors: u64,
-    pub recovered_tails: u64,
+    pub truncated_tails: u64,
     /// Хранилище не влезло в объявленный суммарный потолок — см. одноимённое
     /// поле [`Counters`].
-    pub over_budget: u64,
+    pub budget_overruns: u64,
 }
 
 impl Stats {

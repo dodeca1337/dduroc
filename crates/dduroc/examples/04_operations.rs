@@ -114,7 +114,7 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 // бюджет «всей телеметрии» — нет: каналы черпают из него вместе, и при
 // превышении вытесняется старейший сегмент КЛАССА, в чьём бы неймспейсе он
 // ни лежал — молчащий сервис не держит место, которого не хватает шумному.
-// (Личный предел прожорливому сервису — `store.namespace_with` + NsQuota.)
+// (Личный предел прожорливому сервису — `store.namespace_with_quota` + NsQuota.)
 // ---------------------------------------------------------------------------
 fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("— общий бюджет класса на все неймспейсы —");
@@ -160,12 +160,12 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let reader = Reader::open(root, &[probe::SCHEMA])?;
     let listing = reader.namespaces()?;
     for ns in &listing.namespaces {
-        println!("  {}: занято {} КиБ", ns.name, ns.bytes >> 10);
+        println!("  {}: занято {} КиБ", ns.name, ns.total_bytes >> 10);
     }
     println!(
         "  тихий писал 6 МиБ — его голову вытеснил чужой поток того же класса; \
-         поверх бюджета не вылезли ни разу (over_budget: {})\n",
-        stats.over_budget
+         поверх бюджета не вылезли ни разу (budget_overruns: {})\n",
+        stats.budget_overruns
     );
     Ok(())
 }
@@ -179,12 +179,14 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("— потери учтены и объявлены —");
     // Крошечные очереди делают переполнение воспроизводимым в примере.
-    let store = Store::open(StoreConfig::new(root).with_budget(16 << 20).with_queues(
-        QueueSizes {
-            normal: 4,
-            critical: 4,
-        },
-    ))?;
+    let store = Store::open(
+        StoreConfig::new(root)
+            .with_budget_per_class(16 << 20)
+            .with_queues(QueueSizes {
+                normal: 4,
+                critical: 4,
+            }),
+    )?;
     let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
 
     // Обычный канал: очередь полна — запись теряется, отказ считается.
@@ -263,13 +265,17 @@ fn vault(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("— критика на своём разделе —");
     {
-        let store = Store::open(StoreConfig::new(root).with_budget(16 << 20).channel(
-            StorageClass::Critical,
-            ChannelConfig {
-                root: Some(vault.to_path_buf()),
-                ..ChannelConfig::critical(16 << 20)
-            },
-        ))?;
+        let store = Store::open(
+            StoreConfig::new(root)
+                .with_budget_per_class(16 << 20)
+                .channel(
+                    StorageClass::Critical,
+                    ChannelConfig {
+                        custom_root: Some(vault.to_path_buf()),
+                        ..ChannelConfig::critical(16 << 20)
+                    },
+                ),
+        )?;
         let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
         ns.log(probe::events::Ping { seq: 1 });
         ns.log(probe::events::Fault { code: 3 });

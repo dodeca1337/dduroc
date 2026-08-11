@@ -70,7 +70,7 @@ const CRASH_ROOT: &str = "DDUROC_TEST_CRASH_ROOT";
 fn crash_does_not_cost_a_whole_segment_of_budget() {
     // Дочерняя роль: пишем, синхронизируем и гибнем, не запечатав сегмент.
     if let Ok(root) = std::env::var(CRASH_ROOT) {
-        let store = Store::open(StoreConfig::new(&root).with_budget(16 << 20)).unwrap();
+        let store = Store::open(StoreConfig::new(&root).with_budget_per_class(16 << 20)).unwrap();
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
         for _ in 0..3 {
             ns.log(durability::events::Tick {});
@@ -103,12 +103,13 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
     // канала целиком, и четыре аварии подряд при бюджете 16 МиБ съели бы его
     // весь — ротация принялась бы за живую историю.
     {
-        let store = Store::open(StoreConfig::new(dir.path()).with_budget(16 << 20)).unwrap();
+        let store =
+            Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
         ns.log(durability::events::Tick {});
         ns.sync().unwrap();
         assert_eq!(
-            store.stats().recovered_tails,
+            store.stats().truncated_tails,
             0,
             "хвост был целым: fdatasync прошёл до гибели"
         );
@@ -141,7 +142,7 @@ fn crashed_segment_gets_a_footer_so_migration_can_see_it() {
     // данных. Без множества типов в нём миграция прошла бы мимо сегмента, а
     // читатель искал бы блоки сканом.
     if let Ok(root) = std::env::var(CRASH_ROOT) {
-        let store = Store::open(StoreConfig::new(&root).with_budget(16 << 20)).unwrap();
+        let store = Store::open(StoreConfig::new(&root).with_budget_per_class(16 << 20)).unwrap();
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
         ns.log(durability::events::Tick {});
         ns.series(durability::metrics::Spectrum)
@@ -163,7 +164,7 @@ fn crashed_segment_gets_a_footer_so_migration_can_see_it() {
         .unwrap();
     assert!(!out.status.success());
 
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(16 << 20)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
     drop(store.namespace("orc-0", durability::SCHEMA).unwrap());
     store.shutdown();
 
@@ -188,7 +189,7 @@ fn record_larger_than_a_segment_is_refused_not_written_past_it() {
     // даже в свежий сегмент, отбрасывается — и объявляется потерянным.
     let dir = tempfile::tempdir().unwrap();
     let segment_bytes = ChannelConfig::new(0).segment_bytes;
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(64 << 20)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(64 << 20)).unwrap();
     let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
 
     ns.series(durability::metrics::Spectrum)
@@ -228,7 +229,7 @@ fn reopened_namespace_does_not_leave_a_second_state_on_the_directory() {
     // со своими инвентарями, и ротация одного удалила бы сегмент, открытый
     // другим: запись продолжалась бы в файл без имени и пропала бы вся.
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(16 << 20)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
     let channel = dir.path().join("orc-0").join("default");
 
     for round in 0..4 {
@@ -272,7 +273,7 @@ fn records_enqueued_before_the_handle_is_dropped_still_land() {
     // уже ответил `Ok`, обязано лечь на диск, даже если ручку отпустили
     // следующей строкой.
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(16 << 20)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
 
     let mut accepted = 0u64;
     {

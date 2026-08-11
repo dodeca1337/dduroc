@@ -133,11 +133,11 @@ impl BlockHeader {
             });
         }
         if raw[3] != 0 || raw[26] != 0 || raw[27] != 0 {
-            return Err(Error::ReservedNotZero);
+            return Err(Error::ReservedValue);
         }
         let compression = Compression::from_bits(raw[2])?;
         if raw[2] & !Compression::MASK != 0 {
-            return Err(Error::ReservedNotZero);
+            return Err(Error::ReservedValue);
         }
 
         let body_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
@@ -288,7 +288,7 @@ impl BlockBuilder {
     }
 
     /// Текущий размер тела (до сжатия).
-    pub fn body_len(&self) -> usize {
+    pub fn raw_len(&self) -> usize {
         self.body.len()
     }
 
@@ -637,12 +637,12 @@ mod tests {
         });
         assert!(matches!(
             b.push(Micros(100), &bad),
-            Err(Error::ReservedNotZero)
+            Err(Error::ReservedValue)
         ));
         assert!(b.is_empty(), "отвергнутая запись не считается");
         assert_eq!(b.base(), None, "и не задаёт базу времени");
         assert_eq!(b.last(), None);
-        assert_eq!(b.body_len(), 0, "буфер тела откачен кодеком");
+        assert_eq!(b.raw_len(), 0, "буфер тела откачен кодеком");
 
         // Накопитель на пустом ходу отдаёт EmptyBlock, а не заголовок с
         // нулевым телом, который сам же считает порчей.
@@ -842,14 +842,14 @@ mod tests {
             bytes[offset] = 1;
             assert_eq!(
                 BlockHeader::parse(&bytes),
-                Err(Error::ReservedNotZero),
+                Err(Error::ReservedValue),
                 "резерв на смещении {offset}"
             );
         }
 
         let mut bytes = h.to_bytes();
         bytes[2] = 0b1000_0000; // старшие биты флагов зарезервированы
-        assert_eq!(BlockHeader::parse(&bytes), Err(Error::ReservedNotZero));
+        assert_eq!(BlockHeader::parse(&bytes), Err(Error::ReservedValue));
     }
 
     #[test]

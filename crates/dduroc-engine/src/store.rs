@@ -39,7 +39,7 @@ pub struct StoreMeta {
 /// Настройки хранилища.
 ///
 /// Строятся цепочкой: каждый метод возвращает настройки, а не меняет их на
-/// месте. `config.with_budget(n);` отдельным выражением не сделало бы ничего.
+/// месте. `config.with_budget_per_class(n);` отдельным выражением не сделало бы ничего.
 #[derive(Debug, Clone)]
 #[must_use = "настройки строятся цепочкой: результат метода и есть настройки"]
 pub struct StoreConfig {
@@ -59,12 +59,12 @@ pub struct StoreConfig {
     /// вытесняется старейший сегмент класса, в чьём бы неймспейсе он ни
     /// лежал. Сумма бюджетов классов и есть потолок занятости; отдельной
     /// ручки «потолок хранилища» нет — при классах на разных носителях
-    /// (см. [`ChannelConfig::root`]) общий потолок не имел бы смысла.
+    /// (см. [`ChannelConfig::custom_root`]) общий потолок не имел бы смысла.
     ///
     /// Потолок класса не может быть меньше того, что держат активные
     /// сегменты: их преаллокация — гарантия ENOSPC. Практический предел
     /// одновременно пишущих каналов класса — `budget_bytes / segment_bytes`;
-    /// попытка выйти за него видна в [`crate::stats::Stats::over_budget`].
+    /// попытка выйти за него видна в [`crate::stats::Stats::budget_overruns`].
     pub default_budget_bytes: u64,
     /// Ёмкости очередей записи. Выделяются целиком при открытии хранилища.
     pub queues: QueueSizes,
@@ -85,7 +85,7 @@ impl StoreConfig {
     ///
     /// Столько получает каждый класс, не названный в
     /// [`StoreConfig::channel`] явно.
-    pub fn with_budget(mut self, bytes: u64) -> Self {
+    pub fn with_budget_per_class(mut self, bytes: u64) -> Self {
         self.default_budget_bytes = bytes;
         self
     }
@@ -167,7 +167,7 @@ impl NsQuota {
     }
 
     /// Ограничить каналы класса `class` этого неймспейса `bytes` байтами.
-    pub fn class(mut self, class: StorageClass, bytes: u64) -> Self {
+    pub fn limit_bytes(mut self, class: StorageClass, bytes: u64) -> Self {
         self.slots[class.index()] = Some(bytes);
         self
     }
@@ -233,7 +233,10 @@ impl Store {
         let mut groups = Vec::with_capacity(StorageClass::ALL.len());
         for class in StorageClass::ALL {
             let cfg = config.config_for(class);
-            let base = cfg.root.clone().unwrap_or_else(|| config.root.clone());
+            let base = cfg
+                .custom_root
+                .clone()
+                .unwrap_or_else(|| config.root.clone());
             fsutil::create_dir_all_synced(&base)?;
             let c = canon(&base);
             let key = keys.iter().position(|k| *k == c).unwrap_or_else(|| {
@@ -327,13 +330,13 @@ impl Store {
     /// каналы получили бы бюджет, о котором хранилище не знает.
     ///
     /// Каналы черпают из общих бюджетов своих классов; неймспейсу, которому
-    /// положен личный предел, есть [`Store::namespace_with`].
+    /// положен личный предел, есть [`Store::namespace_with_quota`].
     pub fn namespace(self: &Arc<Self>, name: &str, schema: Schema) -> Result<Namespace> {
-        self.namespace_with(name, schema, NsQuota::default())
+        self.namespace_with_quota(name, schema, NsQuota::default())
     }
 
     /// Поднять неймспейс с личными квотами — см. [`NsQuota`].
-    pub fn namespace_with(
+    pub fn namespace_with_quota(
         self: &Arc<Self>,
         name: &str,
         schema: Schema,
@@ -402,7 +405,7 @@ impl Store {
                     .join(name)
                     .join(class.as_str()),
                 group: class.index(),
-                quota: personal,
+                quota_bytes: personal,
                 config,
             });
         }
@@ -981,7 +984,7 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+        let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
 
         // Три запуска, каждый оставляет свой сегмент.
         for _ in 0..3 {
@@ -1067,7 +1070,7 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+        let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
 
         // Запуск 0 оставляет после себя сегмент.
         {

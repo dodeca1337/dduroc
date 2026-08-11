@@ -103,7 +103,7 @@ fn read_all(root: &std::path::Path) -> Vec<Seen> {
 #[test]
 fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
     let dir = tempfile::tempdir().unwrap();
-    let cfg = StoreConfig::new(dir.path()).with_budget(16 << 20);
+    let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 << 20);
 
     // Вчера: прошивка v1 пишет свою историю.
     {

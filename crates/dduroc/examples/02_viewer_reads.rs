@@ -45,7 +45,7 @@ dduroc::schema! {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::temp_dir().join("dduroc-examples").join("02");
     let _ = std::fs::remove_dir_all(&root);
-    let cfg = StoreConfig::new(&root).with_budget(16 << 20);
+    let cfg = StoreConfig::new(&root).with_budget_per_class(16 << 20);
 
     // -----------------------------------------------------------------------
     // История. Запуск 1: связь поднялась — единственное изменение состояния
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for ns in &listing.namespaces {
         println!(
             "  {}: схема {} v{}, каналы {:?}, занято {} Б",
-            ns.name, ns.schema_name, ns.protocol_version, ns.channels, ns.bytes
+            ns.name, ns.schema_name, ns.protocol_version, ns.channels, ns.total_bytes
         );
     }
     // Нечитаемый неймспейс попал бы в `listing.damaged`, а не выпал молча.
@@ -168,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let EntryKind::Sample {
             metric_name,
             unit,
-            state,
+            state_name,
             severity,
             value,
             ..
@@ -183,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|u| format!(" {u}"))
                     .unwrap_or_default(),
                 severity.unwrap_or_default(),
-                state
+                state_name
                     .map(|s| format!(" состояние: {s}"))
                     .unwrap_or_default(),
             );
@@ -240,13 +240,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  отсчётов в окне: {}", seeded.entries.len());
     for seed in &seeded.seeds {
         if let EntryKind::Sample {
-            metric_name, state, ..
+            metric_name,
+            state_name,
+            ..
         } = &seed.kind
         {
             println!(
                 "  затравка: {} = {} (отсчёт из прошлого, {})",
                 metric_name.unwrap_or("?"),
-                state.unwrap_or("?"),
+                state_name.unwrap_or("?"),
                 seed.at
             );
         }
@@ -278,7 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("02-no-sync");
     let _ = std::fs::remove_dir_all(&lone);
     {
-        let store = Store::open(StoreConfig::new(&lone).with_budget(16 << 20))?;
+        let store = Store::open(StoreConfig::new(&lone).with_budget_per_class(16 << 20))?;
         let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
         ns.log(radio::events::Started {});
         ns.sync()?;

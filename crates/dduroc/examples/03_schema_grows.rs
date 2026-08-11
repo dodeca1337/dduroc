@@ -81,7 +81,7 @@ mod today {
         // Незатронутое правилами (Note, текст, спаны) проходит как есть.
         //
         // Для перемен, которые правилами не выразить, остаётся сырой шаг:
-        //   `1 => migrate_v1,` — fn(MigratedRecord) с полным доступом.
+        //   `1 => migrate_v1,` — fn(MigrationInput) с полным доступом.
         migrations {
             1 => {
                 v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) },
@@ -95,7 +95,7 @@ mod today {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = std::env::temp_dir().join("dduroc-examples").join("03");
     let _ = std::fs::remove_dir_all(&root);
-    let cfg = StoreConfig::new(&root).with_budget(16 << 20);
+    let cfg = StoreConfig::new(&root).with_budget_per_class(16 << 20);
 
     // Вчера: прошивка v1 пишет свою историю.
     {

@@ -81,22 +81,22 @@ pub enum Error {
     #[error("миграция неймспейса {0:?} уже идёт")]
     MigrationBusy(String),
 
-    #[error("метрика {id} не объявлена в схеме")]
-    UnknownMetric { id: u16 },
+    #[error("метрика {metric_id} не объявлена в схеме")]
+    UnknownMetric { metric_id: u16 },
 
     #[error(
-        "метрика {metric} объявлена как {declared:?}, а значение — {got:?}: \
+        "метрика {metric_id} объявлена как {declared:?}, а значение — {got:?}: \
          тип отсчёта — свойство метрики, а не отдельной записи"
     )]
     ValueTypeMismatch {
-        metric: u16,
+        metric_id: u16,
         declared: dduroc_format::ValueType,
         got: dduroc_format::ValueType,
     },
 
-    #[error("недопустимые пределы метрики {metric:?}: {reason}")]
+    #[error("недопустимые пределы метрики {metric_name:?}: {reason}")]
     BadLimits {
-        metric: &'static str,
+        metric_name: &'static str,
         reason: &'static str,
     },
 
@@ -255,13 +255,13 @@ mod tests {
                 schema: "radio",
                 event: 7,
             },
-            Error::UnknownMetric { id: 7 },
+            Error::UnknownMetric { metric_id: 7 },
             Error::UnknownSpanKind {
                 schema: "radio",
                 kind: 7,
             },
             Error::ValueTypeMismatch {
-                metric: 1,
+                metric_id: 1,
                 declared: dduroc_format::ValueType::F32,
                 got: dduroc_format::ValueType::U64,
             },

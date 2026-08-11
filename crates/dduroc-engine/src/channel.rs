@@ -61,7 +61,7 @@ pub struct ChannelConfig {
     /// переносит историю: новые сегменты пишутся в новое место, старое
     /// остаётся читаемым (`Reader::with_extra_root`), но в бюджете класса
     /// больше не учитывается.
-    pub root: Option<PathBuf>,
+    pub custom_root: Option<PathBuf>,
 }
 
 impl ChannelConfig {
@@ -74,7 +74,7 @@ impl ChannelConfig {
             flush_interval: Duration::from_secs(1),
             sync_interval: Duration::from_secs(10),
             compression: Compression::Lz4,
-            root: None,
+            custom_root: None,
         }
     }
 

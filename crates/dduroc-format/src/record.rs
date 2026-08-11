@@ -150,7 +150,7 @@ impl Record<'_> {
 #[inline]
 fn write_span(out: &mut Vec<u8>, span: SpanId) -> Result<()> {
     if span.0 == SpanId::NONE_RAW {
-        return Err(Error::ReservedNotZero);
+        return Err(Error::ReservedValue);
     }
     varint::write_u64(out, u64::from(span.0));
     Ok(())
@@ -265,7 +265,7 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
             // нет префикса длины.
             let ty = ValueType::from_u8(flags & SAMPLE_VTYPE_MASK)?;
             if flags & !SAMPLE_VTYPE_MASK != 0 {
-                return Err(Error::ReservedNotZero);
+                return Err(Error::ReservedValue);
             }
             let metric = MetricId(c.varint_u16("metric_id")?);
             Record::Sample(Sample {
@@ -348,7 +348,7 @@ impl<'a> Iterator for RecordIter<'a> {
 #[inline]
 fn read_span(c: &mut Cursor<'_>) -> Result<SpanId> {
     let raw = c.varint_u32("span")?;
-    SpanId::from_raw(raw).ok_or(Error::ReservedNotZero)
+    SpanId::from_raw(raw).ok_or(Error::ReservedValue)
 }
 
 #[inline]
@@ -356,12 +356,12 @@ fn read_flagged_span(c: &mut Cursor<'_>, flags: u8) -> Result<Option<SpanId>> {
     if flags & FLAG_SPAN == 0 {
         // Прочие биты у этих типов пока не определены.
         if flags != 0 {
-            return Err(Error::ReservedNotZero);
+            return Err(Error::ReservedValue);
         }
         return Ok(None);
     }
     if flags & !FLAG_SPAN != 0 {
-        return Err(Error::ReservedNotZero);
+        return Err(Error::ReservedValue);
     }
     Ok(Some(read_span(c)?))
 }
@@ -369,7 +369,7 @@ fn read_flagged_span(c: &mut Cursor<'_>, flags: u8) -> Result<Option<SpanId>> {
 #[inline]
 fn reject_flags(flags: u8) -> Result<()> {
     if flags != 0 {
-        return Err(Error::ReservedNotZero);
+        return Err(Error::ReservedValue);
     }
     Ok(())
 }
@@ -630,7 +630,7 @@ mod tests {
         varint::write_u64(&mut buf, 1); // event
         varint::write_u64(&mut buf, 0); // span = 0 — недопустимо
         varint::write_u64(&mut buf, 0); // payload_len
-        assert_eq!(decode(&buf), Err(Error::ReservedNotZero));
+        assert_eq!(decode(&buf), Err(Error::ReservedValue));
     }
 
     #[test]
@@ -664,7 +664,7 @@ mod tests {
             }),
             Record::SpanEnd { span: SpanId(0) },
         ] {
-            assert_eq!(encode(&rec, 0, &mut buf), Err(Error::ReservedNotZero));
+            assert_eq!(encode(&rec, 0, &mut buf), Err(Error::ReservedValue));
             assert!(buf.is_empty(), "отказ не должен оставлять обрывок: {buf:?}");
         }
 
@@ -694,7 +694,7 @@ mod tests {
         let mut buf = vec![(kind::SPAN_END << 4) | 0b0010];
         varint::write_u64(&mut buf, 0);
         varint::write_u64(&mut buf, 1);
-        assert_eq!(decode(&buf), Err(Error::ReservedNotZero));
+        assert_eq!(decode(&buf), Err(Error::ReservedValue));
 
         // Неизвестный vtype в флагах сэмпла.
         let mut buf = vec![(kind::SAMPLE << 4) | 0b0110];

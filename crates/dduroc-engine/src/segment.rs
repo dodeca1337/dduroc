@@ -324,13 +324,14 @@ pub struct Scan {
     /// времени сегмента: точное значение требует разбора тела).
     pub last_base: Micros,
     /// Чем закончился обход.
-    pub end: ScanEnd,
+    /// Чем кончился обход: концом данных, порчей или обрывом.
+    pub stopped_by: ScanEnd,
 }
 
 impl Scan {
     /// Хвост был повреждён и отброшен.
     pub fn truncated(&self) -> bool {
-        self.end.is_damage()
+        self.stopped_by.is_damage()
     }
 
     /// Проверить, что сегмент принадлежит этому хранилищу.
@@ -497,7 +498,7 @@ impl Scan {
                 block_count,
                 next_seq: block_count,
                 last_base,
-                end,
+                stopped_by: end,
             },
             footer_complete,
         ))
@@ -520,7 +521,7 @@ impl Scan {
 pub struct Recovered {
     pub name: SegmentName,
     /// Размер файла после запечатывания.
-    pub size: u64,
+    pub size_bytes: u64,
     /// Сколько байт преаллокации вернулось носителю.
     pub reclaimed: u64,
     /// Хвост был повреждён и отброшен (обрыв питания посреди блока).
@@ -594,7 +595,7 @@ pub fn seal_orphan(path: &Path, expect_store: Option<u64>) -> Result<Option<Reco
     let size = scan.data_end + bytes.len() as u64;
     Ok(Some(Recovered {
         name: scan.header.file_name(),
-        size,
+        size_bytes: size,
         reclaimed: len.saturating_sub(size),
         truncated: scan.truncated(),
     }))
@@ -875,7 +876,7 @@ mod tests {
 
         let scan = Scan::of_path(&path).unwrap();
         assert_eq!(scan.block_count, 2);
-        assert_eq!(scan.end, ScanEnd::ZeroTail);
+        assert_eq!(scan.stopped_by, ScanEnd::ZeroTail);
         assert!(!scan.truncated(), "целый хвост не считается повреждённым");
         assert_eq!(scan.data_end, end);
     }
@@ -899,7 +900,11 @@ mod tests {
 
         let scan = Scan::of_path(&path).unwrap();
         assert_eq!(scan.block_count, 1, "уцелел первый блок");
-        assert_eq!(scan.end, ScanEnd::Corrupt, "обрыв распознан как порча");
+        assert_eq!(
+            scan.stopped_by,
+            ScanEnd::Corrupt,
+            "обрыв распознан как порча"
+        );
         assert_eq!(scan.data_end, good_end, "конец данных — до битого блока");
 
         // Продолжение записи с восстановленной позиции затирает битый хвост.
@@ -950,7 +955,7 @@ mod tests {
         w.sync().unwrap();
         let scan = Scan::of_path(&path).unwrap();
         assert_eq!(scan.block_count, 2);
-        assert_eq!(scan.end, ScanEnd::ZeroTail, "чистый конец данных");
+        assert_eq!(scan.stopped_by, ScanEnd::ZeroTail, "чистый конец данных");
     }
 
     #[test]
@@ -970,7 +975,7 @@ mod tests {
         let scan = Scan::of_path(&path).unwrap();
         assert_eq!(scan.block_count, 1);
         assert_eq!(
-            scan.end,
+            scan.stopped_by,
             ScanEnd::SeqGap {
                 expected: 1,
                 found: 5
@@ -1044,11 +1049,15 @@ mod tests {
         assert!(!rec.truncated, "целый хвост — не повреждение");
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
-            rec.size,
+            rec.size_bytes,
             "размер файла совпал с объявленным"
         );
-        assert!(rec.size < 4 * 1024, "преаллокация возвращена: {}", rec.size);
-        assert_eq!(rec.reclaimed, 32 * 1024 - rec.size);
+        assert!(
+            rec.size_bytes < 4 * 1024,
+            "преаллокация возвращена: {}",
+            rec.size_bytes
+        );
+        assert_eq!(rec.reclaimed, 32 * 1024 - rec.size_bytes);
 
         // Footer собран тем же обходом, которым искался конец данных.
         let r = SegmentReader::open(&path).unwrap();

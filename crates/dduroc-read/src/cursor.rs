@@ -137,14 +137,14 @@ fn own(record: &Record<'_>) -> OwnedRecord {
 /// версия и цепочка, и оба поля `'static`, так что контекст копируется.
 #[derive(Debug, Clone, Copy)]
 pub struct MigrationCtx {
-    pub current: u16,
+    pub current_version: u16,
     pub steps: &'static [Migration],
 }
 
 impl MigrationCtx {
     pub fn of(schema: &Schema) -> Self {
         Self {
-            current: schema.version.0,
+            current_version: schema.version.0,
             steps: schema.migrations,
         }
     }
@@ -218,20 +218,20 @@ impl SegmentCursor {
         let seg_version = reader.header().protocol_version.0;
         let mut migration = MigrationState::None;
         if let Some(ctx) = migrations {
-            if seg_version > ctx.current {
+            if seg_version > ctx.current_version {
                 damaged.push(Damage {
                     path: path.to_owned(),
                     offset: 0,
                     reason: format!(
                         "версия протокола {seg_version} новее схемы ({}): записи этой \
                          раскладки этому билду не разобрать",
-                        ctx.current
+                        ctx.current_version
                     ),
                 });
                 return Ok(Self::empty(reader, path, reverse, damaged));
             }
-            if seg_version < ctx.current {
-                match migrate::chain_between(ctx.steps, seg_version, ctx.current) {
+            if seg_version < ctx.current_version {
+                match migrate::chain_between(ctx.steps, seg_version, ctx.current_version) {
                     Ok(steps) => {
                         let untouched = reader
                             .footer()
@@ -387,7 +387,7 @@ impl SegmentCursor {
     ///
     /// Вызывается один раз, до начала обхода: окно вырезается из списка
     /// смещений, а не запоминается отдельным состоянием.
-    pub fn seek_bounds(&mut self, from: Option<Micros>, to: Option<Micros>) {
+    pub fn clip_to_window(&mut self, from: Option<Micros>, to: Option<Micros>) {
         debug_assert_eq!(self.next_block, 0, "окно вырезается до начала обхода");
         if from.is_none() && to.is_none() {
             return;
@@ -535,7 +535,8 @@ pub struct ChannelCursor {
     dir: PathBuf,
     /// Имена сегментов в порядке обхода.
     segments: Vec<SegmentName>,
-    next: usize,
+    /// Индекс следующего сегмента в `segments`.
+    next_segment: usize,
     current: Option<SegmentCursor>,
     reverse: bool,
     bounds: Bounds,
@@ -666,7 +667,7 @@ impl ChannelCursor {
         Ok(Self {
             dir: dir.to_owned(),
             segments,
-            next: 0,
+            next_segment: 0,
             current: None,
             reverse,
             bounds: scope.bounds.clone(),
@@ -746,9 +747,9 @@ impl ChannelCursor {
     }
 
     fn advance(&mut self) -> bool {
-        while self.next < self.segments.len() {
-            let name = self.segments[self.next];
-            self.next += 1;
+        while self.next_segment < self.segments.len() {
+            let name = self.segments[self.next_segment];
+            self.next_segment += 1;
             let path = self.dir.join(name.to_string());
             match SegmentCursor::open(
                 &path,
@@ -769,7 +770,7 @@ impl ChannelCursor {
                     // Границы — в шкале того запуска, которому принадлежит
                     // сегмент: микросекунды разных запусков не сравнимы.
                     if let Some(run) = self.bounds.for_boot(c.boot()) {
-                        c.seek_bounds(run.from, run.to);
+                        c.clip_to_window(run.from, run.to);
                     }
                     self.current = Some(c);
                     return true;
@@ -819,7 +820,7 @@ impl std::fmt::Debug for ChannelCursor {
             .field("namespace", &self.namespace)
             .field("channel", &self.channel)
             .field("segments", &self.segments.len())
-            .field("next", &self.next)
+            .field("next_segment", &self.next_segment)
             .field("damaged", &self.damaged.len())
             .finish()
     }
@@ -1051,11 +1052,11 @@ mod tests {
         // выпадает, ремапнутая метрика меняет номер, нетронутый тип идёт
         // байт в байт. Без цепочки текущие декодеры разобрали бы старую
         // раскладку молча и неверно — postcard не самоописуем.
-        use dduroc_engine::schema::{DecodeError, MigratedRecord, OwnedRecord as Out};
+        use dduroc_engine::schema::{DecodeError, MigrationInput, MigrationOutcome as Out};
         use dduroc_format::record::{Message, Sample};
         use dduroc_format::{EventId, MetricId, Value};
 
-        fn step1(r: MigratedRecord<'_>) -> std::result::Result<Option<Out>, DecodeError> {
+        fn step1(r: MigrationInput<'_>) -> std::result::Result<Option<Out>, DecodeError> {
             match (r.event_id(), r.metric_id()) {
                 (Some(EventId(1)), _) => {
                     let old: (u8,) = r.decode()?;
@@ -1077,7 +1078,7 @@ mod tests {
             migrate: step1,
         }];
         let ctx = MigrationCtx {
-            current: 2,
+            current_version: 2,
             steps: STEPS,
         };
 
@@ -1198,7 +1199,7 @@ mod tests {
         );
 
         let ctx = MigrationCtx {
-            current: 2,
+            current_version: 2,
             steps: &[],
         };
         let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx)).unwrap();
@@ -1222,11 +1223,11 @@ mod tests {
         // Отказ шага — систематический: весь блок одной раскладки. Тысяча
         // одинаковых записей о повреждении хуже одной со счётчиком — но и
         // молчание недопустимо: запись выпала из ответа.
-        use dduroc_engine::schema::{DecodeError, MigratedRecord, OwnedRecord as Out};
+        use dduroc_engine::schema::{DecodeError, MigrationInput, MigrationOutcome as Out};
         use dduroc_format::EventId;
         use dduroc_format::record::Message;
 
-        fn broken(r: MigratedRecord<'_>) -> std::result::Result<Option<Out>, DecodeError> {
+        fn broken(r: MigrationInput<'_>) -> std::result::Result<Option<Out>, DecodeError> {
             let _: (u64, u64, u64, u64) = r.decode()?;
             Ok(Some(Out::AsIs))
         }
@@ -1262,7 +1263,7 @@ mod tests {
             ],
         );
         let ctx = MigrationCtx {
-            current: 2,
+            current_version: 2,
             steps: STEPS,
         };
         let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx)).unwrap();
@@ -1291,7 +1292,7 @@ mod tests {
         let read = |reverse: bool, from: Option<u64>, to: Option<u64>| -> Vec<u64> {
             let mut c = SegmentCursor::open(&path, reverse, None, None, None).unwrap();
             assert_eq!(c.offsets.len(), times.len(), "иначе тест не про отбор");
-            c.seek_bounds(from.map(Micros), to.map(Micros));
+            c.clip_to_window(from.map(Micros), to.map(Micros));
             std::iter::from_fn(|| c.next_entry())
                 .map(|e| e.at.at.0)
                 .collect()

@@ -127,7 +127,7 @@ const RELEASE_AFTER: Duration = Duration::from_secs(2);
 /// Пауза заметно длиннее [`RELEASE_AFTER`], потому что цена другая: буферы
 /// стоят пары аллокаций, а сегмент — `fdatasync` и `ftruncate`, и обхода
 /// файла при возвращении.
-const SEAL_AFTER: Duration = Duration::from_secs(300);
+const PARK_AFTER: Duration = Duration::from_secs(300);
 
 /// Источник отметок о служебных событиях в потоке записей.
 const DIAG_TARGET: &str = "dduroc";
@@ -211,7 +211,7 @@ pub struct ChannelSpec {
     pub group: usize,
     /// Личная квота неймспейса в группе. `None` — канал черпает из общего
     /// бюджета группы без индивидуального предела.
-    pub quota: Option<u64>,
+    pub quota_bytes: Option<u64>,
     pub config: ChannelConfig,
 }
 
@@ -513,8 +513,8 @@ struct ChannelState {
     /// Ключ носителя группы — копия [`GroupBudget::root_key`], чтобы путь
     /// ошибки не ходил по таблице групп.
     root_key: u8,
-    /// Личная квота неймспейса. `None` — только общий бюджет группы.
-    quota: Option<u64>,
+    /// Личная квота неймспейса, байт. `None` — только общий бюджет группы.
+    quota_bytes: Option<u64>,
     /// Свой номер и счётчики потерь неймспейса: потерю, обнаруженную уже в
     /// writer'е, надо отметить там же, где образовалась дыра, — иначе она не
     /// попадёт в поток отдельной записью.
@@ -523,7 +523,7 @@ struct ChannelState {
     identity: SegmentIdentity,
     inventory: Inventory,
     /// Открытый сегмент. `None` — канал ещё ничего не писал либо отпустил
-    /// сегмент по бездействию ([`SEAL_AFTER`]): молчащий неймспейс не должен
+    /// сегмент по бездействию ([`PARK_AFTER`]): молчащий неймспейс не должен
     /// занимать ни файлового дескриптора, ни преаллоцированных байт.
     segment: Option<SegmentWriter>,
     /// Отпущенный по бездействию сегмент: файл обрезан до данных и закрыт, но
@@ -533,7 +533,7 @@ struct ChannelState {
     /// раз в час — восемь тысяч крохотных сегментов в год, и байтовая ротация
     /// не убрала бы ни одного, потому что байт в них почти нет. Файлы
     /// кончились бы раньше места.
-    parked: Option<SegmentName>,
+    parked_segment: Option<SegmentName>,
     builder: BlockBuilder,
     footer: FooterBuilder,
     /// Буфер сериализации блока. Переиспользуется: аллокация и рост на
@@ -551,11 +551,11 @@ struct ChannelState {
     /// Флаг, а не `active.contains(..)`: проверка выполняется на **каждую**
     /// запись, и линейный поиск по списку в десятки тысяч пар превращал бы
     /// раскладку батча в квадрат от числа пишущих каналов.
-    in_active: bool,
+    is_in_active_list: bool,
     /// С какого момента каналу нечего обслуживать. `None` — есть.
     ///
     /// Отсрочка возврата ресурсов: сперва буферы ([`RELEASE_AFTER`]), затем
-    /// сегмент ([`SEAL_AFTER`]).
+    /// сегмент ([`PARK_AFTER`]).
     idle_since: Option<Instant>,
     /// Отданы ли уже буферы этого простоя.
     ///
@@ -576,7 +576,7 @@ impl ChannelState {
         let ChannelSpec {
             dir,
             group,
-            quota,
+            quota_bytes,
             config,
         } = spec;
         // След прерванной миграции: обрыв до rename оставляет `*.tmp`, чьё
@@ -596,20 +596,20 @@ impl ChannelState {
             dir,
             group,
             root_key,
-            quota,
+            quota_bytes,
             index,
             drops,
             identity,
             inventory,
             segment: None,
-            parked: None,
+            parked_segment: None,
             footer: FooterBuilder::new(),
             scratch: Vec::new(),
             last_time: Micros(0),
             block_opened: None,
             last_sync: now,
             dirty_since_sync: false,
-            in_active: false,
+            is_in_active_list: false,
             idle_since: None,
             buffers_released: true,
         })
@@ -666,10 +666,10 @@ impl ChannelState {
         }
         match crate::segment::seal_orphan(&newest.path(dir), Some(identity.store_id)) {
             Ok(Some(recovered)) => {
-                inventory.update_size(recovered.name, recovered.size);
+                inventory.update_size_bytes(recovered.name, recovered.size_bytes);
                 Counters::bump(&counters.segments_sealed);
                 if recovered.truncated {
-                    Counters::bump(&counters.recovered_tails);
+                    Counters::bump(&counters.truncated_tails);
                 }
             }
             Ok(None) => {}
@@ -1027,12 +1027,12 @@ impl WriterLoop {
         // ему опять станет нечего обслуживать.
         ch.idle_since = None;
         ch.buffers_released = false;
-        if !ch.in_active {
-            ch.in_active = true;
+        if !ch.is_in_active_list {
+            ch.is_in_active_list = true;
             self.active.push((ns_idx, ch_idx));
         }
 
-        if ch.builder.body_len() >= ch.config.block_max_bytes {
+        if ch.builder.raw_len() >= ch.config.block_max_bytes {
             Self::flush_block(ch, &self.counters)?;
         }
         Ok(())
@@ -1060,8 +1060,8 @@ impl WriterLoop {
         seg.close_unsealed()?;
         // Бюджет обязан увидеть возврат: незапечатанный сегмент числился в
         // нём целиком, вместе с преаллокацией.
-        ch.inventory.update_size(name, data_end);
-        ch.parked = Some(name);
+        ch.inventory.update_size_bytes(name, data_end);
+        ch.parked_segment = Some(name);
         Ok(())
     }
 
@@ -1073,7 +1073,7 @@ impl WriterLoop {
     /// только теми каналами, которые молчали, — то есть теми, у кого сегмент
     /// мал.
     fn unpark(ch: &mut ChannelState, counters: &Counters) -> bool {
-        let Some(name) = ch.parked.take() else {
+        let Some(name) = ch.parked_segment.take() else {
             return false;
         };
         let path = ch.dir.join(name.to_string());
@@ -1087,7 +1087,7 @@ impl WriterLoop {
                 // так же, как от нового сегмента, и сторож бюджета обязан это
                 // заметить.
                 ch.inventory
-                    .update_size(name, seg.remaining() + seg.data_end());
+                    .update_size_bytes(name, seg.remaining() + seg.data_end());
                 ch.segment = Some(seg);
                 Counters::bump(&counters.segments_opened);
                 true
@@ -1108,7 +1108,7 @@ impl WriterLoop {
     fn ensure_room(ch: &mut ChannelState, at: Micros, counters: &Counters) -> Result<()> {
         let need = ch.config.block_max_bytes as u64 + BlockHeader::SIZE as u64 * 2;
 
-        if ch.segment.is_none() && ch.parked.is_some() {
+        if ch.segment.is_none() && ch.parked_segment.is_some() {
             Self::unpark(ch, counters);
         }
         if let Some(seg) = &ch.segment
@@ -1143,7 +1143,7 @@ impl WriterLoop {
                 Ok(seg) => {
                     ch.inventory.push_newest(SegmentEntry {
                         name: SegmentName::new(boot, base),
-                        size: ch.config.segment_bytes,
+                        size_bytes: ch.config.segment_bytes,
                     });
                     ch.segment = Some(seg);
                     ch.footer.reset();
@@ -1336,11 +1336,12 @@ impl WriterLoop {
         let name = SegmentName::new(seg.header().boot, seg.header().base);
         let data_end = seg.data_end();
         let footer = ch.footer.build();
-        let footer_len = footer.len() as u64;
+        let footer_bytes = footer.len() as u64;
         seg.seal(&footer)?;
         // Запечатанный файл обрезан до фактических данных — бюджет обязан
         // это учесть, иначе ротация считала бы преаллокацию вечной.
-        ch.inventory.update_size(name, data_end + footer_len);
+        ch.inventory
+            .update_size_bytes(name, data_end + footer_bytes);
         ch.footer.reset();
         ch.dirty_since_sync = false;
         Counters::bump(&counters.segments_sealed);
@@ -1353,7 +1354,7 @@ impl WriterLoop {
         ch.segment
             .as_ref()
             .map(|s| SegmentName::new(s.header().boot, s.header().base))
-            .or(ch.parked)
+            .or(ch.parked_segment)
     }
 
     /// Удержать канал в личной квоте неймспейса, если она задана.
@@ -1361,9 +1362,11 @@ impl WriterLoop {
     /// Без квоты поканальной ротации нет вовсе: предел держит бюджет группы,
     /// и старейшее вытесняется по всему классу (`enforce_groups`).
     fn rotate(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
-        let Some(quota) = ch.quota else { return Ok(()) };
-        let active = Self::live_segment(ch);
-        let removed = ch.inventory.enforce_budget(&ch.dir, quota, active)?;
+        let Some(quota_bytes) = ch.quota_bytes else {
+            return Ok(());
+        };
+        let live = Self::live_segment(ch);
+        let removed = ch.inventory.enforce_budget(&ch.dir, quota_bytes, live)?;
         Counters::add(&counters.segments_rotated, removed as u64);
         Ok(())
     }
@@ -1371,11 +1374,11 @@ impl WriterLoop {
     /// Удалить ровно один самый старый сегмент. Используется, когда на
     /// носителе кончилось место.
     fn rotate_one(ch: &mut ChannelState, counters: &Counters) -> Result<bool> {
-        let active = Self::live_segment(ch);
+        let live = Self::live_segment(ch);
         let Some(oldest) = ch.inventory.oldest().cloned() else {
             return Ok(false);
         };
-        if Some(oldest.name) == active {
+        if Some(oldest.name) == live {
             return Ok(false);
         }
         crate::fsutil::remove_synced(&oldest.path(&ch.dir))?;
@@ -1408,7 +1411,7 @@ impl WriterLoop {
     ///
     /// Мера того, сколько надо освободить, чтобы попытка записи имела шанс:
     /// сегмент выделяется целиком, и половина его — не помощь.
-    fn widest_segment_on(&self, root: u8) -> u64 {
+    fn max_segment_bytes_on(&self, root: u8) -> u64 {
         self.namespaces
             .iter()
             .flatten()
@@ -1472,7 +1475,7 @@ impl WriterLoop {
         }
         ch.inventory.remove(entry.name);
         Counters::bump(&self.counters.segments_rotated);
-        Some(entry.size)
+        Some(entry.size_bytes)
     }
 
     /// Отпустить сегменты каналов, молчащих не меньше `quiet_for`, досрочно.
@@ -1530,7 +1533,7 @@ impl WriterLoop {
                 if pressured & (1 << root) == 0 {
                     continue;
                 }
-                let need = self.widest_segment_on(root);
+                let need = self.max_segment_bytes_on(root);
                 let mut freed = 0;
                 while freed < need {
                     let Some(f) = self.evict_oldest_where(|ch| ch.root_key == root) else {
@@ -1559,29 +1562,29 @@ impl WriterLoop {
         let mut totals = self.group_totals();
         let mut parked = false;
         for g in 0..self.groups.len() {
-            let cap = self.groups[g].budget_bytes;
-            totals[g] = self.evict_group_down_to(g, cap, totals[g]);
-            if totals[g] > cap && !parked {
+            let budget_bytes = self.groups[g].budget_bytes;
+            totals[g] = self.evict_group_down_to(g, budget_bytes, totals[g]);
+            if totals[g] > budget_bytes && !parked {
                 // Вытеснять больше нечего, но остались непрописанные хвосты
                 // преаллокации у молчащих каналов — отдать их дешевле, чем
                 // объявлять бюджет невыполнимым.
                 parked = true;
                 if self.park_idle(RELEASE_AFTER) > 0 {
                     totals = self.group_totals();
-                    totals[g] = self.evict_group_down_to(g, cap, totals[g]);
+                    totals[g] = self.evict_group_down_to(g, budget_bytes, totals[g]);
                 }
             }
-            if totals[g] > cap {
+            if totals[g] > budget_bytes {
                 // Всё, что осталось, — живые сегменты: вытеснить их нельзя, и
                 // бюджет группы в этой конфигурации попросту невыполним.
-                Counters::bump(&self.counters.over_budget);
+                Counters::bump(&self.counters.budget_overruns);
             }
         }
     }
 
     /// Вытеснять старейшее в группе, пока её сумма не влезет в бюджет.
-    fn evict_group_down_to(&mut self, group: usize, cap: u64, mut total: u64) -> u64 {
-        while total > cap {
+    fn evict_group_down_to(&mut self, group: usize, budget_bytes: u64, mut total: u64) -> u64 {
+        while total > budget_bytes {
             let Some(freed) = self.evict_oldest_where(|ch| ch.group == group) else {
                 break;
             };
@@ -1674,7 +1677,7 @@ impl WriterLoop {
                 //
                 // Потом сегмент: он стоит дескриптора и целиком числится в
                 // бюджете, хотя записанного в нём может быть сто байт
-                // (см. `SEAL_AFTER`). Запечатывание обрезает файл до
+                // (см. `PARK_AFTER`). Запечатывание обрезает файл до
                 // фактических данных и закрывает дескриптор; из списка
                 // обслуживаемых канал уходит только здесь — иначе отдавать
                 // сегмент стало бы некому.
@@ -1684,12 +1687,12 @@ impl WriterLoop {
                     ch.release_buffers();
                     ch.buffers_released = true;
                 }
-                if idle >= SEAL_AFTER {
+                if idle >= PARK_AFTER {
                     if Self::park_segment(ch, &counters).is_err() {
                         Counters::bump(&counters.io_errors);
                     }
                     ch.footer.shrink_to_fit();
-                    ch.in_active = false;
+                    ch.is_in_active_list = false;
                     ch.idle_since = None;
                 } else {
                     self.active.push((ns_idx, ch_idx));
@@ -1886,7 +1889,7 @@ impl WriterLoop {
             MigrationCommit::Replace { tmp, size } => {
                 std::fs::rename(&tmp, &path).ctx_path("подмена сегмента", &path)?;
                 crate::fsutil::sync_dir(&ch.dir)?;
-                ch.inventory.update_size(name, size);
+                ch.inventory.update_size_bytes(name, size);
             }
             MigrationCommit::Remove => {
                 crate::fsutil::remove_synced(&path)?;
@@ -2084,7 +2087,7 @@ mod tests {
             ChannelSpec {
                 dir: dir.path().to_path_buf(),
                 group: 0,
-                quota: None,
+                quota_bytes: None,
                 config: ChannelConfig::new(64 * 1024 * 1024),
             },
             0,
@@ -2186,7 +2189,7 @@ mod tests {
             .map(|(i, c)| ChannelSpec {
                 dir: dir.join(format!("ch{i}")),
                 group: 0,
-                quota: None,
+                quota_bytes: None,
                 config: c,
             })
             .collect();
@@ -2364,7 +2367,7 @@ mod tests {
         // А настоящее бездействие — забирает.
         {
             let ch = &mut w.namespaces[0].as_mut().unwrap().channels[0];
-            ch.idle_since = Instant::now().checked_sub(SEAL_AFTER * 2);
+            ch.idle_since = Instant::now().checked_sub(PARK_AFTER * 2);
         }
         w.tick();
 
@@ -2523,7 +2526,7 @@ mod tests {
             "активный сегмент неприкосновенен: в него пишут"
         );
         assert_eq!(
-            w.counters.snapshot().over_budget,
+            w.counters.snapshot().budget_overruns,
             0,
             "потолок выдержан — жаловаться не на что"
         );
@@ -2554,10 +2557,10 @@ mod tests {
         w.tick();
         {
             let ch = &mut w.namespaces[0].as_mut().unwrap().channels[0];
-            ch.idle_since = Instant::now().checked_sub(SEAL_AFTER * 2);
+            ch.idle_since = Instant::now().checked_sub(PARK_AFTER * 2);
         }
         w.tick();
-        assert!(channel_of(&w).parked.is_some(), "сегмент отпущен");
+        assert!(channel_of(&w).parked_segment.is_some(), "сегмент отпущен");
         assert!(
             !crate::segment::SegmentReader::open(&path)
                 .unwrap()
@@ -2745,7 +2748,7 @@ mod tests {
 
         assert!(path.exists(), "сегмент, в который пишут, не удаляют");
         assert_eq!(
-            w.counters.snapshot().over_budget,
+            w.counters.snapshot().budget_overruns,
             1,
             "невыполнимый потолок обязан быть виден снаружи"
         );

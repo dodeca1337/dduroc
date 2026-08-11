@@ -18,7 +18,7 @@
 //! копируются и не перекодируются.
 
 use crate::error::{Error, Result};
-use crate::schema::{DecodeError, MigratedRecord, Migration, OwnedRecord, Schema};
+use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome, Schema};
 use crate::segment::{SegmentReader, SegmentWriter};
 use crate::staged::{ChannelIdx, NsId};
 use crate::writer::{MigrationCommit, Writer};
@@ -195,12 +195,12 @@ pub fn apply<'a>(
             step_from: step.from,
             kind,
         };
-        let outcome = (step.migrate)(MigratedRecord { record: viewed })
+        let outcome = (step.migrate)(MigrationInput { record: viewed })
             .map_err(|DecodeError| failed(ChainErrorKind::Decode))?;
         current = match outcome {
             None => return Ok(Chained::Dropped),
-            Some(OwnedRecord::AsIs) => current,
-            Some(OwnedRecord::Message { event, payload }) => {
+            Some(MigrationOutcome::AsIs) => current,
+            Some(MigrationOutcome::Message { event, payload }) => {
                 let span = match viewed {
                     Record::Message(m) => m.span,
                     Record::Text(t) => t.span,
@@ -212,7 +212,7 @@ pub fn apply<'a>(
                     payload,
                 })
             }
-            Some(OwnedRecord::SampleMetric(metric)) => match current {
+            Some(MigrationOutcome::SampleMetric(metric)) => match current {
                 // Ремап поверх ремапа: значение так и заимствует исходный
                 // буфер, меняется только идентификатор.
                 Chained::Owned(OwnedChained::Sample { original, .. }) => {
@@ -254,7 +254,7 @@ pub struct MigrationReport {
     /// Прогон их не трогает; читателю они и так известны как повреждение
     /// или чужак — штампу меты они не мешают, потому что никакая версия
     /// схемы их бы не прочла.
-    pub unreadable: usize,
+    pub corrupt_or_foreign: usize,
     /// Записей легло в переписанные сегменты.
     pub records_rewritten: u64,
     /// Записей удалено шагами.
@@ -311,14 +311,14 @@ fn run_channel(
             // нечего, и держать из-за него мету незаштампованной значило бы
             // сделать миграцию невозможной навсегда.
             Err(Error::Corrupt { .. }) => {
-                report.unreadable += 1;
+                report.corrupt_or_foreign += 1;
                 continue;
             }
             Err(e) => return Err(e),
         };
         if reader.header().store_id != store_id {
             // Чужой дамп, подложенный в каталог: не наше — не трогаем.
-            report.unreadable += 1;
+            report.corrupt_or_foreign += 1;
             continue;
         }
         let seg_version = reader.header().protocol_version.0;
@@ -521,7 +521,7 @@ mod tests {
         from: u16,
         events: &'static [EventId],
         metrics: &'static [MetricId],
-        migrate: fn(MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError>,
+        migrate: fn(MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError>,
     ) -> Migration {
         Migration {
             from,
@@ -537,8 +537,8 @@ mod tests {
         // Шаг объявил события [1] — записей других типов он не видит вовсе.
         // Иначе «объявил одно, преобразует другое» жило бы молча: сегменты
         // отбирались бы по объявленному, а переписывалось бы фактическое.
-        fn poison(_: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
-            Ok(Some(OwnedRecord::Message {
+        fn poison(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::Message {
                 event: EventId(0xEE),
                 payload: vec![0xEE],
             }))
@@ -578,10 +578,10 @@ mod tests {
         // Текст и спаны не выразить множествами типов — но шаг с touches_all
         // обязан их видеть: он единственный способ, например, вычистить
         // свободный текст с чувствительными данными.
-        fn drop_text(r: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
+        fn drop_text(r: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
             Ok(match r.record {
                 Record::Text(_) => None,
-                _ => Some(OwnedRecord::AsIs),
+                _ => Some(MigrationOutcome::AsIs),
             })
         }
         let s = step(1, &[], &[], drop_text);
@@ -605,16 +605,16 @@ mod tests {
         // Прыжок v1 → v3: шаг 1 перекодирует payload и меняет тип, шаг 2
         // обязан увидеть уже НОВЫЙ тип — так один и тот же шаг работает и в
         // одиночку, и в цепочке.
-        fn one(r: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
+        fn one(r: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
             let old: (u8,) = r.decode()?;
-            Ok(Some(OwnedRecord::Message {
+            Ok(Some(MigrationOutcome::Message {
                 event: EventId(2),
                 payload: postcard::to_allocvec(&(u16::from(old.0) * 2,)).unwrap(),
             }))
         }
-        fn two(r: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
+        fn two(r: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
             let mid: (u16,) = r.decode()?;
-            Ok(Some(OwnedRecord::Message {
+            Ok(Some(MigrationOutcome::Message {
                 event: EventId(3),
                 payload: postcard::to_allocvec(&(u32::from(mid.0) + 1,)).unwrap(),
             }))
@@ -645,8 +645,8 @@ mod tests {
 
     #[test]
     fn metric_remap_keeps_the_value_bytes() {
-        fn remap(_: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
-            Ok(Some(OwnedRecord::SampleMetric(MetricId(0x20))))
+        fn remap(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::SampleMetric(MetricId(0x20))))
         }
         let s = step(1, &[], &[MetricId(0x10)], remap);
         let steps = [&s];
@@ -670,11 +670,11 @@ mod tests {
 
     #[test]
     fn a_failing_step_names_itself() {
-        fn broken(r: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
+        fn broken(r: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
             let _: (u64, u64, u64, u64) = r.decode()?; // payload заведомо короче
-            Ok(Some(OwnedRecord::AsIs))
+            Ok(Some(MigrationOutcome::AsIs))
         }
-        let s1 = step(1, &[EventId(1)], &[], |_| Ok(Some(OwnedRecord::AsIs)));
+        let s1 = step(1, &[EventId(1)], &[], |_| Ok(Some(MigrationOutcome::AsIs)));
         let s2 = step(2, &[EventId(1)], &[], broken);
         let steps = [&s1, &s2];
 
@@ -687,8 +687,8 @@ mod tests {
     fn an_outcome_that_does_not_fit_the_record_is_a_step_bug() {
         // SampleMetric для сообщения — ошибка кода шага. Молча пропустить её
         // значило бы оставить запись в старой раскладке и объявить успех.
-        fn wrong(_: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
-            Ok(Some(OwnedRecord::SampleMetric(MetricId(1))))
+        fn wrong(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::SampleMetric(MetricId(1))))
         }
         let s = step(1, &[EventId(1)], &[], wrong);
         let err = apply(&[&s], msg(1, &[1])).unwrap_err();
@@ -698,8 +698,8 @@ mod tests {
     #[test]
     fn chain_is_resolved_or_refused_never_guessed() {
         use crate::schema::tests_support::minimal_schema_with_migrations;
-        fn asis(_: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
-            Ok(Some(OwnedRecord::AsIs))
+        fn asis(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::AsIs))
         }
         static STEPS: &[Migration] = &[
             Migration {

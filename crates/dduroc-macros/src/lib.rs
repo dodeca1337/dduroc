@@ -104,7 +104,7 @@ struct MetricDef {
     name: Ident,
     id: u16,
     /// `None` — тип выводится: у перечисления это `u64`.
-    vtype: Option<Ident>,
+    value_type: Option<Ident>,
     unit: LitStr,
     tags: Vec<Ident>,
     store: Option<Ident>,
@@ -544,7 +544,7 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     let content;
     braced!(content in input);
 
-    let mut vtype = None;
+    let mut value_type = None;
     let mut unit = None;
     let mut tags = Vec::new();
     let mut store = None;
@@ -565,7 +565,7 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         };
         content.parse::<Token![:]>()?;
         match key.to_string().as_str() {
-            "type" => vtype = Some(content.parse::<Ident>()?),
+            "type" => value_type = Some(content.parse::<Ident>()?),
             "unit" => unit = Some(content.parse::<LitStr>()?),
             "tags" => tags = parse_ident_list(&content)?,
             "store" => store = Some(content.parse::<Ident>()?),
@@ -577,7 +577,7 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
             // поэтому и ключ другой — перепутать их молча невозможно.
             "warn_if" => warn_if = Some(content.parse::<syn::Expr>()?),
             "alarm_if" => alarm_if = Some(content.parse::<syn::Expr>()?),
-            "vtype" => {
+            "value_type" => {
                 return Err(syn::Error::new(
                     key.span(),
                     "ключ называется `type`: приставка `v` не несла смысла",
@@ -631,10 +631,10 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     }
 
     // Тип перечисления выводится: код состояния — целое.
-    if vtype.is_none() && !states.is_empty() {
-        vtype = Some(Ident::new("u64", name.span()));
+    if value_type.is_none() && !states.is_empty() {
+        value_type = Some(Ident::new("u64", name.span()));
     }
-    if vtype.is_none() {
+    if value_type.is_none() {
         return Err(syn::Error::new(
             name.span(),
             format!(
@@ -643,7 +643,8 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
             ),
         ));
     }
-    if vtype.as_ref().is_some_and(|t| t == "blob") && (warn_if.is_some() || alarm_if.is_some()) {
+    if value_type.as_ref().is_some_and(|t| t == "blob") && (warn_if.is_some() || alarm_if.is_some())
+    {
         return Err(syn::Error::new(
             name.span(),
             format!(
@@ -656,7 +657,7 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     Ok(MetricDef {
         name,
         id,
-        vtype,
+        value_type,
         unit,
         tags,
         store,
@@ -944,8 +945,8 @@ fn class_path(store: Option<&Ident>) -> syn::Result<TokenStream2> {
     })
 }
 
-fn vtype_path(vtype: &Ident) -> syn::Result<TokenStream2> {
-    Ok(match vtype.to_string().as_str() {
+fn value_type_path(value_type: &Ident) -> syn::Result<TokenStream2> {
+    Ok(match value_type.to_string().as_str() {
         "f32" => quote!(::dduroc::ValueType::F32),
         "f64" => quote!(::dduroc::ValueType::F64),
         "i64" => quote!(::dduroc::ValueType::I64),
@@ -954,7 +955,7 @@ fn vtype_path(vtype: &Ident) -> syn::Result<TokenStream2> {
         "blob" => quote!(::dduroc::ValueType::Blob),
         other => {
             return Err(syn::Error::new(
-                vtype.span(),
+                value_type.span(),
                 format!("неизвестный тип значения `{other}`: ожидались f32/f64/i64/u64/bool/blob"),
             ));
         }
@@ -966,11 +967,11 @@ fn vtype_path(vtype: &Ident) -> syn::Result<TokenStream2> {
 /// Он и определяет, что примет `sample`: у `Metric<f32>` — только `f32`.
 /// У перечисления это сам сгенерированный enum, поэтому состояние чужой
 /// метрики не проходит проверку типов.
-fn marker_path(vtype: &Ident, states_enum: Option<&Ident>) -> syn::Result<TokenStream2> {
+fn marker_path(value_type: &Ident, states_enum: Option<&Ident>) -> syn::Result<TokenStream2> {
     if let Some(name) = states_enum {
         return Ok(quote!(#name));
     }
-    Ok(match vtype.to_string().as_str() {
+    Ok(match value_type.to_string().as_str() {
         "f32" => quote!(f32),
         "f64" => quote!(f64),
         "i64" => quote!(i64),
@@ -979,7 +980,7 @@ fn marker_path(vtype: &Ident, states_enum: Option<&Ident>) -> syn::Result<TokenS
         "blob" => quote!(::dduroc::Blob),
         other => {
             return Err(syn::Error::new(
-                vtype.span(),
+                value_type.span(),
                 format!("неизвестный тип значения `{other}`: ожидались f32/f64/i64/u64/bool/blob"),
             ));
         }
@@ -1303,13 +1304,16 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
     // ── метрики ──────────────────────────────────────────────────────────
     let mut metric_consts = Vec::new();
     let mut metric_descs = Vec::new();
-    let mut state_statics = Vec::new();
+    let mut metric_items = Vec::new();
     for m in &input.metrics {
         let name = &m.name;
         let name_str = name.to_string();
         let id = m.id;
-        let vtype_ident = m.vtype.as_ref().expect("vtype проверен при разборе");
-        let vtype = vtype_path(vtype_ident)?;
+        let value_type_ident = m
+            .value_type
+            .as_ref()
+            .expect("value_type проверен при разборе");
+        let value_type = value_type_path(value_type_ident)?;
         let class = class_path(m.store.as_ref())?;
         let unit = &m.unit;
         let tags: Vec<String> = m.tags.iter().map(|t| t.to_string()).collect();
@@ -1321,14 +1325,14 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         // указатель на них лежит в дескрипторе, и читатель пользуется ими так
         // же, как диапазонами, — дамп со своей схемой раскрашивается одинаково
         // на приборе и во вьюере.
-        let mut predicate = |suffix: &str, expr: Option<&syn::Expr>| match expr {
+        let mut predicate = |key: &str, expr: Option<&syn::Expr>| match expr {
             None => quote!(::core::option::Option::None),
             Some(expr) => {
-                let fn_name = quote::format_ident!("__{}_{}", suffix, name_str.to_lowercase());
+                let fn_name = quote::format_ident!("__{}_{}", key, name_str.to_lowercase());
                 // Двустороннее условие естественно пишется `v > a || v < b`,
                 // а clippy предлагает переписать его диапазоном — ровно той
                 // формой, вместо которой предикат и выбран.
-                state_statics.push(quote! {
+                metric_items.push(quote! {
                     #[allow(clippy::manual_range_contains)]
                     fn #fn_name(v: f64) -> bool {
                         #expr
@@ -1345,7 +1349,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         // Имя занимает пространство значений, поэтому перечисление состояний
         // может называться так же.
         let marker = marker_path(
-            vtype_ident,
+            value_type_ident,
             if m.states.is_empty() {
                 None
             } else {
@@ -1375,7 +1379,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                     })
                 })
                 .collect::<syn::Result<_>>()?;
-            state_statics.push(quote! {
+            metric_items.push(quote! {
                 static #states_static: &[::dduroc::StateDesc] = &[#(#entries),*];
             });
 
@@ -1440,7 +1444,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             ::dduroc::MetricDesc {
                 id: ::dduroc::MetricId(#id),
                 name: #name_str,
-                value_type: #vtype,
+                value_type: #value_type,
                 class: #class,
                 unit: #unit,
                 tags: &[#(#tags),*],
@@ -1507,7 +1511,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             #(#history_mods)*
             #(#migration_fns)*
 
-            #(#state_statics)*
+            #(#metric_items)*
 
             static EVENTS: &[::dduroc::EventDesc] = &[#(#event_descs),*];
             static METRICS: &[::dduroc::MetricDesc] = &[#(#metric_descs),*];
@@ -1794,16 +1798,16 @@ fn codegen_rules_step(
     let f = quote! {
         #[doc(hidden)]
         pub fn #fn_name(
-            __r: ::dduroc::MigratedRecord<'_>,
+            __r: ::dduroc::MigrationInput<'_>,
         ) -> ::core::result::Result<
-            ::core::option::Option<::dduroc::OwnedRecord>,
+            ::core::option::Option<::dduroc::MigrationOutcome>,
             ::dduroc::DecodeError,
         > {
             if let ::core::option::Option::Some(__ev) = __r.event_id() {
                 return match __ev.0 {
                     #(#event_arms)*
                     _ => ::core::result::Result::Ok(::core::option::Option::Some(
-                        ::dduroc::OwnedRecord::AsIs,
+                        ::dduroc::MigrationOutcome::AsIs,
                     )),
                 };
             }
@@ -1811,12 +1815,12 @@ fn codegen_rules_step(
                 return match __m.0 {
                     #(#metric_arms)*
                     _ => ::core::result::Result::Ok(::core::option::Option::Some(
-                        ::dduroc::OwnedRecord::AsIs,
+                        ::dduroc::MigrationOutcome::AsIs,
                     )),
                 };
             }
             ::core::result::Result::Ok(::core::option::Option::Some(
-                ::dduroc::OwnedRecord::AsIs,
+                ::dduroc::MigrationOutcome::AsIs,
             ))
         }
     };
@@ -1922,7 +1926,7 @@ fn resolve_rule(
                 old_id,
                 arm: quote! {
                     #old_id => ::core::result::Result::Ok(::core::option::Option::Some(
-                        ::dduroc::OwnedRecord::Message {
+                        ::dduroc::MigrationOutcome::Message {
                             event: ::dduroc::EventId(#target_id),
                             payload: __r.payload().unwrap_or(&[]).to_vec(),
                         },
@@ -1949,7 +1953,7 @@ fn resolve_rule(
                 old_id,
                 arm: quote! {
                     #old_id => ::core::result::Result::Ok(::core::option::Option::Some(
-                        ::dduroc::OwnedRecord::SampleMetric(::dduroc::MetricId(#target_id)),
+                        ::dduroc::MigrationOutcome::SampleMetric(::dduroc::MetricId(#target_id)),
                     )),
                 },
             });
@@ -1985,7 +1989,7 @@ fn clone_metric(m: &MetricDef) -> MetricDef {
     MetricDef {
         name: m.name.clone(),
         id: m.id,
-        vtype: m.vtype.clone(),
+        value_type: m.value_type.clone(),
         unit: m.unit.clone(),
         tags: m.tags.clone(),
         store: m.store.clone(),
@@ -2235,7 +2239,7 @@ mod tests {
     fn old_metric_spellings_get_pointed_at_the_new_ones() {
         // Прежнее имя ключа — подсказка, а не «неизвестный ключ».
         let e = err(r#"name: radio, version: 1, languages: [en],
-               metrics { Temp = 0x01 { vtype: f32 } }"#);
+               metrics { Temp = 0x01 { value_type: f32 } }"#);
         assert!(e.contains("`type`"), "{e}");
 
         // Условие на месте диапазона: у форм противоположная полярность,

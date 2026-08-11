@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 pub struct SegmentEntry {
     pub name: SegmentName,
     /// Размер файла на диске (с учётом преаллокации).
-    pub size: u64,
+    pub size_bytes: u64,
 }
 
 impl SegmentEntry {
@@ -65,12 +65,12 @@ impl Inventory {
             }
             segments.push(SegmentEntry {
                 name,
-                size: meta.len(),
+                size_bytes: meta.len(),
             });
         }
 
         segments.sort_by_key(|s| s.name);
-        let total = segments.iter().map(|s| s.size).sum();
+        let total = segments.iter().map(|s| s.size_bytes).sum();
         Ok(Self {
             segments: segments.into(),
             total,
@@ -125,27 +125,28 @@ impl Inventory {
 
     /// Добавить только что созданный сегмент (он самый новый).
     pub fn push_newest(&mut self, entry: SegmentEntry) {
-        self.total += entry.size;
+        self.total += entry.size_bytes;
         self.segments.push_back(entry);
     }
 
     /// Уточнить размер сегмента (после запечатывания файл обрезается).
-    pub fn update_size(&mut self, name: SegmentName, size: u64) {
+    pub fn update_size_bytes(&mut self, name: SegmentName, size_bytes: u64) {
         if let Some(e) = self.segments.iter_mut().find(|e| e.name == name) {
-            self.total = self.total - e.size + size;
-            e.size = size;
+            self.total = self.total - e.size_bytes + size_bytes;
+            e.size_bytes = size_bytes;
         }
     }
 
     /// Удалять самые старые сегменты, пока сумма превышает бюджет.
     ///
-    /// `protect` — сегмент, который удалять нельзя (активный: в него пишут).
+    /// `live` — сегмент, в который канал пишет или продолжит писать
+    /// (см. `WriterLoop::live_segment`): удалять его нельзя.
     /// Возвращает число удалённых.
     pub fn enforce_budget(
         &mut self,
         dir: &Path,
         budget: u64,
-        protect: Option<SegmentName>,
+        live: Option<SegmentName>,
     ) -> Result<usize> {
         let mut removed = 0;
         while self.total > budget {
@@ -154,7 +155,7 @@ impl Inventory {
             };
             // Единственный оставшийся сегмент — активный: удалять нечего,
             // иначе запись потеряла бы файл под собой.
-            if Some(front.name) == protect {
+            if Some(front.name) == live {
                 break;
             }
             let path = front.path(dir);
@@ -165,7 +166,7 @@ impl Inventory {
                 Err(e) => return Err(e).ctx_path("удаление сегмента", &path),
             }
             let entry = self.segments.pop_front().expect("front проверен выше");
-            self.total = self.total.saturating_sub(entry.size);
+            self.total = self.total.saturating_sub(entry.size_bytes);
             removed += 1;
         }
         if removed > 0 {
@@ -178,7 +179,7 @@ impl Inventory {
     pub fn remove(&mut self, name: SegmentName) {
         if let Some(pos) = self.segments.iter().position(|e| e.name == name) {
             let entry = self.segments.remove(pos).expect("позиция найдена");
-            self.total = self.total.saturating_sub(entry.size);
+            self.total = self.total.saturating_sub(entry.size_bytes);
         }
     }
 
@@ -194,9 +195,9 @@ mod tests {
     use super::*;
     use dduroc_format::{BootCounter, Micros};
 
-    fn make(dir: &Path, boot: u32, base: u64, size: usize) {
+    fn make(dir: &Path, boot: u32, base: u64, size_bytes: usize) {
         let name = SegmentName::new(BootCounter(boot), Micros(base));
-        std::fs::write(dir.join(name.to_string()), vec![0u8; size]).unwrap();
+        std::fs::write(dir.join(name.to_string()), vec![0u8; size_bytes]).unwrap();
     }
 
     #[test]
@@ -292,7 +293,7 @@ mod tests {
 
         // Запечатывание обрезает хвост преаллокации.
         let name = inv.newest().unwrap().name;
-        inv.update_size(name, 200);
+        inv.update_size_bytes(name, 200);
         assert_eq!(inv.total_bytes(), 200, "бюджет учитывает реальный размер");
 
         inv.remove(name);

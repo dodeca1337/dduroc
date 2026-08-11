@@ -137,7 +137,7 @@ impl<'a> Value<'a> {
                 Some(1) => Ok((Value::Bool(true), 1)),
                 // Любой другой байт — повреждение, а не «истина»: тихое
                 // приведение скрывало бы порчу данных.
-                Some(_) => Err(Error::ReservedNotZero),
+                Some(_) => Err(Error::ReservedValue),
                 None => Err(Error::Truncated),
             },
             ValueType::Blob => {
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(Value::decode(ValueType::Bool, &[]), Err(Error::Truncated));
         assert_eq!(
             Value::decode(ValueType::Bool, &[2]),
-            Err(Error::ReservedNotZero)
+            Err(Error::ReservedValue)
         );
         // Blob с длиной больше доступного.
         let mut buf = Vec::new();

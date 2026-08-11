@@ -6,6 +6,7 @@
 //! определяется её местоположением — в самих записях никакого «кто это
 //! написал» не хранится.
 
+use crate::Clock;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::limits::{EffectiveLimits, LimitsRegistry, MetricLimits};
@@ -15,7 +16,6 @@ use crate::staged::{ChannelIdx, DropCounters, NsId, OwnedValue, Payload, Staged,
 use crate::stats::Counters;
 use crate::store::next_span_id;
 use crate::writer::Writer;
-use crate::{Clock, schema};
 use dduroc_format::{
     BootTime, EventId, Level, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId,
 };
@@ -218,7 +218,12 @@ impl Namespace {
         }
     }
 
-    pub fn protocol_version(&self) -> ProtocolVersion {
+    /// Версия схемы ЭТОГО билда — та, которой пишутся новые сегменты.
+    ///
+    /// Не путать с версией последней завершённой миграции
+    /// ([`NsMeta::protocol_version`]): их расхождение и есть непогашенный долг,
+    /// который называет [`Namespace::pending_migration`].
+    pub fn schema_version(&self) -> ProtocolVersion {
         self.inner.schema.version
     }
 
@@ -529,7 +534,9 @@ impl Namespace {
         self.inner
             .schema
             .metric(metric)
-            .ok_or(Error::UnknownMetric { id: metric.0 })
+            .ok_or(Error::UnknownMetric {
+                metric_id: metric.0,
+            })
     }
 
     /// Выставить границы значений поверх схемных.
@@ -726,7 +733,7 @@ impl<M> Series<M> {
     pub fn try_sample_raw(&self, value: OwnedValue) -> Result<()> {
         if value.value_type() != self.value_type {
             return Err(Error::ValueTypeMismatch {
-                metric: self.metric.0,
+                metric_id: self.metric.0,
                 declared: self.value_type,
                 got: value.value_type(),
             });
@@ -876,9 +883,6 @@ impl Drop for SpanGuard {
         }
     }
 }
-
-/// Уровни и классы — реэкспорт для потребителей ручки.
-pub use schema::StorageClass as Class;
 
 /// Бит вида нарушения контракта: объявляется по одному разу на вид.
 fn contract_bit(e: &Error) -> u8 {
@@ -1031,7 +1035,7 @@ mod tests {
     }
 
     fn open_store(dir: &Path) -> Arc<Store> {
-        Store::open(StoreConfig::new(dir).with_budget(16 * 1024 * 1024)).unwrap()
+        Store::open(StoreConfig::new(dir).with_budget_per_class(16 * 1024 * 1024)).unwrap()
     }
 
     #[test]
@@ -1209,10 +1213,12 @@ mod tests {
         // мигрированным, хотя физического прогона ещё нет. Будущая миграция
         // обошла бы старые сегменты стороной, и их разобрали бы декодерами
         // новой версии — молча и неверно. Регрессия была бы совершенно тихой.
-        use crate::schema::{DecodeError, MigratedRecord, Migration, OwnedRecord};
+        use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome};
 
-        fn noop(_: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
-            Ok(Some(OwnedRecord::AsIs))
+        fn noop(
+            _: MigrationInput<'_>,
+        ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::AsIs))
         }
         static STEPS: &[Migration] = &[Migration {
             from: 1,
@@ -1288,18 +1294,20 @@ mod tests {
         // не тронут, мета заштампована, повтор пуст. Всё это на живом
         // хранилище с работающим writer'ом: фиксация идёт через него.
         use crate::migrate::MigrationReport;
-        use crate::schema::{DecodeError, MigratedRecord, Migration, OwnedRecord};
+        use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome};
 
-        fn step(r: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+        fn step(
+            r: MigrationInput<'_>,
+        ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
             match (r.event_id(), r.metric_id()) {
                 // PowerSet перекодируется в фиксированный новый payload.
-                (Some(EventId(1)), _) => Ok(Some(OwnedRecord::Message {
+                (Some(EventId(1)), _) => Ok(Some(MigrationOutcome::Message {
                     event: EventId(1),
                     payload: vec![0xAA, 0xBB],
                 })),
                 // Отсчёты temp удаляются целиком.
                 (_, Some(MetricId(1))) => Ok(None),
-                _ => Ok(Some(OwnedRecord::AsIs)),
+                _ => Ok(Some(MigrationOutcome::AsIs)),
             }
         }
         static STEPS: &[Migration] = &[Migration {
@@ -1398,10 +1406,12 @@ mod tests {
         // записи флеша: он не переписывается и сохраняет прежнюю версию в
         // заголовке — при заштампованной мете. Это легально: незатронутость
         // и означает, что текущие декодеры читают его верно.
-        use crate::schema::{DecodeError, MigratedRecord, Migration, OwnedRecord};
+        use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome};
 
-        fn nope(_: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
-            Ok(Some(OwnedRecord::Message {
+        fn nope(
+            _: MigrationInput<'_>,
+        ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::Message {
                 event: EventId(2),
                 payload: vec![0xEE],
             }))

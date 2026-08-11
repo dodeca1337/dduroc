@@ -401,7 +401,7 @@ pub struct Migration {
     pub events: &'static [EventId],
     pub metrics: &'static [MetricId],
     /// Преобразование одной записи. `Ok(None)` — запись удаляется.
-    pub migrate: fn(MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError>,
+    pub migrate: fn(MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError>,
 }
 
 impl Migration {
@@ -426,13 +426,17 @@ impl std::fmt::Debug for Migration {
     }
 }
 
-/// Запись, поданная шагу миграции.
+/// Вход шага миграции: запись **в прежней раскладке**, как она лежит на диске.
+///
+/// Парна [`MigrationOutcome`] — тому, что шаг возвращает. Разведены именами
+/// намеренно: причастие («мигрированная запись») переворачивало бы стороны
+/// сигнатуры, а шаг получает именно то, что ещё не приведено.
 #[derive(Debug, Clone, Copy)]
-pub struct MigratedRecord<'a> {
+pub struct MigrationInput<'a> {
     pub record: dduroc_format::Record<'a>,
 }
 
-impl MigratedRecord<'_> {
+impl MigrationInput<'_> {
     /// Тип сообщения. `None` — запись не сообщение.
     pub fn event_id(&self) -> Option<EventId> {
         match &self.record {
@@ -474,10 +478,14 @@ impl MigratedRecord<'_> {
     }
 }
 
-/// Результат преобразования: владеющая форма, так как шаг миграции обычно
+/// Исход шага миграции — то, чем запись станет. Владеющая форма: шаг обычно
 /// перекодирует payload.
+///
+/// Парен [`MigrationInput`]. Прежнее имя `OwnedRecord` сталкивалось с
+/// одноимённым типом читателя (владеющая копия wire-записи) — при импорте
+/// обоих крейтов они были неразличимы.
 #[derive(Debug, Clone, PartialEq)]
-pub enum OwnedRecord {
+pub enum MigrationOutcome {
     /// Оставить как есть.
     AsIs,
     /// Заменить тип и/или payload сообщения.
@@ -1074,8 +1082,8 @@ mod tests {
     #[test]
     fn migration_chain_must_be_continuous() {
         static EVENTS: &[EventDesc] = &[];
-        fn noop(_: MigratedRecord<'_>) -> Result<Option<OwnedRecord>, DecodeError> {
-            Ok(Some(OwnedRecord::AsIs))
+        fn noop(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::AsIs))
         }
         static STEPS: &[Migration] = &[Migration {
             from: 1,

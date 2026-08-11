@@ -67,7 +67,7 @@ fn bench_root() -> PathBuf {
 
 fn store_config(root: &std::path::Path) -> StoreConfig {
     StoreConfig::new(root)
-        .with_budget(256 * 1024 * 1024)
+        .with_budget_per_class(256 * 1024 * 1024)
         // Долговечность отключена намеренно: иначе бенчмарк мерил бы
         // fdatasync носителя, а не стоимость собственного кода.
         .channel(

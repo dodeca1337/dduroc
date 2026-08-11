@@ -65,9 +65,9 @@
 //!         // Бюджет КЛАССА на всё хранилище: «вся телеметрия — столько-то,
 //!         // все логи — столько-то». Каналы всех неймспейсов класса черпают
 //!         // из общего бюджета, вытесняется старейший сегмент класса — в
-//!         // чьём бы неймспейсе он ни лежал. with_budget задаёт бюджет
+//!         // чьём бы неймспейсе он ни лежал. with_budget_per_class задаёт бюджет
 //!         // каждому классу, не названному в .channel() явно.
-//!         .with_budget(4 << 30),
+//!         .with_budget_per_class(4 << 30),
 //! )?;
 //!
 //! // Экземпляр микросервиса поднимает свой неймспейс.
@@ -161,9 +161,9 @@ pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, SeverityFn, State
 pub use dduroc_engine::metric::{Blob, Metric, MetricState, MetricValue, Untyped};
 pub use dduroc_engine::namespace::{Namespace, Series, SpanGuard};
 pub use dduroc_engine::schema::{
-    DecodeError, EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MetricKind,
-    MigratedRecord, Migration, OwnedRecord, Range, Schema, Severity, SpanDesc, StateDesc,
-    StorageClass, Thresholds,
+    DecodeError, EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MetricKind, Migration,
+    MigrationInput, MigrationOutcome, Range, Schema, Severity, SpanDesc, StateDesc, StorageClass,
+    Thresholds,
 };
 pub use dduroc_engine::staged::{OwnedValue, Payload};
 pub use dduroc_engine::stats::Stats;
@@ -214,28 +214,28 @@ impl<E: Event> EventShape for E {
     const SHAPE_ID: EventId = E::ID;
 }
 
-/// Исход типизированного правила миграции.
+/// Приведение возврата правила к [`MigrationOutcome`].
 ///
 /// Замыкание правила возвращает либо payload ([`EventShape`] — запись
 /// перекодируется), либо `Option` от него (`None` — запись удаляется).
 /// Трейт существует, чтобы генерируемый код принимал и то, и другое, не
 /// заставляя каждое правило писать `Some(...)`.
-pub trait MigrateOutcome {
-    /// Превратить исход в запись миграции.
-    fn into_outcome(self) -> std::result::Result<Option<OwnedRecord>, DecodeError>;
+pub trait IntoMigrationOutcome {
+    /// Превратить возврат правила в исход шага.
+    fn into_outcome(self) -> std::result::Result<Option<MigrationOutcome>, DecodeError>;
 }
 
-impl<E: EventShape> MigrateOutcome for E {
-    fn into_outcome(self) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
-        Ok(Some(OwnedRecord::Message {
+impl<E: EventShape> IntoMigrationOutcome for E {
+    fn into_outcome(self) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+        Ok(Some(MigrationOutcome::Message {
             event: E::SHAPE_ID,
             payload: postcard::to_allocvec(&self).map_err(|_| DecodeError)?,
         }))
     }
 }
 
-impl<E: EventShape> MigrateOutcome for Option<E> {
-    fn into_outcome(self) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+impl<E: EventShape> IntoMigrationOutcome for Option<E> {
+    fn into_outcome(self) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
         match self {
             Some(e) => e.into_outcome(),
             None => Ok(None),
@@ -250,10 +250,10 @@ impl<E: EventShape> MigrateOutcome for Option<E> {
 /// подсказать тип параметра. Ожидание `impl FnOnce(T)` сообщает его до
 /// проверки тела, и правило пишется без аннотации: `|old| ...`.
 #[doc(hidden)]
-pub fn __migrate_map<T, O: MigrateOutcome>(
+pub fn __migrate_map<T, O: IntoMigrationOutcome>(
     map: impl FnOnce(T) -> O,
     old: T,
-) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
+) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
     map(old).into_outcome()
 }
 
@@ -412,11 +412,15 @@ mod tests {
 
     /// Шаги миграции живут рядом с объявлением схемы; макрос раскрывается в
     /// отдельный модуль, но имена из этой области там видны.
-    fn migrate_v1(_: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
-        Ok(Some(OwnedRecord::AsIs))
+    fn migrate_v1(
+        _: MigrationInput<'_>,
+    ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+        Ok(Some(MigrationOutcome::AsIs))
     }
-    fn migrate_v2(_: MigratedRecord<'_>) -> std::result::Result<Option<OwnedRecord>, DecodeError> {
-        Ok(Some(OwnedRecord::AsIs))
+    fn migrate_v2(
+        _: MigrationInput<'_>,
+    ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+        Ok(Some(MigrationOutcome::AsIs))
     }
 
     schema! {
@@ -519,7 +523,7 @@ mod tests {
         // и увести записи класса в чужой каталог опиской стало непредставимо.
         let dir = tempfile::tempdir().unwrap();
         let config = StoreConfig::new(dir.path())
-            .with_budget(16 * 1024 * 1024)
+            .with_budget_per_class(16 * 1024 * 1024)
             .channel(
                 StorageClass::Telemetry,
                 ChannelConfig {
@@ -672,7 +676,7 @@ mod tests {
         use dduroc_read::{KindFilter, Order, Query, Reader};
 
         let dir = tempfile::tempdir().unwrap();
-        let config = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+        let config = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
         {
             let store = Store::open(config.clone()).unwrap();
             let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
@@ -809,7 +813,8 @@ mod tests {
         // контекстом берёт диагноз на себя целиком и снимается обратно.
         let dir = tempfile::tempdir().unwrap();
         let store =
-            Store::open(StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024)).unwrap();
+            Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024))
+                .unwrap();
         let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
 
         let hw_max = 40.0;
@@ -827,7 +832,7 @@ mod tests {
             Severity::Alarm,
             "по схеме было бы Warn: замыкание победило"
         );
-        assert!(ns.limits(testing::metrics::Temp).unwrap().custom_fn);
+        assert!(ns.limits(testing::metrics::Temp).unwrap().has_severity_fn);
 
         ns.clear_severity_fn(testing::metrics::Temp).unwrap();
         assert_eq!(
@@ -843,7 +848,7 @@ mod tests {
         use dduroc_read::{EntryKind, KindFilter, Order, Query, Reader};
 
         let dir = tempfile::tempdir().unwrap();
-        let config = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+        let config = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
         {
             let store = Store::open(config.clone()).unwrap();
             let ns = store.namespace("orc-radio-0", testing::SCHEMA).unwrap();
@@ -884,7 +889,7 @@ mod tests {
             .iter()
             .filter_map(|e| match &e.kind {
                 EntryKind::Sample {
-                    state: Some(name),
+                    state_name: Some(name),
                     severity: Some(sev),
                     ..
                 } => Some((*name, *sev)),
@@ -918,7 +923,7 @@ mod tests {
         // Крошечная очередь делает переполнение воспроизводимым, а не
         // зависящим от того, чем ещё занята машина.
         let config = StoreConfig::new(dir.path())
-            .with_budget(32 * 1024 * 1024)
+            .with_budget_per_class(32 * 1024 * 1024)
             .with_queues(QueueSizes {
                 normal: 4,
                 critical: 4,

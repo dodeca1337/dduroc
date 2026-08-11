@@ -115,7 +115,7 @@ pub struct EffectiveLimits {
     /// Диагноз целиком взят рантайм-замыканием
     /// ([`crate::namespace::Namespace::set_severity_fn`]): числа выше
     /// описывают то, что оно перекрывает, и полосы по ним рисовать нельзя.
-    pub custom_fn: bool,
+    pub has_severity_fn: bool,
 }
 
 /// Замыкание, целиком берущее диагноз метрики на себя.
@@ -178,14 +178,14 @@ impl LimitsRegistry {
         if let Some(l) = &limits {
             if l.thresholds.is_some_and(|t| !t.is_unset()) && !desc.states.is_empty() {
                 return Err(Error::BadLimits {
-                    metric: desc.name,
+                    metric_name: desc.name,
                     reason: "числовые границы у метрики-перечисления: её значения \
                              не упорядочены, задавайте важность состояний",
                 });
             }
             if !l.states.is_empty() && desc.states.is_empty() {
                 return Err(Error::BadLimits {
-                    metric: desc.name,
+                    metric_name: desc.name,
                     reason: "важность состояний у метрики, которая не объявлена \
                              перечислением",
                 });
@@ -193,7 +193,7 @@ impl LimitsRegistry {
             for (code, _) in &l.states {
                 if desc.state(*code).is_none() {
                     return Err(Error::BadLimits {
-                        metric: desc.name,
+                        metric_name: desc.name,
                         reason: "важность кода состояния, которого нет в схеме: \
                                  подписать его будет нечем",
                     });
@@ -227,7 +227,7 @@ impl LimitsRegistry {
         let (index, desc) = resolve(schema, metric)?;
         if check.is_some() && desc.value_type == dduroc_format::ValueType::Blob {
             return Err(Error::BadLimits {
-                metric: desc.name,
+                metric_name: desc.name,
                 reason: "замыкание диагноза у blob-метрики: значение не приводится \
                          к числу, и вызвать его было бы не с чем",
             });
@@ -245,7 +245,7 @@ impl LimitsRegistry {
         let (index, desc) = resolve(schema, metric)?;
         let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
         let over = slots.get(index).and_then(|o| o.as_ref());
-        let custom_fn = self
+        let has_severity_fn = self
             .fns
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -253,7 +253,7 @@ impl LimitsRegistry {
             .is_some_and(Option::is_some);
 
         Ok(EffectiveLimits {
-            custom_fn,
+            has_severity_fn,
             metric: desc.id,
             name: desc.name,
             unit: desc.unit,
@@ -306,19 +306,19 @@ impl LimitsRegistry {
 }
 
 fn resolve(schema: &Schema, metric: MetricId) -> Result<(usize, &'static MetricDesc)> {
-    schema
-        .metric_index(metric)
-        .ok_or(Error::UnknownMetric { id: metric.0 })
+    schema.metric_index(metric).ok_or(Error::UnknownMetric {
+        metric_id: metric.0,
+    })
 }
 
 /// `alarm` обязан включать `warn`: величина сначала выходит из нормы и
 /// только потом из допустимого.
-pub(crate) fn check_nesting(metric: &'static str, t: &Thresholds) -> Result<()> {
+pub(crate) fn check_nesting(metric_name: &'static str, t: &Thresholds) -> Result<()> {
     let bad_low = matches!((t.warn.min, t.alarm.min), (Some(w), Some(c)) if c > w);
     let bad_high = matches!((t.warn.max, t.alarm.max), (Some(w), Some(c)) if c < w);
     if bad_low || bad_high {
         return Err(Error::BadLimits {
-            metric,
+            metric_name,
             reason: "аварийный диапазон обязан включать тревожный: иначе \
                      значение оказалось бы аварийным, не будучи тревожным",
         });
@@ -562,7 +562,10 @@ mod tests {
         assert!(matches!(err, Error::BadLimits { .. }), "вложенность");
 
         let err = r.set(&s, MetricId(99), None).unwrap_err();
-        assert!(matches!(err, Error::UnknownMetric { id: 99 }), "{err}");
+        assert!(
+            matches!(err, Error::UnknownMetric { metric_id: 99 }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -654,7 +657,7 @@ mod tests {
             Severity::Alarm,
             "замыкание помнит контекст: авария заперта"
         );
-        assert!(r.effective(&s, MetricId(1)).unwrap().custom_fn);
+        assert!(r.effective(&s, MetricId(1)).unwrap().has_severity_fn);
 
         // Состоянию замыкание тоже доступно: код приходит числом.
         r.set_fn(
@@ -679,7 +682,7 @@ mod tests {
         r.set_fn(&s, MetricId(1), None).unwrap();
         assert_eq!(sev(90.0), Severity::Alarm, "теперь по схемным диапазонам");
         assert_eq!(sev(20.0), Severity::Normal);
-        assert!(!r.effective(&s, MetricId(1)).unwrap().custom_fn);
+        assert!(!r.effective(&s, MetricId(1)).unwrap().has_severity_fn);
     }
 
     #[test]

@@ -91,7 +91,7 @@ fn rotation_drops_the_oldest_and_keeps_the_class_inside_its_budget() {
     // и защита активного сегмента.
     const BUDGET: u64 = 32 << 20;
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(BUDGET)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(BUDGET)).unwrap();
     let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
     let seq = ns.series(pressure::metrics::Seq).unwrap();
     let bulk = ns.series(pressure::metrics::Bulk).unwrap();
@@ -180,7 +180,7 @@ fn the_class_budget_is_shared_across_namespaces() {
         "класс занимает {occupied} при бюджете {CEILING}"
     );
     assert_eq!(
-        store.stats().over_budget,
+        store.stats().budget_overruns,
         0,
         "бюджет класса выполним: активных сегментов всего два"
     );
@@ -203,7 +203,7 @@ fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreConfig::new(dir.path())
-            .with_budget(16 << 20)
+            .with_budget_per_class(16 << 20)
             // Очередь на одну запись: ожидание становится не редкостью, а
             // правилом — и проверяется именно оно.
             .with_queues(QueueSizes {
@@ -254,7 +254,7 @@ fn many_threads_write_one_namespace_without_losing_or_duplicating() {
     const THREADS: u64 = 8;
     const PER_THREAD: u64 = 500;
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(64 << 20)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(64 << 20)).unwrap();
     let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
 
     std::thread::scope(|s| {
@@ -300,7 +300,7 @@ fn reading_a_live_store_never_takes_back_what_it_already_showed() {
     // показанное — нельзя ему.
     const N: u64 = 3_000;
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(64 << 20)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(64 << 20)).unwrap();
     let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
 
     let done = Arc::new(AtomicBool::new(false));
@@ -358,11 +358,11 @@ fn a_class_budget_below_two_segments_is_refused_at_open() {
     // момент, когда это ещё поправимо.
     let dir = tempfile::tempdir().unwrap();
     let segment = ChannelConfig::new(0).segment_bytes;
-    let err = Store::open(StoreConfig::new(dir.path()).with_budget(segment))
+    let err = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(segment))
         .expect_err("невыполнимый бюджет обязан быть отвергнут");
     assert!(matches!(err, dduroc::Error::BadChannel { .. }), "{err}");
 
-    Store::open(StoreConfig::new(dir.path()).with_budget(segment * 2))
+    Store::open(StoreConfig::new(dir.path()).with_budget_per_class(segment * 2))
         .expect("двух сегментов уже достаточно");
 }
 
@@ -373,13 +373,13 @@ fn a_namespace_quota_rotates_inside_the_shared_class_budget() {
     // упрётся в свой бюджет, — и не выедает соседей.
     const QUOTA: u64 = 16 << 20;
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(256 << 20)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(256 << 20)).unwrap();
 
     let hog = store
-        .namespace_with(
+        .namespace_with_quota(
             "orc-hog",
             pressure::SCHEMA,
-            NsQuota::new().class(StorageClass::Default, QUOTA),
+            NsQuota::new().limit_bytes(StorageClass::Default, QUOTA),
         )
         .unwrap();
     let bulk = hog.series(pressure::metrics::Bulk).unwrap();
@@ -411,12 +411,12 @@ fn a_namespace_quota_rotates_inside_the_shared_class_budget() {
     );
 
     // Квота меньше двух сегментов бессмысленна и отвергается при открытии.
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget(256 << 20)).unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(256 << 20)).unwrap();
     let err = store
-        .namespace_with(
+        .namespace_with_quota(
             "orc-tiny",
             pressure::SCHEMA,
-            NsQuota::new().class(StorageClass::Default, 1 << 20),
+            NsQuota::new().limit_bytes(StorageClass::Default, 1 << 20),
         )
         .expect_err("квота в один сегмент бессмысленна");
     assert!(matches!(err, dduroc::Error::BadChannel { .. }), "{err}");
@@ -431,13 +431,17 @@ fn a_class_can_live_on_its_own_root() {
     let main = tempfile::tempdir().unwrap();
     let vault = tempfile::tempdir().unwrap();
     {
-        let store = Store::open(StoreConfig::new(main.path()).with_budget(16 << 20).channel(
-            StorageClass::Critical,
-            ChannelConfig {
-                root: Some(vault.path().to_path_buf()),
-                ..ChannelConfig::critical(16 << 20)
-            },
-        ))
+        let store = Store::open(
+            StoreConfig::new(main.path())
+                .with_budget_per_class(16 << 20)
+                .channel(
+                    StorageClass::Critical,
+                    ChannelConfig {
+                        custom_root: Some(vault.path().to_path_buf()),
+                        ..ChannelConfig::critical(16 << 20)
+                    },
+                ),
+        )
         .unwrap();
         let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
         ns.log(pressure::events::Mark {});

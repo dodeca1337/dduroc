@@ -76,7 +76,7 @@ pub enum EntryKind {
         /// это не косметика, а ложь на графике.
         kind: Option<MetricKind>,
         /// Подпись состояния, если метрика — перечисление и код объявлен.
-        state: Option<&'static str>,
+        state_name: Option<&'static str>,
         /// Важность значения по пределам **из схемы**.
         ///
         /// Рантайм-переопределения читателю недоступны by design: он может
@@ -345,7 +345,7 @@ pub struct NamespaceInfo {
     pub protocol_version: u16,
     pub channels: Vec<String>,
     /// Суммарный размер сегментов, байт.
-    pub bytes: u64,
+    pub total_bytes: u64,
 }
 
 /// Что нашлось в корне при перечислении неймспейсов.
@@ -491,14 +491,14 @@ impl Reader {
     /// нельзя — иначе перечисление объявляло бы полным ответ, из которого
     /// целый неймспейс выпал, и его данные исчезли бы бесследно.
     pub fn namespaces(&self) -> Result<NamespaceListing> {
-        let mut unreadable = Vec::new();
-        let dirs = self.namespace_dirs(&mut unreadable)?;
-        let mut namespaces = Vec::with_capacity(dirs.len());
-        for ns in dirs {
-            let mut bytes = 0;
+        let mut damaged_dirs = Vec::new();
+        let found = self.scan_namespaces(&mut damaged_dirs)?;
+        let mut namespaces = Vec::with_capacity(found.len());
+        for ns in found {
+            let mut total_bytes = 0;
             for (_, dir) in &ns.channels {
                 if let Ok(inv) = dduroc_engine::rotation::Inventory::scan(dir) {
-                    bytes += inv.total_bytes();
+                    total_bytes += inv.total_bytes();
                 }
             }
             namespaces.push(NamespaceInfo {
@@ -506,12 +506,12 @@ impl Reader {
                 schema_name: ns.schema_name,
                 protocol_version: ns.protocol_version,
                 channels: ns.channels.into_iter().map(|(n, _)| n).collect(),
-                bytes,
+                total_bytes,
             });
         }
         Ok(NamespaceListing {
             namespaces,
-            damaged: unreadable
+            damaged: damaged_dirs
                 .into_iter()
                 .map(|path| Damage {
                     path,
@@ -524,8 +524,8 @@ impl Reader {
 
     /// Неймспейсы и их каналы — без обращения к размерам файлов.
     ///
-    /// Каталоги с нечитаемой метой накапливаются в `unreadable`.
-    fn namespace_dirs(&self, unreadable: &mut Vec<PathBuf>) -> Result<Vec<NsScan>> {
+    /// Каталоги с нечитаемой метой накапливаются в `damaged_dirs`.
+    fn scan_namespaces(&self, damaged_dirs: &mut Vec<PathBuf>) -> Result<Vec<NsScan>> {
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(e) => e,
@@ -552,7 +552,7 @@ impl Reader {
                 // неймспейс, который мы не можем показать, и молчать об этом
                 // нельзя: его данные просто исчезли бы из всех ответов.
                 if path.join(NS_META).exists() {
-                    unreadable.push(path);
+                    damaged_dirs.push(path);
                 }
                 continue;
             };
@@ -799,9 +799,9 @@ impl Reader {
     ) -> Result<OpenedCursors> {
         let mut cursors = Vec::new();
         let mut schemas = Vec::new();
-        let mut unreadable = Vec::new();
+        let mut damaged_dirs = Vec::new();
 
-        for ns in self.namespace_dirs(&mut unreadable)? {
+        for ns in self.scan_namespaces(&mut damaged_dirs)? {
             if !q.namespaces.matches(&ns.name) {
                 continue;
             }
@@ -835,7 +835,7 @@ impl Reader {
             }
         }
 
-        let damaged = unreadable
+        let damaged = damaged_dirs
             .into_iter()
             .map(|path| Damage {
                 path,
@@ -999,7 +999,7 @@ impl Reader {
                         unit: desc.map(|d| d.unit),
                         tags: desc.map_or(&[][..], |d| d.tags),
                         kind: desc.map(|d| d.kind),
-                        state: desc.zip(code).and_then(|(d, c)| d.state(c)).map(|s| s.name),
+                        state_name: desc.zip(code).and_then(|(d, c)| d.state(c)).map(|s| s.name),
                         severity: desc.map(|d| d.severity_of(&as_format_value(value))),
                         value: value.clone(),
                     },
@@ -1271,7 +1271,8 @@ mod tests {
 
     /// Наполнить хранилище и закрыть его.
     fn populate(root: &Path) {
-        let store = Store::open(StoreConfig::new(root).with_budget(16 * 1024 * 1024)).unwrap();
+        let store =
+            Store::open(StoreConfig::new(root).with_budget_per_class(16 * 1024 * 1024)).unwrap();
         for inst in 0..2 {
             let ns = store
                 .namespace(&format!("orc-radio-{inst}"), schema())
@@ -1309,7 +1310,7 @@ mod tests {
         assert_eq!(namespaces.len(), 3, "три неймспейса");
         assert_eq!(namespaces[0].name, "apt-modem-0");
         assert_eq!(namespaces[0].schema_name, "radio");
-        assert!(namespaces[0].bytes > 0);
+        assert!(namespaces[0].total_bytes > 0);
 
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         assert!(result.is_complete(), "повреждений быть не должно");
@@ -1365,7 +1366,7 @@ mod tests {
                 unit,
                 tags,
                 kind,
-                state,
+                state_name,
                 severity,
                 value,
             } => {
@@ -1374,7 +1375,7 @@ mod tests {
                 assert_eq!(*unit, Some("°C"));
                 assert_eq!(tags, &["thermal"]);
                 assert_eq!(*kind, Some(MetricKind::Gauge));
-                assert_eq!(*state, None, "не перечисление — подписи нет");
+                assert_eq!(*state_name, None, "не перечисление — подписи нет");
                 assert!(severity.is_some(), "важность посчитана по схеме");
                 assert!(value.as_f64().unwrap() >= 20.0);
             }
@@ -1453,7 +1454,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store =
-                Store::open(StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024)).unwrap();
+                Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024))
+                    .unwrap();
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
             ns.log_raw(EventId(1), &[7], None); // PowerSet, тэг rf
             ns.log_raw(EventId(2), &[1], None); // Alarm, тэг fault
@@ -1546,7 +1548,7 @@ mod tests {
         // менялось, не содержит ни одного отсчёта — и полоса на графике
         // оказалась бы пустой, хотя состояние было известно всё это время.
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+        let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
         let store = Store::open(cfg.clone()).unwrap();
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
@@ -1579,10 +1581,13 @@ mod tests {
         let plain = reader.query(&window).unwrap();
         assert!(plain.seeds.is_empty());
         assert!(
-            !plain
-                .entries
-                .iter()
-                .any(|e| matches!(&e.kind, EntryKind::Sample { state: Some(_), .. })),
+            !plain.entries.iter().any(|e| matches!(
+                &e.kind,
+                EntryKind::Sample {
+                    state_name: Some(_),
+                    ..
+                }
+            )),
             "в окне действительно нет ни одного состояния"
         );
 
@@ -1604,13 +1609,13 @@ mod tests {
         match &seed.kind {
             EntryKind::Sample {
                 metric,
-                state,
+                state_name,
                 kind,
                 severity,
                 ..
             } => {
                 assert_eq!(*metric, MetricId(2));
-                assert_eq!(*state, Some("Lock"), "подпись состояния из схемы");
+                assert_eq!(*state_name, Some("Lock"), "подпись состояния из схемы");
                 assert_eq!(*kind, Some(MetricKind::State));
                 assert_eq!(*severity, Some(Severity::Normal));
             }
@@ -1650,7 +1655,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let after;
         {
-            let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+            let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
             let store = Store::open(cfg).unwrap();
 
             let radio = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1696,8 +1701,10 @@ mod tests {
         let seed = &seeded.seeds[0];
         assert_eq!(&*seed.namespace, "orc-radio-0");
         match &seed.kind {
-            EntryKind::Sample { state, kind, .. } => {
-                assert_eq!(*state, Some("Lock"));
+            EntryKind::Sample {
+                state_name, kind, ..
+            } => {
+                assert_eq!(*state_name, Some("Lock"));
                 assert_eq!(*kind, Some(MetricKind::State));
             }
             other => panic!("ожидалось состояние: {other:?}"),
@@ -1729,7 +1736,7 @@ mod tests {
         // таблицы серий. Идентичность приходится собирать проходом по телам —
         // тем же, которым находятся смещения блоков.
         let dir = tempfile::tempdir().unwrap();
-        let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+        let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
         let store = Store::open(cfg.clone()).unwrap();
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
         let temp = ns.series(TEMP).unwrap();
@@ -2035,7 +2042,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let store =
-                Store::open(StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024)).unwrap();
+                Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024))
+                    .unwrap();
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
             // Восемь блоков в одном сегменте: `sync` закрывает блок, поэтому
             // сегмент заведомо не будет дочитан до конца под лимитом.
@@ -2088,7 +2096,7 @@ mod tests {
     fn utc_is_resolved_when_anchor_exists() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+            let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
             let store = Store::open(cfg.clone()).unwrap();
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
             ns.log_raw(EventId(1), &[1], None);
@@ -2121,7 +2129,7 @@ mod tests {
         // Иначе граница «с 12:00» врала бы ровно на ошибку конверсии.
         let dir = tempfile::tempdir().unwrap();
         {
-            let cfg = StoreConfig::new(dir.path()).with_budget(16 * 1024 * 1024);
+            let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
             let store = Store::open(cfg.clone()).unwrap();
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
             store

@@ -43,7 +43,7 @@ pub struct BlockIndexEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Trailer {
     /// Длина секций footer'а до трейлера.
-    pub footer_len: u32,
+    pub sections_len: u32,
     pub block_count: u32,
     /// Время первой записи сегмента.
     pub min: Micros,
@@ -69,7 +69,7 @@ impl Trailer {
         }
 
         Ok(Some(Self {
-            footer_len: u32::from_le_bytes(raw[0..4].try_into().expect("срез 4 байта")),
+            sections_len: u32::from_le_bytes(raw[0..4].try_into().expect("срез 4 байта")),
             block_count: u32::from_le_bytes(raw[4..8].try_into().expect("срез 4 байта")),
             min: Micros(u64::from_le_bytes(raw[8..16].try_into().expect("срез 8"))),
             max: Micros(u64::from_le_bytes(raw[16..24].try_into().expect("срез 8"))),
@@ -79,11 +79,11 @@ impl Trailer {
 
     /// Полный размер footer'а на диске (секции + трейлер).
     pub fn total_len(&self) -> u64 {
-        u64::from(self.footer_len) + Self::SIZE as u64
+        u64::from(self.sections_len) + Self::SIZE as u64
     }
 
     fn write(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.footer_len.to_le_bytes());
+        out.extend_from_slice(&self.sections_len.to_le_bytes());
         out.extend_from_slice(&self.block_count.to_le_bytes());
         out.extend_from_slice(&self.min.0.to_le_bytes());
         out.extend_from_slice(&self.max.0.to_le_bytes());
@@ -151,7 +151,7 @@ impl Footer {
         for _ in 0..trailer.block_count {
             offset = offset.checked_add(c.varint()?).ok_or(Error::Truncated)?;
             base = base.checked_add(c.varint()?).ok_or(Error::Truncated)?;
-            let count = c.varint_u16("block count")?;
+            let count = c.varint_u16("records per block")?;
             blocks.push(BlockIndexEntry {
                 offset,
                 base: Micros(base),
@@ -253,7 +253,7 @@ fn read_id_set(c: &mut Cursor<'_>, what: &'static str, available: usize) -> Resu
         // Первый элемент — абсолютное значение, дальше строго возрастающие
         // дельты: нулевая дельта означала бы дубль в множестве.
         if i > 0 && delta == 0 {
-            return Err(Error::ReservedNotZero);
+            return Err(Error::ReservedValue);
         }
         prev = prev.checked_add(delta).ok_or(Error::Truncated)?;
         if prev > u64::from(u16::MAX) {
@@ -424,7 +424,7 @@ impl FooterBuilder {
         write_id_set(&mut sections, &self.metrics);
 
         let mut trailer = Trailer {
-            footer_len: sections.len() as u32,
+            sections_len: sections.len() as u32,
             block_count: self.blocks.len() as u32,
             min: self.min.unwrap_or(Micros(0)),
             max: self.max,
@@ -760,7 +760,7 @@ mod tests {
     /// Собрать footer с произвольным трейлером и корректным CRC —
     /// имитация файла, подготовленного злонамеренно или испорченного.
     fn forge(sections: Vec<u8>, mut trailer: Trailer) -> Vec<u8> {
-        trailer.footer_len = sections.len() as u32;
+        trailer.sections_len = sections.len() as u32;
         let mut tb = Vec::new();
         trailer.write(&mut tb);
         trailer.crc = crc32c::crc32c_append(crc32c::crc32c(&sections), &tb[..24]);
@@ -778,7 +778,7 @@ mod tests {
         let bytes = forge(
             Vec::new(),
             Trailer {
-                footer_len: 0,
+                sections_len: 0,
                 block_count: u32::MAX,
                 min: Micros(0),
                 max: Micros(0),
@@ -795,7 +795,7 @@ mod tests {
         // Число блоков берётся из трейлера, поэтому секции начинаются сразу
         // с множества событий.
         let empty_trailer = Trailer {
-            footer_len: 0,
+            sections_len: 0,
             block_count: 0,
             min: Micros(0),
             max: Micros(0),
@@ -825,7 +825,7 @@ mod tests {
         let bytes = forge(
             sections,
             Trailer {
-                footer_len: 0,
+                sections_len: 0,
                 block_count: 0,
                 min: Micros(0),
                 max: Micros(0),
@@ -889,7 +889,7 @@ mod tests {
         varint::write_u64(&mut sections, 0); // метрик нет
 
         let mut trailer = Trailer {
-            footer_len: sections.len() as u32,
+            sections_len: sections.len() as u32,
             block_count: 0,
             min: Micros(0),
             max: Micros(0),
@@ -901,6 +901,6 @@ mod tests {
         let mut bytes = sections;
         trailer.write(&mut bytes);
 
-        assert_eq!(Footer::parse(&bytes), Err(Error::ReservedNotZero));
+        assert_eq!(Footer::parse(&bytes), Err(Error::ReservedValue));
     }
 }

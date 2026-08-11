@@ -86,7 +86,7 @@ impl SegmentHeader {
             ));
         }
         if raw[5] != 0 {
-            return Err(Error::ReservedNotZero);
+            return Err(Error::ReservedValue);
         }
 
         Ok(Self {
