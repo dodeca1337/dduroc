@@ -10,7 +10,7 @@ use crate::Clock;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::limits::{EffectiveLimits, LimitsRegistry, MetricLimits};
-use crate::metric::{Metric, MetricValue, Untyped};
+use crate::metric::{Metric, MetricValue, NumericMetric, Untyped};
 use crate::schema::{MetricDesc, MetricKind, Schema, Severity, StorageClass, Thresholds};
 use crate::staged::{ChannelIdx, DropCounters, NsId, OwnedValue, Payload, Staged, StagedRecord};
 use crate::stats::Counters;
@@ -95,6 +95,24 @@ impl NsMeta {
                 Ok(meta)
             }
         }
+    }
+}
+
+/// Диапазон из range-выражения над значениями метрики.
+///
+/// Границы приводятся к `f64` — в нём движок их и хранит, — но записываются
+/// тем же типом, что и отсчёты: `..=60.0` у `Metric<f32>`, `..=10` у
+/// `Metric<u64>`. Исключающая граница трактуется как включающая по той же
+/// причине, что и в [`crate::schema::Range`].
+fn numeric_range<T: NumericMetric>(r: impl std::ops::RangeBounds<T>) -> crate::schema::Range {
+    use std::ops::Bound;
+    let bound = |b: Bound<&T>| match b {
+        Bound::Unbounded => None,
+        Bound::Included(v) | Bound::Excluded(v) => Some((*v).into_f64()),
+    };
+    crate::schema::Range {
+        min: bound(r.start_bound()),
+        max: bound(r.end_bound()),
     }
 }
 
@@ -550,9 +568,34 @@ impl Namespace {
     /// ns.set_thresholds(metrics::Vswr, 1.0..=1.5, 1.0..=2.0)?; // с двух сторон
     /// ```
     ///
+    /// Границы — того же типа, что и отсчёты метрики ([`NumericMetric`]):
+    /// метрике-перечислению или `type: blob` их не задать, и говорит об этом
+    /// компилятор, а не отказ на устройстве. Метрику, известную только в
+    /// рантайме, обслуживает [`Namespace::set_thresholds_raw`].
+    ///
     /// **На диск не пишется.** Границы — свойство установки, а не измерения;
     /// подробнее в [`crate::limits`].
-    pub fn set_thresholds(
+    pub fn set_thresholds<T: NumericMetric>(
+        &self,
+        metric: Metric<T>,
+        warn: impl std::ops::RangeBounds<T>,
+        alarm: impl std::ops::RangeBounds<T>,
+    ) -> Result<()> {
+        self.set_limits(
+            metric,
+            MetricLimits::numeric(Thresholds {
+                warn: numeric_range(warn),
+                alarm: numeric_range(alarm),
+            }),
+        )
+    }
+
+    /// То же для метрики, известной только в рантайме.
+    ///
+    /// Путь веб-слоя: метрика пришла строкой из запроса, границы — числами из
+    /// конфигурации. Несовместимость с объявленным типом здесь по-прежнему
+    /// ловит только рантайм — компилятору тут не на что опереться.
+    pub fn set_thresholds_raw(
         &self,
         metric: impl Into<MetricId>,
         warn: impl std::ops::RangeBounds<f64>,
@@ -1824,6 +1867,27 @@ mod tests {
         // Метрика не из этой схемы — дефект вызова, а не потеря.
         let e = ns.clear_limits(MetricId(99)).unwrap_err();
         assert!(e.breaks_contract(), "{e}");
+    }
+
+    #[test]
+    fn numeric_bounds_on_a_state_metric_are_refused_at_runtime_too() {
+        // Типизация `set_thresholds` сняла эту ошибку с типизированного
+        // вызова — `set_thresholds(LINK, ..)` теперь не компилируется, — но
+        // рантайм-путь остался и обязан отвечать так же: через него ходят
+        // веб-слой и `set_limits`, где типа метрики нет.
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("orc-radio-0", schema()).unwrap();
+
+        let e = ns
+            .set_thresholds_raw(MetricId(2), ..=1.0, ..=2.0)
+            .unwrap_err();
+        assert!(matches!(e, Error::BadLimits { .. }), "{e}");
+
+        // А числовой метрике те же границы через люк ставятся.
+        ns.set_thresholds_raw(MetricId(1), ..=40.0, ..=50.0)
+            .unwrap();
+        assert_eq!(ns.severity_of(TEMP, 45.0), Severity::Warn);
     }
 
     #[test]

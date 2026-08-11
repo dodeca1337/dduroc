@@ -158,7 +158,7 @@ pub use dduroc_engine::MigrationReport;
 pub use dduroc_engine::channel::ChannelConfig;
 pub use dduroc_engine::epochs::SyncSource;
 pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, SeverityFn, StateStatus};
-pub use dduroc_engine::metric::{Blob, Metric, MetricState, MetricValue, Untyped};
+pub use dduroc_engine::metric::{Blob, Metric, MetricState, MetricValue, NumericMetric, Untyped};
 pub use dduroc_engine::namespace::{Namespace, Series, SpanGuard};
 pub use dduroc_engine::schema::{
     DecodeError, EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MetricKind, Migration,
