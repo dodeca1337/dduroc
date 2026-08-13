@@ -10,7 +10,9 @@
 
 use dduroc::prelude::*;
 use dduroc::read::{EntryKind, KindFilter, Order, OwnedSampleValue, Query, Reader};
-use dduroc::{ChannelConfig, Compression, EventId, QueueSizes, StorageClass};
+use dduroc::{
+    ChannelConfig, ChannelOverride, Compression, EventId, GroupPolicy, QueueSizes, StorageClass,
+};
 
 dduroc::schema! {
     name: probe,
@@ -114,18 +116,39 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 // бюджет «всей телеметрии» — нет: каналы черпают из него вместе, и при
 // превышении вытесняется старейший сегмент КЛАССА, в чьём бы неймспейсе он
 // ни лежал — молчащий сервис не держит место, которого не хватает шумному.
-// (Личный предел прожорливому сервису — `store.namespace_with_quota` + NsQuota.)
+// (Личный предел прожорливому сервису — `store.namespace_with_quota` + NsQuota,
+// а сразу всей группе — `StoreConfig::group`, как ниже.)
 // ---------------------------------------------------------------------------
 fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("— общий бюджет класса на все неймспейсы —");
-    let store = Store::open(StoreConfig::new(root).channel(
-        StorageClass::Telemetry,
-        ChannelConfig {
-            compression: Compression::None,
-            segment_bytes: 4 << 20,
-            ..ChannelConfig::new(12 << 20)
-        },
-    ))?;
+    let store = Store::open(
+        StoreConfig::new(root)
+            .channel(
+                StorageClass::Telemetry,
+                ChannelConfig {
+                    compression: Compression::None,
+                    segment_bytes: 4 << 20,
+                    ..ChannelConfig::new(12 << 20)
+                },
+            )
+            // Настройки класса общие на хранилище — ровно до тех пор, пока
+            // неймспейсы однородны. Группа (префикс имени, тот же, которым
+            // отбирает `Query::group`) говорит про всех оркестраторов разом,
+            // вместо повторения при каждом открытии. Бюджет и носитель ей
+            // недоступны: они принадлежат КЛАССУ и общие на всё хранилище.
+            .group(
+                "orc-",
+                GroupPolicy::new().channel(
+                    StorageClass::Telemetry,
+                    ChannelOverride::new().segment_bytes(2 << 20),
+                ),
+            )
+            // Потолок оперативной памяти под буферы блоков — не бюджет:
+            // бюджет про место на носителе. Необязателен и по умолчанию
+            // отсутствует; нужен там, где «пишущих единицы» перестаёт быть
+            // правдой.
+            .with_buffer_ceiling(4 << 20),
+    )?;
 
     // Тихий сервис записал 6 МиБ и замолчал.
     let quiet = store.namespace("orc-quiet", probe::SCHEMA)?;
@@ -164,8 +187,8 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "  тихий писал 6 МиБ — его голову вытеснил чужой поток того же класса; \
-         поверх бюджета не вылезли ни разу (budget_overruns: {})\n",
-        stats.budget_overruns
+         поверх потолков не вылезли ни разу (место: {}, память: {})\n",
+        stats.budget_overruns, stats.buffer_overruns
     );
     Ok(())
 }
