@@ -346,8 +346,9 @@ impl EntryStream<'_> {
 ///
 /// Опрашивать реже раза в час нечего и незачем, а `Duration::MAX` в сроке
 /// — это паника на сложении, то есть худший из возможных ответов на просьбу
-/// подождать подольше.
-const MAX_WAIT: Duration = Duration::from_secs(3600);
+/// подождать подольше. Тот же предел, что у самой отметки: два числа с одним
+/// обоснованием разошлись бы.
+const MAX_WAIT: Duration = dduroc_engine::pulse::LONGEST_WAIT;
 
 /// Не чаще этого подписка обходит корни в поисках новых неймспейсов.
 ///
@@ -1180,7 +1181,7 @@ impl Reader {
                         None => damaged.push(Damage {
                             path: ch_path,
                             offset: 0,
-                            reason: "каталог не является каналом известного                                      класса хранения"
+                            reason: "каталог не является каналом известного класса хранения"
                                 .to_owned(),
                         }),
                     }
@@ -1372,7 +1373,7 @@ impl Reader {
     /// Жив ли поток writer'а хранилища; у дампа писать некому по определению.
     fn writer_alive(&self) -> bool {
         match &self.source {
-            Source::Store(store) => store.writer_alive(),
+            Source::Store(store) => store.is_writing(),
             Source::Dump { .. } => false,
         }
     }

@@ -906,7 +906,7 @@ mod tests {
             .iter()
             .filter_map(|e| match &e.kind {
                 dduroc_read::EntryKind::Message { event, payload, .. } => {
-                    dduroc_read::reader_render(&testing::SCHEMA, *event, payload, "ru")
+                    dduroc_read::render_with_schema(&testing::SCHEMA, *event, payload, "ru")
                 }
                 _ => None,
             })

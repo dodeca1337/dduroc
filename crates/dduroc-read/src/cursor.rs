@@ -465,18 +465,6 @@ impl SegmentCursor {
         self.reader.header().boot
     }
 
-    pub fn protocol_version(&self) -> u16 {
-        self.reader.header().protocol_version.0
-    }
-
-    pub fn name(&self) -> SegmentName {
-        self.reader.header().file_name()
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Пропущенные фрагменты, накопленные к этому моменту.
     pub fn damaged(&self) -> &[Damage] {
         &self.damaged
@@ -1006,17 +994,6 @@ impl ChannelCursor {
             out.append(&mut c.take_damage());
         }
         out
-    }
-
-    /// Версия протокола текущего сегмента: миграции применяются при чтении,
-    /// поэтому знать её нужно на каждую запись.
-    pub fn current_protocol_version(&self) -> Option<u16> {
-        self.current.as_ref().map(|c| c.protocol_version())
-    }
-
-    /// Определения серий текущего сегмента.
-    pub fn current_segment_path(&self) -> Option<&Path> {
-        self.current.as_ref().map(|c| c.path())
     }
 
     fn finish_current(&mut self) {

@@ -30,7 +30,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
-pub mod cursor;
+// Курсоры — внутренняя механика обхода: `SegmentCursor`, `ChannelScope`,
+// `Prefilter` и прочее живут здесь, но публичному API принадлежат только
+// плоды их работы, перечисленные ниже. Открытый модуль обязывал бы держать
+// совместимость и у машинерии.
+mod cursor;
 mod error;
 pub mod query;
 mod reader;
@@ -49,5 +53,5 @@ pub use query::{
 };
 pub use reader::{
     Entry, EntryKind, EntryStream, Follow, NamespaceInfo, NamespaceListing, QueryResult, Reader,
-    Tail, render as reader_render,
+    Tail, render as render_with_schema,
 };
