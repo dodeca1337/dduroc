@@ -68,8 +68,8 @@ fn bench_root() -> PathBuf {
 fn store_config(root: &std::path::Path) -> StoreConfig {
     StoreConfig::new(root)
         .with_budget_per_class(256 * 1024 * 1024)
-        // Долговечность отключена намеренно: иначе бенчмарк мерил бы
-        // fdatasync носителя, а не стоимость собственного кода.
+        // Долговечность обычного канала отключена намеренно: иначе бенчмарк
+        // мерил бы fdatasync носителя, а не стоимость собственного кода.
         .channel(
             StorageClass::Default,
             ChannelConfig {
@@ -77,12 +77,13 @@ fn store_config(root: &std::path::Path) -> StoreConfig {
                 ..ChannelConfig::new(256 * 1024 * 1024)
             },
         )
+        // А критический — как есть: немедленность не настройка, а его
+        // определение, и хранилище такую подмену отвергает при открытии.
+        // Прикладной поток от неё всё равно не выигрывает: `fdatasync` делает
+        // writer, а измеряется здесь постановка в очередь.
         .channel(
             StorageClass::Critical,
-            ChannelConfig {
-                sync_interval: std::time::Duration::from_secs(3600),
-                ..ChannelConfig::critical(64 * 1024 * 1024)
-            },
+            ChannelConfig::critical(64 * 1024 * 1024),
         )
 }
 
