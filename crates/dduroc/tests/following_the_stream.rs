@@ -201,6 +201,39 @@ fn rotation_under_a_subscription_loses_nothing_and_looks_like_nothing() {
 }
 
 #[test]
+fn a_lasting_damage_is_named_once_not_at_every_rotation() {
+    // Подписка обходит корни заново на каждую смену устройства хранилища, а
+    // нечитаемый каталог никуда не девается. Без памяти о сказанном она
+    // объявляла бы одно и то же повреждение при каждой ротации — и список,
+    // который отдаётся разницей, перестал бы быть разницей.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
+    let ns = store.namespace("dev-0", probe::SCHEMA).unwrap();
+    // Каталог, не являющийся каналом ни одного класса: причина постоянная.
+    std::fs::create_dir(dir.path().join("dev-0").join("attic")).unwrap();
+
+    let reader = store.reader();
+    let mut tail = reader.follow(&Query::new().order(Order::Oldest)).unwrap();
+    ns.log(probe::events::Tick { n: 0 });
+    ns.sync().unwrap();
+    take(&mut tail, 1);
+
+    let first = tail.take_damage();
+    assert_eq!(first.len(), 1, "чужой каталог назван: {first:?}");
+
+    // Ещё сколько угодно оборотов — о том же молчим.
+    for n in 1..4 {
+        ns.log(probe::events::Tick { n });
+        ns.sync().unwrap();
+        take(&mut tail, 1);
+    }
+    assert!(
+        tail.take_damage().is_empty(),
+        "о том же повреждении сказано второй раз"
+    );
+}
+
+#[test]
 fn a_stopped_store_ends_the_subscription_instead_of_leaving_it_waiting() {
     // Остановка хранилища для подписки — не тишина, а конец: без явного
     // ответа она ждала бы новых записей от того, кому их уже некому писать, и

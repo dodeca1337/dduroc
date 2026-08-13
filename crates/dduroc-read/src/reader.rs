@@ -398,6 +398,13 @@ pub struct Follow<'a> {
     /// Уже открытые пары (неймспейс, класс): подписка на группу обязана
     /// подхватить сервис, стартовавший позже неё.
     known: HashSet<(String, StorageClass)>,
+    /// О чём из увиденного при обходе корней уже сказано.
+    ///
+    /// Обход повторяется на каждую смену устройства хранилища, а нечитаемый
+    /// каталог никуда не девается — без этой памяти подписка объявляла бы одно
+    /// и то же повреждение при каждой ротации. Множество ограничено числом
+    /// сломанных путей, а не числом обходов.
+    reported: HashSet<(PathBuf, String)>,
     damaged: Vec<Damage>,
     unanchored: Vec<BootCounter>,
     pulse: Arc<dduroc_engine::pulse::Pulse>,
@@ -540,6 +547,16 @@ impl Follow<'_> {
         }
     }
 
+    /// Объявить повреждение обхода, если о нём ещё не говорили.
+    fn note_once(&mut self, damage: Damage) {
+        if self
+            .reported
+            .insert((damage.path.clone(), damage.reason.clone()))
+        {
+            self.damaged.push(damage);
+        }
+    }
+
     /// Открыть каналы неймспейсов, поднятых уже после начала подписки.
     fn adopt_new_channels(&mut self) {
         let opened = self
@@ -558,7 +575,7 @@ impl Follow<'_> {
             // неймспейс, который так и не подхватился, выглядел бы как
             // невзлетевший сервис.
             Err(e) => {
-                self.damaged.push(Damage {
+                self.note_once(Damage {
                     path: self.reader.root().to_owned(),
                     offset: 0,
                     reason: format!("неймспейсы не перечислились: {e}"),
@@ -566,7 +583,9 @@ impl Follow<'_> {
                 return;
             }
         };
-        self.damaged.extend(damaged);
+        for d in damaged {
+            self.note_once(d);
+        }
         for (cursor, schema) in cursors.into_iter().zip(schemas) {
             let key = (cursor.namespace.to_string(), cursor.channel);
             if !self.known.insert(key) {
@@ -1205,6 +1224,10 @@ impl Reader {
             heads,
             queued,
             known,
+            reported: damaged
+                .iter()
+                .map(|d| (d.path.clone(), d.reason.clone()))
+                .collect(),
             damaged,
             unanchored,
             pulse,
