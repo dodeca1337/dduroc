@@ -1008,6 +1008,16 @@ impl ChannelCursor {
         let Ok(all) = dduroc_engine::rotation::Inventory::scan_names(&self.dir) else {
             return false;
         };
+        // Пройденное — выбросить. Подписка живёт неделями, канал сменяет
+        // сегмент за сегментом, и список, в который только дописывают, растёт
+        // ровно со временем её жизни: за месяц ротации раз в пять минут — под
+        // сотню тысяч имён на канал, притом что нужны из них лишь непрочитанные.
+        // Новейшее помнится отдельно (`newest`), поэтому отбор от этого не
+        // меняется: он сравнивает с ним, а не с началом списка.
+        if self.next_segment > 0 {
+            self.segments.drain(..self.next_segment);
+            self.next_segment = 0;
+        }
         let selected = select_segments(&all, &self.bounds, self.boot, &mut self.unanchored);
         let mut grew = false;
         for name in selected {
@@ -1497,6 +1507,49 @@ mod tests {
             once.next_entry().is_none(),
             "разовому запросу этот сегмент покажет следующий запрос, а не этот"
         );
+    }
+
+    #[test]
+    fn a_long_subscription_does_not_remember_every_segment_it_ever_read() {
+        // Подписка живёт неделями, а канал сменяет сегмент за сегментом.
+        // Список имён, в который только дописывают, растёт ровно со временем
+        // её жизни: за месяц ротации раз в пять минут — под сотню тысяч имён
+        // на канал, и все, кроме непрочитанных, мертвы. Новейшее помнится
+        // отдельно, поэтому отбор от уборки не меняется.
+        let dir = tempfile::tempdir().unwrap();
+        sealed_segment(dir.path(), &[100]);
+
+        let scope = ChannelScope {
+            liveness: Liveness::Following,
+            ..ChannelScope::default()
+        };
+        let mut c = ChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
+            .unwrap();
+
+        let mut seen = Vec::new();
+        for i in 1..40u64 {
+            // Сегмент прочитан до конца, за ним появился следующий.
+            while let Some(e) = c.next_entry() {
+                seen.push(e.at.at.0);
+            }
+            sealed_segment(dir.path(), &[100 * (i + 1)]);
+            c.extend(true);
+            assert!(
+                c.segments.len() <= 3,
+                "после {i} ротаций в списке {} имён — уборка пройденного не работает",
+                c.segments.len()
+            );
+        }
+        while let Some(e) = c.next_entry() {
+            seen.push(e.at.at.0);
+        }
+
+        assert_eq!(
+            seen,
+            (1..=40u64).map(|i| i * 100).collect::<Vec<_>>(),
+            "уборка не имеет права стоить ни одной записи"
+        );
+        assert!(c.damaged().is_empty(), "{:?}", c.damaged());
     }
 
     #[test]

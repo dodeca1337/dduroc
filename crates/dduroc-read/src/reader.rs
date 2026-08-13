@@ -356,7 +356,25 @@ const MAX_WAIT: Duration = dduroc_engine::pulse::LONGEST_WAIT;
 /// замечал человек, но замечал прибор с тысячами неймспейсов.
 const ADOPT_EVERY: Duration = Duration::from_millis(500);
 
+/// Кого дочитывать при пробуждении.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rearm {
+    /// Только исчерпавшихся. У остальных голова уже в куче, а всё, что
+    /// добавится, ляжет **за** ней — и новые блоки открытого сегмента, и новые
+    /// сегменты канала. Значит, дочитывание их очереди выдачи не меняет, а
+    /// стоит обращения к носителю на каждый курсор при каждом пробуждении.
+    Starved,
+    /// Всех. Единственный случай — обход после остановки хранилища: второго
+    /// не будет, и хвост, не прочитанный сейчас, не прочитается никогда.
+    Every,
+}
+
 /// Что подписка отдала на этот раз.
+///
+/// Перечисление **закрытое** намеренно: новый исход подписки — это новое
+/// решение вызывающего, а не то, что можно молча пропустить. Отметить его
+/// `#[non_exhaustive]` значило бы заставить каждый цикл опроса завести
+/// `_ => {}` — то есть заранее проглотить всё, что появится потом.
 #[derive(Debug)]
 pub enum Tail {
     /// Очередная запись.
@@ -410,14 +428,19 @@ pub struct Follow<'a> {
     /// Чья голова сейчас в куче. Курсор, исчерпавшийся до подхода новых
     /// данных, из кучи выпадает, и вернуть его туда больше нечему.
     queued: Vec<bool>,
-    /// Уже открытые пары (неймспейс, класс): подписка на группу обязана
-    /// подхватить сервис, стартовавший позже неё.
-    known: HashSet<(String, StorageClass)>,
+    /// Что уже открыто: неймспейс → маска классов по [`StorageClass::index`].
+    ///
+    /// Подписка на группу обязана подхватить сервис, стартовавший позже неё, —
+    /// но открывать заново то, что уже открыто, ей незачем. Маска, а не
+    /// множество пар: спросить «знаком ли этот канал» стоит одного хэша имени,
+    /// без построения ключа, а имя хранится по разу на неймспейс, а не по разу
+    /// на канал.
+    known: HashMap<String, u8>,
     /// О чём из увиденного при обходе корней уже сказано.
     ///
-    /// Обход повторяется на каждую смену устройства хранилища, а нечитаемый
+    /// Обход повторяется, когда в хранилище появляются каталоги, а нечитаемый
     /// каталог никуда не девается — без этой памяти подписка объявляла бы одно
-    /// и то же повреждение при каждой ротации. Множество ограничено числом
+    /// и то же повреждение при каждом обходе. Множество ограничено числом
     /// сломанных путей, а не числом обходов.
     reported: HashSet<(PathBuf, String)>,
     damaged: Vec<Damage>,
@@ -429,8 +452,8 @@ pub struct Follow<'a> {
     last_adopt: Option<Instant>,
     /// Последний обход после остановки хранилища уже сделан.
     swept: bool,
-    /// Каталоги менялись, а обход отложен по частоте: его долг не имеет права
-    /// пропасть — неймспейс, о котором объявили один раз, иначе не
+    /// Состав хранилища менялся, а обход отложен по частоте: его долг не имеет
+    /// права пропасть — неймспейс, о котором объявили один раз, иначе не
     /// подхватился бы никогда.
     adopt_due: bool,
     limit: usize,
@@ -478,7 +501,7 @@ impl Follow<'_> {
                     // остановки носитель окончателен — одного обхода хватает.
                     self.swept = true;
                     self.adopt_new_channels();
-                    self.rearm(true);
+                    self.rearm(true, Rearm::Every);
                     continue;
                 }
                 // Хранилище остановлено, и всё, что легло на носитель, отдано.
@@ -516,8 +539,9 @@ impl Follow<'_> {
                 return Tail::Idle;
             }
             let shape_changed = beat.shape != self.seen.shape;
+            let roster_changed = beat.roster != self.seen.roster;
             self.seen = beat;
-            self.refresh(shape_changed);
+            self.refresh(shape_changed, roster_changed);
         }
     }
 
@@ -603,12 +627,16 @@ impl Follow<'_> {
     }
 
     /// Забрать всё, что появилось с прошлого пробуждения.
-    fn refresh(&mut self, shape_changed: bool) {
+    fn refresh(&mut self, shape_changed: bool, roster_changed: bool) {
         self.epochs = self.reader.epochs_now().into_owned();
-        if shape_changed {
+        // Обход корней заводится только составом хранилища — то есть подъёмом
+        // неймспейса. Пока он заводился и ротацией, подписка перечисляла всё
+        // хранилище каждые полсекунды подряд: сегменты сменяются постоянно, а
+        // сервисы стартуют раз за свою жизнь.
+        if roster_changed {
             self.adopt_due = true;
         }
-        self.rearm(shape_changed);
+        self.rearm(shape_changed, Rearm::Starved);
     }
 
     /// Дочитать курсоры и вернуть в кучу тех, кто из неё выпал.
@@ -616,9 +644,12 @@ impl Follow<'_> {
     /// Выпадает курсор, исчерпавшийся до подхода новых данных, и вернуть его
     /// туда больше нечему — в том числе только что открытому курсору нового
     /// неймспейса: без этого он лежал бы с данными мимо слияния.
-    fn rearm(&mut self, relist: bool) {
+    fn rearm(&mut self, relist: bool, reach: Rearm) {
         for idx in 0..self.cursors.len() {
-            // Обход каталога — только когда хранилище объявило, что каталоги
+            if self.queued[idx] && reach == Rearm::Starved {
+                continue;
+            }
+            // Обход каталога — только когда хранилище объявило, что сегменты
             // менялись: пока писатель льёт в тот же файл, подписка обходится
             // одним чтением хвоста.
             self.cursors[idx].extend(relist);
@@ -642,7 +673,7 @@ impl Follow<'_> {
         self.adopt_due = false;
         self.last_adopt = Some(Instant::now());
         self.adopt_new_channels();
-        self.rearm(true);
+        self.rearm(true, Rearm::Starved);
         true
     }
 
@@ -668,12 +699,19 @@ impl Follow<'_> {
     }
 
     /// Открыть каналы неймспейсов, поднятых уже после начала подписки.
+    ///
+    /// Знакомые каналы отсеиваются **до** открытия курсора, а не после: иначе
+    /// каждый обход заново перечислял каталог и открывал сегмент у каждого уже
+    /// читаемого канала, чтобы тут же выбросить результат.
     fn adopt_new_channels(&mut self) {
-        let opened = self
-            .reader
-            .open_cursors_with(&self.query, &self.bounds, |scope| {
+        let opened = self.reader.open_cursors_beyond(
+            &self.query,
+            &self.bounds,
+            |scope| {
                 scope.liveness = crate::cursor::Liveness::Following;
-            });
+            },
+            &self.known,
+        );
         let OpenedCursors {
             cursors,
             schemas,
@@ -697,10 +735,12 @@ impl Follow<'_> {
             self.note_once(d);
         }
         for (cursor, schema) in cursors.into_iter().zip(schemas) {
-            let key = (cursor.namespace.to_string(), cursor.channel);
-            if !self.known.insert(key) {
+            let bit = 1u8 << cursor.channel.index();
+            let mask = self.known.entry(cursor.namespace.to_string()).or_default();
+            if *mask & bit != 0 {
                 continue;
             }
+            *mask |= bit;
             self.cursors.push(cursor);
             self.schemas.push(schema);
             self.queued.push(false);
@@ -1322,9 +1362,9 @@ impl Reader {
 
         let mut heads = BinaryHeap::with_capacity(cursors.len());
         let mut queued = vec![false; cursors.len()];
-        let mut known = HashSet::with_capacity(cursors.len());
+        let mut known: HashMap<String, u8> = HashMap::new();
         for (idx, cursor) in cursors.iter_mut().enumerate() {
-            known.insert((cursor.namespace.to_string(), cursor.channel));
+            *known.entry(cursor.namespace.to_string()).or_default() |= 1 << cursor.channel.index();
             if let Some(head) = cursor.peek() {
                 heads.push(Head {
                     at: head.at,
@@ -1540,6 +1580,23 @@ impl Reader {
         bounds: &Bounds,
         adjust: impl Fn(&mut crate::cursor::ChannelScope),
     ) -> Result<OpenedCursors> {
+        self.open_cursors_beyond(q, bounds, adjust, &HashMap::new())
+    }
+
+    /// То же, минуя уже открытые каналы: `known` — маска классов по имени
+    /// неймспейса ([`StorageClass::index`]).
+    ///
+    /// Нужно подписке: она обходит корни снова и снова, а открыть курсор — это
+    /// перечислить каталог канала и разобрать заголовок сегмента. Платить это
+    /// за каналы, которые уже читаются, значит платить за всё хранилище ради
+    /// одного новичка.
+    fn open_cursors_beyond(
+        &self,
+        q: &Query,
+        bounds: &Bounds,
+        adjust: impl Fn(&mut crate::cursor::ChannelScope),
+        known: &HashMap<String, u8>,
+    ) -> Result<OpenedCursors> {
         let mut cursors = Vec::new();
         let mut schemas = Vec::new();
         let mut damaged = Vec::new();
@@ -1566,8 +1623,12 @@ impl Reader {
             };
             adjust(&mut scope);
 
+            let seen = known.get(&ns.name).copied().unwrap_or(0);
             for &(channel, ref dir) in &ns.channels {
                 if !q.channels.is_empty() && !q.channels.contains(&channel) {
+                    continue;
+                }
+                if seen & (1 << channel.index()) != 0 {
                     continue;
                 }
                 cursors.push(ChannelCursor::open(

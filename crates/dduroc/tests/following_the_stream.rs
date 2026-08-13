@@ -429,3 +429,59 @@ fn a_subscription_refuses_what_it_cannot_promise() {
     let e = dump.follow(&Query::new().order(Order::Oldest)).unwrap_err();
     assert!(matches!(e, dduroc_read::ReadError::NotFollowable(_)), "{e}");
 }
+
+#[test]
+fn a_rotation_is_not_announced_as_a_new_namespace() {
+    // Ответы на «сменился сегмент» и «поднялся неймспейс» стоят разного:
+    // первый — перечислить каталог одного канала, второй — обойти корень,
+    // прочитать `ns-meta` у каждого подходящего каталога и завести курсоры.
+    // Пока это была одна отметка, подписка делала второе на каждую ротацию,
+    // то есть постоянно и впустую: на заявленных двадцати четырёх тысячах
+    // неймспейсов — обход всего хранилища каждые полсекунды ради сегмента,
+    // сменившегося в одном канале.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreConfig::new(dir.path())
+            .with_budget_per_class(64 << 20)
+            .channel(
+                StorageClass::Default,
+                ChannelConfig {
+                    segment_bytes: 8 << 10,
+                    block_max_bytes: 512,
+                    compression: dduroc::Compression::None,
+                    flush_interval: Duration::from_millis(5),
+                    ..ChannelConfig::new(64 << 20)
+                },
+            ),
+    )
+    .unwrap();
+    let ns = store.namespace("dev-0", probe::SCHEMA).unwrap();
+    ns.log(probe::events::Tick { n: 0 });
+    ns.sync().unwrap();
+
+    let base = store.pulse().wait(Default::default(), PATIENCE);
+    assert!(base.shape > 0, "первый сегмент уже заведён");
+
+    // Много ротаций и ни одного нового неймспейса.
+    for n in 1..2000u32 {
+        ns.log(probe::events::Tick { n });
+    }
+    ns.sync().unwrap();
+    let rotated = store.pulse().wait(base, PATIENCE);
+    assert_ne!(rotated.shape, base.shape, "сегменты сменялись");
+    assert_eq!(
+        rotated.roster, base.roster,
+        "состав хранилища не менялся — обходить корень подписке незачем"
+    );
+
+    // А подъём неймспейса — наоборот: только он и заводит обход.
+    let _late = store.namespace("dev-1", latecomer::SCHEMA).unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    let mut now = rotated;
+    while now.roster == rotated.roster {
+        assert!(Instant::now() < deadline, "подъём неймспейса не объявлен");
+        now = store.pulse().wait(now, Duration::from_millis(50));
+    }
+
+    store.shutdown();
+}

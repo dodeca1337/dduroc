@@ -283,7 +283,7 @@ impl Writer {
             pulse,
             pulsed_blocks: 0,
             pulsed_shape: 0,
-            shape_changed: false,
+            roster_changed: false,
         };
 
         let handle = std::thread::Builder::new()
@@ -780,9 +780,10 @@ struct WriterLoop {
     pulsed_blocks: u64,
     /// Сумма счётчиков событий с сегментами на момент последней отметки.
     pulsed_shape: u64,
-    /// В этом обороте появился неймспейс: каталогов стало больше, а счётчиками
-    /// сегментов это не видно.
-    shape_changed: bool,
+    /// В этом обороте поднялся неймспейс: в хранилище появились каталоги, о
+    /// которых читатель не знает, а счётчиками сегментов это не видно — пустой
+    /// канал файлов ещё не завёл.
+    roster_changed: bool,
     /// Битовая маска корней ([`GroupBudget::root_key`]), отказавших по месту
     /// с прошлого обхода.
     ///
@@ -878,16 +879,23 @@ impl WriterLoop {
             self.pulsed_blocks = blocks;
             self.pulse.data_written();
         }
-        // Устройство хранилища меняют ровно четыре события, и все они уже
+        // Устройство каналов меняют ровно четыре события, и все они уже
         // считаются: сегмент создан, взят в работу, запечатан, вытеснен.
         let shape = self.counters.segments_created.load(Ordering::Relaxed)
             + self.counters.segments_opened.load(Ordering::Relaxed)
             + self.counters.segments_sealed.load(Ordering::Relaxed)
             + self.counters.segments_rotated.load(Ordering::Relaxed);
-        if shape != self.pulsed_shape || self.shape_changed {
+        if shape != self.pulsed_shape {
             self.pulsed_shape = shape;
-            self.shape_changed = false;
             self.pulse.shape_changed();
+        }
+        // Состав хранилища — отдельная отметка и по отдельной причине: ответ
+        // на неё пропорционален всему хранилищу, а поднимается она раз за
+        // жизнь сервиса. Смешать её с ротацией значило бы заставить подписку
+        // обходить двадцать четыре тысячи каталогов каждые полсекунды.
+        if self.roster_changed {
+            self.roster_changed = false;
+            self.pulse.roster_changed();
         }
     }
 
@@ -2082,7 +2090,7 @@ impl WriterLoop {
         // Каталогов стало больше, а счётчиками сегментов это не видно: пустой
         // канал файлов ещё не завёл. Подписке на группу неймспейсов сервис,
         // стартовавший позже, обязан достаться без её перезапуска.
-        self.shape_changed = true;
+        self.roster_changed = true;
         let identity = SegmentIdentity {
             protocol_version: setup.protocol_version,
             store_id: setup.store_id,
@@ -2357,7 +2365,7 @@ mod tests {
             pulse: Arc::new(crate::pulse::Pulse::new()),
             pulsed_blocks: 0,
             pulsed_shape: 0,
-            shape_changed: false,
+            roster_changed: false,
         }
     }
 
