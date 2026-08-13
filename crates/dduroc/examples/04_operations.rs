@@ -264,24 +264,21 @@ fn vault(
     vault: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("— критика на своём разделе —");
-    {
-        let store = Store::open(
-            StoreConfig::new(root)
-                .with_budget_per_class(16 << 20)
-                .channel(
-                    StorageClass::Critical,
-                    ChannelConfig {
-                        custom_root: Some(vault.to_path_buf()),
-                        ..ChannelConfig::critical(16 << 20)
-                    },
-                ),
-        )?;
-        let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
-        ns.log(probe::events::Ping { seq: 1 });
-        ns.log(probe::events::Fault { code: 3 });
-        ns.sync()?;
-        store.shutdown();
-    }
+    let store = Store::open(
+        StoreConfig::new(root)
+            .with_budget_per_class(16 << 20)
+            .channel(
+                StorageClass::Critical,
+                ChannelConfig {
+                    custom_root: Some(vault.to_path_buf()),
+                    ..ChannelConfig::critical(16 << 20)
+                },
+            ),
+    )?;
+    let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
+    ns.log(probe::events::Ping { seq: 1 });
+    ns.log(probe::events::Fault { code: 3 });
+    ns.sync()?;
     println!(
         "  основной корень: {:?}\n  раздел критики:  {:?}",
         std::fs::read_dir(root.join("orc-probe-0"))?
@@ -296,8 +293,10 @@ fn vault(
             .collect::<Vec<_>>(),
     );
 
-    // Читатель сливает деревья, когда ему назвали оба корня.
-    let reader = Reader::open(root, &[probe::SCHEMA])?.with_extra_root(vault);
+    // Своё хранилище читается им самим: корни (оба!) и схемы поднятых
+    // неймспейсов у него уже есть. Назвать раздел критики второй раз можно
+    // только забыв — и тогда история молча оказалась бы короче.
+    let reader = store.reader()?;
     let read = reader.query(&Query::new().kinds(KindFilter::LOGS).order(Order::Oldest))?;
     for e in &read.entries {
         println!(
@@ -306,5 +305,18 @@ fn vault(
             reader.render(e, "ru").unwrap_or_default()
         );
     }
+
+    // Чужой дамп — другое дело: `Store` там открывать нельзя (он берёт
+    // блокировку корня и подметает временные файлы), поэтому корни и схемы
+    // называются руками.
+    store.shutdown();
+    let offline = Reader::open(root, &[probe::SCHEMA])?.with_extra_root(vault);
+    println!(
+        "  тот же дамп вьюером: {} записей",
+        offline
+            .query(&Query::new().kinds(KindFilter::LOGS))?
+            .entries
+            .len()
+    );
     Ok(())
 }

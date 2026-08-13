@@ -512,7 +512,12 @@ ns.clear_limits(radio::metrics::Temp)?;   // снова действует сх�
 Чтение (тот же API на устройстве и в вьюере):
 
 ```rust
-let reader = Reader::open(path, &[radio::SCHEMA])?;
+// Своё хранилище читается им самим: корни — включая вынесенные носители
+// классов — и схемы поднятых неймспейсов у него уже есть.
+let reader = store.reader()?;
+// Чужой дамп — руками: `Store` там открывать нельзя, он берёт блокировку
+// корня и подметает временные файлы.
+let reader = Reader::open(path, &[radio::SCHEMA])?.with_extra_root(vault);
 let q = Query::new()
     .group("orc-")                            // все экземпляры оркестратора
     .since(Utc::now() - TimeDelta::hours(2))   // или .since(BootTime)

@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
 use dduroc_engine::schema::{MetricKind, Schema, Severity};
+use dduroc_engine::store::Store;
 use dduroc_format::{BootCounter, BootTime, EventId, Level, MetricId, SpanId, Value};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -409,13 +410,53 @@ impl Reader {
         })
     }
 
+    /// Читатель открытого хранилища: корни и схемы берутся у него самого.
+    ///
+    /// Это нормальный способ читать своё собственное хранилище — на приборе,
+    /// где то же приложение и пишет. [`Reader::open`] остаётся для чужого
+    /// дампа: там `Store` открывать нельзя (он берёт блокировку корня и
+    /// подметает временные файлы), и корни со схемами называют руками.
+    ///
+    /// Существенно, что корни приходят от хранилища: вынесенный на свой
+    /// носитель класс ([`ChannelConfig::custom_root`]) — это второе дерево, и
+    /// читатель, которому о нём не сказали, показал бы историю без критики,
+    /// ничем не выдав пропажу. Забыть об этом здесь не из чего.
+    ///
+    /// Видно ровно то, что уже на носителе: записи, ещё лежащие в очереди
+    /// writer'а, не видны никакому читателю — их сперва надо вытолкнуть
+    /// ([`Store::sync`]).
+    ///
+    /// [`ChannelConfig::custom_root`]: dduroc_engine::channel::ChannelConfig::custom_root
+    pub fn of_store(store: &Store) -> Result<Self> {
+        let roots = store.roots();
+        let mut reader = Self::open(store.root(), &store.schemas())?;
+        // Первый корень — основной, он уже стоит в `root`.
+        for extra in roots.iter().skip(1) {
+            reader = reader.with_extra_root(extra);
+        }
+        Ok(reader)
+    }
+
     /// Добавить корень, в котором живут каналы вынесенных классов хранения.
     ///
     /// Хранилище с критическим классом на своём разделе — это два дерева;
     /// дамп такого хранилища копируется целиком, и вьюеру называют оба корня.
     /// Идентичность неймспейсов (`ns-meta`) и эпохи живут в основном корне.
+    ///
+    /// Читателю, построенному по [`Reader::of_store`], это не нужно: корни он
+    /// уже знает.
     pub fn with_extra_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.extra_roots.push(root.into());
+        self
+    }
+
+    /// Добавить схему, которой не было среди переданных при открытии.
+    ///
+    /// Нужно, когда в хранилище есть неймспейс чужого сервиса: его записи без
+    /// схемы остаются идентификаторами. Схема с тем же именем заменяет
+    /// прежнюю.
+    pub fn with_schema(mut self, schema: Schema) -> Self {
+        self.schemas.insert(schema.name.to_owned(), schema);
         self
     }
 

@@ -175,8 +175,11 @@ pub use dduroc_format::{
     SpanKindId, ValueType,
 };
 
-/// Всё, что нужно для записи: типы и трейты одной строкой.
+/// Всё, что нужно для записи, и мост к чтению своего же хранилища
+/// ([`StoreExt::reader`]): типы и трейты одной строкой.
 pub mod prelude {
+    #[cfg(feature = "read")]
+    pub use crate::StoreExt;
     pub use crate::{
         BootTime, Event, Level, MetricLimits, MetricState, NamespaceExt, OwnedValue, Severity,
         SpanExt, Store, StoreConfig, SyncSource, Thresholds,
@@ -328,6 +331,30 @@ impl SpanExt for SpanGuard {
     #[inline]
     fn try_log<E: Event>(&self, event: E) -> Result<()> {
         self.try_log_payload(E::ID, encode(&event)?)
+    }
+}
+
+/// Расширение [`Store`] чтением собственного хранилища.
+///
+/// Читатель отдельным типом не случайно: чтение — это другой набор гарантий
+/// (ничего не изменять, пережить порчу, показать чужой дамп), и вьюеру
+/// `Store` открывать нельзя вовсе — тот берёт блокировку корня. Но **своё**
+/// хранилище называть по второму разу незачем: корни и схемы у него уже есть.
+#[cfg(feature = "read")]
+pub trait StoreExt {
+    /// Читатель этого хранилища: корни (включая вынесенные носители классов)
+    /// и схемы поднятых неймспейсов берутся у него самого.
+    ///
+    /// Видно то, что уже на носителе; свежие записи сперва вытолкнуть
+    /// [`Store::sync`].
+    fn reader(&self) -> read::Result<read::Reader>;
+}
+
+#[cfg(feature = "read")]
+impl StoreExt for Store {
+    #[inline]
+    fn reader(&self) -> read::Result<read::Reader> {
+        read::Reader::of_store(self)
     }
 }
 

@@ -204,6 +204,13 @@ pub struct Store {
     /// Открытые неймспейсы: повторное открытие того же имени в одном
     /// процессе дало бы два независимых состояния на одном каталоге.
     open: Mutex<HashMap<String, Option<NsId>>>,
+    /// Схемы, принесённые поднятыми неймспейсами, по имени схемы.
+    ///
+    /// Отдельно от `open` и **не** убирается вместе с ручкой: занятость имени
+    /// — про запись, а умение расшифровать записи процесс не теряет от того,
+    /// что ручку отпустили. Отсюда их берёт читатель, построенный по
+    /// хранилищу.
+    schemas: Mutex<HashMap<&'static str, Schema>>,
     /// Держится открытым, пока живёт хранилище: снимается ядром при
     /// завершении процесса, в том числе аварийном.
     _lock: File,
@@ -284,6 +291,7 @@ impl Store {
             counters,
             next_span: Arc::new(AtomicU32::new(1)),
             open: Mutex::new(HashMap::new()),
+            schemas: Mutex::new(HashMap::new()),
             _lock: lock,
         });
 
@@ -299,6 +307,30 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Все корни, в которых лежат данные хранилища; первый — основной.
+    ///
+    /// Их больше одного, когда класс вынесен на свой носитель
+    /// ([`ChannelConfig::custom_root`]): критика на защищённом разделе — это
+    /// второе дерево `<корень>/<неймспейс>/<класс>/`. Читатель обязан знать их
+    /// все, иначе покажет хранилище без вынесенного класса и промолчит об
+    /// этом.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.scan_roots
+    }
+
+    /// Схемы, которые это хранилище умеет расшифровывать.
+    ///
+    /// Их приносят поднятые неймспейсы; отпущенная ручка схему не уносит.
+    /// Одна схема на несколько неймспейсов считается один раз.
+    pub fn schemas(&self) -> Vec<Schema> {
+        self.schemas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .copied()
+            .collect()
     }
 
     pub fn meta(&self) -> StoreMeta {
@@ -424,6 +456,10 @@ impl Store {
         })?;
 
         self.locked_open().insert(name.to_owned(), Some(id));
+        self.schemas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(schema.name, schema);
         guard.disarm();
 
         Ok(Namespace::new(
