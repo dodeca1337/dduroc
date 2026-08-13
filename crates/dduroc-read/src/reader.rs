@@ -383,9 +383,10 @@ enum Source {
     /// у него в момент каждого запроса — устареть им не из чего. Хранилище
     /// удерживается живым, как его удерживает и ручка неймспейса.
     Store(Arc<Store>),
-    /// Дамп: всё прочитано с диска при открытии и заморожено. Для дампа это
-    /// не изъян, а определение — его никто не дописывает.
-    Dump { root: PathBuf, epochs: Epochs },
+    /// Дамп: все корни названы при открытии, всё прочитано с диска и
+    /// заморожено. Для дампа это не изъян, а определение — его никто не
+    /// дописывает.
+    Dump { roots: Vec<PathBuf>, epochs: Epochs },
 }
 
 /// Читатель хранилища.
@@ -397,16 +398,12 @@ enum Source {
 ///   определение: каждый запрос видит свежие корни, схемы и якоря времени,
 ///   ротация под ногами и дописываемый хвост сегмента — штатные события,
 ///   а не порча;
-/// - **дамп** ([`Reader::open`]) — снимок, который никто не дописывает:
-///   всё прочитано при открытии, и любой признак недописанности честно
-///   доносится как повреждение.
+/// - **дамп** ([`Reader::open_dump`]) — снимок, который никто не дописывает:
+///   все корни названы при открытии и проверены на полноту, а любой признак
+///   недописанности честно доносится как повреждение.
 #[derive(Debug)]
 pub struct Reader {
     source: Source,
-    /// Дополнительные корни: классы хранения могут жить на своих носителях
-    /// (критический — на защищённом разделе), и их деревья `<ns>/<канал>`
-    /// сливаются с основным при чтении.
-    extra_roots: Vec<PathBuf>,
     /// Схемы, названные руками (при открытии и [`Reader::with_schema`]).
     /// Живой читатель поверх них видит схемы поднятых неймспейсов.
     schemas: HashMap<String, Schema>,
@@ -422,7 +419,18 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Открыть дамп хранилища на чтение.
+    /// Открыть дамп хранилища: **все** его корни и схемы — разом.
+    ///
+    /// Первый корень — основной (в нём живут `ns-meta`, эпохи и идентичность
+    /// хранилища); остальные — деревья классов, вынесенных на свои носители
+    /// ([`ChannelConfig::custom_root`]). Корни именно перечисляются, а не
+    /// добавляются по одному опциональным строителем: хранилище с критикой на
+    /// защищённом разделе — это два дерева, и читатель, которому назвали не
+    /// все, показывал бы историю без критики, ничем не выдав пропажу.
+    /// Полнота проверяется при открытии по схемам: у каждого неймспейса
+    /// известной схемы каждый объявленный ею класс обязан найтись в одном из
+    /// корней — иначе [`ReadError::IncompleteDump`], а не молча короткий
+    /// ответ.
     ///
     /// Только чтение: ни восстановления, ни уборки временных файлов. Вьюер
     /// не имеет права изменять дамп, который ему дали посмотреть. `Store`
@@ -432,17 +440,67 @@ impl Reader {
     /// Хранилищу, которое пишет этот же процесс, нужен [`Reader::of_store`]:
     /// снимок эпох и схем, сделанный здесь, устаревает первой же
     /// синхронизацией времени или подъёмом нового неймспейса.
-    pub fn open(root: impl Into<PathBuf>, schemas: &[Schema]) -> Result<Self> {
-        let root = root.into();
-        let epochs = EpochStore::open_read_only(&root).unwrap_or_default();
-        let store_id = read_store_id(&root);
-        Ok(Self {
-            source: Source::Dump { root, epochs },
-            extra_roots: Vec::new(),
+    ///
+    /// [`ChannelConfig::custom_root`]: dduroc_engine::channel::ChannelConfig::custom_root
+    pub fn open_dump<P: Into<PathBuf>>(
+        roots: impl IntoIterator<Item = P>,
+        schemas: &[Schema],
+    ) -> Result<Self> {
+        let roots: Vec<PathBuf> = roots.into_iter().map(Into::into).collect();
+        let Some(main_root) = roots.first() else {
+            return Err(ReadError::Io {
+                context: "открытие дампа".to_owned(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "не назван ни один корень",
+                ),
+            });
+        };
+        // Опечатка в пути не имеет права выглядеть как пустое хранилище.
+        if !main_root.is_dir() {
+            return Err(ReadError::Io {
+                context: format!("открытие дампа {}", main_root.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "основной корень не существует",
+                ),
+            });
+        }
+        let epochs = EpochStore::open_read_only(main_root).unwrap_or_default();
+        let store_id = read_store_id(main_root);
+        let reader = Self {
+            source: Source::Dump { roots, epochs },
             schemas: schemas.iter().map(|s| (s.name.to_owned(), *s)).collect(),
             store_id,
             schema_cache: RwLock::new(HashMap::new()),
-        })
+        };
+        reader.check_dump_completeness()?;
+        Ok(reader)
+    }
+
+    /// Убедиться, что среди корней дампа есть дерево каждого класса.
+    ///
+    /// Проверка структурная и не зависит от того, куда дамп перенесли:
+    /// схема неймспейса объявляет его классы, каталог каждого класса
+    /// создаётся при подъёме неймспейса — значит, каждый обязан найтись в
+    /// одном из названных корней. Неймспейс неизвестной схемы проверить
+    /// нечем — его записи и так останутся идентификаторами.
+    fn check_dump_completeness(&self) -> Result<()> {
+        let mut damaged = Vec::new();
+        for ns in self.scan_namespaces(&mut damaged)? {
+            let Some(schema) = self.schema_by_name(&ns.schema_name) else {
+                continue;
+            };
+            for class in schema.classes() {
+                if !ns.channels.iter().any(|(name, _)| *name == class.as_str()) {
+                    return Err(ReadError::IncompleteDump {
+                        namespace: ns.name,
+                        class: class.as_str(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Живой читатель: параллелен записи по построению.
@@ -477,7 +535,6 @@ impl Reader {
         let store_id = store.meta().store_id;
         Self {
             source: Source::Store(Arc::clone(store)),
-            extra_roots: Vec::new(),
             schemas: HashMap::new(),
             store_id: Some(store_id),
             schema_cache: RwLock::new(HashMap::new()),
@@ -491,12 +548,10 @@ impl Reader {
 
     /// Все корни хранилища в порядке обхода; первый — основной.
     fn all_roots(&self) -> Vec<PathBuf> {
-        let mut roots = match &self.source {
+        match &self.source {
             Source::Store(store) => store.roots().to_vec(),
-            Source::Dump { root, .. } => vec![root.clone()],
-        };
-        roots.extend(self.extra_roots.iter().cloned());
-        roots
+            Source::Dump { roots, .. } => roots.clone(),
+        }
     }
 
     /// Эпохи на этот момент: у живого читателя — из памяти хранилища, у
@@ -534,19 +589,6 @@ impl Reader {
         out.into_values().collect()
     }
 
-    /// Добавить корень, в котором живут каналы вынесенных классов хранения.
-    ///
-    /// Хранилище с критическим классом на своём разделе — это два дерева;
-    /// дамп такого хранилища копируется целиком, и вьюеру называют оба корня.
-    /// Идентичность неймспейсов (`ns-meta`) и эпохи живут в основном корне.
-    ///
-    /// Читателю, построенному по [`Reader::of_store`], это не нужно: корни он
-    /// уже знает.
-    pub fn with_extra_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.extra_roots.push(root.into());
-        self
-    }
-
     /// Добавить схему, которой не было среди переданных при открытии.
     ///
     /// Нужно, когда в хранилище есть неймспейс чужого сервиса: его записи без
@@ -570,7 +612,7 @@ impl Reader {
     pub fn root(&self) -> &Path {
         match &self.source {
             Source::Store(store) => store.root(),
-            Source::Dump { root, .. } => root,
+            Source::Dump { roots, .. } => &roots[0],
         }
     }
 
@@ -1465,7 +1507,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let listing = reader.namespaces().unwrap();
         assert!(listing.is_complete(), "все неймспейсы перечислены");
         let namespaces = listing.namespaces;
@@ -1495,7 +1537,7 @@ mod tests {
     fn schema_resolves_names_levels_and_units() {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         let result = reader
             .query(&Query::new().order(Order::Oldest).limit(500))
@@ -1560,7 +1602,7 @@ mod tests {
     fn filters_by_group_level_and_kind() {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         // Только оркестраторы.
         let orc = reader
@@ -1633,7 +1675,7 @@ mod tests {
             ns.sync().unwrap();
             store.shutdown();
         }
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         let rf = reader
             .query(&Query::new().any_tag("rf").order(Order::Oldest))
@@ -1679,7 +1721,7 @@ mod tests {
         // из потока нельзя: вся телеметрия приходила бы обезличенной.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         for order in [Order::Oldest, Order::Newest] {
             let result = reader
@@ -1728,7 +1770,7 @@ mod tests {
         store.shutdown();
         drop(store);
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let window = Query {
             from: Some(BootTime::new(after_state.boot, Micros(after_state.at.0 + 1)).into()),
             order: Order::Oldest,
@@ -1840,7 +1882,7 @@ mod tests {
             store.shutdown();
         }
 
-        let reader = Reader::open(dir.path(), &[schema(), other()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema(), other()]).unwrap();
         let seeded = reader
             .query(&Query {
                 from: Some(BootTime::new(after.boot, Micros(after.at.0 + 1)).into()),
@@ -1879,7 +1921,7 @@ mod tests {
         // неоткуда.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let r = reader
             .query(&Query {
                 from: Some(BootTime::from_raw(0, 0).into()),
@@ -1907,7 +1949,7 @@ mod tests {
         }
         ns.sync().unwrap(); // данные на диске, но сегмент не запечатан
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         for order in [Order::Oldest, Order::Newest] {
             let result = reader
                 .query(&Query::new().kinds(KindFilter::TELEMETRY).order(order))
@@ -1934,7 +1976,7 @@ mod tests {
         // footer-индексу — вместе с лежащими там определениями серий.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         let all = reader
             .query(
@@ -1973,7 +2015,7 @@ mod tests {
     fn newest_order_and_limit() {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         let newest = reader
             .query(&Query::new().order(Order::Newest).limit(5))
@@ -2003,7 +2045,7 @@ mod tests {
         // кнопка «дальше», ведущая в пустоту.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         let total = all.entries.len();
@@ -2042,7 +2084,7 @@ mod tests {
         // работать, когда файла на диске больше нет.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let result = reader
             .query(&Query::new().order(Order::Oldest).kinds(KindFilter::LOGS))
             .unwrap();
@@ -2065,7 +2107,7 @@ mod tests {
     fn merge_is_ordered_across_namespaces() {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         let keys: Vec<BootTime> = all.entries.iter().map(|e| e.at).collect();
@@ -2084,7 +2126,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         // Читаем без схем — как чужой билд.
-        let reader = Reader::open(dir.path(), &[]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
 
         assert!(!result.entries.is_empty(), "записи всё равно читаются");
@@ -2106,7 +2148,7 @@ mod tests {
     fn time_range_narrows_result() {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         let mid = all.entries[all.entries.len() / 2].at;
@@ -2144,7 +2186,7 @@ mod tests {
         )
         .unwrap();
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         assert!(
             !result.is_complete(),
@@ -2153,7 +2195,7 @@ mod tests {
         assert!(result.entries.is_empty());
 
         // Явное разрешение читает их как есть.
-        let reader = Reader::open(dir.path(), &[schema()])
+        let reader = Reader::open_dump([dir.path()], &[schema()])
             .unwrap()
             .allow_foreign_segments();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
@@ -2179,7 +2221,7 @@ mod tests {
             f.write_all_at(&[0xFF; 16], 40).unwrap();
         }
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         assert!(
             !result.is_complete(),
@@ -2233,7 +2275,7 @@ mod tests {
             f.write_all_at(&[0xFF; 16], 40).unwrap();
         }
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let result = reader
             .query(&Query::new().order(Order::Oldest).limit(1))
             .unwrap();
@@ -2272,7 +2314,7 @@ mod tests {
             store.shutdown();
         }
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         let entry = &result.entries[0];
         let utc = entry
@@ -2307,7 +2349,7 @@ mod tests {
             store.shutdown();
         }
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         assert_eq!(all.entries.len(), 40);
         let mid = &all.entries[all.entries.len() / 2];
@@ -2356,7 +2398,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let utc = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
         let r = reader
             .query(&Query::new().order(Order::Oldest).since(utc))
@@ -2390,7 +2432,7 @@ mod tests {
         // посередине `query` не позволяет.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let q = Query::new().order(Order::Oldest);
 
         // Первые пять записей — и обход прекращён, остальные сегменты даже не
@@ -2419,7 +2461,7 @@ mod tests {
         // правдоподобным и неверным.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let r = reader
             .query(&Query::new().order(Order::Oldest).kinds(KindFilter::LOGS))
             .unwrap();
@@ -2435,7 +2477,7 @@ mod tests {
         assert_eq!(reader.render(msg, "de").as_deref(), Some("power set"));
 
         // Читателю без схем рендерить нечем, и выдумывать он не станет.
-        let blind = Reader::open(dir.path(), &[]).unwrap();
+        let blind = Reader::open_dump([dir.path()], &[]).unwrap();
         assert_eq!(blind.render(msg, "ru"), None);
     }
 
@@ -2449,7 +2491,7 @@ mod tests {
         populate(dir.path());
         std::fs::remove_file(dir.path().join(dduroc_engine::epochs::EPOCHS_FILE)).unwrap();
 
-        let reader = Reader::open(dir.path(), &[schema()]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let utc = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
         let r = reader
             .query(&Query::new().order(Order::Oldest).since(utc))

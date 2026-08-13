@@ -130,7 +130,7 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
     );
 
     // И главное — все записи на месте, повреждений нет.
-    let reader = Reader::open(dir.path(), &[durability::SCHEMA]).unwrap();
+    let reader = Reader::open_dump([dir.path()], &[durability::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
     assert_eq!(result.entries.len(), 4, "три до аварии и одна после");
@@ -213,7 +213,7 @@ fn record_larger_than_a_segment_is_refused_not_written_past_it() {
     assert_eq!(stats.io_errors, 0, "это не отказ носителя: {stats:?}");
 
     // Дыра объявлена в самом потоке, а не только в счётчике.
-    let reader = Reader::open(dir.path(), &[durability::SCHEMA]).unwrap();
+    let reader = Reader::open_dump([dir.path()], &[durability::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     let announced = result.entries.iter().any(|e| {
         matches!(&e.kind, dduroc_read::EntryKind::Text { text, .. }
@@ -260,7 +260,7 @@ fn reopened_namespace_does_not_leave_a_second_state_on_the_directory() {
     store.shutdown();
 
     // Ни одна запись не потерялась по дороге.
-    let reader = Reader::open(dir.path(), &[durability::SCHEMA]).unwrap();
+    let reader = Reader::open_dump([dir.path()], &[durability::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
     assert_eq!(result.entries.len(), 200, "четыре круга по пятьдесят");
@@ -291,7 +291,7 @@ fn records_enqueued_before_the_handle_is_dropped_still_land() {
     drop(store.namespace("orc-0", durability::SCHEMA).unwrap());
     store.shutdown();
 
-    let reader = Reader::open(dir.path(), &[durability::SCHEMA]).unwrap();
+    let reader = Reader::open_dump([dir.path()], &[durability::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(
         result.entries.len() as u64 >= accepted,

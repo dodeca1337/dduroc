@@ -729,7 +729,7 @@ mod tests {
             store.shutdown();
         }
 
-        let reader = Reader::open(dir.path(), &[testing::SCHEMA]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[testing::SCHEMA]).unwrap();
         let result = reader
             .query(&Query::new().order(Order::Oldest).kinds(KindFilter::LOGS))
             .unwrap();
@@ -905,7 +905,7 @@ mod tests {
             store.shutdown();
         }
 
-        let reader = Reader::open(dir.path(), &[testing::SCHEMA]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[testing::SCHEMA]).unwrap();
         let result = reader
             .query(
                 &Query::new()
@@ -980,7 +980,7 @@ mod tests {
         };
         assert!(refused > 0, "тест бессмыслен без переполнения очереди");
 
-        let reader = Reader::open(dir.path(), &[testing::SCHEMA]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[testing::SCHEMA]).unwrap();
         let result = reader
             .query(&Query::new().order(Order::Oldest).kinds(KindFilter {
                 text: true,

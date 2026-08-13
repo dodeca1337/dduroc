@@ -110,11 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     // Дальше — офлайн-вьюер: хранилище закрыто, разбирается его дамп.
     // `Store` для дампа не открывают (он берёт блокировку корня и подметает
-    // временные файлы) — корень и схемы называются руками; для дампа с
-    // другого прибора есть `allow_foreign_segments`. Reader дампа не изменяет
-    // ничего и замораживает снимок в момент открытия.
+    // временные файлы) — ВСЕ корни дампа и схемы называются разом; для дампа
+    // с другого прибора есть `allow_foreign_segments`. Полнота проверяется
+    // при открытии: дамп, в котором не хватает дерева какого-то класса, — это
+    // ошибка, а не молча укороченная история. Reader дампа не изменяет ничего
+    // и замораживает снимок в момент открытия.
     // -----------------------------------------------------------------------
-    let reader = Reader::open(&root, &[radio::SCHEMA])?;
+    let reader = Reader::open_dump([&root], &[radio::SCHEMA])?;
 
     println!("— что есть в хранилище —");
     let listing = reader.namespaces()?;
@@ -306,7 +308,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ns.sync()?;
         store.shutdown(); // record_sync не звали: якоря нет
     }
-    let no_clock = Reader::open(&lone, &[radio::SCHEMA])?;
+    let no_clock = Reader::open_dump([&lone], &[radio::SCHEMA])?;
     let asked =
         no_clock.query(&Query::new().range(sync_at - chrono::TimeDelta::hours(1), sync_at))?;
     println!(

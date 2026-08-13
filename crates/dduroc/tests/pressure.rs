@@ -67,7 +67,7 @@ fn bytes_under(root: &Path) -> u64 {
 
 /// Номера, дошедшие до диска, в порядке чтения.
 fn sequence(root: &Path) -> Vec<u64> {
-    let reader = Reader::open(root, &[pressure::SCHEMA]).unwrap();
+    let reader = Reader::open_dump([root], &[pressure::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
     result
@@ -231,7 +231,7 @@ fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
         "критическая запись не теряется: {stats:?}"
     );
 
-    let reader = Reader::open(dir.path(), &[pressure::SCHEMA]).unwrap();
+    let reader = Reader::open_dump([dir.path()], &[pressure::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
     let alarms = result
@@ -323,7 +323,7 @@ fn reading_a_live_store_never_takes_back_what_it_already_showed() {
         let mut queries = 0u32;
         let mut floor = 0usize;
         while !done.load(Ordering::Acquire) {
-            let reader = Reader::open(dir.path(), &[pressure::SCHEMA]).unwrap();
+            let reader = Reader::open_dump([dir.path()], &[pressure::SCHEMA]).unwrap();
             let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
             let count = result
                 .entries
@@ -465,10 +465,8 @@ fn a_class_can_live_on_its_own_root() {
         "обычный канал остался в основном корне"
     );
 
-    // Читатель собирает оба дерева, когда ему назвали оба корня.
-    let reader = Reader::open(main.path(), &[pressure::SCHEMA])
-        .unwrap()
-        .with_extra_root(vault.path());
+    // Читатель собирает оба дерева: дамп открывается всеми корнями разом.
+    let reader = Reader::open_dump([main.path(), vault.path()], &[pressure::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "{:?}", result.damaged);
     let kinds: Vec<u16> = result
@@ -487,15 +485,15 @@ fn a_class_can_live_on_its_own_root() {
         "перечисление сливает каналы обоих корней"
     );
 
-    // Без второго корня критики не видно — дамп такого хранилища копируется
-    // двумя деревьями, и вьюеру называют оба.
-    let partial = Reader::open(main.path(), &[pressure::SCHEMA]).unwrap();
-    let result = partial.query(&Query::new().order(Order::Oldest)).unwrap();
+    // Дамп без второго дерева — не «короткий ответ», а отказ: полнота
+    // проверяется по схеме при открытии, и потерять критику молча нельзя.
+    let e = Reader::open_dump([main.path()], &[pressure::SCHEMA]).unwrap_err();
     assert!(
-        result
-            .entries
-            .iter()
-            .all(|e| !matches!(&e.kind, EntryKind::Message { event, .. } if event.0 == 2)),
-        "критический канал в другом дереве"
+        matches!(
+            &e,
+            dduroc_read::ReadError::IncompleteDump { namespace, class }
+                if namespace == "orc-0" && *class == "critical"
+        ),
+        "{e}"
     );
 }

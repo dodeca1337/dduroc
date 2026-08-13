@@ -491,7 +491,7 @@ fn bench_read(c: &mut Criterion) {
 
     g.bench_function("query/all_100k", |b| {
         b.iter(|| {
-            let reader = Reader::open(&root, &[bench::SCHEMA]).unwrap();
+            let reader = Reader::open_dump([&root], &[bench::SCHEMA]).unwrap();
             let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
             // Прочитанного может быть больше: неудачные try_send оставляют
             // в потоке отметку о потере. Меньше — значит записи исчезли.
@@ -507,7 +507,7 @@ fn bench_read(c: &mut Criterion) {
     g.throughput(Throughput::Elements(100));
     g.bench_function("query/newest_100", |b| {
         b.iter(|| {
-            let reader = Reader::open(&root, &[bench::SCHEMA]).unwrap();
+            let reader = Reader::open_dump([&root], &[bench::SCHEMA]).unwrap();
             let result = reader
                 .query(&Query::new().order(Order::Newest).limit(100))
                 .unwrap();
@@ -518,7 +518,7 @@ fn bench_read(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("query/errors_only", |b| {
         b.iter(|| {
-            let reader = Reader::open(&root, &[bench::SCHEMA]).unwrap();
+            let reader = Reader::open_dump([&root], &[bench::SCHEMA]).unwrap();
             let result = reader
                 .query(
                     &Query::new()

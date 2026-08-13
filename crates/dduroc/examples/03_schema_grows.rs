@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Прочитать весь журнал и телеметрию глазами схемы v2.
 fn read_all(root: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let reader = Reader::open(root, &[today::radio::SCHEMA])?;
+    let reader = Reader::open_dump([root], &[today::radio::SCHEMA])?;
     let result = reader.query(
         &Query::new()
             .kinds(KindFilter {

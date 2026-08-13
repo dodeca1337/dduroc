@@ -91,7 +91,7 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     store.shutdown();
 
     // Что выжило: самый старый доступный слепок — уже не нулевой.
-    let reader = Reader::open(root, &[probe::SCHEMA])?;
+    let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
     let oldest = reader.query(
         &Query::new()
             .kinds(KindFilter::TELEMETRY)
@@ -157,7 +157,7 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let stats = store.stats();
     store.shutdown();
 
-    let reader = Reader::open(root, &[probe::SCHEMA])?;
+    let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
     let listing = reader.namespaces()?;
     for ns in &listing.namespaces {
         println!("  {}: занято {} КиБ", ns.name, ns.total_bytes >> 10);
@@ -227,7 +227,7 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // Дыра, о которой нигде не сказано, неотличима от тишины: потери
     // объявлены отметками в самом потоке, и их сумма равна счётчику.
-    let reader = Reader::open(root, &[probe::SCHEMA])?;
+    let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
     let mut announced = 0u64;
     let mut marks = 0usize;
     for e in reader.stream(&Query::new().kinds(KindFilter {
@@ -310,7 +310,7 @@ fn vault(
     // блокировку корня и подметает временные файлы), поэтому корни и схемы
     // называются руками.
     store.shutdown();
-    let offline = Reader::open(root, &[probe::SCHEMA])?.with_extra_root(vault);
+    let offline = Reader::open_dump([root, vault], &[probe::SCHEMA])?;
     println!(
         "  тот же дамп вьюером: {} записей",
         offline

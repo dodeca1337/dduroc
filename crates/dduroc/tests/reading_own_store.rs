@@ -62,13 +62,22 @@ fn a_reader_of_the_store_sees_the_class_that_lives_on_another_medium() {
     let reader = store.reader();
     assert_eq!(lines(&reader), ["пинг 1", "отказ 3"]);
 
-    // А вот и то, ради чего мост нужен: читателю, которому назвали только
-    // основной корень, критики не видно, и молчит он об этом совершенно.
-    let blind = Reader::open(&root, &[split::SCHEMA]).unwrap();
+    // Дамп, которому назвали не все корни, — не «короткий ответ», а отказ:
+    // полнота проверяется по схеме при открытии. Раньше такой читатель
+    // показывал историю без критики, ничем не выдав пропажу.
+    let e = Reader::open_dump([&root], &[split::SCHEMA]).unwrap_err();
+    assert!(
+        matches!(
+            &e,
+            dduroc_read::ReadError::IncompleteDump { namespace, class }
+                if namespace == "orc-probe-0" && *class == "critical"
+        ),
+        "{e}"
+    );
+    // Со всеми корнями дамп читается целиком.
     assert_eq!(
-        lines(&blind),
-        ["пинг 1"],
-        "проверка потеряла смысл: без второго корня критика не может быть видна"
+        lines(&Reader::open_dump([&root, &vault], &[split::SCHEMA]).unwrap()),
+        ["пинг 1", "отказ 3"]
     );
 
     store.shutdown();
@@ -182,7 +191,7 @@ fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
         live.damaged
     );
 
-    let dump = Reader::open(dir.path(), &[split::SCHEMA])
+    let dump = Reader::open_dump([dir.path()], &[split::SCHEMA])
         .unwrap()
         .query(&Query::new().kinds(KindFilter::LOGS))
         .unwrap();

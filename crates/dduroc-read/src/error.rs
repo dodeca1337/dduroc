@@ -20,6 +20,15 @@ pub enum ReadError {
         found: u64,
     },
 
+    #[error(
+        "дамп неполон: у неймспейса {namespace:?} нет дерева класса {class:?} — \
+         хранилище писало этот класс в свой корень, назовите ВСЕ корни дампа"
+    )]
+    IncompleteDump {
+        namespace: String,
+        class: &'static str,
+    },
+
     #[error("недопустимый шаблон выбора неймспейсов {0:?}")]
     BadPattern(String),
 

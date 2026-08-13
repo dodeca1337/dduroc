@@ -70,7 +70,7 @@ enum Seen {
 }
 
 fn read_all(root: &std::path::Path) -> Vec<Seen> {
-    let reader = Reader::open(root, &[now::probe::SCHEMA]).unwrap();
+    let reader = Reader::open_dump([root], &[now::probe::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
     result
@@ -136,7 +136,7 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
 
     // И рендер работает по текущему шаблону поверх мигрированного payload'а.
     {
-        let reader = Reader::open(dir.path(), &[now::probe::SCHEMA]).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[now::probe::SCHEMA]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         let power = result
             .entries
