@@ -2,7 +2,12 @@
 
 use std::path::PathBuf;
 
+/// Отказ чтения.
+///
+/// Перечисление **открытое** по той же причине, что и [`dduroc_engine::Error`]:
+/// новая причина отказа — это новая проверка, а не новое решение вызывающего.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReadError {
     #[error(transparent)]
     Engine(#[from] dduroc_engine::Error),

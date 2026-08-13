@@ -112,7 +112,12 @@ impl Counters {
 }
 
 /// Снимок счётчиков.
+///
+/// Структура **открытая**: счётчик добавляется всякий раз, когда движок
+/// научается замечать что-то новое, и это не должно ломать сборку тем, кто их
+/// только читает.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Stats {
     pub records_written: u64,
     pub blocks_written: u64,

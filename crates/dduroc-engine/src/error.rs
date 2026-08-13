@@ -2,7 +2,15 @@
 
 use std::path::PathBuf;
 
+/// Отказ движка.
+///
+/// Перечисление **открытое** (`#[non_exhaustive]`): новая причина отказа
+/// появляется от новой проверки, а не от нового решения вызывающего — на путях
+/// записи вопрос звучит «потеряна ли запись» ([`Error::loses_record`]) и
+/// «дефект ли это сборки» ([`Error::breaks_contract`]), и ответ на него у новых
+/// вариантов уже есть.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("{context}: {source}")]
     Io {

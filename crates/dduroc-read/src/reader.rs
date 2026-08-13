@@ -36,6 +36,13 @@ fn as_format_value(v: &OwnedSampleValue) -> Value<'_> {
 }
 
 /// Разновидность записи в ответе.
+///
+/// Перечисление **закрытое** намеренно, в отличие от [`QueryResult`] и
+/// [`Damage`]. Разница в том, чего стоит молчание: лишнее поле в отчёте можно
+/// не читать, а вид записи, которого показывающий код не знает, — это строчка,
+/// молча пропавшая с экрана. Пусть лучше сборка не соберётся. Записи, вида
+/// которых не знает **сам билд**, приходят как [`EntryKind::Ext`] — для них
+/// ветка есть всегда.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
     /// Схемное сообщение.
@@ -95,6 +102,7 @@ pub enum EntryKind {
 
 /// Запись ответа.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Entry {
     pub namespace: std::sync::Arc<str>,
     /// Класс хранения, в чьём канале лежала запись. Канал и есть класс:
@@ -140,6 +148,7 @@ impl Entry {
 
 /// Ответ на запрос.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct QueryResult {
     pub entries: Vec<Entry>,
     /// Состояния на левый край окна: последний отсчёт каждого
@@ -772,6 +781,7 @@ struct OpenedCursors {
 
 /// Сведения о неймспейсе хранилища.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NamespaceInfo {
     pub name: String,
     pub schema_name: String,
@@ -790,6 +800,7 @@ pub struct NamespaceInfo {
 /// молчание, против которого заведено [`QueryResult::damaged`]. Пустой
 /// `damaged` означает, что перечислено всё.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct NamespaceListing {
     pub namespaces: Vec<NamespaceInfo>,
     /// Каталоги, опознанные как неймспейсы, но не поддавшиеся чтению.

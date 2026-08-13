@@ -287,6 +287,7 @@ pub fn apply<'a>(
 ///
 /// Сегменты: каждый из перечисленных при прогоне попал ровно в одну графу.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MigrationReport {
     /// Переписаны в текущую раскладку.
     pub rewritten: usize,

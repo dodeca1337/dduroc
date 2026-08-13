@@ -102,6 +102,7 @@ pub struct StateStatus {
 ///
 /// То, что отдаётся наружу — прикладному коду и (в будущем) веб-слою.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EffectiveLimits {
     pub metric: MetricId,
     pub name: &'static str,

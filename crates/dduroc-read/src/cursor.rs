@@ -234,6 +234,7 @@ pub struct SegmentCursor {
 
 /// Сведения о пропущенном фрагменте.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Damage {
     pub path: PathBuf,
     pub offset: u64,
