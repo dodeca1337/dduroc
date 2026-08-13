@@ -8,7 +8,7 @@
 //! открытие Store), затем разбирает её запросами.
 
 use dduroc::prelude::*;
-use dduroc::read::{EntryKind, KindFilter, Order, Query, Reader};
+use dduroc::read::{EntryKind, KindFilter, Order, Query, Reader, Tail};
 use dduroc::{BootCounter, Micros};
 
 dduroc::schema! {
@@ -103,6 +103,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {}", live.render(e, "ru").unwrap_or_default());
         }
         assert!(now.damaged.is_empty());
+
+        // -------------------------------------------------------------------
+        // Подписка: то же окно, но поток не заканчивается на конце данных, а
+        // ждёт продолжения. Читатель спит, пока писать нечего, и просыпается
+        // на первом же блоке, легшем в файл, — опрос по таймеру не нужен.
+        // `Idle` — тишина, а не конец; конец объявляется только `Ended`.
+        // -------------------------------------------------------------------
+        let mut tail = live.follow(&Query::new().since(ns.now()).order(Order::Oldest))?;
+        ns.log(radio::events::PowerSet { dbm: 12.0 });
+        ns.log(radio::events::Started);
+        ns.sync()?;
+
+        println!("— подписка на поток —");
+        let mut seen = 0;
+        while seen < 2 {
+            match tail.next(std::time::Duration::from_millis(200)) {
+                Tail::Entry(e) => {
+                    seen += 1;
+                    println!("  {}", live.render(&e, "ru").unwrap_or_default());
+                }
+                // В примере ждать нечего: всё написанное уже на носителе.
+                Tail::Idle => break,
+                Tail::Ended => break,
+            }
+        }
+        assert_eq!(seen, 2, "подписка отдала обе записи");
+        assert!(tail.take_damage().is_empty());
 
         store.shutdown();
     }

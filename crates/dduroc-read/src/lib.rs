@@ -10,7 +10,9 @@
 //! - **живой** читатель ([`Reader::of_store`], на фасаде — `store.reader()`)
 //!   параллелен записи по построению: корни, схемы и якоря времени он
 //!   спрашивает у хранилища на каждый запрос, а ротацию и дописываемый хвост
-//!   сегмента терпит как штатные события;
+//!   сегмента терпит как штатные события. Ему же принадлежит подписка
+//!   ([`Reader::follow`]): вместо опроса по таймеру читатель спит, пока писать
+//!   нечего, и просыпается на первом же блоке, легшем в файл;
 //! - **дамп** ([`Reader::open_dump`]) — замороженный снимок: все корни и
 //!   схемы называются разом, потому что расшифровать записи без схемы
 //!   нельзя — на диске лежат только идентификаторы и бинарные поля, — а
@@ -37,7 +39,7 @@ mod reader;
 /// пользователю не нужно добавлять зависимость ради границы запроса.
 pub use chrono;
 
-pub use cursor::{Damage, OwnedRecord, OwnedSampleValue, RawEntry};
+pub use cursor::{Damage, Liveness, OwnedRecord, OwnedSampleValue, RawEntry};
 /// Класс хранения — тот же тип, что у пишущей стороны: канал и есть класс.
 pub use dduroc_engine::schema::StorageClass;
 pub use dduroc_format::{BootCounter, BootTime, Micros};
@@ -46,6 +48,6 @@ pub use query::{
     Bounds, Filter, KindFilter, NsSelect, Order, Query, Resolution, RunBounds, Timestamp,
 };
 pub use reader::{
-    Entry, EntryKind, EntryStream, NamespaceInfo, NamespaceListing, QueryResult, Reader,
-    render as reader_render,
+    Entry, EntryKind, EntryStream, Follow, NamespaceInfo, NamespaceListing, QueryResult, Reader,
+    Tail, render as reader_render,
 };

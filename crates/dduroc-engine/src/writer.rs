@@ -38,6 +38,7 @@ use dduroc_format::block::{BlockBuilder, BlockHeader};
 use dduroc_format::segment::{SegmentHeader, SegmentName};
 use dduroc_format::{BootCounter, FooterBuilder, Level, Micros, ProtocolVersion};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -260,6 +261,7 @@ impl Writer {
         counters: Arc<Counters>,
         queues: QueueSizes,
         groups: Vec<GroupBudget>,
+        pulse: Arc<crate::pulse::Pulse>,
     ) -> Result<Arc<Self>> {
         let queues = queues.sanitized();
         let (normal_tx, normal_rx) = crossbeam_channel::bounded(queues.normal);
@@ -276,6 +278,10 @@ impl Writer {
             groups,
             segments_seen: 0,
             pressured_roots: 0,
+            pulse,
+            pulsed_blocks: 0,
+            pulsed_shape: 0,
+            shape_changed: false,
         };
 
         let handle = std::thread::Builder::new()
@@ -747,6 +753,17 @@ struct WriterLoop {
     /// отпускание и вытеснение её уменьшают. Поэтому неизменившийся счётчик
     /// доказывает, что считать нечего.
     segments_seen: u64,
+    /// Отметки для подписки читателя. Поднимаются раз в оборот цикла, а не на
+    /// каждый блок: за один оборот writer успевает записать целый батч, и
+    /// будить читателя чаще значило бы будить его на ту же порцию данных.
+    pulse: Arc<crate::pulse::Pulse>,
+    /// Значение [`Counters::blocks_written`] на момент последней отметки.
+    pulsed_blocks: u64,
+    /// Сумма счётчиков событий с сегментами на момент последней отметки.
+    pulsed_shape: u64,
+    /// В этом обороте появился неймспейс: каталогов стало больше, а счётчиками
+    /// сегментов это не видно.
+    shape_changed: bool,
     /// Битовая маска корней ([`GroupBudget::root_key`]), отказавших по месту
     /// с прошлого обхода.
     ///
@@ -810,9 +827,42 @@ impl WriterLoop {
             }
 
             self.tick();
+            self.publish_pulse();
         }
 
         self.finish();
+        // Дописанное на остановке — тоже данные, и объявить о них надо до
+        // закрытия: подписка обязана дочитать поток до конца, а не оборваться
+        // на последней порции.
+        self.publish_pulse();
+        // Ожидающих больше некому будить: без этого подписка на остановленном
+        // хранилище висела бы до таймаута и выглядела бы как молчащий прибор.
+        self.pulse.close();
+    }
+
+    /// Объявить читателям то, что случилось за оборот цикла.
+    ///
+    /// Считается по уже существующим счётчикам: отдельный учёт в `flush_block`
+    /// пришлось бы протаскивать через все шесть его вызывающих, а разница
+    /// между «блоков стало больше» и «блок лёг вот сюда» подписке не нужна —
+    /// она всё равно дочитывает сегмент с последнего своего места.
+    fn publish_pulse(&mut self) {
+        let blocks = self.counters.blocks_written.load(Ordering::Relaxed);
+        if blocks != self.pulsed_blocks {
+            self.pulsed_blocks = blocks;
+            self.pulse.data_written();
+        }
+        // Устройство хранилища меняют ровно четыре события, и все они уже
+        // считаются: сегмент создан, взят в работу, запечатан, вытеснен.
+        let shape = self.counters.segments_created.load(Ordering::Relaxed)
+            + self.counters.segments_opened.load(Ordering::Relaxed)
+            + self.counters.segments_sealed.load(Ordering::Relaxed)
+            + self.counters.segments_rotated.load(Ordering::Relaxed);
+        if shape != self.pulsed_shape || self.shape_changed {
+            self.pulsed_shape = shape;
+            self.shape_changed = false;
+            self.pulse.shape_changed();
+        }
     }
 
     /// Вычерпать обе очереди данных досуха.
@@ -1899,6 +1949,10 @@ impl WriterLoop {
     }
 
     fn register(&mut self, setup: NsSetup) -> Result<NsId> {
+        // Каталогов стало больше, а счётчиками сегментов это не видно: пустой
+        // канал файлов ещё не завёл. Подписке на группу неймспейсов сервис,
+        // стартовавший позже, обязан достаться без её перезапуска.
+        self.shape_changed = true;
         let identity = SegmentIdentity {
             protocol_version: setup.protocol_version,
             store_id: setup.store_id,
@@ -2169,6 +2223,10 @@ mod tests {
             }],
             segments_seen: 0,
             pressured_roots: 0,
+            pulse: Arc::new(crate::pulse::Pulse::new()),
+            pulsed_blocks: 0,
+            pulsed_shape: 0,
+            shape_changed: false,
         }
     }
 
@@ -2825,8 +2883,13 @@ mod tests {
         // ни отметки, ни ответа вызывающему — то есть ровно та неотличимая от
         // тишины дыра, против которой заведён весь учёт потерь.
         let counters = Arc::new(Counters::default());
-        let writer =
-            Writer::spawn(Arc::clone(&counters), QueueSizes::default(), Vec::new()).unwrap();
+        let writer = Writer::spawn(
+            Arc::clone(&counters),
+            QueueSizes::default(),
+            Vec::new(),
+            Arc::new(crate::pulse::Pulse::new()),
+        )
+        .unwrap();
         let drops = DropCounters::new(1);
         let item = Staged {
             ns: NsId(0),

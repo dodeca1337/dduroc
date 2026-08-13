@@ -32,6 +32,9 @@ pub enum ReadError {
     #[error("недопустимый шаблон выбора неймспейсов {0:?}")]
     BadPattern(String),
 
+    #[error("на такой запрос нельзя подписаться: {0}")]
+    NotFollowable(&'static str),
+
     #[error("недопустимый курсор пагинации")]
     BadCursor,
 

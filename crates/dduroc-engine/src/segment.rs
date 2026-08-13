@@ -760,39 +760,73 @@ impl SegmentReader {
     /// между которыми образовалась дыра, а ответ без единого признака выглядел
     /// бы полным.
     pub fn scan_block_offsets(&self) -> (Vec<u64>, Option<(u64, String)>) {
-        let mut offsets = Vec::new();
+        let scan = self.scan_block_offsets_from(Self::first_block_offset(), 0);
+        (scan.offsets, scan.stopped)
+    }
+
+    /// Продолжить скан блоков с известного места.
+    ///
+    /// Нужен подписке на поток: сегмент, который пишется прямо сейчас,
+    /// перечитывается по мере роста, и начинать каждый раз с начала значило бы
+    /// вычитывать весь файл на каждую порцию новых записей — восьмимегабайтный
+    /// сегмент вместо десятка килобайт свежего хвоста.
+    ///
+    /// `expected_seq` продолжает нумерацию блоков: она своя у каждого сегмента
+    /// и начинается с нуля, поэтому частичный скан обязан принести её с собой —
+    /// иначе продолжение объявляло бы разрыв нумерации на первом же блоке.
+    pub fn scan_block_offsets_from(&self, start: u64, expected_seq: u32) -> BlockScan {
+        let mut scan = BlockScan {
+            offsets: Vec::new(),
+            end: start,
+            next_seq: expected_seq,
+            stopped: None,
+        };
         let mut buf = Vec::new();
-        let mut offset = Self::first_block_offset();
-        let mut expected_seq = 0u32;
+        let mut offset = start;
         loop {
             match self.read_block_at(offset, &mut buf) {
                 Ok(Some(next)) => {
                     // Заголовок уже прочитан в буфер — разбор не стоит ни
                     // одного обращения к носителю.
                     if let Ok(Some(header)) = BlockHeader::parse(&buf)
-                        && header.seq != expected_seq
+                        && header.seq != scan.next_seq
                     {
-                        return (
-                            offsets,
-                            Some((
-                                offset,
-                                format!(
-                                    "разрыв нумерации блоков: ожидался {expected_seq}, \
-                                     в файле {}",
-                                    header.seq
-                                ),
-                            )),
-                        );
+                        scan.stopped = Some((
+                            offset,
+                            format!(
+                                "разрыв нумерации блоков: ожидался {}, в файле {}",
+                                scan.next_seq, header.seq
+                            ),
+                        ));
+                        return scan;
                     }
-                    expected_seq = expected_seq.saturating_add(1);
-                    offsets.push(offset);
+                    scan.next_seq = scan.next_seq.saturating_add(1);
+                    scan.offsets.push(offset);
+                    scan.end = next;
                     offset = next;
                 }
-                Ok(None) => return (offsets, None),
-                Err(e) => return (offsets, Some((offset, e.to_string()))),
+                Ok(None) => return scan,
+                Err(e) => {
+                    scan.stopped = Some((offset, e.to_string()));
+                    return scan;
+                }
             }
         }
     }
+}
+
+/// Итог скана блоков вместе с местом, где его продолжать.
+#[derive(Debug, Clone)]
+pub struct BlockScan {
+    /// Смещения найденных блоков, от старых к новым.
+    pub offsets: Vec<u64>,
+    /// Смещение, с которого продолжится следующий скан: конец последнего
+    /// целого блока либо место обрыва.
+    pub end: u64,
+    /// Номер, которого следующий скан ждёт у блока на `end`.
+    pub next_seq: u32,
+    /// Где и почему скан оборвался. `None` — дошёл до конца данных.
+    pub stopped: Option<(u64, String)>,
 }
 
 /// Разобрать блок из сырых байт, прочитанных [`SegmentReader::read_block_at`].

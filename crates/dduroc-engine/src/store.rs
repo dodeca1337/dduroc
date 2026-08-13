@@ -205,6 +205,9 @@ pub struct Store {
     /// Открытые неймспейсы: повторное открытие того же имени в одном
     /// процессе дало бы два независимых состояния на одном каталоге.
     open: Mutex<HashMap<String, Option<NsId>>>,
+    /// Отметки о том, что смотреть снова есть смысл: их поднимает writer,
+    /// а ждёт подписка читателя.
+    pulse: Arc<crate::pulse::Pulse>,
     /// Схемы, принесённые поднятыми неймспейсами, по имени схемы.
     ///
     /// Отдельно от `open` и **не** убирается вместе с ручкой: занятость имени
@@ -277,7 +280,13 @@ impl Store {
         );
 
         let counters = Arc::new(Counters::default());
-        let writer = Writer::spawn(Arc::clone(&counters), config.queues, groups)?;
+        let pulse = Arc::new(crate::pulse::Pulse::new());
+        let writer = Writer::spawn(
+            Arc::clone(&counters),
+            config.queues,
+            groups,
+            Arc::clone(&pulse),
+        )?;
 
         let store = Arc::new(Self {
             root: config.root.clone(),
@@ -291,6 +300,7 @@ impl Store {
             writer,
             counters,
             next_span: Arc::new(AtomicU32::new(1)),
+            pulse,
             open: Mutex::new(HashMap::new()),
             schemas: Mutex::new(HashMap::new()),
             _lock: lock,
@@ -336,6 +346,22 @@ impl Store {
 
     pub fn meta(&self) -> StoreMeta {
         self.meta
+    }
+
+    /// Отметки хранилища о новых данных — на них спит подписка читателя.
+    ///
+    /// Отметка не заменяет чтение и ничего о записях не рассказывает: она лишь
+    /// говорит, что смотреть снова есть смысл. Правда по-прежнему на носителе.
+    pub fn pulse(&self) -> &Arc<crate::pulse::Pulse> {
+        &self.pulse
+    }
+
+    /// Жив ли поток writer'а.
+    ///
+    /// Подписке это нужно, чтобы не ждать вечно того, кого уже некому писать:
+    /// поток, снятый паникой, отметку о закрытии выставить не успевает.
+    pub fn writer_alive(&self) -> bool {
+        self.writer.is_alive()
     }
 
     /// Прежняя версия контейнера, если хранилище было поднято со старой.

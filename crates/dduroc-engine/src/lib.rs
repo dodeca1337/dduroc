@@ -27,6 +27,7 @@ pub mod limits;
 pub mod metric;
 pub mod migrate;
 pub mod namespace;
+pub mod pulse;
 pub mod rotation;
 pub mod schema;
 pub mod segment;
@@ -42,12 +43,13 @@ pub use error::{Error, Result};
 pub use limits::{EffectiveLimits, MetricLimits, StateStatus};
 pub use migrate::MigrationReport;
 pub use namespace::{Namespace, Series, SpanGuard};
+pub use pulse::{Beat, Pulse};
 pub use rotation::Inventory;
 pub use schema::{
     EventDesc, Language, MetricDesc, MetricKind, Range, Schema, Severity, SpanDesc, StateDesc,
     StorageClass, Thresholds,
 };
-pub use segment::{Recovered, Scan, SegmentReader, SegmentWriter, seal_orphan};
+pub use segment::{BlockScan, Recovered, Scan, SegmentReader, SegmentWriter, seal_orphan};
 pub use staged::{NsId, Staged, StagedRecord};
 pub use stats::Stats;
 pub use store::{Store, StoreConfig};

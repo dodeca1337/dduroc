@@ -13,6 +13,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 /// Сколько сегментов назад искать состояние на левый край окна.
 ///
@@ -338,6 +339,248 @@ impl EntryStream<'_> {
     /// Сколько записей уже выдано.
     pub fn yielded(&self) -> usize {
         self.yielded
+    }
+}
+
+/// Что подписка отдала на этот раз.
+#[derive(Debug)]
+pub enum Tail {
+    /// Очередная запись.
+    Entry(Box<Entry>),
+    /// За отведённое время нового не появилось. Спросить снова — можно и нужно:
+    /// это не конец, а тишина.
+    Idle,
+    /// Писать больше некому: хранилище остановлено, и всё, что успело лечь на
+    /// носитель, уже отдано. Дальше будет только `Ended`.
+    Ended,
+}
+
+/// Подписка на поток записей живого хранилища.
+///
+/// Читает то же и теми же средствами, что и [`Reader::query`], — но не
+/// заканчивается на конце данных, а ждёт продолжения. Отличий от запроса три,
+/// и все они следуют из того, что запись ещё идёт:
+///
+/// - **порядок только от старого к новому** ([`Order::Oldest`]): «последние
+///   сто» у потока, у которого нет последней записи, ничего не означают;
+/// - **верхней границы окна нет**: подписка читает то, чего ещё нет;
+/// - **недописанный хвост откладывается**, а не пропускается: у разового
+///   запроса есть следующий запрос, у подписки — нет.
+///
+/// Порядок между каналами — по времени в пределах того, что видно на момент
+/// пробуждения, и это всё, что честно можно обещать: каналы синхронизируются
+/// по своим политикам (критический — сразу, обычный — раз в секунду), поэтому
+/// запись обычного канала может стать видимой позже критической, случившейся
+/// после неё. Внутри одного канала порядок точен — он и есть порядок на диске.
+///
+/// Подписка держит хранилище живым, как и всякий читатель: пока она жива, не
+/// отработает и остановка writer'а.
+#[derive(Debug)]
+pub struct Follow<'a> {
+    reader: &'a Reader,
+    query: Query,
+    /// Границы окна, посчитанные один раз при открытии.
+    ///
+    /// Пересчитывать их на каждое пробуждение нельзя: настенная граница
+    /// переводится в шкалу запуска по якорю, а синхронизация времени
+    /// ретроактивна — окно ездило бы под ногами у подписки, которая уже
+    /// прошла часть потока и вернуться назад не может.
+    bounds: Bounds,
+    /// Якоря времени — наоборот, свежие на каждое пробуждение: UTC у записи
+    /// появляется от синхронизации, случившейся позже самой записи.
+    epochs: Epochs,
+    cursors: Vec<ChannelCursor>,
+    schemas: Vec<Option<Schema>>,
+    heads: BinaryHeap<Head>,
+    /// Чья голова сейчас в куче. Курсор, исчерпавшийся до подхода новых
+    /// данных, из кучи выпадает, и вернуть его туда больше нечему.
+    queued: Vec<bool>,
+    /// Уже открытые пары (неймспейс, класс): подписка на группу обязана
+    /// подхватить сервис, стартовавший позже неё.
+    known: HashSet<(String, StorageClass)>,
+    damaged: Vec<Damage>,
+    unanchored: Vec<BootCounter>,
+    pulse: Arc<dduroc_engine::pulse::Pulse>,
+    seen: dduroc_engine::pulse::Beat,
+    seeds: std::vec::IntoIter<Entry>,
+    limit: usize,
+    yielded: usize,
+    ended: bool,
+}
+
+impl Follow<'_> {
+    /// Дождаться очередной записи, но не дольше `wait`.
+    ///
+    /// [`Tail::Idle`] означает «пока тихо», а не «конец»: подписку опрашивают
+    /// в цикле, и таймаут задаёт, как быстро этот цикл сможет заметить
+    /// остановку, заданную самим приложением.
+    pub fn next(&mut self, wait: Duration) -> Tail {
+        if let Some(seed) = self.seeds.next() {
+            return Tail::Entry(Box::new(seed));
+        }
+        if self.ended {
+            return Tail::Ended;
+        }
+        // Срок считается один раз на вызов: пробуждение на чужих данных
+        // (отметка одна на всё хранилище) не имеет права продлевать ожидание
+        // сверх обещанного.
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(entry) = self.pop_ready() {
+                return Tail::Entry(Box::new(entry));
+            }
+            if self.ended {
+                return Tail::Ended;
+            }
+            if self.seen.closed {
+                // Хранилище остановлено, и всё, что легло на носитель, отдано.
+                self.ended = true;
+                return Tail::Ended;
+            }
+            let rest = deadline.saturating_duration_since(Instant::now());
+            let beat = self.pulse.wait(self.seen, rest);
+            if beat == self.seen {
+                // Поток writer'а, снятый паникой, отметку о закрытии выставить
+                // не успевает: без этой проверки подписка ждала бы вечно того,
+                // кого уже некому писать.
+                if !self.reader.writer_alive() {
+                    self.ended = true;
+                    return Tail::Ended;
+                }
+                return Tail::Idle;
+            }
+            let shape_changed = beat.shape != self.seen.shape;
+            self.seen = beat;
+            self.refresh(shape_changed);
+        }
+    }
+
+    /// Забрать повреждения, обнаруженные с прошлого раза.
+    ///
+    /// Именно забрать: подписка живёт долго, и список, который только растёт,
+    /// повторял бы одно и то же повреждение в каждой порции — а заодно рос бы
+    /// без предела. Пустой ответ означает, что с прошлого раза всё прочиталось.
+    pub fn take_damage(&mut self) -> Vec<Damage> {
+        let mut out = std::mem::take(&mut self.damaged);
+        for c in &mut self.cursors {
+            out.append(&mut c.take_damage());
+        }
+        out
+    }
+
+    /// Запуски, выпавшие из настенного окна за неимением якоря —
+    /// см. [`QueryResult::unanchored`].
+    pub fn unanchored(&self) -> &[BootCounter] {
+        &self.unanchored
+    }
+
+    /// Сколько записей уже отдано.
+    pub fn yielded(&self) -> usize {
+        self.yielded
+    }
+
+    /// Взять запись из того, что уже прочитано с носителя.
+    fn pop_ready(&mut self) -> Option<Entry> {
+        loop {
+            let Head { idx, .. } = self.heads.pop()?;
+            self.queued[idx] = false;
+            let taken = self.cursors[idx].next_entry();
+            self.requeue(idx);
+            let Some(raw) = taken else { continue };
+
+            if !self.bounds.contains(raw.at) {
+                continue;
+            }
+            let ns = std::sync::Arc::clone(&self.cursors[idx].namespace);
+            let ch = self.cursors[idx].channel;
+            let Some(entry) = self.reader.build_entry(
+                ns,
+                ch,
+                self.schemas[idx].as_ref(),
+                &raw,
+                &self.query,
+                &self.epochs,
+            ) else {
+                continue;
+            };
+            self.yielded += 1;
+            if self.yielded >= self.limit {
+                self.ended = true;
+            }
+            return Some(entry);
+        }
+    }
+
+    fn requeue(&mut self, idx: usize) {
+        if let Some(head) = self.cursors[idx].peek() {
+            let at = head.at;
+            self.heads.push(Head {
+                at,
+                idx,
+                newest_first: false,
+            });
+            self.queued[idx] = true;
+        }
+    }
+
+    /// Забрать всё, что появилось с прошлого пробуждения.
+    fn refresh(&mut self, shape_changed: bool) {
+        self.epochs = self.reader.epochs_now().into_owned();
+        if shape_changed {
+            self.adopt_new_channels();
+        }
+        for idx in 0..self.cursors.len() {
+            // Обход каталога — только когда хранилище объявило, что каталоги
+            // менялись: пока писатель льёт в тот же файл, подписка обходится
+            // одним чтением хвоста.
+            self.cursors[idx].extend(shape_changed);
+            if !self.queued[idx] {
+                self.requeue(idx);
+            }
+        }
+    }
+
+    /// Открыть каналы неймспейсов, поднятых уже после начала подписки.
+    fn adopt_new_channels(&mut self) {
+        let opened = self
+            .reader
+            .open_cursors_with(&self.query, &self.bounds, |scope| {
+                scope.liveness = crate::cursor::Liveness::Following;
+            });
+        let OpenedCursors {
+            cursors,
+            schemas,
+            damaged,
+        } = match opened {
+            Ok(o) => o,
+            // Каталог не перечислился — почти всегда потому, что его меняли
+            // прямо сейчас. Подписку это ронять не должно, а молчать нельзя:
+            // неймспейс, который так и не подхватился, выглядел бы как
+            // невзлетевший сервис.
+            Err(e) => {
+                self.damaged.push(Damage {
+                    path: self.reader.root().to_owned(),
+                    offset: 0,
+                    reason: format!("неймспейсы не перечислились: {e}"),
+                });
+                return;
+            }
+        };
+        self.damaged.extend(damaged);
+        for (cursor, schema) in cursors.into_iter().zip(schemas) {
+            let key = (cursor.namespace.to_string(), cursor.channel);
+            if !self.known.insert(key) {
+                continue;
+            }
+            for boot in cursor.unanchored() {
+                if !self.unanchored.contains(boot) {
+                    self.unanchored.push(*boot);
+                }
+            }
+            self.cursors.push(cursor);
+            self.schemas.push(schema);
+            self.queued.push(false);
+        }
     }
 }
 
@@ -869,6 +1112,118 @@ impl Reader {
         })
     }
 
+    /// Подписаться на поток записей: читать по мере появления.
+    ///
+    /// Живой читатель видит записи опросом, и без подписки опрос пришлось бы
+    /// делать по таймеру — частому (обращения к носителю впустую, а на приборе
+    /// это ещё и износ флеша) или редкому (график отстаёт на период). Подписка
+    /// спит, пока писать нечего, и просыпается на первом же блоке, легшем в
+    /// файл.
+    ///
+    /// Начинается там, где начинается запрос: `Query::new()` без границ —
+    /// с начала истории, `since(...)` — с указанного момента, `since(ns.now())`
+    /// — с этой секунды. Отдельной ручки «только новое» нет: это и есть окно
+    /// запроса.
+    ///
+    /// Что подписке нельзя, то отвергается, а не подгоняется молча: обратный
+    /// порядок ([`Order::Newest`]) и верхняя граница окна. Дамп подписки не
+    /// принимает вовсе — его никто не дописывает.
+    ///
+    /// Неймспейсы, поднятые уже после начала подписки, подхватываются: сервис,
+    /// стартовавший позже вьюера, не должен требовать его перезапуска.
+    pub fn follow(&self, q: &Query) -> Result<Follow<'_>> {
+        let Source::Store(store) = &self.source else {
+            return Err(ReadError::NotFollowable(
+                "дамп никто не дописывает — подписываться не на что",
+            ));
+        };
+        if q.order == Order::Newest {
+            return Err(ReadError::NotFollowable(
+                "поток идёт от старого к новому: `Order::Newest` у него нечего означать",
+            ));
+        }
+        if q.to.is_some() {
+            return Err(ReadError::NotFollowable(
+                "у подписки нет верхней границы окна: она читает то, чего ещё нет",
+            ));
+        }
+
+        let pulse = Arc::clone(store.pulse());
+        // Отметка снимается ДО открытия курсоров: всё, что ляжет между этими
+        // двумя моментами, курсоры либо уже увидят сами, либо покажет первое
+        // же пробуждение. Обратный порядок терял бы такие записи до следующей
+        // отметки.
+        let seen = pulse.beat();
+
+        let epochs = self.epochs_now().into_owned();
+        let bounds = q.resolve(&epochs).bounds;
+        let OpenedCursors {
+            mut cursors,
+            schemas,
+            mut damaged,
+        } = self.open_cursors_with(q, &bounds, |scope| {
+            scope.liveness = crate::cursor::Liveness::Following;
+        })?;
+
+        let mut heads = BinaryHeap::with_capacity(cursors.len());
+        let mut queued = vec![false; cursors.len()];
+        let mut known = HashSet::with_capacity(cursors.len());
+        let mut unanchored: Vec<BootCounter> = Vec::new();
+        for (idx, cursor) in cursors.iter_mut().enumerate() {
+            known.insert((cursor.namespace.to_string(), cursor.channel));
+            for boot in cursor.unanchored() {
+                if !unanchored.contains(boot) {
+                    unanchored.push(*boot);
+                }
+            }
+            if let Some(head) = cursor.peek() {
+                heads.push(Head {
+                    at: head.at,
+                    idx,
+                    newest_first: false,
+                });
+                queued[idx] = true;
+            }
+        }
+        unanchored.sort_unstable();
+
+        // Затравка состояний — та же, что у `query`: ряд, не менявшийся с
+        // прошлой недели, иначе выглядел бы у живого графика пустым.
+        let seeds = if q.seed_states && q.from.is_some() {
+            self.collect_state_seeds(q, &bounds, &mut damaged, &epochs)?
+        } else {
+            Vec::new()
+        };
+
+        Ok(Follow {
+            reader: self,
+            query: q.clone(),
+            bounds,
+            epochs,
+            cursors,
+            schemas,
+            heads,
+            queued,
+            known,
+            damaged,
+            unanchored,
+            pulse,
+            seen,
+            seeds: seeds.into_iter(),
+            limit: q.limit.unwrap_or(usize::MAX),
+            yielded: 0,
+            ended: false,
+        })
+    }
+
+    /// Жив ли поток writer'а хранилища; у дампа писать некому по определению.
+    fn writer_alive(&self) -> bool {
+        match &self.source {
+            Source::Store(store) => store.writer_alive(),
+            Source::Dump { .. } => false,
+        }
+    }
+
     /// Выполнить запрос, собрав ответ целиком.
     ///
     /// Годится, когда объём ответа ограничен — `limit`, узкое окно, редкий тип
@@ -1051,7 +1406,11 @@ impl Reader {
                 // Сегменты прежних версий приводятся к текущей прямо при
                 // чтении: корректность ответа не ждёт физического прогона.
                 migrations: schema.as_ref().map(crate::cursor::MigrationCtx::of),
-                live: self.live(),
+                liveness: if self.live() {
+                    crate::cursor::Liveness::Live
+                } else {
+                    crate::cursor::Liveness::Frozen
+                },
             };
             adjust(&mut scope);
 

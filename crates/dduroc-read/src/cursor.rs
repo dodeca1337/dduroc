@@ -158,6 +158,35 @@ enum MigrationState {
     Chain(Vec<&'static Migration>),
 }
 
+/// Как курсор относится к тому, что сегмент могут дописывать прямо сейчас.
+///
+/// Различие не в том, что читается, а в том, чем считается недописанный хвост.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Liveness {
+    /// Дамп: дописывать его некому, поэтому любая недописанность — порча.
+    #[default]
+    Frozen,
+    /// Живое хранилище, разовый запрос: хвост, застигнутый на полуслове, не
+    /// показывается и порчей не считается — его увидит следующий запрос.
+    Live,
+    /// Живое хранилище, подписка: следующего запроса не будет, и пропустить
+    /// хвост значило бы потерять его навсегда. Поэтому недописанный блок
+    /// откладывается до тех пор, пока не долетит целиком.
+    Following,
+}
+
+impl Liveness {
+    /// Пишет ли кто-то в это хранилище прямо сейчас.
+    pub fn is_live(self) -> bool {
+        !matches!(self, Liveness::Frozen)
+    }
+
+    /// Вернётся ли курсор к отложенному хвосту.
+    pub fn is_following(self) -> bool {
+        matches!(self, Liveness::Following)
+    }
+}
+
 /// Курсор по записям одного сегмента.
 pub struct SegmentCursor {
     reader: SegmentReader,
@@ -178,6 +207,15 @@ pub struct SegmentCursor {
     migration: MigrationState,
     /// Блоки, которые не удалось прочитать.
     damaged: Vec<Damage>,
+    /// Отношение к недописанному хвосту.
+    liveness: Liveness,
+    /// Смещение, с которого продолжится скан хвоста, и ожидаемый там номер
+    /// блока: подписка дочитывает сегмент по мере роста, а не перечитывает
+    /// его целиком на каждую порцию.
+    scan_end: u64,
+    expected_seq: u32,
+    /// Сегмент запечатан: дописывать его больше некому, индекс блоков полон.
+    sealed: bool,
     /// Байтовое смещение новейшего блока незапечатанного сегмента при
     /// живом чтении.
     ///
@@ -204,7 +242,7 @@ impl SegmentCursor {
         expect_store: Option<u64>,
         prefilter: Option<Prefilter>,
         migrations: Option<MigrationCtx>,
-        live: bool,
+        liveness: Liveness,
     ) -> Result<Self> {
         let reader = SegmentReader::open(path).map_err(ReadError::Engine)?;
         if let Some(id) = expect_store
@@ -272,12 +310,17 @@ impl SegmentCursor {
         // сэмпл ссылался на локальный номер серии, определение которого лежало
         // в потоке ПЕРЕД ним, то есть при чтении с конца — уже позади.
         let unsealed = reader.footer().is_none();
+        let mut scan_end = u64::MAX;
+        let mut expected_seq = 0;
         let mut offsets: Vec<u64> = match reader.footer() {
             Some(footer) => footer.blocks.iter().map(|b| b.offset).collect(),
             None => {
                 // Скан заодно ловит разрыв нумерации блоков: тела разбирать
                 // для этого не нужно, номер лежит в заголовке.
-                let (offsets, stopped) = reader.scan_block_offsets();
+                let scan = reader.scan_block_offsets_from(SegmentReader::first_block_offset(), 0);
+                let (offsets, stopped) = (scan.offsets, scan.stopped);
+                scan_end = scan.end;
+                expected_seq = scan.next_seq;
                 // Обрыв скана незапечатанного сегмента при живом чтении —
                 // не повреждение, а настоящее время: writer дописывает хвост
                 // (блок, footer при запечатывании), и читатель застал его на
@@ -285,7 +328,7 @@ impl SegmentCursor {
                 // доедет к следующему запросу. У дампа тот же обрыв — порча
                 // или потеря питания, и о нём сообщается.
                 if let Some((offset, reason)) = stopped
-                    && !live
+                    && !liveness.is_live()
                 {
                     damaged.push(Damage {
                         path: path.to_owned(),
@@ -296,7 +339,7 @@ impl SegmentCursor {
                 offsets
             }
         };
-        let live_tail_offset = if live && unsealed {
+        let live_tail_offset = if liveness.is_live() && unsealed {
             offsets.last().copied()
         } else {
             None
@@ -316,8 +359,70 @@ impl SegmentCursor {
             prefilter,
             migration,
             damaged,
+            liveness,
+            scan_end,
+            expected_seq,
+            sealed: !unsealed,
             live_tail_offset,
         })
+    }
+
+    /// Дочитать хвост сегмента, который пишется прямо сейчас.
+    ///
+    /// `true` — появились новые блоки. Читатель сегмента открывается заново, а
+    /// не переиспользуется: у открытого запомнены длина файла и конец данных, а
+    /// под ним файл и растёт (новые блоки), и укорачивается (сегмент отпущен по
+    /// бездействию либо запечатан). Открытие стоит трёх системных вызовов —
+    /// дешевле любой попытки угадать, что из этого случилось.
+    pub fn extend(&mut self) -> bool {
+        if self.sealed || self.reverse {
+            return false;
+        }
+        let Ok(reader) = SegmentReader::open(&self.path) else {
+            // Файла больше нет. Данных, которые «пропали», тоже нет: в
+            // вытесненный сегмент никто уже не писал. Непрочитанные блоки,
+            // если они были, доносит `fill` отказами чтения.
+            self.sealed = true;
+            return false;
+        };
+        let grew = match reader.footer() {
+            Some(footer) => {
+                // Сегмент запечатан: индекс блоков стал авторитетным, и
+                // недописанности в нём больше нет — значит, и терпеть её
+                // больше нельзя.
+                let before = self.offsets.len();
+                for b in &footer.blocks {
+                    if b.offset >= self.scan_end {
+                        self.offsets.push(b.offset);
+                    }
+                }
+                self.sealed = true;
+                self.live_tail_offset = None;
+                self.offsets.len() != before
+            }
+            None => {
+                let scan = reader.scan_block_offsets_from(self.scan_end, self.expected_seq);
+                let grew = !scan.offsets.is_empty();
+                self.offsets.extend_from_slice(&scan.offsets);
+                self.scan_end = scan.end;
+                self.expected_seq = scan.next_seq;
+                // Терпимость переезжает на новый хвост: прежний, если за ним
+                // встал следующий блок, дописан и обязан читаться как обычный.
+                self.live_tail_offset = self.offsets.last().copied();
+                grew
+            }
+        };
+        self.reader = reader;
+        grew
+    }
+
+    /// Забрать накопленные повреждения, оставив список пустым.
+    ///
+    /// Подписка живёт долго и о повреждении сообщает один раз: список, который
+    /// только растёт, повторял бы одно и то же повреждение в каждой порции и
+    /// рос бы без предела.
+    pub fn take_damage(&mut self) -> Vec<Damage> {
+        std::mem::take(&mut self.damaged)
     }
 
     /// Курсор, который не отдаст ни записи, — для сегментов, которые нельзя
@@ -334,6 +439,10 @@ impl SegmentCursor {
             prefilter: None,
             migration: MigrationState::None,
             damaged,
+            liveness: Liveness::Frozen,
+            scan_end: u64::MAX,
+            expected_seq: 0,
+            sealed: true,
             live_tail_offset: None,
         }
     }
@@ -455,14 +564,27 @@ impl SegmentCursor {
 
             // Живой хвост: скан видел заголовок блока, но тело могло ещё не
             // долететь — заголовок и тело кладутся одним write, а страницы
-            // становятся видимыми читателю без гарантии целиком. Такой блок
-            // молча пропускается: к следующему запросу он будет дописан.
+            // становятся видимыми читателю без гарантии целиком. Разовый
+            // запрос такой блок молча пропускает: его увидит следующий. У
+            // подписки следующего запроса нет, поэтому она откладывает блок и
+            // возвращается к нему, когда он долетит целиком.
             let tolerate_tear = self.live_tail_offset == Some(offset);
+            let defer_tear = tolerate_tear && self.liveness.is_following();
 
             match self.reader.read_block_at(offset, &mut buf) {
                 Ok(Some(_)) => {}
-                Ok(None) => continue,
+                Ok(None) => {
+                    if defer_tear {
+                        self.next_block -= 1;
+                        return false;
+                    }
+                    continue;
+                }
                 Err(e) => {
+                    if defer_tear {
+                        self.next_block -= 1;
+                        return false;
+                    }
                     // Битый блок не обрывает сегмент: остальные блоки
                     // адресуются независимо, и терять их незачем.
                     if !tolerate_tear {
@@ -478,8 +600,18 @@ impl SegmentCursor {
 
             let block = match parse_block(&buf) {
                 Ok(Some(b)) => b,
-                Ok(None) => continue,
+                Ok(None) => {
+                    if defer_tear {
+                        self.next_block -= 1;
+                        return false;
+                    }
+                    continue;
+                }
                 Err(e) => {
+                    if defer_tear {
+                        self.next_block -= 1;
+                        return false;
+                    }
                     if !tolerate_tear {
                         self.damaged.push(Damage {
                             path: self.path.clone(),
@@ -551,6 +683,14 @@ impl SegmentCursor {
             // Обрыв разбора записей внутри блока: у живого хвоста это та же
             // недописанность (кадры записей рвутся на границе долетевшего),
             // и записи до обрыва остаются в выборке как есть.
+            if broken.is_some() && defer_tear {
+                // Половина блока не отдаётся даже подписке: вернувшись к нему
+                // целому, она выдала бы эти записи второй раз.
+                self.buffered.clear();
+                self.pos = 0;
+                self.next_block -= 1;
+                return false;
+            }
             if let Some(reason) = broken
                 && !tolerate_tear
             {
@@ -585,9 +725,13 @@ pub struct ChannelCursor {
     prefilter: Option<Prefilter>,
     require_metrics: Option<Arc<std::collections::HashSet<dduroc_format::MetricId>>>,
     migrations: Option<MigrationCtx>,
-    live: bool,
+    liveness: Liveness,
+    /// Запуск, которым ограничен отбор: подписка перечисляет каталог снова и
+    /// обязана отбирать сегменты тем же правилом, что и при открытии.
+    boot: Option<BootCounter>,
     /// Новейший сегмент листинга: при живом чтении он мог быть застигнут в
-    /// момент рождения (файл создан, заголовок ещё не дописан).
+    /// момент рождения (файл создан, заголовок ещё не дописан). У подписки он
+    /// же — граница, за которой начинается неперечисленное.
     newest: Option<SegmentName>,
     damaged: Vec<Damage>,
     /// Запуски, чьи сегменты пришлось пропустить: окно настенное, якоря нет.
@@ -622,7 +766,7 @@ pub struct ChannelScope {
     /// Версия схемы и шаги миграции: сегменты прежних версий читаются через
     /// цепочку. `None` — схема неизвестна, записи идут как есть.
     pub migrations: Option<MigrationCtx>,
-    /// Хранилище прямо сейчас пишется этим же процессом.
+    /// Пишется ли хранилище прямо сейчас и вернётся ли курсор за добавкой.
     ///
     /// Живое чтение обязано терпеть два штатных совпадения, которые у дампа
     /// означали бы порчу: сегмент, вытесненный ротацией между листингом и
@@ -631,7 +775,7 @@ pub struct ChannelScope {
     /// момент (страница видна читателю раньше, чем запись легла целиком).
     /// У дампа ни того, ни другого не бывает, и там те же признаки честно
     /// доносятся как повреждение.
-    pub live: bool,
+    pub liveness: Liveness,
 }
 
 /// Отобрать сегменты, которые могут содержать записи из окна.
@@ -732,7 +876,8 @@ impl ChannelCursor {
             prefilter: scope.prefilter.clone(),
             require_metrics: scope.require_metrics.clone(),
             migrations: scope.migrations,
-            live: scope.live,
+            liveness: scope.liveness,
+            boot,
             newest,
             damaged: Vec::new(),
             unanchored,
@@ -772,6 +917,9 @@ impl ChannelCursor {
             if has {
                 return self.current.as_mut().and_then(|c| c.peek());
             }
+            if self.holds_the_live_segment() {
+                return None;
+            }
             self.finish_current();
         }
     }
@@ -784,8 +932,66 @@ impl ChannelCursor {
             if let Some(item) = self.current.as_mut().and_then(|c| c.next_entry()) {
                 return Some(item);
             }
+            if self.holds_the_live_segment() {
+                return None;
+            }
             self.finish_current();
         }
+    }
+
+    /// Держит ли курсор сегмент, в который прямо сейчас пишут.
+    ///
+    /// Такой сегмент нельзя закрывать, дочитав до конца: подписка вернётся к
+    /// нему за добавкой. Признак — за ним не перечислено ни одного следующего:
+    /// писатель, заведя новый сегмент, к прежнему уже не вернётся.
+    fn holds_the_live_segment(&self) -> bool {
+        self.liveness.is_following() && self.next_segment >= self.segments.len()
+    }
+
+    /// Дочитать то, что появилось с прошлого раза. `true` — появилось.
+    ///
+    /// Две разные цены: дочитать хвост открытого сегмента — это открытие файла
+    /// и чтение свежих блоков, а заметить новый сегмент — обход каталога.
+    /// Поэтому обход делается не всегда, а только когда хранилище объявило,
+    /// что каталоги менялись (`relist`): пока писатель льёт в тот же файл,
+    /// подписка не делает ни одного `readdir`.
+    pub fn extend(&mut self, relist: bool) -> bool {
+        let grew = self.current.as_mut().is_some_and(|c| c.extend());
+        // Перечислять всё равно приходится: сегмент мог смениться ровно между
+        // двумя пробуждениями, и тогда рост хвоста ничего не значит.
+        if relist { self.relist() || grew } else { grew }
+    }
+
+    /// Перечислить каталог снова и добавить сегменты, появившиеся после.
+    fn relist(&mut self) -> bool {
+        if self.reverse {
+            return false;
+        }
+        let Ok(all) = dduroc_engine::rotation::Inventory::scan_names(&self.dir) else {
+            return false;
+        };
+        let selected = select_segments(&all, &self.bounds, self.boot, &mut self.unanchored);
+        let mut grew = false;
+        for name in selected {
+            // Строго новее всего перечисленного: список растёт только с конца,
+            // а `next_segment` — индекс в нём, и вставка в середину увела бы
+            // подписку на уже прочитанное.
+            if Some(name) > self.newest {
+                self.segments.push(name);
+                self.newest = Some(name);
+                grew = true;
+            }
+        }
+        grew
+    }
+
+    /// Забрать накопленные повреждения, оставив списки пустыми.
+    pub fn take_damage(&mut self) -> Vec<Damage> {
+        let mut out = std::mem::take(&mut self.damaged);
+        if let Some(c) = &mut self.current {
+            out.append(&mut c.take_damage());
+        }
+        out
     }
 
     /// Версия протокола текущего сегмента: миграции применяются при чтении,
@@ -816,7 +1022,7 @@ impl ChannelCursor {
                 self.expect_store,
                 self.prefilter.clone(),
                 self.migrations,
-                self.live,
+                self.liveness,
             ) {
                 Ok(mut c) => {
                     // Сегмент, в котором заведомо нет нужных метрик, не
@@ -842,7 +1048,7 @@ impl ChannelCursor {
                     // И новейший сегмент, застигнутый в момент рождения:
                     // файл уже создан, а заголовок ещё не дописан — данных в
                     // нём ещё нет, к следующему запросу он будет готов.
-                    if self.live && (is_not_found(&e) || Some(name) == self.newest) {
+                    if self.liveness.is_live() && (is_not_found(&e) || Some(name) == self.newest) {
                         continue;
                     }
                     // Сегмент, который не открылся, не должен прекращать
@@ -1056,9 +1262,9 @@ mod tests {
         sealed_segment(dir.path(), &[100, 200]);
         let later = sealed_segment(dir.path(), &[900]);
 
-        let run = |live: bool| {
+        let run = |liveness: Liveness| {
             let scope = ChannelScope {
-                live,
+                liveness,
                 ..ChannelScope::default()
             };
             let mut c =
@@ -1073,12 +1279,12 @@ mod tests {
             (times, c.damaged())
         };
 
-        let (times, damaged) = run(true);
+        let (times, damaged) = run(Liveness::Live);
         assert_eq!(times, vec![100, 200], "уцелевшие сегменты читаются");
         assert!(damaged.is_empty(), "вытеснение — не порча: {damaged:?}");
 
         sealed_segment(dir.path(), &[900]);
-        let (times, damaged) = run(false);
+        let (times, damaged) = run(Liveness::Frozen);
         assert_eq!(times, vec![100, 200]);
         assert_eq!(damaged.len(), 1, "у дампа исчезнувший файл — повреждение");
     }
@@ -1135,7 +1341,7 @@ mod tests {
             .path()
             .join(SegmentName::new(BootCounter(0), Micros(100)).to_string());
 
-        let mut live = SegmentCursor::open(&path, false, None, None, None, true).unwrap();
+        let mut live = SegmentCursor::open(&path, false, None, None, None, Liveness::Live).unwrap();
         let mut times = Vec::new();
         while let Some(e) = live.next_entry() {
             times.push(e.at.at.0);
@@ -1143,9 +1349,200 @@ mod tests {
         assert_eq!(times, vec![100], "целый блок читается, рваный хвост ждёт");
         assert!(live.damaged().is_empty(), "{:?}", live.damaged());
 
-        let mut dump = SegmentCursor::open(&path, false, None, None, None, false).unwrap();
+        let mut dump =
+            SegmentCursor::open(&path, false, None, None, None, Liveness::Frozen).unwrap();
         while dump.next_entry().is_some() {}
         assert_eq!(dump.damaged().len(), 1, "у дампа рваный блок — порча");
+    }
+
+    #[test]
+    fn a_torn_tail_is_kept_for_the_subscription_instead_of_stepped_over() {
+        // Разовый запрос пропускает недописанный хвост потому, что его увидит
+        // СЛЕДУЮЩИЙ запрос. У подписки следующего запроса нет: пройдя мимо,
+        // она потеряла бы эти записи навсегда. Поэтому она откладывает блок и
+        // возвращается к нему, когда тот долетит целиком.
+        use std::os::unix::fs::FileExt;
+
+        let (path, tail_offset, whole_tail) = segment_with_a_half_written_tail();
+
+        // Подписка: целый блок отдан, рваный отложен — и повреждением не
+        // объявлен, потому что он ещё не данные.
+        let mut following =
+            SegmentCursor::open(&path, false, None, None, None, Liveness::Following).unwrap();
+        let mut times = Vec::new();
+        while let Some(e) = following.next_entry() {
+            times.push(e.at.at.0);
+        }
+        assert_eq!(times, vec![100], "рваный хвост не отдаётся половиной");
+        assert!(following.damaged().is_empty(), "{:?}", following.damaged());
+
+        // Разовый запрос на том же месте: хвост пропущен НАСОВСЕМ.
+        let mut once = SegmentCursor::open(&path, false, None, None, None, Liveness::Live).unwrap();
+        while once.next_entry().is_some() {}
+
+        // Writer дописал блок.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(&whole_tail, tail_offset)
+            .unwrap();
+
+        following.extend();
+        let mut rest = Vec::new();
+        while let Some(e) = following.next_entry() {
+            rest.push(e.at.at.0);
+        }
+        assert_eq!(rest, vec![200], "долетевший блок обязан достаться подписке");
+        assert!(following.damaged().is_empty(), "{:?}", following.damaged());
+
+        once.extend();
+        assert!(
+            once.next_entry().is_none(),
+            "разовому запросу этот блок покажет следующий запрос, а не этот"
+        );
+    }
+
+    #[test]
+    fn a_growing_segment_is_read_further_without_being_reopened() {
+        // Сегмент, в который пишут, дочитывается по мере роста: подписка не
+        // перечитывает файл с начала — иначе восьмимегабайтный сегмент
+        // вычитывался бы целиком на каждую порцию свежих записей.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut seg, mut builder, record) = growing_segment(dir.path());
+        let mut out = Vec::new();
+
+        builder.push(Micros(100), &record).unwrap();
+        builder
+            .finish(seg.next_seq(), dduroc_format::Compression::None, &mut out)
+            .unwrap();
+        seg.append_block(&out).unwrap();
+
+        let path = dir
+            .path()
+            .join(SegmentName::new(BootCounter(0), Micros(100)).to_string());
+        let mut c =
+            SegmentCursor::open(&path, false, None, None, None, Liveness::Following).unwrap();
+        assert_eq!(c.next_entry().map(|e| e.at.at.0), Some(100));
+        assert!(c.next_entry().is_none(), "пока это всё, что написано");
+
+        out.clear();
+        builder.push(Micros(200), &record).unwrap();
+        builder
+            .finish(seg.next_seq(), dduroc_format::Compression::None, &mut out)
+            .unwrap();
+        seg.append_block(&out).unwrap();
+
+        assert!(c.extend(), "дописанный блок обязан найтись");
+        assert_eq!(c.next_entry().map(|e| e.at.at.0), Some(200));
+    }
+
+    #[test]
+    fn a_subscription_holds_the_live_segment_and_picks_up_the_next_one() {
+        // Дочитав сегмент до конца, подписка не имеет права его закрыть: в
+        // него ещё пишут, а вместе с курсором сегмента пропало бы и место, с
+        // которого дочитывать. Закрыть его можно, только когда перечислен
+        // следующий: писатель, заведя новый файл, к прежнему не вернётся.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut seg, mut builder, record) = growing_segment(dir.path());
+        let mut out = Vec::new();
+        let mut write = |at: u64, seg: &mut dduroc_engine::segment::SegmentWriter| {
+            out.clear();
+            builder.push(Micros(at), &record).unwrap();
+            builder
+                .finish(seg.next_seq(), dduroc_format::Compression::None, &mut out)
+                .unwrap();
+            seg.append_block(&out).unwrap();
+        };
+        write(100, &mut seg);
+
+        let scope = ChannelScope {
+            liveness: Liveness::Following,
+            ..ChannelScope::default()
+        };
+        let mut c = ChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
+            .unwrap();
+        assert_eq!(c.next_entry().map(|e| e.at.at.0), Some(100));
+        assert!(c.next_entry().is_none(), "пока это всё, что написано");
+
+        // Тот же файл дорос: каталог не менялся, обходить его незачем.
+        write(200, &mut seg);
+        assert!(c.extend(false), "дописанный хвост живого сегмента");
+        assert_eq!(c.next_entry().map(|e| e.at.at.0), Some(200));
+
+        // Ротация: писатель запечатал прежний сегмент и завёл следующий.
+        drop(seg);
+        sealed_segment(dir.path(), &[900]);
+        assert!(
+            !c.extend(false),
+            "без объявления о смене каталогов подписка их не обходит"
+        );
+        assert!(c.extend(true), "объявили — обошла и нашла");
+        assert_eq!(c.next_entry().map(|e| e.at.at.0), Some(900));
+    }
+
+    /// Незапечатанный сегмент, готовый принимать блоки, вместе с накопителем.
+    fn growing_segment(
+        dir: &Path,
+    ) -> (
+        dduroc_engine::segment::SegmentWriter,
+        dduroc_format::block::BlockBuilder,
+        Record<'static>,
+    ) {
+        use dduroc_format::record::Message;
+        use dduroc_format::segment::SegmentHeader;
+        use dduroc_format::{EventId, ProtocolVersion};
+
+        let header = SegmentHeader {
+            protocol_version: ProtocolVersion(1),
+            boot: BootCounter(0),
+            base: Micros(100),
+            store_id: 0,
+        };
+        let seg = dduroc_engine::segment::SegmentWriter::create(dir, header, 1 << 20).unwrap();
+        let record = Record::Message(Message {
+            event: EventId(1),
+            span: None,
+            payload: &[0xAB; 4],
+        });
+        (seg, dduroc_format::block::BlockBuilder::new(), record)
+    }
+
+    /// Сегмент, чей последний блок дошёл до носителя наполовину — ровно так
+    /// выглядит блок, чей `write` читатель застал на полуслове. Возвращает
+    /// путь, смещение хвоста и его целые байты.
+    fn segment_with_a_half_written_tail() -> (PathBuf, u64, Vec<u8>) {
+        use std::os::unix::fs::FileExt;
+
+        // tempdir живёт до конца процесса: путь возвращается наружу.
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let (mut seg, mut builder, record) = growing_segment(dir.path());
+        let mut out = Vec::new();
+
+        builder.push(Micros(100), &record).unwrap();
+        builder
+            .finish(seg.next_seq(), dduroc_format::Compression::None, &mut out)
+            .unwrap();
+        seg.append_block(&out).unwrap();
+
+        let mut tail = Vec::new();
+        builder.push(Micros(200), &record).unwrap();
+        builder
+            .finish(seg.next_seq(), dduroc_format::Compression::None, &mut tail)
+            .unwrap();
+        let tail_offset = seg.data_end();
+        drop(seg);
+
+        let path = dir
+            .path()
+            .join(SegmentName::new(BootCounter(0), Micros(100)).to_string());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(&tail[..tail.len() / 2], tail_offset)
+            .unwrap();
+        (path, tail_offset, tail)
     }
 
     /// Запечатанный сегмент, в котором каждый блок — одна запись с указанным
@@ -1303,7 +1700,8 @@ mod tests {
             ],
         );
 
-        let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx), false).unwrap();
+        let mut c =
+            SegmentCursor::open(&path, false, None, None, Some(ctx), Liveness::Frozen).unwrap();
         let got: Vec<RawEntry> = std::iter::from_fn(|| c.next_entry()).collect();
         assert!(c.damaged().is_empty(), "{:?}", c.damaged());
 
@@ -1347,7 +1745,8 @@ mod tests {
                 }),
             )],
         );
-        let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx), false).unwrap();
+        let mut c =
+            SegmentCursor::open(&path, false, None, None, Some(ctx), Liveness::Frozen).unwrap();
         match &c.next_entry().unwrap().record {
             OwnedRecord::Message { payload, .. } => {
                 assert_eq!(payload, &fresh, "текущая версия не трогается");
@@ -1383,7 +1782,8 @@ mod tests {
             current_version: 2,
             steps: &[],
         };
-        let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx), false).unwrap();
+        let mut c =
+            SegmentCursor::open(&path, false, None, None, Some(ctx), Liveness::Frozen).unwrap();
         assert!(c.next_entry().is_none(), "записей из будущего не выдаётся");
         let damaged = c.damaged();
         assert_eq!(damaged.len(), 1);
@@ -1395,7 +1795,7 @@ mod tests {
 
         // Без контекста миграций (схемы нет вовсе) поведение прежнее: записи
         // выдаются как есть — их разбирает тот, у кого схема есть.
-        let mut c = SegmentCursor::open(&path, false, None, None, None, false).unwrap();
+        let mut c = SegmentCursor::open(&path, false, None, None, None, Liveness::Frozen).unwrap();
         assert!(c.next_entry().is_some());
     }
 
@@ -1447,7 +1847,8 @@ mod tests {
             current_version: 2,
             steps: STEPS,
         };
-        let mut c = SegmentCursor::open(&path, false, None, None, Some(ctx), false).unwrap();
+        let mut c =
+            SegmentCursor::open(&path, false, None, None, Some(ctx), Liveness::Frozen).unwrap();
         let got: Vec<RawEntry> = std::iter::from_fn(|| c.next_entry()).collect();
         assert_eq!(got.len(), 1, "уцелевшая запись читается");
         let damaged = c.damaged();
@@ -1471,7 +1872,8 @@ mod tests {
         let path = sealed_segment(dir.path(), &times);
 
         let read = |reverse: bool, from: Option<u64>, to: Option<u64>| -> Vec<u64> {
-            let mut c = SegmentCursor::open(&path, reverse, None, None, None, false).unwrap();
+            let mut c =
+                SegmentCursor::open(&path, reverse, None, None, None, Liveness::Frozen).unwrap();
             assert_eq!(c.offsets.len(), times.len(), "иначе тест не про отбор");
             c.clip_to_window(from.map(Micros), to.map(Micros));
             std::iter::from_fn(|| c.next_entry())
