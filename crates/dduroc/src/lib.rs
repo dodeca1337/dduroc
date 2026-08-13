@@ -342,18 +342,20 @@ impl SpanExt for SpanGuard {
 /// хранилище называть по второму разу незачем: корни и схемы у него уже есть.
 #[cfg(feature = "read")]
 pub trait StoreExt {
-    /// Читатель этого хранилища: корни (включая вынесенные носители классов)
-    /// и схемы поднятых неймспейсов берутся у него самого.
+    /// Живой читатель этого хранилища: параллелен записи по построению.
     ///
+    /// Создаётся один раз и живёт сколько нужно — правду (корни, схемы,
+    /// якоря времени) он спрашивает у хранилища на каждый запрос, а ротация
+    /// и дописываемый хвост сегмента для него штатные события, а не порча.
     /// Видно то, что уже на носителе; свежие записи сперва вытолкнуть
-    /// [`Store::sync`].
-    fn reader(&self) -> read::Result<read::Reader>;
+    /// [`Store::sync`]. Подробности — [`read::Reader::of_store`].
+    fn reader(&self) -> read::Reader;
 }
 
 #[cfg(feature = "read")]
-impl StoreExt for Store {
+impl StoreExt for std::sync::Arc<Store> {
     #[inline]
-    fn reader(&self) -> read::Result<read::Reader> {
+    fn reader(&self) -> read::Reader {
         read::Reader::of_store(self)
     }
 }

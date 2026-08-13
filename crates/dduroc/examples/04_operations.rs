@@ -296,7 +296,7 @@ fn vault(
     // Своё хранилище читается им самим: корни (оба!) и схемы поднятых
     // неймспейсов у него уже есть. Назвать раздел критики второй раз можно
     // только забыв — и тогда история молча оказалась бы короче.
-    let reader = store.reader()?;
+    let reader = store.reader();
     let read = reader.query(&Query::new().kinds(KindFilter::LOGS).order(Order::Oldest))?;
     for e in &read.entries {
         println!(

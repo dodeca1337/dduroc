@@ -12,7 +12,7 @@ use dduroc_format::{BootCounter, BootTime, EventId, Level, MetricId, SpanId, Val
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Сколько сегментов назад искать состояние на левый край окна.
 ///
@@ -198,6 +198,9 @@ pub struct EntryStream<'a> {
     reader: &'a Reader,
     /// Копия запроса: разбор записи сверяется с фильтром на каждой.
     query: Query,
+    /// Снимок эпох на весь поток: границы окна и UTC записей считаются
+    /// одними якорями, даже если у живого хранилища они меняются под ногами.
+    epochs: Epochs,
     bounds: Bounds,
     cursors: Vec<ChannelCursor>,
     /// Схема на каждый курсор, в том же порядке.
@@ -253,10 +256,14 @@ impl Iterator for EntryStream<'_> {
 
             let ns = std::sync::Arc::clone(&self.cursors[idx].namespace);
             let ch = std::sync::Arc::clone(&self.cursors[idx].channel);
-            if let Some(entry) =
-                self.reader
-                    .build_entry(ns, ch, self.schemas[idx].as_ref(), &raw, &self.query)
-            {
+            if let Some(entry) = self.reader.build_entry(
+                ns,
+                ch,
+                self.schemas[idx].as_ref(),
+                &raw,
+                &self.query,
+                &self.epochs,
+            ) {
                 // Обрезка объявляется, только когда очередная запись
                 // действительно **есть**, а места в ответе уже нет. Ставить
                 // отметку при входе значило бы объявлять обрезанным всякий
@@ -369,17 +376,40 @@ impl NamespaceListing {
     }
 }
 
+/// Откуда читатель берёт правду о хранилище.
+#[derive(Debug)]
+enum Source {
+    /// Живое хранилище этого же процесса: корни, схемы и эпохи спрашиваются
+    /// у него в момент каждого запроса — устареть им не из чего. Хранилище
+    /// удерживается живым, как его удерживает и ручка неймспейса.
+    Store(Arc<Store>),
+    /// Дамп: всё прочитано с диска при открытии и заморожено. Для дампа это
+    /// не изъян, а определение — его никто не дописывает.
+    Dump { root: PathBuf, epochs: Epochs },
+}
+
 /// Читатель хранилища.
+///
+/// Живёт в двух режимах, и различие между ними — источник правды:
+///
+/// - **живой** ([`Reader::of_store`]) — читает хранилище, которое этот же
+///   процесс пишет прямо сейчас. Работать параллельно с записью — его
+///   определение: каждый запрос видит свежие корни, схемы и якоря времени,
+///   ротация под ногами и дописываемый хвост сегмента — штатные события,
+///   а не порча;
+/// - **дамп** ([`Reader::open`]) — снимок, который никто не дописывает:
+///   всё прочитано при открытии, и любой признак недописанности честно
+///   доносится как повреждение.
 #[derive(Debug)]
 pub struct Reader {
-    root: PathBuf,
+    source: Source,
     /// Дополнительные корни: классы хранения могут жить на своих носителях
     /// (критический — на защищённом разделе), и их деревья `<ns>/<канал>`
     /// сливаются с основным при чтении.
     extra_roots: Vec<PathBuf>,
-    /// Схемы приложения по имени: без них записи остаются идентификаторами.
+    /// Схемы, названные руками (при открытии и [`Reader::with_schema`]).
+    /// Живой читатель поверх них видит схемы поднятых неймспейсов.
     schemas: HashMap<String, Schema>,
-    epochs: Epochs,
     /// Идентичность хранилища; `None` — не проверять (чтение чужого дампа
     /// разрешено явно).
     store_id: Option<u64>,
@@ -392,49 +422,116 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// Открыть хранилище на чтение.
+    /// Открыть дамп хранилища на чтение.
     ///
     /// Только чтение: ни восстановления, ни уборки временных файлов. Вьюер
-    /// не имеет права изменять дамп, который ему дали посмотреть.
+    /// не имеет права изменять дамп, который ему дали посмотреть. `Store`
+    /// для дампа не открывают вовсе — тот берёт блокировку корня и подметает
+    /// временные файлы, поэтому корни и схемы называются руками.
+    ///
+    /// Хранилищу, которое пишет этот же процесс, нужен [`Reader::of_store`]:
+    /// снимок эпох и схем, сделанный здесь, устаревает первой же
+    /// синхронизацией времени или подъёмом нового неймспейса.
     pub fn open(root: impl Into<PathBuf>, schemas: &[Schema]) -> Result<Self> {
         let root = root.into();
         let epochs = EpochStore::open_read_only(&root).unwrap_or_default();
         let store_id = read_store_id(&root);
         Ok(Self {
-            root,
+            source: Source::Dump { root, epochs },
             extra_roots: Vec::new(),
             schemas: schemas.iter().map(|s| (s.name.to_owned(), *s)).collect(),
-            epochs,
             store_id,
             schema_cache: RwLock::new(HashMap::new()),
         })
     }
 
-    /// Читатель открытого хранилища: корни и схемы берутся у него самого.
+    /// Живой читатель: параллелен записи по построению.
     ///
-    /// Это нормальный способ читать своё собственное хранилище — на приборе,
-    /// где то же приложение и пишет. [`Reader::open`] остаётся для чужого
-    /// дампа: там `Store` открывать нельзя (он берёт блокировку корня и
-    /// подметает временные файлы), и корни со схемами называют руками.
+    /// Правда берётся у самого хранилища в момент **каждого запроса**, а не
+    /// при создании читателя, поэтому создать его можно один раз при старте
+    /// и держать сколько угодно:
     ///
-    /// Существенно, что корни приходят от хранилища: вынесенный на свой
-    /// носитель класс ([`ChannelConfig::custom_root`]) — это второе дерево, и
-    /// читатель, которому о нём не сказали, показал бы историю без критики,
-    /// ничем не выдав пропажу. Забыть об этом здесь не из чего.
+    /// - корни — все, включая вынесенные носители классов
+    ///   ([`ChannelConfig::custom_root`]): читатель, которому назвали не все
+    ///   деревья, показывал бы историю без критики, ничем не выдав пропажу;
+    /// - схемы — поднятых к этому моменту неймспейсов: сервис, стартовавший
+    ///   после создания читателя, читается с текстами, а не голыми id;
+    /// - эпохи — с якорями на этот момент: синхронизация времени ретроактивна,
+    ///   и запрос после неё показывает UTC у записей, сделанных до.
+    ///
+    /// Внутри одного запроса снимок один: все записи ответа переведены в UTC
+    /// одними и теми же якорями.
+    ///
+    /// Ротация и дописывание не мешают чтению: сегмент, вытесненный между
+    /// листингом и открытием, молча пропускается (его данные вытеснены, а не
+    /// потеряны), недописанный хвост живого сегмента — «ещё не данные», а не
+    /// порча. У дампа то и другое честно объявляется повреждением.
     ///
     /// Видно ровно то, что уже на носителе: записи, ещё лежащие в очереди
     /// writer'а, не видны никакому читателю — их сперва надо вытолкнуть
-    /// ([`Store::sync`]).
+    /// ([`Store::sync`]). Читатель держит хранилище живым, как держит его
+    /// ручка неймспейса.
     ///
     /// [`ChannelConfig::custom_root`]: dduroc_engine::channel::ChannelConfig::custom_root
-    pub fn of_store(store: &Store) -> Result<Self> {
-        let roots = store.roots();
-        let mut reader = Self::open(store.root(), &store.schemas())?;
-        // Первый корень — основной, он уже стоит в `root`.
-        for extra in roots.iter().skip(1) {
-            reader = reader.with_extra_root(extra);
+    pub fn of_store(store: &Arc<Store>) -> Self {
+        let store_id = store.meta().store_id;
+        Self {
+            source: Source::Store(Arc::clone(store)),
+            extra_roots: Vec::new(),
+            schemas: HashMap::new(),
+            store_id: Some(store_id),
+            schema_cache: RwLock::new(HashMap::new()),
         }
-        Ok(reader)
+    }
+
+    /// Живой ли это читатель — см. [`Reader::of_store`].
+    fn live(&self) -> bool {
+        matches!(self.source, Source::Store(_))
+    }
+
+    /// Все корни хранилища в порядке обхода; первый — основной.
+    fn all_roots(&self) -> Vec<PathBuf> {
+        let mut roots = match &self.source {
+            Source::Store(store) => store.roots().to_vec(),
+            Source::Dump { root, .. } => vec![root.clone()],
+        };
+        roots.extend(self.extra_roots.iter().cloned());
+        roots
+    }
+
+    /// Эпохи на этот момент: у живого читателя — из памяти хранилища, у
+    /// дампа — снимок открытия. Берутся один раз на запрос: все записи
+    /// одного ответа обязаны быть переведены в UTC одними якорями.
+    fn epochs_now(&self) -> std::borrow::Cow<'_, Epochs> {
+        match &self.source {
+            Source::Store(store) => std::borrow::Cow::Owned(store.epochs()),
+            Source::Dump { epochs, .. } => std::borrow::Cow::Borrowed(epochs),
+        }
+    }
+
+    /// Схема по имени: названные руками — прежде всего (они — явное решение
+    /// вызывающего), затем схемы поднятых неймспейсов живого хранилища.
+    fn schema_by_name(&self, name: &str) -> Option<Schema> {
+        if let Some(s) = self.schemas.get(name) {
+            return Some(*s);
+        }
+        match &self.source {
+            Source::Store(store) => store.schemas().into_iter().find(|s| s.name == name),
+            Source::Dump { .. } => None,
+        }
+    }
+
+    /// Все известные схемы: названные руками плюс — у живого читателя —
+    /// схемы поднятых неймспейсов.
+    fn all_schemas(&self) -> Vec<Schema> {
+        let mut out: HashMap<&'static str, Schema> = match &self.source {
+            Source::Store(store) => store.schemas().into_iter().map(|s| (s.name, s)).collect(),
+            Source::Dump { .. } => HashMap::new(),
+        };
+        for s in self.schemas.values() {
+            out.insert(s.name, *s);
+        }
+        out.into_values().collect()
     }
 
     /// Добавить корень, в котором живут каналы вынесенных классов хранения.
@@ -469,12 +566,18 @@ impl Reader {
         self
     }
 
+    /// Основной корень хранилища.
     pub fn root(&self) -> &Path {
-        &self.root
+        match &self.source {
+            Source::Store(store) => store.root(),
+            Source::Dump { root, .. } => root,
+        }
     }
 
-    pub fn epochs(&self) -> &Epochs {
-        &self.epochs
+    /// Эпохи на этот момент. У живого читателя ответ меняется от вызова к
+    /// вызову — по мере синхронизаций времени; у дампа он заморожен открытием.
+    pub fn epochs(&self) -> Epochs {
+        self.epochs_now().into_owned()
     }
 
     /// Текст записи на указанном языке.
@@ -514,9 +617,14 @@ impl Reader {
         {
             return *found;
         }
-        let resolved = read_ns_meta(&self.root.join(namespace))
-            .and_then(|meta| self.schemas.get(&meta.schema_name).copied());
-        if let Ok(mut cache) = self.schema_cache.write() {
+        let resolved = read_ns_meta(&self.root().join(namespace))
+            .and_then(|meta| self.schema_by_name(&meta.schema_name));
+        // Живому читателю «схемы нет» запоминать нельзя: неймспейс мог ещё
+        // не подняться, и закешированный `None` прятал бы его тексты до
+        // конца жизни читателя. Найденная схема неизменна в обоих режимах.
+        if (resolved.is_some() || !self.live())
+            && let Ok(mut cache) = self.schema_cache.write()
+        {
             cache.insert(namespace.to_owned(), resolved);
         }
         resolved
@@ -568,12 +676,14 @@ impl Reader {
     /// Каталоги с нечитаемой метой накапливаются в `damaged_dirs`.
     fn scan_namespaces(&self, damaged_dirs: &mut Vec<PathBuf>) -> Result<Vec<NsScan>> {
         let mut out = Vec::new();
-        let entries = match std::fs::read_dir(&self.root) {
+        let roots = self.all_roots();
+        let main_root = &roots[0];
+        let entries = match std::fs::read_dir(main_root) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(source) => {
                 return Err(ReadError::Io {
-                    context: format!("чтение {}", self.root.display()),
+                    context: format!("чтение {}", main_root.display()),
                     source,
                 });
             }
@@ -603,7 +713,7 @@ impl Reader {
             // ns-meta. Имя канала уникально в пределах неймспейса — класс
             // живёт ровно в одном корне.
             let mut channels: Vec<(String, PathBuf)> = Vec::new();
-            for root in std::iter::once(&self.root).chain(self.extra_roots.iter()) {
+            for root in &roots {
                 let ns_dir = root.join(name);
                 let Ok(dir) = std::fs::read_dir(&ns_dir) else {
                     continue;
@@ -642,10 +752,14 @@ impl Reader {
     /// поток сообщает теми же средствами, что и `query`, — но полны эти
     /// сведения только после того, как поток исчерпан либо оставлен.
     pub fn stream(&self, q: &Query) -> Result<EntryStream<'_>> {
+        // Эпохи берутся один раз на весь поток: и границы окна, и UTC каждой
+        // записи считаются одними якорями — ответ внутренне согласован, даже
+        // если синхронизация времени придёт посреди обхода.
+        let epochs = self.epochs_now().into_owned();
         // Границы приводятся к относительной шкале один раз: настенная
         // граница требует якоря на каждый запуск, и делать это на запись
         // значило бы линейный поиск по эпохам на каждую из сотен тысяч.
-        let bounds = q.resolve(&self.epochs).bounds;
+        let bounds = q.resolve(&epochs).bounds;
         let OpenedCursors {
             mut cursors,
             schemas,
@@ -669,6 +783,7 @@ impl Reader {
         Ok(EntryStream {
             reader: self,
             query: q.clone(),
+            epochs,
             bounds,
             cursors,
             schemas,
@@ -701,7 +816,8 @@ impl Reader {
 
         if q.seed_states && q.from.is_some() {
             let bounds = stream.bounds.clone();
-            result.seeds = self.collect_state_seeds(q, &bounds, &mut result.damaged)?;
+            result.seeds =
+                self.collect_state_seeds(q, &bounds, &mut result.damaged, &stream.epochs)?;
         }
         Ok(result)
     }
@@ -721,6 +837,7 @@ impl Reader {
         q: &Query,
         window: &Bounds,
         damaged: &mut Vec<Damage>,
+        epochs: &Epochs,
     ) -> Result<Vec<Entry>> {
         let Some(from) = q.from else {
             return Ok(Vec::new());
@@ -736,8 +853,8 @@ impl Reader {
         // каждой схемы, и метрика чужой схемы с тем же номером означает
         // совсем другую величину.
         let union: HashSet<MetricId> = self
-            .schemas
-            .values()
+            .all_schemas()
+            .iter()
             .flat_map(|s| s.metrics.iter())
             .filter(|m| m.kind == MetricKind::State)
             .map(|m| m.id)
@@ -761,7 +878,7 @@ impl Reader {
             },
             ..q.clone()
         };
-        let probe_bounds = probe.resolve(&self.epochs).bounds;
+        let probe_bounds = probe.resolve(epochs).bounds;
 
         let OpenedCursors {
             mut cursors,
@@ -801,7 +918,9 @@ impl Reader {
                 }
                 let ns = std::sync::Arc::clone(&cursor.namespace);
                 let ch = std::sync::Arc::clone(&cursor.channel);
-                if let Some(entry) = self.build_entry(ns, ch, schemas[idx].as_ref(), &raw, &probe) {
+                if let Some(entry) =
+                    self.build_entry(ns, ch, schemas[idx].as_ref(), &raw, &probe, epochs)
+                {
                     out.push(entry);
                 }
                 // Все ряды этого канала найдены — дальше читать нечего.
@@ -846,7 +965,7 @@ impl Reader {
             if !q.namespaces.matches(&ns.name) {
                 continue;
             }
-            let schema = self.schemas.get(&ns.schema_name).copied();
+            let schema = self.schema_by_name(&ns.schema_name);
             let ns_name: std::sync::Arc<str> = std::sync::Arc::from(ns.name.as_str());
             let mut scope = crate::cursor::ChannelScope {
                 bounds: bounds.clone(),
@@ -859,6 +978,7 @@ impl Reader {
                 // Сегменты прежних версий приводятся к текущей прямо при
                 // чтении: корректность ответа не ждёт физического прогона.
                 migrations: schema.as_ref().map(crate::cursor::MigrationCtx::of),
+                live: self.live(),
             };
             adjust(&mut scope);
 
@@ -899,6 +1019,7 @@ impl Reader {
         schema: Option<&Schema>,
         raw: &crate::cursor::RawEntry,
         q: &Query,
+        epochs: &Epochs,
     ) -> Option<Entry> {
         let kinds = q.filter.kinds;
         // Фильтры, говорящие о содержимом. Запись, у которой такого свойства
@@ -1072,7 +1193,7 @@ impl Reader {
             namespace: ns,
             channel,
             at: raw.at,
-            utc: self.epochs.to_utc(raw.at),
+            utc: epochs.to_utc(raw.at),
             span,
             kind,
         })

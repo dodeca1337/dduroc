@@ -542,6 +542,16 @@ impl Store {
         self.locked_epochs().epochs().to_utc(at)
     }
 
+    /// Снимок эпох в этот момент — со всеми якорями, включая только что
+    /// записанные [`Store::record_sync`].
+    ///
+    /// Отсюда их берёт живой читатель на каждый запрос: разобранный при
+    /// своём открытии `epochs.bin` устаревает с первой же синхронизацией
+    /// времени, и записи, у которых якорь уже есть, оставались бы без UTC.
+    pub fn epochs(&self) -> crate::epochs::Epochs {
+        self.locked_epochs().epochs().clone()
+    }
+
     /// Текущий момент в тех же координатах, что и у записей.
     pub fn now(&self) -> BootTime {
         self.clock.now_at()
