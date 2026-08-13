@@ -378,12 +378,21 @@ impl SegmentCursor {
         if self.sealed || self.reverse {
             return false;
         }
-        let Ok(reader) = SegmentReader::open(&self.path) else {
-            // Файла больше нет. Данных, которые «пропали», тоже нет: в
-            // вытесненный сегмент никто уже не писал. Непрочитанные блоки,
-            // если они были, доносит `fill` отказами чтения.
-            self.sealed = true;
-            return false;
+        let reader = match SegmentReader::open(&self.path) {
+            Ok(r) => r,
+            Err(dduroc_engine::Error::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // Файла больше нет. Данных, которые «пропали», тоже нет: в
+                // вытесненный сегмент никто уже не писал. Непрочитанные блоки,
+                // если они были, доносит `fill` отказами чтения.
+                self.sealed = true;
+                return false;
+            }
+            // Прочий отказ открытия — не приговор: он может быть
+            // преходящим, и объявлять сегмент законченным из-за него значило
+            // бы оглохнуть на этом канале навсегда.
+            Err(_) => return false,
         };
         let grew = match reader.footer() {
             Some(footer) => {
@@ -524,7 +533,7 @@ impl SegmentCursor {
     /// смещений, а не запоминается отдельным состоянием.
     pub fn clip_to_window(&mut self, from: Option<Micros>, to: Option<Micros>) {
         debug_assert_eq!(self.next_block, 0, "окно вырезается до начала обхода");
-        if from.is_none() && to.is_none() {
+        if from.is_none() && to.is_none() || self.offsets.is_empty() {
             return;
         }
         let Some(footer) = self.reader.footer() else {
@@ -1042,13 +1051,22 @@ impl ChannelCursor {
                     return true;
                 }
                 Err(e) => {
-                    // Живое чтение терпит два штатных совпадения. Сегмент,
-                    // вытесненный ротацией между листингом и открытием, —
-                    // файла больше нет, но нет и данных, которые «пропали».
-                    // И новейший сегмент, застигнутый в момент рождения:
-                    // файл уже создан, а заголовок ещё не дописан — данных в
-                    // нём ещё нет, к следующему запросу он будет готов.
-                    if self.liveness.is_live() && (is_not_found(&e) || Some(name) == self.newest) {
+                    // Сегмент, вытесненный ротацией между листингом и
+                    // открытием: файла больше нет — но нет и данных, которые
+                    // «пропали», историю убрал сам движок.
+                    if self.liveness.is_live() && is_not_found(&e) {
+                        continue;
+                    }
+                    // Новейший сегмент, застигнутый в момент рождения: файл
+                    // уже создан, а заголовок ещё не дописан. Разовый запрос
+                    // проходит мимо — его увидит следующий запрос. Подписке
+                    // мимо нельзя: следующего запроса у неё нет, и сегмент
+                    // пропал бы целиком. Она отступает на шаг и вернётся.
+                    if self.liveness.is_live() && Some(name) == self.newest {
+                        if self.liveness.is_following() {
+                            self.next_segment -= 1;
+                            return false;
+                        }
                         continue;
                     }
                     // Сегмент, который не открылся, не должен прекращать
@@ -1400,6 +1418,61 @@ mod tests {
         assert!(
             once.next_entry().is_none(),
             "разовому запросу этот блок покажет следующий запрос, а не этот"
+        );
+    }
+
+    #[test]
+    fn a_newborn_segment_is_waited_for_by_a_subscription_not_walked_past() {
+        // Сегмент рождается в два приёма: сперва файл, потом заголовок. Между
+        // ними он не открывается. Разовый запрос проходит мимо — его покажет
+        // следующий запрос; подписке мимо нельзя, следующего запроса у неё
+        // нет, и сегмент пропал бы целиком.
+        let dir = tempfile::tempdir().unwrap();
+        sealed_segment(dir.path(), &[100]);
+        let newborn = dir
+            .path()
+            .join(SegmentName::new(BootCounter(0), Micros(900)).to_string());
+        // Файл есть, заголовка ещё нет.
+        std::fs::File::create(&newborn).unwrap();
+
+        let open = |liveness| {
+            let scope = ChannelScope {
+                liveness,
+                ..ChannelScope::default()
+            };
+            ChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope).unwrap()
+        };
+        let mut following = open(Liveness::Following);
+        let mut once = open(Liveness::Live);
+        for c in [&mut following, &mut once] {
+            assert_eq!(c.next_entry().map(|e| e.at.at.0), Some(100));
+            assert_eq!(
+                c.next_entry().map(|e| e.at.at.0),
+                None,
+                "новорождённый ждёт"
+            );
+            assert!(
+                c.damaged().is_empty(),
+                "рождение — не порча: {:?}",
+                c.damaged()
+            );
+        }
+
+        // Writer дописал заголовок и блок.
+        std::fs::remove_file(&newborn).unwrap();
+        sealed_segment(dir.path(), &[900]);
+
+        following.extend(true);
+        assert_eq!(
+            following.next_entry().map(|e| e.at.at.0),
+            Some(900),
+            "родившийся сегмент обязан достаться подписке целиком"
+        );
+
+        once.extend(true);
+        assert!(
+            once.next_entry().is_none(),
+            "разовому запросу этот сегмент покажет следующий запрос, а не этот"
         );
     }
 

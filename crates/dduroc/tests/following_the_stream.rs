@@ -287,6 +287,64 @@ fn a_stopped_store_ends_the_subscription_instead_of_leaving_it_waiting() {
 }
 
 #[test]
+fn a_newborn_segment_is_waited_for_not_walked_past() {
+    // Сегмент, застигнутый в момент рождения (файл создан, заголовок ещё не
+    // дописан), разовый запрос пропускает: его покажет следующий запрос. У
+    // подписки следующего запроса нет — пройдя мимо, она потеряла бы весь
+    // сегмент. Проверяется тем же способом, что и всё остальное: ротация под
+    // непрерывной записью, где такие моменты и случаются.
+    const COUNT: u32 = 2000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreConfig::new(dir.path())
+            .with_budget_per_class(64 << 20)
+            .channel(
+                StorageClass::Default,
+                ChannelConfig {
+                    segment_bytes: 8 << 10,
+                    block_max_bytes: 512,
+                    compression: dduroc::Compression::None,
+                    flush_interval: Duration::from_millis(1),
+                    ..ChannelConfig::new(64 << 20)
+                },
+            ),
+    )
+    .unwrap();
+    let ns = store.namespace("dev-0", probe::SCHEMA).unwrap();
+    let reader = store.reader();
+    let mut tail = reader.follow(&Query::new().order(Order::Oldest)).unwrap();
+
+    // Писатель не останавливается: подписка читает вместе с ним, а не после.
+    let writer = std::thread::spawn({
+        let ns = ns.clone();
+        move || {
+            for n in 0..COUNT {
+                ns.log(probe::events::Tick { n });
+                if n % 64 == 0 {
+                    std::thread::yield_now();
+                }
+            }
+            ns.sync().unwrap();
+        }
+    });
+    let got = take(&mut tail, COUNT as usize);
+    writer.join().unwrap();
+
+    let numbers: Vec<u32> = got
+        .iter()
+        .filter_map(|e| reader.decode::<probe::events::Tick>(e))
+        .map(|t| t.expect("payload разбирается").n)
+        .collect();
+    assert_eq!(
+        numbers,
+        (0..COUNT).collect::<Vec<_>>(),
+        "ни одного пропуска"
+    );
+    assert!(tail.take_damage().is_empty());
+}
+
+#[test]
 fn asking_to_wait_forever_answers_instead_of_panicking() {
     // `Duration::MAX` в сроке ожидания — это паника на сложении с часами.
     // Паника вместо ожидания была бы худшим прочтением такой просьбы.

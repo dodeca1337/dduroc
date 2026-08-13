@@ -1860,12 +1860,18 @@ impl WriterLoop {
             };
             // Выталкивать некуда: сегмент отпущен или не открылся, и flush
             // отбросил бы весь блок, посчитав его записи потерянными. Память
-            // такой цены не стоит.
-            if state.segment.is_none() {
+            // такой цены не стоит. Пустой накопитель этим не связан: у него
+            // нечего терять, а ёмкость он держит.
+            if state.segment.is_none() && !state.builder.is_empty() {
                 continue;
             }
-            if Self::flush_block(state, &counters).is_err() {
+            if let Err(e) = Self::flush_block(state, &counters) {
                 Counters::bump(&counters.io_errors);
+                // Место кончилось — освобождать его надо там, где оно занято,
+                // и обход по носителям об этом должен узнать.
+                if e.is_no_space() {
+                    self.pressured_roots |= 1 << state.root_key.min(7);
+                }
             }
             state.release_buffers();
             state.buffers_released = true;
