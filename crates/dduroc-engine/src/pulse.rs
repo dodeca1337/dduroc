@@ -27,6 +27,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// Во что урезается срок, который часы не умеют сложить.
+///
+/// Час — заведомо больше любого осмысленного периода опроса и заведомо
+/// меньше того, на чём переполняется [`Instant`].
+pub const LONGEST_WAIT: Duration = Duration::from_secs(3600);
+
 /// Что читатель уже видел.
 ///
 /// Сравнивается целиком: изменилось что угодно — значит, смотреть снова есть
@@ -101,6 +107,11 @@ impl Pulse {
     ///
     /// Возвращает текущее состояние: равное `seen` означает, что ничего не
     /// произошло за отведённое время.
+    ///
+    /// Срок, который часы не умеют сложить (`Duration::MAX` и всё, что близко
+    /// к нему), урезается до [`LONGEST_WAIT`]: паника на сложении была бы
+    /// худшим из возможных ответов на просьбу подождать подольше, а спросить
+    /// снова подписке ничего не стоит.
     pub fn wait(&self, seen: Beat, timeout: Duration) -> Beat {
         // Ожидающий объявляется ДО чтения счётчиков, а писатель поднимает
         // счётчик ДО чтения числа ожидающих. В общем порядке SeqCst хотя бы
@@ -111,7 +122,10 @@ impl Pulse {
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let mut now = self.beat();
         if now == seen && !timeout.is_zero() {
-            let deadline = Instant::now() + timeout;
+            let start = Instant::now();
+            let deadline = start
+                .checked_add(timeout)
+                .unwrap_or_else(|| start + LONGEST_WAIT);
             let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 now = self.beat();
@@ -171,6 +185,29 @@ mod tests {
         let now = pulse.wait(seen, Duration::from_secs(30));
         assert_ne!(now, seen);
         assert!(started.elapsed() < Duration::from_secs(1), "не спало");
+    }
+
+    #[test]
+    fn a_wait_longer_than_the_clock_can_count_is_shortened_not_fatal() {
+        // «Подожди сколько угодно» — законная просьба, и паника на сложении
+        // была бы худшим из возможных ответов на неё: ожидание превратилось бы
+        // в снятый поток вьюера. Отметка при этом обязана прийти как обычно —
+        // урезание срока не имеет права ничего проспать.
+        let pulse = Arc::new(Pulse::new());
+        let seen = pulse.beat();
+        let writer = Arc::clone(&pulse);
+        let hand = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            writer.data_written();
+        });
+        let started = Instant::now();
+        let now = pulse.wait(seen, Duration::MAX);
+        assert_ne!(
+            now, seen,
+            "отметка пришла, а не потерялась в урезанном сроке"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        hand.join().unwrap();
     }
 
     #[test]
