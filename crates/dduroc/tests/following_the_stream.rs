@@ -345,6 +345,47 @@ fn a_newborn_segment_is_waited_for_not_walked_past() {
 }
 
 #[test]
+fn a_run_without_an_anchor_is_named_even_if_it_appears_after_the_start() {
+    // Прибор без RTC и без синхронизации: у запуска нет якоря, и настенное
+    // окно приложить к нему нечем. Такой запуск выпадает из выборки — и
+    // обязан быть назван, иначе молчание подписки неотличимо от «в эти часы
+    // прибор ничего не писал». Сегментов при открытии подписки ещё нет, так
+    // что узнать о запуске она может только обойдя каталоги позже.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(dir.path())).unwrap();
+    let ns = store.namespace("dev-0", probe::SCHEMA).unwrap();
+    let boot = dduroc::BootCounter(store.boot_counter());
+
+    let reader = store.reader();
+    let mut tail = reader
+        .follow(
+            &Query::new()
+                .since(Utc::now() - dduroc::chrono::TimeDelta::hours(1))
+                .order(Order::Oldest),
+        )
+        .unwrap();
+    assert!(tail.unanchored().is_empty(), "писать ещё не начинали");
+
+    ns.log(probe::events::Tick { n: 0 });
+    ns.sync().unwrap();
+
+    // Записей не будет: запуск в настенное окно не укладывается. Но и тишины
+    // быть не должно — подписку опрашивают, пока она не назовёт причину.
+    let deadline = Instant::now() + PATIENCE;
+    while tail.unanchored().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "запуск без якоря так и не назван — молчание неотличимо от пустоты"
+        );
+        assert!(
+            !matches!(tail.next(Duration::from_millis(50)), Tail::Entry(_)),
+            "запись без якоря не имеет права попасть в настенное окно"
+        );
+    }
+    assert_eq!(tail.unanchored(), vec![boot], "назван именно этот запуск");
+}
+
+#[test]
 fn asking_to_wait_forever_answers_instead_of_panicking() {
     // `Duration::MAX` в сроке ожидания — это паника на сложении с часами.
     // Паника вместо ожидания была бы худшим прочтением такой просьбы.

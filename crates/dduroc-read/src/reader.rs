@@ -420,7 +420,6 @@ pub struct Follow<'a> {
     /// сломанных путей, а не числом обходов.
     reported: HashSet<(PathBuf, String)>,
     damaged: Vec<Damage>,
-    unanchored: Vec<BootCounter>,
     pulse: Arc<dduroc_engine::pulse::Pulse>,
     seen: dduroc_engine::pulse::Beat,
     seeds: std::vec::IntoIter<Entry>,
@@ -700,11 +699,6 @@ impl Follow<'_> {
             let key = (cursor.namespace.to_string(), cursor.channel);
             if !self.known.insert(key) {
                 continue;
-            }
-            for boot in cursor.unanchored() {
-                if !self.unanchored.contains(boot) {
-                    self.unanchored.push(*boot);
-                }
             }
             self.cursors.push(cursor);
             self.schemas.push(schema);
@@ -1328,14 +1322,8 @@ impl Reader {
         let mut heads = BinaryHeap::with_capacity(cursors.len());
         let mut queued = vec![false; cursors.len()];
         let mut known = HashSet::with_capacity(cursors.len());
-        let mut unanchored: Vec<BootCounter> = Vec::new();
         for (idx, cursor) in cursors.iter_mut().enumerate() {
             known.insert((cursor.namespace.to_string(), cursor.channel));
-            for boot in cursor.unanchored() {
-                if !unanchored.contains(boot) {
-                    unanchored.push(*boot);
-                }
-            }
             if let Some(head) = cursor.peek() {
                 heads.push(Head {
                     at: head.at,
@@ -1345,7 +1333,6 @@ impl Reader {
                 queued[idx] = true;
             }
         }
-        unanchored.sort_unstable();
 
         // Затравка состояний — та же, что у `query`: ряд, не менявшийся с
         // прошлой недели, иначе выглядел бы у живого графика пустым.
@@ -1370,7 +1357,6 @@ impl Reader {
                 .map(|d| (d.path.clone(), d.reason.clone()))
                 .collect(),
             damaged,
-            unanchored,
             pulse,
             seen,
             seeds: seeds.into_iter(),
