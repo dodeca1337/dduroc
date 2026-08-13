@@ -57,6 +57,21 @@ impl StorageClass {
             StorageClass::Telemetry => 2,
         }
     }
+
+    /// Класс по имени его каталога — обратное к [`StorageClass::as_str`].
+    ///
+    /// `None` — каталог не является каналом ни одного класса этой сборки:
+    /// либо чужая директория, либо дамп из будущей версии с новым классом.
+    /// Читатель обязан различить это и сказать, а не разбирать неизвестное.
+    pub fn from_dir_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for StorageClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Код языка шаблонов (`"en"`, `"ru"`, `"ja"`…).
@@ -508,6 +523,34 @@ pub struct Schema {
     pub migrations: &'static [Migration],
 }
 
+/// Вид дескриптора схемы — чьё пространство идентификаторов имеется в виду.
+///
+/// Перечисление, а не строка: у события, метрики и спана id-пространства
+/// раздельные, и диагностика, называющая вид строкой, позволяла бы назвать
+/// несуществующий.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorKind {
+    Event,
+    Metric,
+    Span,
+}
+
+impl DescriptorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DescriptorKind::Event => "event",
+            DescriptorKind::Metric => "metric",
+            DescriptorKind::Span => "span",
+        }
+    }
+}
+
+impl std::fmt::Display for DescriptorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Ошибка валидации схемы: ловится при подъёме неймспейса, то есть на старте
 /// процесса, а не через месяц работы на нечитаемых логах.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -515,7 +558,7 @@ pub enum SchemaError {
     #[error("схема {schema:?}: {kind} id {id} объявлен дважды ({first:?} и {second:?})")]
     DuplicateId {
         schema: &'static str,
-        kind: &'static str,
+        kind: DescriptorKind,
         id: u16,
         first: &'static str,
         second: &'static str,
@@ -563,7 +606,7 @@ pub enum SchemaError {
     )]
     Unsorted {
         schema: &'static str,
-        kind: &'static str,
+        kind: DescriptorKind,
         name: &'static str,
     },
 
@@ -605,17 +648,17 @@ impl Schema {
 
         check_unique(
             self.name,
-            "event",
+            DescriptorKind::Event,
             self.events.iter().map(|e| (e.id.0, e.name)),
         )?;
         check_unique(
             self.name,
-            "metric",
+            DescriptorKind::Metric,
             self.metrics.iter().map(|m| (m.id.0, m.name)),
         )?;
         check_unique(
             self.name,
-            "span",
+            DescriptorKind::Span,
             self.spans.iter().map(|s| (s.id.0, s.name)),
         )?;
 
@@ -624,17 +667,17 @@ impl Schema {
         // раскладывает их сам, но схему можно объявить и вручную.
         check_sorted(
             self.name,
-            "event",
+            DescriptorKind::Event,
             self.events.iter().map(|e| (e.id.0, e.name)),
         )?;
         check_sorted(
             self.name,
-            "metric",
+            DescriptorKind::Metric,
             self.metrics.iter().map(|m| (m.id.0, m.name)),
         )?;
         check_sorted(
             self.name,
-            "span",
+            DescriptorKind::Span,
             self.spans.iter().map(|s| (s.id.0, s.name)),
         )?;
 
@@ -857,7 +900,7 @@ impl Schema {
 /// Проверить возрастание идентификаторов: по ним идёт бинарный поиск.
 fn check_sorted(
     schema: &'static str,
-    kind: &'static str,
+    kind: DescriptorKind,
     items: impl Iterator<Item = (u16, &'static str)>,
 ) -> Result<(), SchemaError> {
     let mut prev: Option<u16> = None;
@@ -872,7 +915,7 @@ fn check_sorted(
 
 fn check_unique(
     schema: &'static str,
-    kind: &'static str,
+    kind: DescriptorKind,
     items: impl Iterator<Item = (u16, &'static str)>,
 ) -> Result<(), SchemaError> {
     let mut seen: Vec<(u16, &'static str)> = Vec::new();

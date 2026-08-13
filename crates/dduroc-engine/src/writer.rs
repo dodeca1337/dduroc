@@ -130,7 +130,7 @@ const RELEASE_AFTER: Duration = Duration::from_secs(2);
 const PARK_AFTER: Duration = Duration::from_secs(300);
 
 /// Источник отметок о служебных событиях в потоке записей.
-const DIAG_TARGET: &str = "dduroc";
+const DIAG_TARGET: &str = crate::diag::TARGET;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Команды
@@ -1761,8 +1761,7 @@ impl WriterLoop {
                     level: Level::Error,
                     span: None,
                     target: Arc::clone(&self.diag_target),
-                    text: format!("потеряно записей: {count} (очередь переполнена)")
-                        .into_boxed_str(),
+                    text: crate::diag::drop_notice(count).into_boxed_str(),
                 },
             };
             if self.push(&item).is_err() {

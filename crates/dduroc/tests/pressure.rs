@@ -241,7 +241,10 @@ fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
         .count();
     assert_eq!(alarms as u64, N, "ждали места — значит все дошли");
     assert!(
-        result.entries.iter().all(|e| &*e.channel == "critical"),
+        result
+            .entries
+            .iter()
+            .all(|e| e.channel == StorageClass::Critical),
         "критические события обязаны лежать в своём канале"
     );
 }
@@ -481,7 +484,7 @@ fn a_class_can_live_on_its_own_root() {
     let listing = reader.namespaces().unwrap();
     assert_eq!(
         listing.namespaces[0].channels,
-        ["critical", "default"],
+        [StorageClass::Default, StorageClass::Critical],
         "перечисление сливает каналы обоих корней"
     );
 
@@ -492,7 +495,7 @@ fn a_class_can_live_on_its_own_root() {
         matches!(
             &e,
             dduroc_read::ReadError::IncompleteDump { namespace, class }
-                if namespace == "orc-0" && *class == "critical"
+                if namespace == "orc-0" && *class == StorageClass::Critical
         ),
         "{e}"
     );

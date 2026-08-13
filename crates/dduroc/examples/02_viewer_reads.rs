@@ -232,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n— окно по настенным часам: минута вокруг синхронизации —");
     let minute = reader.query(
         &Query::new()
-            .range(
+            .time_window(
                 sync_at - chrono::TimeDelta::seconds(30),
                 sync_at + chrono::TimeDelta::seconds(30),
             )
@@ -309,8 +309,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.shutdown(); // record_sync не звали: якоря нет
     }
     let no_clock = Reader::open_dump([&lone], &[radio::SCHEMA])?;
-    let asked =
-        no_clock.query(&Query::new().range(sync_at - chrono::TimeDelta::hours(1), sync_at))?;
+    let asked = no_clock
+        .query(&Query::new().time_window(sync_at - chrono::TimeDelta::hours(1), sync_at))?;
     println!(
         "\n— настенное окно без якоря: записей {}, выпали запуски {:?} —",
         asked.entries.len(),

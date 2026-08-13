@@ -19,21 +19,51 @@ use crate::value::{Value, ValueType};
 use crate::varint;
 
 /// Тип записи — старший полубайт первого байта.
-pub mod kind {
-    pub const MESSAGE: u8 = 0x0;
-    pub const SPAN_START: u8 = 0x1;
-    pub const SPAN_END: u8 = 0x2;
-    /// Занят в контейнере версии 1 записью `SeriesDef`, определявшей серию
-    /// как `(метрика, рантайм-тэги)`. Рантайм-тэгов больше нет, идентичность
-    /// серии равна метрике, и сэмпл несёт `metric_id` напрямую. Код не
-    /// переиспользуется: цена — ничего, а спутать разбор версий нельзя.
-    pub const RETIRED_SERIES_DEF: u8 = 0x3;
-    pub const SAMPLE: u8 = 0x4;
-    pub const TEXT: u8 = 0x5;
+///
+/// Перечисление, а не голые константы: несуществующий тип непредставим, а
+/// `match` по типу обязан быть полным. Число за вариантом — формат на диске,
+/// оно закреплено дискриминантом ровно затем, чтобы у имени и провода был
+/// один источник.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordKind {
+    Message = 0x0,
+    SpanStart = 0x1,
+    SpanEnd = 0x2,
+    Sample = 0x4,
+    Text = 0x5,
     /// Расширение: `len varint` + байты. Единственный способ добавить
     /// новую разновидность записи, не ломая старых читателей — они умеют
     /// пропустить её по длине.
-    pub const EXT: u8 = 0xF;
+    Ext = 0xF,
+}
+
+/// Занят в контейнере версии 1 записью `SeriesDef`, определявшей серию
+/// как `(метрика, рантайм-тэги)`. Рантайм-тэгов больше нет, идентичность
+/// серии равна метрике, и сэмпл несёт `metric_id` напрямую. Код не
+/// переиспользуется: цена — ничего, а спутать разбор версий нельзя. В
+/// [`RecordKind`] варианта нет — это НЕ тип записи текущего формата, а
+/// отличимый диагноз в [`RecordKind::from_u8`].
+const RETIRED_SERIES_DEF: u8 = 0x3;
+
+impl RecordKind {
+    /// Тип из полубайта — обратное к дискриминанту.
+    ///
+    /// Код прежней версии даёт отличимый диагноз: «неизвестный тип» отправил
+    /// бы искать порчу носителя там, где на самом деле читается сегмент
+    /// версии 1.
+    pub const fn from_u8(raw: u8) -> Result<Self> {
+        match raw {
+            0x0 => Ok(RecordKind::Message),
+            0x1 => Ok(RecordKind::SpanStart),
+            0x2 => Ok(RecordKind::SpanEnd),
+            0x4 => Ok(RecordKind::Sample),
+            0x5 => Ok(RecordKind::Text),
+            0xF => Ok(RecordKind::Ext),
+            RETIRED_SERIES_DEF => Err(Error::RetiredRecordKind(RETIRED_SERIES_DEF)),
+            other => Err(Error::UnknownRecordKind(other)),
+        }
+    }
 }
 
 /// Флаг наличия `span` в записи (сообщения и текст).
@@ -116,15 +146,15 @@ pub struct Framed<'a> {
 }
 
 impl Record<'_> {
-    /// Полубайт типа.
-    pub const fn kind(&self) -> u8 {
+    /// Тип записи.
+    pub const fn kind(&self) -> RecordKind {
         match self {
-            Record::Message(_) => kind::MESSAGE,
-            Record::SpanStart(_) => kind::SPAN_START,
-            Record::SpanEnd { .. } => kind::SPAN_END,
-            Record::Sample(_) => kind::SAMPLE,
-            Record::Text(_) => kind::TEXT,
-            Record::Ext { .. } => kind::EXT,
+            Record::Message(_) => RecordKind::Message,
+            Record::SpanStart(_) => RecordKind::SpanStart,
+            Record::SpanEnd { .. } => RecordKind::SpanEnd,
+            Record::Sample(_) => RecordKind::Sample,
+            Record::Text(_) => RecordKind::Text,
+            Record::Ext { .. } => RecordKind::Ext,
         }
     }
 
@@ -166,7 +196,7 @@ pub fn encode(record: &Record<'_>, dt: u64, out: &mut Vec<u8>) -> Result<usize> 
         Record::Sample(s) => s.value.value_type() as u8,
         _ => 0,
     };
-    out.push((record.kind() << 4) | flags);
+    out.push(((record.kind() as u8) << 4) | flags);
     varint::write_u64(out, dt);
 
     // Проверки живут внутри разбора, а не отдельным проходом перед ним:
@@ -231,8 +261,8 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
     let (kind, flags) = (b0 >> 4, b0 & 0x0F);
     let dt = c.varint()?;
 
-    let record = match kind {
-        kind::MESSAGE => {
+    let record = match RecordKind::from_u8(kind)? {
+        RecordKind::Message => {
             let event = EventId(c.varint_u16("event_id")?);
             let span = read_flagged_span(&mut c, flags)?;
             let len = c.varint_len("payload_len")?;
@@ -242,7 +272,7 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
                 payload: c.take(len)?,
             })
         }
-        kind::SPAN_START => {
+        RecordKind::SpanStart => {
             reject_flags(flags)?;
             let span = read_span(&mut c)?;
             let span_kind = SpanKindId(c.varint_u16("span_kind_id")?);
@@ -253,13 +283,13 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
                 parent,
             })
         }
-        kind::SPAN_END => {
+        RecordKind::SpanEnd => {
             reject_flags(flags)?;
             Record::SpanEnd {
                 span: read_span(&mut c)?,
             }
         }
-        kind::SAMPLE => {
+        RecordKind::Sample => {
             // Тип значения дублирован во флагах: без него длину значения
             // взять негде — у сэмпла, в отличие от сообщения и расширения,
             // нет префикса длины.
@@ -273,7 +303,7 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
                 value: c.value(ty)?,
             })
         }
-        kind::TEXT => {
+        RecordKind::Text => {
             let level = Level::from_u8(c.u8()?)?;
             let span = read_flagged_span(&mut c, flags)?;
             let target = c.str("target")?;
@@ -285,20 +315,13 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
                 text,
             })
         }
-        kind::EXT => {
+        RecordKind::Ext => {
             reject_flags(flags)?;
             let len = c.varint_len("ext_len")?;
             Record::Ext {
                 bytes: c.take(len)?,
             }
         }
-        // Отличимый диагноз для кода, занятого прежней версией: «неизвестный
-        // тип» отправил бы искать порчу носителя там, где на самом деле
-        // читается сегмент версии 1.
-        kind::RETIRED_SERIES_DEF => {
-            return Err(Error::RetiredRecordKind(kind::RETIRED_SERIES_DEF));
-        }
-        other => return Err(Error::UnknownRecordKind(other)),
     };
 
     Ok((Framed { dt, record }, c.pos()))
@@ -474,11 +497,11 @@ mod tests {
         // переиспользуется, и встретить его можно только в файле чужой
         // версии — читатель обязан честно отказаться, а не разобрать
         // байты как что-то другое.
-        let mut buf = vec![kind::RETIRED_SERIES_DEF << 4];
+        let mut buf = vec![RETIRED_SERIES_DEF << 4];
         varint::write_u64(&mut buf, 0);
         assert_eq!(
             decode(&buf),
-            Err(Error::RetiredRecordKind(kind::RETIRED_SERIES_DEF)),
+            Err(Error::RetiredRecordKind(RETIRED_SERIES_DEF)),
             "диагноз обязан указывать на версию формата, а не на порчу"
         );
     }
@@ -564,7 +587,7 @@ mod tests {
         assert_eq!(
             buf,
             vec![
-                (kind::SAMPLE << 4) | ValueType::U64 as u8,
+                ((RecordKind::Sample as u8) << 4) | ValueType::U64 as u8,
                 0,    // dt
                 0x2a, // metric_id
                 2,    // значение
@@ -613,7 +636,7 @@ mod tests {
         )
         .unwrap();
         // Обрезанная вторая запись — как после обрыва питания.
-        body.push(kind::MESSAGE << 4);
+        body.push((RecordKind::Message as u8) << 4);
 
         let results: Vec<_> = iter(&body).collect();
         assert_eq!(results.len(), 2);
@@ -625,7 +648,7 @@ mod tests {
     #[test]
     fn zero_span_id_rejected() {
         // span_id = 0 при выставленном флаге — зарезервированное значение.
-        let mut buf = vec![(kind::MESSAGE << 4) | FLAG_SPAN];
+        let mut buf = vec![((RecordKind::Message as u8) << 4) | FLAG_SPAN];
         varint::write_u64(&mut buf, 0); // dt
         varint::write_u64(&mut buf, 1); // event
         varint::write_u64(&mut buf, 0); // span = 0 — недопустимо
@@ -691,13 +714,13 @@ mod tests {
         assert_eq!(decode(&buf), Err(Error::UnknownRecordKind(0x6)));
 
         // Ненулевые зарезервированные флаги у SpanEnd.
-        let mut buf = vec![(kind::SPAN_END << 4) | 0b0010];
+        let mut buf = vec![((RecordKind::SpanEnd as u8) << 4) | 0b0010];
         varint::write_u64(&mut buf, 0);
         varint::write_u64(&mut buf, 1);
         assert_eq!(decode(&buf), Err(Error::ReservedValue));
 
         // Неизвестный vtype в флагах сэмпла.
-        let mut buf = vec![(kind::SAMPLE << 4) | 0b0110];
+        let mut buf = vec![((RecordKind::Sample as u8) << 4) | 0b0110];
         varint::write_u64(&mut buf, 0);
         varint::write_u64(&mut buf, 0);
         assert_eq!(decode(&buf), Err(Error::UnknownValueType(6)));

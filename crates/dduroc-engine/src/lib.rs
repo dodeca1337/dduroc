@@ -19,6 +19,7 @@
 
 pub mod channel;
 pub mod clock;
+pub mod diag;
 pub mod epochs;
 mod error;
 mod fsutil;

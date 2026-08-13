@@ -7,7 +7,7 @@
 //! именем в разных модулях — это «вчерашний» и «сегодняшний» билды.
 
 use dduroc::prelude::*;
-use dduroc::{EventId, MetricId, StoreConfig};
+use dduroc::{EventId, MetricId, StorageClass, StoreConfig};
 use dduroc_read::{EntryKind, Order, OwnedSampleValue, Query, Reader};
 
 /// Схема вчерашней прошивки.
@@ -165,7 +165,10 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
     assert_eq!(read_all(dir.path()), expected, "ответ не изменился");
 
     // Заголовки сегментов — только текущей версии.
-    let channel = dir.path().join("orc-0").join("default");
+    let channel = dir
+        .path()
+        .join("orc-0")
+        .join(StorageClass::Default.as_str());
     for entry in std::fs::read_dir(&channel).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|x| x == "seg") {

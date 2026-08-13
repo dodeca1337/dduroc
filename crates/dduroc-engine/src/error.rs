@@ -41,11 +41,20 @@ pub enum Error {
     )]
     ClassNotDeclared {
         schema: &'static str,
-        class: &'static str,
+        class: crate::schema::StorageClass,
     },
 
-    #[error("недопустимое имя канала {name:?}: {reason}")]
-    BadChannel { name: String, reason: &'static str },
+    #[error(
+        "недопустимый канал {class}{}: {reason}",
+        namespace.as_deref().map(|n| format!(" неймспейса {n:?}")).unwrap_or_default()
+    )]
+    BadChannel {
+        /// Класс хранения: канал и есть класс, второго имени у него нет.
+        class: crate::schema::StorageClass,
+        /// Чей канал; `None` — конфигурация класса до всякого неймспейса.
+        namespace: Option<String>,
+        reason: &'static str,
+    },
 
     #[error("неймспейс {0:?} уже открыт в этом процессе")]
     NamespaceBusy(String),
@@ -267,7 +276,7 @@ mod tests {
             },
             Error::ClassNotDeclared {
                 schema: "radio",
-                class: "critical",
+                class: crate::schema::StorageClass::Critical,
             },
             Error::EncodeFailed { event: "PowerSet" },
         ];

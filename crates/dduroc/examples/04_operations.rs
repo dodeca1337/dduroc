@@ -227,6 +227,8 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 
     // Дыра, о которой нигде не сказано, неотличима от тишины: потери
     // объявлены отметками в самом потоке, и их сумма равна счётчику.
+    // Отметку разбирает `Entry::dropped_records` — формат её текста
+    // принадлежит движку, парсить прозу прикладному коду не нужно.
     let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
     let mut announced = 0u64;
     let mut marks = 0usize;
@@ -234,17 +236,10 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         text: true,
         ..KindFilter::TELEMETRY
     }))? {
-        let EntryKind::Text { text, .. } = &e.kind else {
-            continue;
-        };
-        if let Some(rest) = text.strip_prefix("потеряно записей: ") {
+        if let Some(count) = e.dropped_records() {
             marks += 1;
-            announced += rest
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-        } else {
+            announced += count;
+        } else if let EntryKind::Text { text, .. } = &e.kind {
             println!("  объявление в журнале: «{text}»");
         }
     }
@@ -301,7 +296,7 @@ fn vault(
     for e in &read.entries {
         println!(
             "  [{}] {}",
-            e.channel,
+            e.channel.as_str(),
             reader.render(e, "ru").unwrap_or_default()
         );
     }

@@ -13,7 +13,7 @@
 use crate::error::{ReadError, Result};
 use crate::query::{Bounds, Fit};
 use dduroc_engine::migrate::{self, Chained};
-use dduroc_engine::schema::{Migration, Schema};
+use dduroc_engine::schema::{Migration, Schema, StorageClass};
 use dduroc_engine::segment::{SegmentReader, parse_block};
 use dduroc_format::segment::SegmentName;
 use dduroc_format::{BootCounter, BootTime, Micros, Record};
@@ -178,14 +178,15 @@ pub struct SegmentCursor {
     migration: MigrationState,
     /// Блоки, которые не удалось прочитать.
     damaged: Vec<Damage>,
-    /// Смещение новейшего блока незапечатанного сегмента при живом чтении.
+    /// Байтовое смещение новейшего блока незапечатанного сегмента при
+    /// живом чтении.
     ///
     /// Единственное место файла, где нечитаемость штатна: writer может
     /// дописывать этот блок прямо сейчас, и читатель видит страницу раньше,
     /// чем запись легла целиком. Отказ на этом смещении — «данные ещё не
     /// готовы», а не порча; блоки перед ним дописаны раньше и читаются как
     /// обычно.
-    live_tail: Option<u64>,
+    live_tail_offset: Option<u64>,
 }
 
 /// Сведения о пропущенном фрагменте.
@@ -295,7 +296,7 @@ impl SegmentCursor {
                 offsets
             }
         };
-        let live_tail = if live && unsealed {
+        let live_tail_offset = if live && unsealed {
             offsets.last().copied()
         } else {
             None
@@ -315,7 +316,7 @@ impl SegmentCursor {
             prefilter,
             migration,
             damaged,
-            live_tail,
+            live_tail_offset,
         })
     }
 
@@ -333,7 +334,7 @@ impl SegmentCursor {
             prefilter: None,
             migration: MigrationState::None,
             damaged,
-            live_tail: None,
+            live_tail_offset: None,
         }
     }
 
@@ -456,7 +457,7 @@ impl SegmentCursor {
             // долететь — заголовок и тело кладутся одним write, а страницы
             // становятся видимыми читателю без гарантии целиком. Такой блок
             // молча пропускается: к следующему запросу он будет дописан.
-            let tolerate_tear = self.live_tail == Some(offset);
+            let tolerate_tear = self.live_tail_offset == Some(offset);
 
             match self.reader.read_block_at(offset, &mut buf) {
                 Ok(Some(_)) => {}
@@ -591,12 +592,13 @@ pub struct ChannelCursor {
     damaged: Vec<Damage>,
     /// Запуски, чьи сегменты пришлось пропустить: окно настенное, якоря нет.
     unanchored: Vec<BootCounter>,
-    /// Неймспейс и канал — для маркировки выдаваемых записей.
+    /// Неймспейс — для маркировки выдаваемых записей.
     ///
     /// `Arc<str>`, а не `String`: имя копируется в каждую выдаваемую запись,
     /// и на сотне тысяч записей это была бы сотня тысяч аллокаций.
     pub namespace: Arc<str>,
-    pub channel: Arc<str>,
+    /// Класс хранения канала: канал и есть класс, второго имени у него нет.
+    pub channel: StorageClass,
 }
 
 /// Параметры открытия канала.
@@ -698,7 +700,7 @@ impl ChannelCursor {
     pub fn open(
         dir: &Path,
         namespace: Arc<str>,
-        channel: Arc<str>,
+        channel: StorageClass,
         scope: &ChannelScope,
     ) -> Result<Self> {
         let (boot, reverse, expect_store) = (scope.boot, scope.reverse, scope.expect_store);
@@ -1060,7 +1062,8 @@ mod tests {
                 ..ChannelScope::default()
             };
             let mut c =
-                ChannelCursor::open(dir.path(), Arc::from("ns"), Arc::from("ch"), &scope).unwrap();
+                ChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
+                    .unwrap();
             // Листинг уже сделан — теперь «ротация» забирает поздний сегмент.
             std::fs::remove_file(&later).unwrap();
             let mut times = Vec::new();

@@ -10,7 +10,7 @@ use crate::Clock;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::limits::{EffectiveLimits, LimitsRegistry, MetricLimits};
-use crate::metric::{Metric, MetricValue, NumericMetric, Untyped};
+use crate::metric::{Metric, MetricValue, NumericValue, Untyped};
 use crate::schema::{MetricDesc, MetricKind, Schema, Severity, StorageClass, Thresholds};
 use crate::staged::{ChannelIdx, DropCounters, NsId, OwnedValue, Payload, Staged, StagedRecord};
 use crate::stats::Counters;
@@ -104,7 +104,7 @@ impl NsMeta {
 /// тем же типом, что и отсчёты: `..=60.0` у `Metric<f32>`, `..=10` у
 /// `Metric<u64>`. Исключающая граница трактуется как включающая по той же
 /// причине, что и в [`crate::schema::Range`].
-fn numeric_range<T: NumericMetric>(r: impl std::ops::RangeBounds<T>) -> crate::schema::Range {
+fn numeric_range<T: NumericValue>(r: impl std::ops::RangeBounds<T>) -> crate::schema::Range {
     use std::ops::Bound;
     let bound = |b: Bound<&T>| match b {
         Bound::Unbounded => None,
@@ -349,7 +349,7 @@ impl Namespace {
             .map(|i| ChannelIdx(i as u16))
             .ok_or(Error::ClassNotDeclared {
                 schema: self.inner.schema.name,
-                class: class.as_str(),
+                class,
             })
     }
 
@@ -568,14 +568,14 @@ impl Namespace {
     /// ns.set_thresholds(metrics::Vswr, 1.0..=1.5, 1.0..=2.0)?; // с двух сторон
     /// ```
     ///
-    /// Границы — того же типа, что и отсчёты метрики ([`NumericMetric`]):
+    /// Границы — того же типа, что и отсчёты метрики ([`NumericValue`]):
     /// метрике-перечислению или `type: blob` их не задать, и говорит об этом
     /// компилятор, а не отказ на устройстве. Метрику, известную только в
     /// рантайме, обслуживает [`Namespace::set_thresholds_raw`].
     ///
     /// **На диск не пишется.** Границы — свойство установки, а не измерения;
     /// подробнее в [`crate::limits`].
-    pub fn set_thresholds<T: NumericMetric>(
+    pub fn set_thresholds<T: NumericValue>(
         &self,
         metric: Metric<T>,
         warn: impl std::ops::RangeBounds<T>,

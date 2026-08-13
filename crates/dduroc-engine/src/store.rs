@@ -135,7 +135,8 @@ impl StoreConfig {
         // нельзя — оператор считал бы, что настройка действует.
         if self.config_for(StorageClass::Critical).sync_interval != std::time::Duration::ZERO {
             return Err(Error::BadChannel {
-                name: StorageClass::Critical.as_str().to_owned(),
+                class: StorageClass::Critical,
+                namespace: None,
                 reason: "критический канал синхронизируется сразу — в этом его \
                          смысл; настраивайте его от ChannelConfig::critical",
             });
@@ -143,7 +144,7 @@ impl StoreConfig {
 
         for class in StorageClass::ALL {
             let config = self.config_for(class);
-            config.validate(class.as_str())?;
+            config.validate(class)?;
         }
         Ok(())
     }
@@ -427,7 +428,8 @@ impl Store {
                 && q < config.segment_bytes.saturating_mul(2)
             {
                 return Err(Error::BadChannel {
-                    name: format!("{name}/{}", class.as_str()),
+                    class: *class,
+                    namespace: Some(name.to_owned()),
                     reason: "квота меньше двух сегментов — ротация съедала бы \
                              данные сразу после запечатывания",
                 });

@@ -96,10 +96,11 @@ impl ChannelConfig {
         }
     }
 
-    /// Проверить конфигурацию; `name` — чьё это имя в сообщении об ошибке.
-    pub fn validate(&self, name: &str) -> Result<()> {
+    /// Проверить конфигурацию; `class` — чей это канал в сообщении об ошибке.
+    pub fn validate(&self, class: crate::schema::StorageClass) -> Result<()> {
         let bad = |reason| Error::BadChannel {
-            name: name.to_owned(),
+            class,
+            namespace: None,
             reason,
         };
         // Бюджет меньше двух сегментов означает, что при запечатывании
@@ -177,12 +178,12 @@ mod tests {
         // бы 80-МиБ преаллокацию каждому писателю.
         let c = ChannelConfig::new(20 * 1024 * 1024 * 1024);
         assert_eq!(c.segment_bytes, 8 * 1024 * 1024);
-        c.validate("ch").unwrap();
+        c.validate(crate::schema::StorageClass::Default).unwrap();
 
         let c = ChannelConfig::new(64 * 1024 * 1024);
         assert_eq!(c.segment_bytes, 8 * 1024 * 1024, "и от малого не зависит");
         assert_eq!(c.max_segments(), 8);
-        c.validate("ch").unwrap();
+        c.validate(crate::schema::StorageClass::Default).unwrap();
     }
 
     #[test]
@@ -195,7 +196,7 @@ mod tests {
         );
         assert_eq!(c.compression, Compression::None);
         assert!(c.flush_interval < Duration::from_secs(1));
-        c.validate("ch").unwrap();
+        c.validate(crate::schema::StorageClass::Default).unwrap();
     }
 
     #[test]
@@ -203,17 +204,17 @@ mod tests {
         let mut c = ChannelConfig::new(64 * 1024 * 1024);
         c.budget_bytes = c.segment_bytes; // ровно один сегмент
         assert!(
-            c.validate("ch").is_err(),
+            c.validate(crate::schema::StorageClass::Default).is_err(),
             "бюджет в один сегмент бессмыслен"
         );
 
         let mut c = ChannelConfig::new(64 * 1024 * 1024);
         c.block_max_bytes = 16;
-        assert!(c.validate("ch").is_err());
+        assert!(c.validate(crate::schema::StorageClass::Default).is_err());
 
         let mut c = ChannelConfig::new(64 * 1024 * 1024);
         c.block_max_bytes = c.segment_bytes as usize;
-        assert!(c.validate("ch").is_err());
+        assert!(c.validate(crate::schema::StorageClass::Default).is_err());
     }
 
     #[test]

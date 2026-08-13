@@ -17,6 +17,7 @@
 //! сообщается явно ([`Resolution::unanchored`]), а не молча.
 
 use dduroc_engine::epochs::{Epochs, RunOffset};
+use dduroc_engine::schema::StorageClass;
 use dduroc_format::{BootCounter, BootTime, EventId, Level, Micros, SpanId};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -298,8 +299,8 @@ impl KindFilter {
 #[must_use = "запрос строится цепочкой: результат метода и есть настроенный запрос"]
 pub struct Query {
     pub namespaces: NsSelect,
-    /// Каналы по именам. Пусто — все.
-    pub channels: Vec<String>,
+    /// Каналы по классам хранения. Пусто — все.
+    pub channels: Vec<StorageClass>,
     /// Ограничение по запуску ПО: только его сегменты.
     pub boot: Option<BootCounter>,
     /// Нижняя граница окна, включительно.
@@ -338,15 +339,19 @@ impl Query {
         self
     }
 
-    pub fn channel(mut self, name: impl Into<String>) -> Self {
-        self.channels.push(name.into());
+    /// Читать только каналы этого класса хранения.
+    ///
+    /// Класс — перечисление, а не имя: канал с опечаткой непредставим.
+    pub fn channel(mut self, class: StorageClass) -> Self {
+        self.channels.push(class);
         self
     }
 
-    /// Окно `from..=to`. Шкалы границ могут быть разными, но смешивать их
-    /// стоит только осознанно: настенная граница переводится по якорю, и
-    /// запуск без якоря выпадет из выборки целиком.
-    pub fn range(mut self, from: impl Into<Timestamp>, to: impl Into<Timestamp>) -> Self {
+    /// Окно времени `from..=to` — пара к [`Query::boot_window`], но границы
+    /// любой шкалы. Шкалы могут и различаться, только смешивать их стоит
+    /// осознанно: настенная граница переводится по якорю, и запуск без
+    /// якоря выпадет из выборки целиком.
+    pub fn time_window(mut self, from: impl Into<Timestamp>, to: impl Into<Timestamp>) -> Self {
         self.from = Some(from.into());
         self.to = Some(to.into());
         self
@@ -640,7 +645,7 @@ mod tests {
         let utc = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).unwrap();
         // Окно: от 3-й до 5-й секунды BOOTTIME первой загрузки.
         let r = Query::new()
-            .range(utc(anchor_ms + 3_000), utc(anchor_ms + 5_000))
+            .time_window(utc(anchor_ms + 3_000), utc(anchor_ms + 5_000))
             .resolve(&epochs);
 
         assert_eq!(

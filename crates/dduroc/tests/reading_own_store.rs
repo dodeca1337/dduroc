@@ -70,7 +70,7 @@ fn a_reader_of_the_store_sees_the_class_that_lives_on_another_medium() {
         matches!(
             &e,
             dduroc_read::ReadError::IncompleteDump { namespace, class }
-                if namespace == "orc-probe-0" && *class == "critical"
+                if namespace == "orc-probe-0" && *class == StorageClass::Critical
         ),
         "{e}"
     );
@@ -80,6 +80,35 @@ fn a_reader_of_the_store_sees_the_class_that_lives_on_another_medium() {
         ["пинг 1", "отказ 3"]
     );
 
+    store.shutdown();
+}
+
+#[test]
+fn an_unknown_directory_under_a_namespace_is_reported_not_hidden() {
+    // Канал — это класс хранения, и перечисление каналов типизировано.
+    // Каталог, не являющийся каналом ни одного класса этой сборки (чужая
+    // директория, дамп из будущей версии с новым классом), не разбирается —
+    // но и не выпадает молча: он объявляется повреждением.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
+    let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
+    ns.log(split::events::Ping { seq: 1 });
+    ns.sync().unwrap();
+    std::fs::create_dir(dir.path().join("orc-probe-0").join("scratch")).unwrap();
+
+    let listing = store.reader().namespaces().unwrap();
+    assert_eq!(
+        listing.namespaces[0].channels,
+        [StorageClass::Default, StorageClass::Critical],
+        "известные каналы на месте и типизированы"
+    );
+    assert_eq!(
+        listing.damaged.len(),
+        1,
+        "неизвестный каталог обязан быть объявлен: {:?}",
+        listing.damaged
+    );
+    assert!(listing.damaged[0].path.ends_with("scratch"));
     store.shutdown();
 }
 
@@ -157,7 +186,10 @@ fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
     // Единственный сегмент канала — активный. Дописываем в него мусор там,
     // где writer продолжил бы писать: так выглядит блок, чей write ещё не
     // стал виден целиком.
-    let ch_dir = dir.path().join("orc-probe-0").join("default");
+    let ch_dir = dir
+        .path()
+        .join("orc-probe-0")
+        .join(StorageClass::Default.as_str());
     let seg_path = std::fs::read_dir(&ch_dir)
         .unwrap()
         .filter_map(|e| e.ok())

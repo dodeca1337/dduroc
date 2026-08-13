@@ -51,7 +51,7 @@ pub use ids::{
     BootCounter, BootTime, EventId, MetricId, Micros, ProtocolVersion, SpanId, SpanKindId,
 };
 pub use level::Level;
-pub use record::{Framed, Message, Record, Sample, SpanStart, Text};
+pub use record::{Framed, Message, Record, RecordKind, Sample, SpanStart, Text};
 pub use segment::{SegmentHeader, SegmentName};
 pub use value::{Value, ValueType};
 

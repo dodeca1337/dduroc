@@ -38,6 +38,8 @@ mod reader;
 pub use chrono;
 
 pub use cursor::{Damage, OwnedRecord, OwnedSampleValue, RawEntry};
+/// Класс хранения — тот же тип, что у пишущей стороны: канал и есть класс.
+pub use dduroc_engine::schema::StorageClass;
 pub use dduroc_format::{BootCounter, BootTime, Micros};
 pub use error::{ReadError, Result};
 pub use query::{

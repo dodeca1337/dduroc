@@ -6,7 +6,7 @@ use crate::query::{Bounds, Filter, KindFilter, Order, Query};
 use chrono::{DateTime, Utc};
 use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
-use dduroc_engine::schema::{MetricKind, Schema, Severity};
+use dduroc_engine::schema::{MetricKind, Schema, Severity, StorageClass};
 use dduroc_engine::store::Store;
 use dduroc_format::{BootCounter, BootTime, EventId, Level, MetricId, SpanId, Value};
 use std::cmp::Ordering;
@@ -96,7 +96,9 @@ pub enum EntryKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub namespace: std::sync::Arc<str>,
-    pub channel: std::sync::Arc<str>,
+    /// Класс хранения, в чьём канале лежала запись. Канал и есть класс:
+    /// строкового имени у него нет — есть каталог, названный по классу.
+    pub channel: StorageClass,
     /// Относительное время: запуск плюс микросекунды от его старта. Есть
     /// всегда — прибору для этого не нужны ни RTC, ни синхронизация.
     pub at: BootTime,
@@ -114,6 +116,22 @@ impl Entry {
         match &self.kind {
             EntryKind::Message { level, .. } => *level,
             EntryKind::Text { level, .. } => Some(*level),
+            _ => None,
+        }
+    }
+
+    /// Отметка движка о потерянных записях: сколько их выпало прямо перед
+    /// этой отметкой.
+    ///
+    /// Потери объявляются в самом потоке — дыра, о которой нигде не сказано,
+    /// неотличима от тишины. Формат отметки принадлежит движку
+    /// ([`dduroc_engine::diag`]), и разбирать её текст руками прикладному
+    /// коду не нужно.
+    pub fn dropped_records(&self) -> Option<u64> {
+        match &self.kind {
+            EntryKind::Text { target, text, .. } => {
+                dduroc_engine::diag::parse_drop_notice(target, text)
+            }
             _ => None,
         }
     }
@@ -255,7 +273,7 @@ impl Iterator for EntryStream<'_> {
             }
 
             let ns = std::sync::Arc::clone(&self.cursors[idx].namespace);
-            let ch = std::sync::Arc::clone(&self.cursors[idx].channel);
+            let ch = self.cursors[idx].channel;
             if let Some(entry) = self.reader.build_entry(
                 ns,
                 ch,
@@ -332,7 +350,7 @@ struct NsScan {
     name: String,
     schema_name: String,
     protocol_version: u16,
-    channels: Vec<(String, PathBuf)>,
+    channels: Vec<(StorageClass, PathBuf)>,
 }
 
 /// Открытые под запрос курсоры вместе с разрешёнными схемами.
@@ -351,7 +369,9 @@ pub struct NamespaceInfo {
     pub name: String,
     pub schema_name: String,
     pub protocol_version: u16,
-    pub channels: Vec<String>,
+    /// Классы хранения, чьи каналы есть у неймспейса, в порядке
+    /// [`StorageClass::index`].
+    pub channels: Vec<StorageClass>,
     /// Суммарный размер сегментов, байт.
     pub total_bytes: u64,
 }
@@ -492,10 +512,10 @@ impl Reader {
                 continue;
             };
             for class in schema.classes() {
-                if !ns.channels.iter().any(|(name, _)| *name == class.as_str()) {
+                if !ns.channels.iter().any(|&(have, _)| have == class) {
                     return Err(ReadError::IncompleteDump {
                         namespace: ns.name,
-                        class: class.as_str(),
+                        class,
                     });
                 }
             }
@@ -682,8 +702,8 @@ impl Reader {
     /// нельзя — иначе перечисление объявляло бы полным ответ, из которого
     /// целый неймспейс выпал, и его данные исчезли бы бесследно.
     pub fn namespaces(&self) -> Result<NamespaceListing> {
-        let mut damaged_dirs = Vec::new();
-        let found = self.scan_namespaces(&mut damaged_dirs)?;
+        let mut damaged = Vec::new();
+        let found = self.scan_namespaces(&mut damaged)?;
         let mut namespaces = Vec::with_capacity(found.len());
         for ns in found {
             let mut total_bytes = 0;
@@ -702,21 +722,14 @@ impl Reader {
         }
         Ok(NamespaceListing {
             namespaces,
-            damaged: damaged_dirs
-                .into_iter()
-                .map(|path| Damage {
-                    path,
-                    offset: 0,
-                    reason: "мета неймспейса не читается".to_owned(),
-                })
-                .collect(),
+            damaged,
         })
     }
 
     /// Неймспейсы и их каналы — без обращения к размерам файлов.
     ///
-    /// Каталоги с нечитаемой метой накапливаются в `damaged_dirs`.
-    fn scan_namespaces(&self, damaged_dirs: &mut Vec<PathBuf>) -> Result<Vec<NsScan>> {
+    /// Нечитаемая мета и каталоги неизвестных классов копятся в `damaged`.
+    fn scan_namespaces(&self, damaged: &mut Vec<Damage>) -> Result<Vec<NsScan>> {
         let mut out = Vec::new();
         let roots = self.all_roots();
         let main_root = &roots[0];
@@ -745,7 +758,11 @@ impl Reader {
                 // неймспейс, который мы не можем показать, и молчать об этом
                 // нельзя: его данные просто исчезли бы из всех ответов.
                 if path.join(NS_META).exists() {
-                    damaged_dirs.push(path);
+                    damaged.push(Damage {
+                        path,
+                        offset: 0,
+                        reason: "метаданные неймспейса не читаются".to_owned(),
+                    });
                 }
                 continue;
             };
@@ -754,7 +771,7 @@ impl Reader {
             // вынесен на свой носитель, и его каталог живёт не рядом с
             // ns-meta. Имя канала уникально в пределах неймспейса — класс
             // живёт ровно в одном корне.
-            let mut channels: Vec<(String, PathBuf)> = Vec::new();
+            let mut channels: Vec<(StorageClass, PathBuf)> = Vec::new();
             for root in &roots {
                 let ns_dir = root.join(name);
                 let Ok(dir) = std::fs::read_dir(&ns_dir) else {
@@ -765,12 +782,26 @@ impl Reader {
                     if !ch_path.is_dir() {
                         continue;
                     }
-                    if let Some(ch_name) = ch_path.file_name().and_then(|n| n.to_str()) {
-                        channels.push((ch_name.to_owned(), ch_path));
+                    let class = ch_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(StorageClass::from_dir_name);
+                    match class {
+                        Some(class) => channels.push((class, ch_path)),
+                        // Каталог, не являющийся каналом ни одного класса
+                        // этой сборки, — либо чужая директория, либо дамп из
+                        // будущей версии с новым классом. Разбирать его
+                        // нечем, а выпасть молча он не имеет права.
+                        None => damaged.push(Damage {
+                            path: ch_path,
+                            offset: 0,
+                            reason: "каталог не является каналом известного                                      класса хранения"
+                                .to_owned(),
+                        }),
                     }
                 }
             }
-            channels.sort();
+            channels.sort_by_key(|(c, _)| c.index());
 
             out.push(NsScan {
                 name: name.to_owned(),
@@ -959,7 +990,7 @@ impl Reader {
                     continue;
                 }
                 let ns = std::sync::Arc::clone(&cursor.namespace);
-                let ch = std::sync::Arc::clone(&cursor.channel);
+                let ch = cursor.channel;
                 if let Some(entry) =
                     self.build_entry(ns, ch, schemas[idx].as_ref(), &raw, &probe, epochs)
                 {
@@ -1001,9 +1032,9 @@ impl Reader {
     ) -> Result<OpenedCursors> {
         let mut cursors = Vec::new();
         let mut schemas = Vec::new();
-        let mut damaged_dirs = Vec::new();
+        let mut damaged = Vec::new();
 
-        for ns in self.scan_namespaces(&mut damaged_dirs)? {
+        for ns in self.scan_namespaces(&mut damaged)? {
             if !q.namespaces.matches(&ns.name) {
                 continue;
             }
@@ -1024,28 +1055,20 @@ impl Reader {
             };
             adjust(&mut scope);
 
-            for (channel, dir) in &ns.channels {
-                if !q.channels.is_empty() && !q.channels.contains(channel) {
+            for &(channel, ref dir) in &ns.channels {
+                if !q.channels.is_empty() && !q.channels.contains(&channel) {
                     continue;
                 }
                 cursors.push(ChannelCursor::open(
                     dir,
                     std::sync::Arc::clone(&ns_name),
-                    std::sync::Arc::from(channel.as_str()),
+                    channel,
                     &scope,
                 )?);
                 schemas.push(schema);
             }
         }
 
-        let damaged = damaged_dirs
-            .into_iter()
-            .map(|path| Damage {
-                path,
-                offset: 0,
-                reason: "метаданные неймспейса не читаются".to_owned(),
-            })
-            .collect();
         Ok(OpenedCursors {
             cursors,
             schemas,
@@ -1057,7 +1080,7 @@ impl Reader {
     fn build_entry(
         &self,
         ns: std::sync::Arc<str>,
-        channel: std::sync::Arc<str>,
+        channel: StorageClass,
         schema: Option<&Schema>,
         raw: &crate::cursor::RawEntry,
         q: &Query,

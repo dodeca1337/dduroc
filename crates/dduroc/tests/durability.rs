@@ -7,7 +7,7 @@
 //! заведомо неудобных размеров.
 
 use dduroc::prelude::*;
-use dduroc::{ChannelConfig, StoreConfig};
+use dduroc::{ChannelConfig, StorageClass, StoreConfig};
 use dduroc_read::{Order, Query, Reader};
 use std::path::Path;
 
@@ -80,7 +80,10 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let channel = dir.path().join("orc-0").join("default");
+    let channel = dir
+        .path()
+        .join("orc-0")
+        .join(StorageClass::Default.as_str());
     let segment_bytes = ChannelConfig::new(0).segment_bytes;
 
     let out = std::process::Command::new(std::env::current_exe().unwrap())
@@ -168,7 +171,10 @@ fn crashed_segment_gets_a_footer_so_migration_can_see_it() {
     drop(store.namespace("orc-0", durability::SCHEMA).unwrap());
     store.shutdown();
 
-    let channel = dir.path().join("orc-0").join("default");
+    let channel = dir
+        .path()
+        .join("orc-0")
+        .join(StorageClass::Default.as_str());
     let path = channel.join(&segments(&channel)[0].0);
     let reader = dduroc_engine::segment::SegmentReader::open(&path).unwrap();
     assert!(reader.is_sealed(), "оборванный сегмент запечатан");
@@ -199,7 +205,10 @@ fn record_larger_than_a_segment_is_refused_not_written_past_it() {
     ns.sync().unwrap();
     store.shutdown();
 
-    let channel = dir.path().join("orc-0").join("default");
+    let channel = dir
+        .path()
+        .join("orc-0")
+        .join(StorageClass::Default.as_str());
     for (name, size) in segments(&channel) {
         assert!(
             size <= segment_bytes,
@@ -230,7 +239,10 @@ fn reopened_namespace_does_not_leave_a_second_state_on_the_directory() {
     // другим: запись продолжалась бы в файл без имени и пропала бы вся.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
-    let channel = dir.path().join("orc-0").join("default");
+    let channel = dir
+        .path()
+        .join("orc-0")
+        .join(StorageClass::Default.as_str());
 
     for round in 0..4 {
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();

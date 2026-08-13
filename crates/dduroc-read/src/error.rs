@@ -21,12 +21,12 @@ pub enum ReadError {
     },
 
     #[error(
-        "дамп неполон: у неймспейса {namespace:?} нет дерева класса {class:?} — \
+        "дамп неполон: у неймспейса {namespace:?} нет дерева класса {class} — \
          хранилище писало этот класс в свой корень, назовите ВСЕ корни дампа"
     )]
     IncompleteDump {
         namespace: String,
-        class: &'static str,
+        class: dduroc_engine::schema::StorageClass,
     },
 
     #[error("недопустимый шаблон выбора неймспейсов {0:?}")]
