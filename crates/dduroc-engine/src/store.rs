@@ -154,14 +154,23 @@ impl StoreConfig {
         self
     }
 
-    /// Политика группы, которой принадлежит неймспейс: самый длинный из
-    /// подходящих префиксов.
-    fn policy_for(&self, namespace: &str) -> Option<&GroupPolicy> {
-        self.groups
+    /// Политики, которым принадлежит неймспейс, от общей к частной.
+    ///
+    /// Совпасть могут несколько: `orc-radio-` **уточняет** `orc-`, а не
+    /// спорит с ним, — и накладываются они друг на друга, как группа
+    /// накладывается на класс. Иначе уточнение одной настройки молча снимало
+    /// бы все остальные, заданные общей группой: квоту, сжатие, интервалы.
+    fn policies_for<'a>(&'a self, namespace: &'a str) -> impl Iterator<Item = &'a GroupPolicy> {
+        let mut matched: Vec<&(String, GroupPolicy)> = self
+            .groups
             .iter()
             .filter(|(prefix, _)| in_group(prefix, namespace))
-            .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(_, policy)| policy)
+            .collect();
+        // От короткого к длинному: последний слой — самый частный. Длина
+        // однозначна — два разных префикса одной длины не могут оба быть
+        // началом одного имени.
+        matched.sort_by_key(|(prefix, _)| prefix.len());
+        matched.into_iter().map(|(_, policy)| policy)
     }
 
     /// Настройки канала: класс, поверх него — группа неймспейса.
@@ -177,17 +186,22 @@ impl StoreConfig {
             }
             None => ChannelConfig::new(self.default_budget_bytes),
         };
-        if let Some(policy) = namespace.and_then(|n| self.policy_for(n))
-            && let Some(over) = policy.channels.get(&class)
-        {
-            over.apply_to(&mut config);
+        if let Some(name) = namespace {
+            for policy in self.policies_for(name) {
+                if let Some(over) = policy.channels.get(&class) {
+                    over.apply_to(&mut config);
+                }
+            }
         }
         config
     }
 
-    /// Квота, положенная неймспейсу его группой.
+    /// Квота, положенная неймспейсу его группами: побеждает самая частная из
+    /// назвавших её.
     fn group_quota(&self, namespace: &str, class: StorageClass) -> Option<u64> {
-        self.policy_for(namespace)?.quota.get(class)
+        self.policies_for(namespace)
+            .filter_map(|p| p.quota.get(class))
+            .last()
     }
 
     /// Проверить всё, что задало приложение.
@@ -282,6 +296,25 @@ impl StoreConfig {
                     ));
                 }
                 config.check().map_err(bad)?;
+            }
+            // Квота проверяется здесь же, а не при открытии первого
+            // подходящего неймспейса: негодная настройка обязана называться
+            // тогда, когда её ещё можно поправить, — а первое подходящее имя
+            // может подняться через месяцы работы прибора.
+            for class in StorageClass::ALL {
+                let Some(quota) = policy.quota.get(class) else {
+                    continue;
+                };
+                let mut config = self.config_for(None, class);
+                if let Some(over) = policy.channels.get(&class) {
+                    over.apply_to(&mut config);
+                }
+                if quota < config.segment_bytes.saturating_mul(2) {
+                    return Err(bad(
+                        "квота меньше двух сегментов — ротация съедала бы данные сразу \
+                         после запечатывания",
+                    ));
+                }
             }
         }
         Ok(())
@@ -1079,10 +1112,11 @@ mod tests {
     }
 
     #[test]
-    fn the_longest_matching_group_wins_and_the_namespace_beats_them_all() {
-        // Префиксы вкладываются друг в друга: `orc-radio-` уточняет `orc-`, а
-        // не спорит с ним. Зависеть от порядка объявления или от обхода
-        // хэш-таблицы такой ответ не имеет права.
+    fn a_longer_prefix_refines_the_shorter_one_and_the_namespace_beats_them_all() {
+        // Префиксы вкладываются друг в друга: `orc-radio-` УТОЧНЯЕТ `orc-`, а
+        // не заменяет его. Иначе уточнение одной настройки молча снимало бы
+        // все прочие, заданные общей группой. Зависеть от порядка объявления
+        // или от обхода хэш-таблицы такой ответ не имеет права.
         let cfg = StoreConfig::new("/tmp/nowhere")
             .group(
                 "orc-",
@@ -1114,12 +1148,44 @@ mod tests {
             "без имени группы не спрашиваются вовсе"
         );
 
-        // Квота наследуется от ближайшей группы, у которой она есть.
+        // Квота задана только общей группой — уточняющая её не отменяет.
+        assert_eq!(
+            cfg.group_quota("orc-radio-0", StorageClass::Default),
+            Some(100 << 20),
+            "уточнение размера сегмента не снимает квоту общей группы"
+        );
         assert_eq!(
             cfg.group_quota("orc-power-0", StorageClass::Default),
             Some(100 << 20)
         );
         assert_eq!(cfg.group_quota("diag-0", StorageClass::Default), None);
+
+        // И наоборот: настройка класса, которую уточняющая группа не
+        // упоминает, приходит от общей.
+        let refining = StoreConfig::new("/tmp/nowhere")
+            .group(
+                "orc-",
+                GroupPolicy::new().channel(
+                    StorageClass::Telemetry,
+                    ChannelOverride::new()
+                        .segment_bytes(2 << 20)
+                        .compression(dduroc_format::Compression::None),
+                ),
+            )
+            .group(
+                "orc-radio-",
+                GroupPolicy::new().channel(
+                    StorageClass::Telemetry,
+                    ChannelOverride::new().segment_bytes(1 << 20),
+                ),
+            );
+        let refined = refining.config_for(Some("orc-radio-0"), StorageClass::Telemetry);
+        assert_eq!(refined.segment_bytes, 1 << 20, "своё — своё");
+        assert_eq!(
+            refined.compression,
+            dduroc_format::Compression::None,
+            "не упомянутое уточнением приходит от общей группы"
+        );
     }
 
     #[test]
@@ -1209,10 +1275,22 @@ mod tests {
                         StorageClass::Default,
                         ChannelOverride::new().segment_bytes(2 << 20),
                     )
-                    .limit_bytes(StorageClass::Telemetry, 8 << 20),
+                    .limit_bytes(StorageClass::Telemetry, 64 << 20),
             )
             .validate()
             .expect("годная политика группы");
+
+        // Квота группы проверяется при открытии, а не при подъёме первого
+        // подходящего неймспейса: тот может случиться через месяцы работы, и
+        // поправить настройку будет уже негде.
+        let e = base()
+            .group(
+                "orc-",
+                GroupPolicy::new().limit_bytes(StorageClass::Default, 4 << 20),
+            )
+            .validate()
+            .unwrap_err();
+        assert!(matches!(e, Error::BadGroup { .. }), "{e}");
     }
 
     #[test]

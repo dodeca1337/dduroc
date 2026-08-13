@@ -276,9 +276,31 @@ fn a_stopped_store_ends_the_subscription_instead_of_leaving_it_waiting() {
     assert!(ended);
     assert_eq!(after.len(), 1, "последняя запись дошла до конца потока");
     assert!(
+        tail.take_damage().is_empty(),
+        "остановка — не порча: {:?}",
+        tail.take_damage()
+    );
+    assert!(
         matches!(tail.next(Duration::from_millis(10)), Tail::Ended),
         "конец необратим"
     );
+}
+
+#[test]
+fn asking_to_wait_forever_answers_instead_of_panicking() {
+    // `Duration::MAX` в сроке ожидания — это паника на сложении с часами.
+    // Паника вместо ожидания была бы худшим прочтением такой просьбы.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(dir.path())).unwrap();
+    let ns = store.namespace("dev-0", probe::SCHEMA).unwrap();
+    let reader = store.reader();
+    let mut tail = reader.follow(&Query::new().order(Order::Oldest)).unwrap();
+
+    ns.log(probe::events::Tick { n: 0 });
+    ns.sync().unwrap();
+    // Записанное уже на носителе — ждать не придётся, а вот сложить срок
+    // потребуется.
+    assert!(matches!(tail.next(Duration::MAX), Tail::Entry(_)));
 }
 
 #[test]
