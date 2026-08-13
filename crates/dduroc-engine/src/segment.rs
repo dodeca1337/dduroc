@@ -186,6 +186,35 @@ impl SegmentWriter {
         self.remaining() >= block_len + BlockHeader::SIZE as u64
     }
 
+    /// Дорезервировать место под блок, которому не хватило ёмкости.
+    ///
+    /// **Не** для обычной записи: там преаллокация фиксирована ровно затем,
+    /// чтобы ENOSPC приходил один раз, при создании сегмента, а не посреди
+    /// аварийного события. Здесь наоборот — это для файла, чей размер заранее
+    /// неизвестен: миграция переписывает сегмент, и на сколько раздуются
+    /// записи, знает только сама цепочка шагов. Взять с запасом «на всякий
+    /// случай» значит занять на приборе место, которого может не быть; расти
+    /// по мере надобности — значит отказать ровно тогда, когда места
+    /// действительно не хватило.
+    ///
+    /// Шаг роста — восьмая часть текущей ёмкости, а не удвоение: `fallocate`
+    /// на каждый блок стоил бы системного вызова на блок, а удвоение вернуло
+    /// бы ровно ту беду, от которой уходим, — просьбу о вдвое большем месте.
+    /// Лишний хвост обрежет запечатывание.
+    pub fn reserve(&mut self, block_len: u64) -> Result<()> {
+        if self.fits(block_len) {
+            return Ok(());
+        }
+        let need = self
+            .end
+            .saturating_add(block_len)
+            .saturating_add(BlockHeader::SIZE as u64);
+        let want = need.max(self.capacity.saturating_add(self.capacity / 8));
+        grow_to(&self.file, want, &self.path)?;
+        self.capacity = want;
+        Ok(())
+    }
+
     /// Дописать готовый блок (заголовок + тело). Возвращает его смещение.
     ///
     /// Блок обязан быть собран с номером [`Self::next_seq`].
@@ -241,7 +270,7 @@ impl SegmentWriter {
 /// создании сегмента, а не посреди записи критического события.
 fn grow_to(file: &File, capacity: u64, path: &Path) -> Result<()> {
     #[cfg(test)]
-    if fault::take_no_space() {
+    if fault::refuses(capacity) {
         return Err(Error::NoSpace(path.to_owned()));
     }
     match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, capacity) {
@@ -273,6 +302,7 @@ pub(crate) mod fault {
 
     thread_local! {
         static NO_SPACE: Cell<u32> = const { Cell::new(0) };
+        static CEILING: Cell<u64> = const { Cell::new(u64::MAX) };
     }
 
     /// Следующие `n` попыток зарезервировать место отказывают.
@@ -280,12 +310,30 @@ pub(crate) mod fault {
         NO_SPACE.with(|c| c.set(n));
     }
 
-    pub(crate) fn take_no_space() -> bool {
-        NO_SPACE.with(|c| {
+    /// Носитель, на котором свободно ровно `bytes`: попытка зарезервировать
+    /// больше отказывает.
+    ///
+    /// Нужно там, где проверяется не «отказ по месту вообще», а **сколько**
+    /// места операция просит: прогон миграции, который берёт вдвое больше
+    /// нужного, на настоящем приборе ляжет, а на просторной машине разработчика
+    /// пройдёт незамеченным.
+    pub(crate) fn free_space(bytes: u64) {
+        CEILING.with(|c| c.set(bytes));
+    }
+
+    /// Снять потолок, выставленный [`free_space`].
+    pub(crate) fn unlimited_space() {
+        CEILING.with(|c| c.set(u64::MAX));
+    }
+
+    pub(crate) fn refuses(want: u64) -> bool {
+        let over = CEILING.with(|c| want > c.get());
+        let counted = NO_SPACE.with(|c| {
             let left = c.get();
             c.set(left.saturating_sub(1));
             left > 0
-        })
+        });
+        over || counted
     }
 }
 
@@ -743,6 +791,16 @@ impl SegmentReader {
 
     pub fn is_empty(&self) -> bool {
         self.len <= SegmentHeader::SIZE as u64
+    }
+
+    /// Граница полезных данных: конец блоков, до footer'а.
+    ///
+    /// Отличается от [`SegmentReader::len`] у обоих концов: у запечатанного
+    /// сегмента длина файла включает footer, у незапечатанного — непрописанный
+    /// хвост преаллокации. Спрашивают об этом те, кому нужен объём **записей**,
+    /// а не файла, — например, миграция, прикидывая ёмкость под переписывание.
+    pub fn data_end(&self) -> u64 {
+        self.data_end
     }
 
     pub fn is_sealed(&self) -> bool {

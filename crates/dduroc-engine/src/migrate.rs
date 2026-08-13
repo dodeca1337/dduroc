@@ -22,7 +22,7 @@ use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome, Sc
 use crate::segment::{SegmentReader, SegmentWriter};
 use crate::staged::{ChannelIdx, NsId};
 use crate::writer::{MigrationCommit, Writer};
-use dduroc_format::block::BlockBuilder;
+use dduroc_format::block::{BlockBuilder, BlockHeader};
 use dduroc_format::record::{Message, Sample};
 use dduroc_format::segment::SegmentHeader;
 use dduroc_format::{EventId, FooterBuilder, MetricId, ProtocolVersion, Record, SpanId};
@@ -450,10 +450,18 @@ fn rewrite_segment(
         base: src.base,
         store_id: src.store_id,
     };
-    // Ёмкость с запасом: добавленное шагом поле раздувает записи, а упереться
-    // в потолок посреди переписывания значит бросить работу. Хвост обрежет
-    // seal.
-    let capacity = reader.len().saturating_mul(2).max(1 << 20);
+    // Ёмкость — по фактическим данным оригинала, и растёт по мере надобности
+    // (`SegmentWriter::reserve`). Запас «на всякий случай» тут не бесплатен:
+    // временный файл лежит рядом с оригиналом, в бюджете класса не числится и
+    // на носитель давит по-настоящему. Прежний двойной запас означал, что
+    // прогон требовал втрое больше места, чем занимает сегмент, — на приборе,
+    // размеченном под свой бюджет, это ENOSPC на ровном месте. Насколько
+    // раздуются записи, знает только цепочка шагов, поэтому единственный
+    // честный ответ — расти по факту и отказать ровно тогда, когда места
+    // действительно не хватило. Хвост обрежет seal.
+    // Ровно данные оригинала плюс место под нулевой заголовок-терминатор:
+    // при неизменившемся размере записей файл не растёт ни разу.
+    let capacity = reader.data_end() + BlockHeader::SIZE as u64;
     let tmp = tmp_path(path);
     let mut seg = SegmentWriter::create_at(&tmp, header, capacity)?;
 
@@ -513,12 +521,7 @@ fn rewrite_segment(
         }
         out.clear();
         let h = builder.finish(seg.next_seq(), compression, &mut out)?;
-        if !seg.fits(out.len() as u64) {
-            return Err(Error::Corrupt {
-                path: path.to_owned(),
-                reason: "переписанный сегмент не влез в отведённую ёмкость".to_owned(),
-            });
-        }
+        seg.reserve(out.len() as u64)?;
         let at = seg.append_block(&out)?;
         footer.add_block(at, &h, last);
     }
@@ -931,5 +934,83 @@ mod tests {
         let err = chain(&schema, 1).unwrap_err();
         assert_eq!(err.step_from, 1);
         assert_eq!(err.kind, ChainErrorKind::MissingStep);
+    }
+    /// Записать односегментный файл версии `version` с `count` записями.
+    fn segment_of(dir: &Path, version: u16, count: usize) -> (std::path::PathBuf, u64) {
+        use dduroc_format::Compression;
+        use dduroc_format::segment::SegmentName;
+
+        let header = SegmentHeader {
+            protocol_version: ProtocolVersion(version),
+            boot: dduroc_format::BootCounter(0),
+            base: dduroc_format::Micros(0),
+            store_id: 0,
+        };
+        let mut seg = SegmentWriter::create(dir, header, 1 << 20).unwrap();
+        let mut footer = FooterBuilder::new();
+        let mut builder = BlockBuilder::new();
+        let mut out = Vec::new();
+        let payload = vec![0xABu8; 200];
+        for i in 0..count {
+            builder
+                .push(dduroc_format::Micros(i as u64), &msg(1, &payload))
+                .unwrap();
+            if builder.raw_len() >= 4096 || i + 1 == count {
+                out.clear();
+                let h = builder
+                    .finish(seg.next_seq(), Compression::None, &mut out)
+                    .unwrap();
+                footer.add_event(EventId(1));
+                let at = seg.append_block(&out).unwrap();
+                footer.add_block(at, &h, dduroc_format::Micros(i as u64));
+            }
+        }
+        seg.seal(&footer.build()).unwrap();
+        let path = dir.join(
+            SegmentName::new(dduroc_format::BootCounter(0), dduroc_format::Micros(0)).to_string(),
+        );
+        let size = std::fs::metadata(&path).unwrap().len();
+        (path, size)
+    }
+
+    #[test]
+    fn a_rewrite_asks_for_the_room_it_needs_not_for_twice_it() {
+        // Временный файл прогона лежит рядом с оригиналом, в бюджете класса не
+        // числится и давит на носитель по-настоящему. Пока ёмкость бралась
+        // вдвое «на всякий случай», прогон требовал втрое больше места, чем
+        // занимает сегмент, — на приборе, размеченном под свой бюджет, это
+        // ENOSPC на ровном месте, а на просторной машине разработчика прошло
+        // бы незамеченным. Отсюда потолок свободного места в тесте.
+        fn widen(r: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            let _ = r;
+            Ok(Some(MigrationOutcome::AsIs))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (path, size) = segment_of(dir.path(), 1, 400);
+        let steps = [&step_of(1, &[EventId(1)], &[], &[], widen)];
+
+        // На носителе свободно ровно столько, сколько занимает копия с
+        // небольшим запасом: переписанный сегмент того же размера, что и
+        // оригинал, обязан поместиться.
+        crate::segment::fault::free_space(size + size / 8);
+        let outcome = rewrite_segment(
+            &mut SegmentReader::open(&path).unwrap(),
+            &path,
+            ProtocolVersion(2),
+            &steps,
+        );
+        crate::segment::fault::unlimited_space();
+        let rewrite = outcome.expect("места хватает на копию сегмента");
+
+        let MigrationCommit::Replace { tmp, size: out } = rewrite.commit else {
+            panic!("сегмент переписан, а не удалён");
+        };
+        assert_eq!(rewrite.records_rewritten, 400);
+        assert!(
+            out <= size + size / 8,
+            "переписанный сегмент {out} против оригинала {size}"
+        );
+        assert!(tmp.exists(), "результат ждёт фиксации");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
