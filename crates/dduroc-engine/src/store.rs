@@ -68,6 +68,22 @@ pub struct StoreConfig {
     pub default_budget_bytes: u64,
     /// Ёмкости очередей записи. Выделяются целиком при открытии хранилища.
     pub queues: QueueSizes,
+    /// Потолок суммарных байт, которые пишущие каналы держат в памяти под
+    /// блоки. `None` — потолка нет, и это умолчание.
+    ///
+    /// Память на канал — активный буфер блока и его сериализованная копия;
+    /// растут они до крупнейшего прошедшего блока и возвращаются, когда канал
+    /// замолчал. Пишущих в любой момент единицы, и обычно этого достаточно.
+    /// Потолок нужен там, где «единицы» перестают быть правдой: класс с
+    /// сотнями одновременно пишущих каналов при 64 КиБ блока — это десятки
+    /// мегабайт, а на armv7 их может не быть.
+    ///
+    /// Не бюджет: бюджет — про место на носителе и принадлежит классу, а этот
+    /// потолок — про оперативную память и принадлежит процессу. Соблюдается
+    /// освобождением буферов у самых крупных держателей; невыполнимый потолок
+    /// объявляется счётчиком [`crate::stats::Stats::buffer_overruns`], а не
+    /// отброшенными записями.
+    pub buffer_ceiling_bytes: Option<u64>,
     /// Политики групп неймспейсов: префикс имени и то, чем группа отличается
     /// от общих настроек классов.
     ///
@@ -85,8 +101,17 @@ impl StoreConfig {
             channels: HashMap::new(),
             default_budget_bytes: 64 * 1024 * 1024,
             queues: QueueSizes::default(),
+            buffer_ceiling_bytes: None,
             groups: Vec::new(),
         }
+    }
+
+    /// Ограничить суммарные буферы блоков пишущих каналов.
+    ///
+    /// См. [`StoreConfig::buffer_ceiling_bytes`].
+    pub fn with_buffer_ceiling(mut self, bytes: u64) -> Self {
+        self.buffer_ceiling_bytes = Some(bytes);
+        self
     }
 
     /// Бюджет класса по умолчанию — см. [`StoreConfig::default_budget_bytes`].
@@ -194,6 +219,30 @@ impl StoreConfig {
         for class in StorageClass::ALL {
             let config = self.config_for(None, class);
             config.validate(class)?;
+        }
+
+        // Потолок памяти ниже пары блоков невыполним по построению: буфер
+        // обязан вместить хотя бы блок, а `scratch` — его сериализованную
+        // копию. Такой потолок не ограничивал бы ничего, зато заставлял бы
+        // канал выталкивать и переаллоцировать буфер на каждом обороте цикла.
+        if let Some(ceiling) = self.buffer_ceiling_bytes {
+            let block = StorageClass::ALL
+                .iter()
+                .map(|&c| self.config_for(None, c).block_max_bytes as u64)
+                .chain(self.groups.iter().flat_map(|(_, p)| {
+                    p.channels
+                        .values()
+                        .filter_map(|o| o.block_max_bytes.map(|b| b as u64))
+                }))
+                .max()
+                .unwrap_or(0);
+            if ceiling < block.saturating_mul(2) {
+                return Err(Error::BadStore {
+                    setting: "buffer_ceiling_bytes",
+                    reason: "потолок памяти меньше пары блоков — буфер обязан вместить \
+                             хотя бы один, и такой потолок только гонял бы аллокатор",
+                });
+            }
         }
 
         // Группы проверяются ровно так же и по тем же правилам: настройка,
@@ -425,6 +474,7 @@ impl Store {
             Arc::clone(&counters),
             config.queues,
             groups,
+            config.buffer_ceiling_bytes,
             Arc::clone(&pulse),
         )?;
 

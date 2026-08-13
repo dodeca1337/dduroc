@@ -44,6 +44,12 @@ pub enum Error {
         class: crate::schema::StorageClass,
     },
 
+    #[error("недопустимая настройка хранилища {setting}: {reason}")]
+    BadStore {
+        setting: &'static str,
+        reason: &'static str,
+    },
+
     #[error("недопустимая политика группы {prefix:?}: {reason}")]
     BadGroup {
         prefix: String,

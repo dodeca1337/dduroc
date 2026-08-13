@@ -261,6 +261,7 @@ impl Writer {
         counters: Arc<Counters>,
         queues: QueueSizes,
         groups: Vec<GroupBudget>,
+        buffer_ceiling: Option<u64>,
         pulse: Arc<crate::pulse::Pulse>,
     ) -> Result<Arc<Self>> {
         let queues = queues.sanitized();
@@ -278,6 +279,7 @@ impl Writer {
             groups,
             segments_seen: 0,
             pressured_roots: 0,
+            buffer_ceiling,
             pulse,
             pulsed_blocks: 0,
             pulsed_shape: 0,
@@ -644,6 +646,20 @@ impl ChannelState {
         self.scratch = Vec::new();
     }
 
+    /// Байты, которые канал держит в памяти под блоки.
+    ///
+    /// Считается ёмкость, а не занятое: буферы растут до крупнейшего
+    /// прошедшего блока и остаются такими до возврата — держит канал именно
+    /// ёмкость. `scratch` входит наравне с накопителем: он хранит целый
+    /// сериализованный блок, и без него счёт занижался бы примерно на блок.
+    ///
+    /// Индекс блоков footer'а сюда не входит намеренно: он описывает открытый
+    /// сегмент, живыми записями возвращён быть не может и уходит только с
+    /// запечатыванием. Потолок же — про то, что можно отдать.
+    fn held_bytes(&self) -> u64 {
+        (self.builder.capacity() + self.scratch.capacity()) as u64
+    }
+
     /// Запечатать сегмент, оборванный прошлым запуском.
     ///
     /// Смысл — вернуть преаллокацию: незапечатанный сегмент числится в бюджете
@@ -753,6 +769,9 @@ struct WriterLoop {
     /// отпускание и вытеснение её уменьшают. Поэтому неизменившийся счётчик
     /// доказывает, что считать нечего.
     segments_seen: u64,
+    /// Потолок суммарных байт, которые пишущие каналы держат под блоки.
+    /// `None` — потолка нет.
+    buffer_ceiling: Option<u64>,
     /// Отметки для подписки читателя. Поднимаются раз в оборот цикла, а не на
     /// каждый блок: за один оборот writer успевает записать целый батч, и
     /// будить читателя чаще значило бы будить его на ту же порцию данных.
@@ -1555,6 +1574,12 @@ impl WriterLoop {
                     continue;
                 }
                 ch.footer.shrink_to_fit();
+                // Канал, отпустивший сегмент, тем более не нуждается в буферах
+                // блока. Раньше сюда попадали только под давлением по месту, и
+                // память при этом не возвращалась вовсе: до обычного оборота
+                // цикла с его лестницей бездействия ещё надо дожить.
+                ch.release_buffers();
+                ch.buffers_released = true;
                 parked += 1;
             }
         }
@@ -1754,6 +1779,98 @@ impl WriterLoop {
         // В самом конце: и обслуживание дедлайнов, и запечатывание по
         // бездействию только что меняли занятость носителя.
         self.enforce_limits();
+        // После лестницы бездействия: она могла всё уже освободить, и потолок
+        // не должен отбирать буферы у тех, кто и так их сейчас отдаёт.
+        self.enforce_memory();
+    }
+
+    /// Байты, которые каналы держат в памяти под блоки.
+    ///
+    /// Обходится только `active` — и этого достаточно: канал уходит из списка
+    /// обслуживаемых лишь при запечатывании по бездействию, а буферы к тому
+    /// моменту уже возвращены. Полный проход по флоту здесь означал бы десятки
+    /// тысяч каналов на каждом обороте цикла — ровно то, ради устранения чего
+    /// этот список и заведён.
+    fn held_bytes(&self) -> u64 {
+        self.active
+            .iter()
+            .filter_map(|&(ns, ch)| {
+                self.namespaces
+                    .get(ns)?
+                    .as_ref()?
+                    .channels
+                    .get(ch)
+                    .map(ChannelState::held_bytes)
+            })
+            .sum()
+    }
+
+    /// Вернуть буферы блоков в объявленный потолок памяти.
+    ///
+    /// Потолок соблюдается **между оборотами цикла**, а не на каждой записи, и
+    /// это не послабление, а единственный честный вариант. Порог закрытия
+    /// блока проверяется ПОСЛЕ добавления записи, поэтому одна запись способна
+    /// раздуть буфер сверх любого потолка (несжимаемый blob крупнее сегмента —
+    /// уже известный случай), а отбросить её ради бухгалтерии по памяти
+    /// значило бы потерять данные там, где память всего лишь неудобна.
+    /// Невыполнимый потолок объявляется счётчиком — как и невыполнимый бюджет.
+    ///
+    /// Освобождение идёт от самых крупных: одна операция даёт больше всего, а
+    /// стоит каждая выталкивания блока. Порядок обязателен — `shrink_to`
+    /// отказывается сжимать заряженный накопитель, поэтому сперва flush, потом
+    /// возврат.
+    fn enforce_memory(&mut self) {
+        let Some(ceiling) = self.buffer_ceiling else {
+            return;
+        };
+        let mut held = self.held_bytes();
+        if held <= ceiling {
+            return;
+        }
+
+        let mut by_size: Vec<(usize, usize, u64)> = self
+            .active
+            .iter()
+            .filter_map(|&(ns, ch)| {
+                let state = self.namespaces.get(ns)?.as_ref()?.channels.get(ch)?;
+                Some((ns, ch, state.held_bytes()))
+            })
+            .collect();
+        by_size.sort_unstable_by_key(|&(_, _, held)| std::cmp::Reverse(held));
+
+        let counters = Arc::clone(&self.counters);
+        for (ns, ch, was) in by_size {
+            if held <= ceiling {
+                break;
+            }
+            let Some(state) = self
+                .namespaces
+                .get_mut(ns)
+                .and_then(|n| n.as_mut())
+                .and_then(|n| n.channels.get_mut(ch))
+            else {
+                continue;
+            };
+            // Выталкивать некуда: сегмент отпущен или не открылся, и flush
+            // отбросил бы весь блок, посчитав его записи потерянными. Память
+            // такой цены не стоит.
+            if state.segment.is_none() {
+                continue;
+            }
+            if Self::flush_block(state, &counters).is_err() {
+                Counters::bump(&counters.io_errors);
+            }
+            state.release_buffers();
+            state.buffers_released = true;
+            // Слак индекса блоков заодно: живых записей он не теряет, а
+            // отдаётся даром.
+            state.footer.shrink_to_fit();
+            held = held.saturating_sub(was.saturating_sub(state.held_bytes()));
+        }
+
+        if held > ceiling {
+            Counters::bump(&counters.buffer_overruns);
+        }
     }
 
     /// Вставить в поток отметки о потерянных записях.
@@ -2223,6 +2340,7 @@ mod tests {
             }],
             segments_seen: 0,
             pressured_roots: 0,
+            buffer_ceiling: None,
             pulse: Arc::new(crate::pulse::Pulse::new()),
             pulsed_blocks: 0,
             pulsed_shape: 0,
@@ -2277,8 +2395,124 @@ mod tests {
     }
 
     fn held_bytes(w: &WriterLoop) -> usize {
-        let ch = &w.namespaces[0].as_ref().unwrap().channels[0];
-        ch.builder.capacity() + ch.scratch.capacity()
+        w.namespaces[0].as_ref().unwrap().channels[0].held_bytes() as usize
+    }
+
+    #[test]
+    fn a_declared_memory_ceiling_takes_the_buffers_back() {
+        // Память на канал — активный буфер блока и его сериализованная копия.
+        // Пишущих в любой момент единицы, и обычно этого достаточно; там, где
+        // «единицы» перестают быть правдой, потолок отбирает буферы у самых
+        // крупных держателей. Отбирает именно буферы, а не записи: запись,
+        // отброшенная ради бухгалтерии по памяти, — потеря данных.
+        let dir = tempfile::tempdir().unwrap();
+        let config = ChannelConfig {
+            block_max_bytes: 4096,
+            ..ChannelConfig::new(16 * 1024 * 1024)
+        };
+        let (mut w, ns) = loop_with_one_channel(dir.path(), config);
+        // Потолок ниже того, что раздует один крупный blob.
+        w.buffer_ceiling = Some(16 * 1024);
+
+        let noise: Vec<u8> = (0..(1 << 20)).map(|i| (i * 2654435761u64) as u8).collect();
+        w.batch.push(Staged {
+            ns,
+            channel: ChannelIdx(0),
+            at: Micros(1),
+            record: SR::Sample {
+                metric: MetricId(1),
+                value: OwnedValue::Blob(noise.as_slice().into()),
+            },
+        });
+        w.apply_batch();
+        assert!(
+            held_bytes(&w) > 1 << 20,
+            "мегабайтный blob обязан раздуть буферы (иначе тест пуст): {}",
+            held_bytes(&w)
+        );
+
+        w.tick();
+        assert!(
+            (held_bytes(&w) as u64) <= 16 * 1024,
+            "потолок обязан вернуть память: держится {} Б",
+            held_bytes(&w)
+        );
+        // Запись при этом дошла до носителя, а не была принесена в жертву.
+        assert_eq!(w.counters.snapshot().dropped, 0, "потолок не теряет записи");
+        assert!(w.counters.snapshot().blocks_written >= 1);
+        assert_eq!(
+            w.counters.snapshot().buffer_overruns,
+            0,
+            "потолок выполнен — жаловаться не на что"
+        );
+
+        // Канал остаётся рабочим: следующая запись выделит буферы заново.
+        w.batch.push(Staged {
+            ns,
+            channel: ChannelIdx(0),
+            at: Micros(2),
+            record: SR::Sample {
+                metric: MetricId(1),
+                value: OwnedValue::U64(7),
+            },
+        });
+        w.apply_batch();
+        assert!(held_bytes(&w) > 0, "канал жив и пишет дальше");
+    }
+
+    #[test]
+    fn an_unmeetable_memory_ceiling_is_counted_not_paid_for_with_records() {
+        // Одна запись бывает крупнее любого разумного потолка: буфер обязан
+        // вместить хотя бы её. Отбросить такую запись значило бы потерять
+        // данные там, где память всего лишь неудобна, поэтому невыполнимость
+        // объявляется счётчиком — как и невыполнимый бюджет носителя.
+        let dir = tempfile::tempdir().unwrap();
+        let config = ChannelConfig {
+            block_max_bytes: 4096,
+            ..ChannelConfig::new(16 * 1024 * 1024)
+        };
+        let (mut w, ns) = loop_with_one_channel(dir.path(), config);
+        w.buffer_ceiling = Some(16 * 1024);
+
+        // Блок открыт и заряжен записью, но сегмента нет: вытолкнуть его —
+        // значит потерять её. Потолок такой цены не платит.
+        let noise: Vec<u8> = (0..(1 << 20)).map(|i| (i * 2654435761u64) as u8).collect();
+        w.batch.push(Staged {
+            ns,
+            channel: ChannelIdx(0),
+            at: Micros(1),
+            record: SR::Sample {
+                metric: MetricId(1),
+                value: OwnedValue::Blob(noise.as_slice().into()),
+            },
+        });
+        w.apply_batch();
+        {
+            use dduroc_format::record::Sample;
+            use dduroc_format::{Record, Value};
+            let ch = &mut w.namespaces[0].as_mut().unwrap().channels[0];
+            ch.segment = None;
+            ch.builder
+                .push(
+                    Micros(2),
+                    &Record::Sample(Sample {
+                        metric: MetricId(1),
+                        value: Value::Blob(&noise),
+                    }),
+                )
+                .unwrap();
+        }
+
+        w.tick();
+        assert!(
+            held_bytes(&w) > 1 << 20,
+            "заряженный накопитель без сегмента трогать нельзя"
+        );
+        assert_eq!(w.counters.snapshot().dropped, 0, "ни одной записи в жертву");
+        assert!(
+            w.counters.snapshot().buffer_overruns >= 1,
+            "невыполнимый потолок обязан быть назван"
+        );
     }
 
     #[test]
@@ -2887,6 +3121,7 @@ mod tests {
             Arc::clone(&counters),
             QueueSizes::default(),
             Vec::new(),
+            None,
             Arc::new(crate::pulse::Pulse::new()),
         )
         .unwrap();
