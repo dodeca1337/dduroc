@@ -196,7 +196,12 @@ pub struct SegmentCursor {
     /// Индекс следующего блока.
     next_block: usize,
     /// Распакованные записи текущего блока.
-    buffered: Vec<RawEntry>,
+    ///
+    /// `Option` на запись, чтобы отдавать её **переносом**, а не копией:
+    /// payload уже скопирован из буфера блока сюда, и вторая копия ради того
+    /// же содержимого — аллокация на каждую выданную запись. Обхода назад у
+    /// курсора нет, поэтому опустевшее место больше не понадобится.
+    buffered: Vec<Option<RawEntry>>,
     /// Позиция в `buffered`.
     pos: usize,
     /// Обратный порядок.
@@ -506,7 +511,7 @@ impl SegmentCursor {
         if self.pos >= self.buffered.len() && !self.fill() {
             return None;
         }
-        self.buffered.get(self.pos)
+        self.buffered.get(self.pos)?.as_ref()
     }
 
     /// Взять следующую запись.
@@ -514,7 +519,7 @@ impl SegmentCursor {
         if self.pos >= self.buffered.len() && !self.fill() {
             return None;
         }
-        let item = self.buffered.get(self.pos).cloned();
+        let item = self.buffered.get_mut(self.pos).and_then(Option::take);
         self.pos += 1;
         item
     }
@@ -670,10 +675,10 @@ impl SegmentCursor {
                         {
                             continue;
                         }
-                        self.buffered.push(RawEntry {
+                        self.buffered.push(Some(RawEntry {
                             at: BootTime::new(boot, at),
                             record: own(&record),
-                        });
+                        }));
                     }
                     Err(e) => {
                         broken = Some(e.to_string());

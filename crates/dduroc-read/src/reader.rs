@@ -279,7 +279,7 @@ impl Iterator for EntryStream<'_> {
                 ns,
                 ch,
                 self.schemas[idx].as_ref(),
-                &raw,
+                raw,
                 &self.query,
                 &self.epochs,
             ) {
@@ -575,7 +575,7 @@ impl Follow<'_> {
                 ns,
                 ch,
                 self.schemas[idx].as_ref(),
-                &raw,
+                raw,
                 &self.query,
                 &self.epochs,
             ) else {
@@ -1494,13 +1494,14 @@ impl Reader {
                 let OwnedRecord::Sample { metric, .. } = &raw.record else {
                     continue;
                 };
-                if !wanted.contains(metric) || !seen.insert((idx, *metric)) {
+                let metric = *metric;
+                if !wanted.contains(&metric) || !seen.insert((idx, metric)) {
                     continue;
                 }
                 let ns = std::sync::Arc::clone(&cursor.namespace);
                 let ch = cursor.channel;
                 if let Some(entry) =
-                    self.build_entry(ns, ch, schemas[idx].as_ref(), &raw, &probe, epochs)
+                    self.build_entry(ns, ch, schemas[idx].as_ref(), raw, &probe, epochs)
                 {
                     out.push(entry);
                 }
@@ -1585,16 +1586,23 @@ impl Reader {
         })
     }
 
+    /// Собрать запись ответа из прочитанной.
+    ///
+    /// Прочитанная берётся **по значению**: её payload (текст, blob) уже
+    /// скопирован из буфера блока курсором, и вторая копия ради того же
+    /// содержимого — аллокация на каждую показанную запись. Отфильтрованная
+    /// запись при этом просто уничтожается здесь же.
     #[allow(clippy::too_many_arguments)]
     fn build_entry(
         &self,
         ns: std::sync::Arc<str>,
         channel: StorageClass,
         schema: Option<&Schema>,
-        raw: &crate::cursor::RawEntry,
+        raw: crate::cursor::RawEntry,
         q: &Query,
         epochs: &Epochs,
     ) -> Option<Entry> {
+        let crate::cursor::RawEntry { at, record } = raw;
         let kinds = q.filter.kinds;
         // Фильтры, говорящие о содержимом. Запись, у которой такого свойства
         // нет (текст без тэгов, спан без типа события), удовлетворить им не
@@ -1604,7 +1612,7 @@ impl Reader {
         let content_filtered = !q.filter.any_tags.is_empty()
             || q.filter.events.is_some()
             || !q.filter.event_names.is_empty();
-        let (kind, span) = match &raw.record {
+        let (kind, span) = match record {
             OwnedRecord::Message {
                 event,
                 span,
@@ -1613,7 +1621,7 @@ impl Reader {
                 if !kinds.messages {
                     return None;
                 }
-                let desc = schema.and_then(|s| s.event(*event));
+                let desc = schema.and_then(|s| s.event(event));
                 // Уровень и тэги — статические свойства типа, поэтому фильтр
                 // применяется здесь, без чтения payload'а.
                 if let Some(min) = q.filter.min_level {
@@ -1638,7 +1646,7 @@ impl Reader {
                     }
                 }
                 if let Some(want) = &q.filter.events
-                    && !want.contains(event)
+                    && !want.contains(&event)
                 {
                     return None;
                 }
@@ -1650,13 +1658,13 @@ impl Reader {
                 }
                 (
                     EntryKind::Message {
-                        event: *event,
+                        event,
                         name: desc.map(|d| d.name),
                         level: desc.map(|d| d.level),
                         tags: desc.map(|d| d.tags).unwrap_or(&[]),
-                        payload: payload.clone(),
+                        payload,
                     },
-                    *span,
+                    span,
                 )
             }
             OwnedRecord::Text {
@@ -1669,17 +1677,17 @@ impl Reader {
                     return None;
                 }
                 if let Some(min) = q.filter.min_level
-                    && *level < min
+                    && level < min
                 {
                     return None;
                 }
                 (
                     EntryKind::Text {
-                        level: *level,
-                        target: target.clone(),
-                        text: text.clone(),
+                        level,
+                        target,
+                        text,
                     },
-                    *span,
+                    span,
                 )
             }
             OwnedRecord::SpanStart { span, kind, parent } => {
@@ -1688,18 +1696,18 @@ impl Reader {
                 }
                 (
                     EntryKind::SpanStart {
-                        span: *span,
-                        kind_name: schema.and_then(|s| s.span(*kind)).map(|d| d.name),
-                        parent: *parent,
+                        span,
+                        kind_name: schema.and_then(|s| s.span(kind)).map(|d| d.name),
+                        parent,
                     },
-                    Some(*span),
+                    Some(span),
                 )
             }
             OwnedRecord::SpanEnd { span } => {
                 if !kinds.spans || content_filtered {
                     return None;
                 }
-                (EntryKind::SpanEnd { span: *span }, Some(*span))
+                (EntryKind::SpanEnd { span }, Some(span))
             }
             OwnedRecord::Sample { metric, value } => {
                 if !kinds.samples || q.filter.events.is_some() || !q.filter.event_names.is_empty() {
@@ -1709,7 +1717,7 @@ impl Reader {
                 // Всё остальное — имя, единица, подпись состояния, важность,
                 // поведение между отсчётами — резолвится по схеме и на диске
                 // места не занимает.
-                let desc = schema.and_then(|s| s.metric(*metric));
+                let desc = schema.and_then(|s| s.metric(metric));
                 // Тэги у отсчёта есть — метрики: фильтр по ним применяется.
                 if !q.filter.any_tags.is_empty() {
                     let tags = desc.map(|d| d.tags).unwrap_or(&[]);
@@ -1722,22 +1730,25 @@ impl Reader {
                         return None;
                     }
                 }
-                let code = match value {
+                let code = match &value {
                     OwnedSampleValue::U64(v) => Some(*v),
                     OwnedSampleValue::I64(v) if *v >= 0 => Some(*v as u64),
                     OwnedSampleValue::Bool(b) => Some(u64::from(*b)),
                     _ => None,
                 };
+                // Важность считается до переноса значения: одалживать его
+                // потом было бы уже нечему.
+                let severity = desc.map(|d| d.severity_of(&as_format_value(&value)));
                 (
                     EntryKind::Sample {
-                        metric: *metric,
+                        metric,
                         metric_name: desc.map(|d| d.name),
                         unit: desc.map(|d| d.unit),
                         tags: desc.map_or(&[][..], |d| d.tags),
                         kind: desc.map(|d| d.kind),
                         state_name: desc.zip(code).and_then(|(d, c)| d.state(c)).map(|s| s.name),
-                        severity: desc.map(|d| d.severity_of(&as_format_value(value))),
-                        value: value.clone(),
+                        severity,
+                        value,
                     },
                     None,
                 )
@@ -1746,12 +1757,7 @@ impl Reader {
                 if content_filtered {
                     return None;
                 }
-                (
-                    EntryKind::Ext {
-                        bytes: bytes.clone(),
-                    },
-                    None,
-                )
+                (EntryKind::Ext { bytes }, None)
             }
         };
 
@@ -1766,8 +1772,8 @@ impl Reader {
         Some(Entry {
             namespace: ns,
             channel,
-            at: raw.at,
-            utc: epochs.to_utc(raw.at),
+            at,
+            utc: epochs.to_utc(at),
             span,
             kind,
         })
