@@ -302,10 +302,22 @@ impl SampleValue for Vec<u8> {
 
 /// Приведение возврата правила-преобразователя значения к исходу шага.
 ///
-/// Замыкание возвращает либо значение ([`SampleValue`]), либо `Option` от
-/// него (`None` — отсчёт удаляется). Трейт существует ровно для того, чтобы
-/// генерируемый код принимал и то, и другое.
-pub trait IntoSampleOutcome {
+/// Параметр `V` — тип, **объявленный метрике схемой**: возврат правила обязан
+/// быть им (или `Option` от него — `None` удаляет отсчёт). Без этого
+/// параметра миграция могла бы положить на диск отсчёт, чей тип противоречит
+/// схеме, — ровно то, от чего типизированный `sample` защищает запись; и
+/// узналось бы это не при сборке, а при показе: важность считалась бы не тем
+/// путём, подпись состояния не нашлась бы, число выглядело бы бессмыслицей.
+#[diagnostic::on_unimplemented(
+    message = "правило вернуло `{Self}`, а метрике объявлен тип `{V}`",
+    label = "здесь нужен тип из схемы — либо `Option` от него, чтобы удалить отсчёт",
+    note = "тип отсчёта — свойство метрики, и миграция не имеет права его менять: \
+            запись с типом, которому в схеме ничего не соответствует, не пропускает \
+            и обычный `sample`",
+    note = "если тип действительно должен измениться, это правка `type:` в схеме, \
+            а не приведение внутри правила"
+)]
+pub trait IntoSampleOutcome<V: SampleValue> {
     /// Превратить возврат правила в исход шага для метрики `metric`.
     fn into_sample_outcome(
         self,
@@ -313,7 +325,7 @@ pub trait IntoSampleOutcome {
     ) -> std::result::Result<Option<MigrationOutcome>, DecodeError>;
 }
 
-impl<V: SampleValue> IntoSampleOutcome for V {
+impl<V: SampleValue> IntoSampleOutcome<V> for V {
     fn into_sample_outcome(
         self,
         metric: MetricId,
@@ -325,7 +337,7 @@ impl<V: SampleValue> IntoSampleOutcome for V {
     }
 }
 
-impl<V: SampleValue> IntoSampleOutcome for Option<V> {
+impl<V: SampleValue> IntoSampleOutcome<V> for Option<V> {
     fn into_sample_outcome(
         self,
         metric: MetricId,
@@ -340,8 +352,11 @@ impl<V: SampleValue> IntoSampleOutcome for Option<V> {
 /// Вызвать преобразование значения из типизированного правила. Только для
 /// макроса. Существует по той же причине, что и [`__migrate_map`]: тип
 /// параметра замыкания должен быть известен до проверки его тела.
+///
+/// `D` — объявленный схемой тип метрики; макрос подставляет его явно, и
+/// возврат правила обязан ему соответствовать.
 #[doc(hidden)]
-pub fn __migrate_value<T: SampleValue, O: IntoSampleOutcome>(
+pub fn __migrate_value<T: SampleValue, D: SampleValue, O: IntoSampleOutcome<D>>(
     map: impl FnOnce(T) -> O,
     value: Value<'_>,
     metric: MetricId,

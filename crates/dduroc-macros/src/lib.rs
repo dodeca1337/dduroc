@@ -1017,6 +1017,34 @@ fn marker_path(value_type: &Ident, states_enum: Option<&Ident>) -> syn::Result<T
     })
 }
 
+/// Rust-тип значения метрики **на диске**.
+///
+/// Отличается от [`marker_path`]: там у перечисления — сам сгенерированный
+/// enum (им параметризована константа метрики), а на диск идёт код состояния,
+/// то есть `u64`. Правилу миграции важно именно то, что ляжет на диск.
+fn wire_type(m: &MetricDef) -> syn::Result<TokenStream2> {
+    if !m.states.is_empty() {
+        return Ok(quote!(u64));
+    }
+    let Some(value_type) = &m.value_type else {
+        return Ok(quote!(u64));
+    };
+    Ok(match value_type.to_string().as_str() {
+        "f32" => quote!(f32),
+        "f64" => quote!(f64),
+        "i64" => quote!(i64),
+        "u64" => quote!(u64),
+        "bool" => quote!(bool),
+        "blob" => quote!(::std::vec::Vec<u8>),
+        other => {
+            return Err(syn::Error::new(
+                value_type.span(),
+                format!("неизвестный тип значения `{other}`: ожидались f32/f64/i64/u64/bool/blob"),
+            ));
+        }
+    })
+}
+
 fn severity_path(severity: Option<&Ident>) -> syn::Result<TokenStream2> {
     let Some(s) = severity else {
         return Ok(quote!(::dduroc::Severity::Normal));
@@ -1916,8 +1944,15 @@ fn resolve_rule(
 
     // Ключ → старый id + тип для декода (если раскладка известна).
     enum Kind {
-        Event { decode: Option<TokenStream2> },
-        Metric,
+        Event {
+            decode: Option<TokenStream2>,
+        },
+        Metric {
+            /// Тип, объявленный метрике схемой, — тот, что ляжет на диск.
+            /// `None` — метрика названа голым id, и объявленного типа у неё
+            /// в этой схеме нет.
+            declared: Option<TokenStream2>,
+        },
         Span,
     }
     let (old_id, kind) = match &rule.key {
@@ -1954,15 +1989,21 @@ fn resolve_rule(
             )
         }
         RuleKey::RawEvent { id, .. } => (*id, Kind::Event { decode: None }),
-        RuleKey::CurrentMetric { name } => (
-            lookup_id(
+        RuleKey::CurrentMetric { name } => {
+            let id = lookup_id(
                 name,
                 input.metrics.iter().map(|m| (&m.name, m.id)),
                 "метрику",
-            )?,
-            Kind::Metric,
-        ),
-        RuleKey::RawMetric { id, .. } => (*id, Kind::Metric),
+            )?;
+            let declared = input
+                .metrics
+                .iter()
+                .find(|m| m.name == *name)
+                .map(wire_type)
+                .transpose()?;
+            (id, Kind::Metric { declared })
+        }
+        RuleKey::RawMetric { id, .. } => (*id, Kind::Metric { declared: None }),
         RuleKey::CurrentSpan { name } => (
             lookup_id(name, input.spans.iter().map(|s| (&s.name, s.id)), "спан")?,
             Kind::Span,
@@ -2018,13 +2059,13 @@ fn resolve_rule(
         (Kind::Event { .. }, RuleAction::RemapMetric(_)) => {
             return err("событие не превратить в метрику: у них разные виды записей".to_owned());
         }
-        (Kind::Metric, RuleAction::Drop) => {
+        (Kind::Metric { .. }, RuleAction::Drop) => {
             metric_rules.push(ResolvedRule {
                 old_id,
                 arm: quote!(#old_id => ::core::result::Result::Ok(::core::option::Option::None),),
             });
         }
-        (Kind::Metric, RuleAction::RemapMetric(target)) => {
+        (Kind::Metric { .. }, RuleAction::RemapMetric(target)) => {
             let target_id = lookup_id(
                 target,
                 input.metrics.iter().map(|m| (&m.name, m.id)),
@@ -2039,24 +2080,43 @@ fn resolve_rule(
                 },
             });
         }
-        (Kind::Metric, RuleAction::Map(expr)) => {
+        (
+            Kind::Metric {
+                declared: Some(declared),
+            },
+            RuleAction::Map(expr),
+        ) => {
             metric_rules.push(ResolvedRule {
                 old_id,
-                // Тип значения объявляет само замыкание: значение на диске
-                // самоописуемо, и `history` метрике не нужна. Ремап id
-                // отдельным правилом — здесь метрика остаётся своей.
+                // ЧТО правило читает, объявляет само замыкание: значение на
+                // диске самоописуемо, и `history` метрике не нужна. А вот ЧТО
+                // оно возвращает, держит схема: отсчёт, чей тип ей
+                // противоречит, не имеет права лечь на диск — типизированная
+                // запись такого не пропускает, и миграция не должна.
                 arm: quote! {
                     #old_id => {
                         let __v = __r.value().ok_or(::dduroc::DecodeError)?;
-                        ::dduroc::__migrate_value(#expr, __v, ::dduroc::MetricId(#old_id))
+                        ::dduroc::__migrate_value::<_, #declared, _>(
+                            #expr,
+                            __v,
+                            ::dduroc::MetricId(#old_id),
+                        )
                     }
                 },
             });
         }
-        (Kind::Metric, RuleAction::RemapEvent(_)) => {
+        (Kind::Metric { declared: None }, RuleAction::Map(_)) => {
+            return err(format!(
+                "у `metric({old_id:#x})` нет объявленного типа значения — держать возврат \
+                 правила нечем, и отсчёт лёг бы на диск с типом, которому в схеме ничего \
+                 не соответствует. Назовите метрику по имени (`metrics::Имя`), либо \
+                 используйте drop или ремап"
+            ));
+        }
+        (Kind::Metric { .. }, RuleAction::RemapEvent(_)) => {
             return err("метрику не превратить в событие: у них разные виды записей".to_owned());
         }
-        (Kind::Metric, RuleAction::RemapSpan(_)) => {
+        (Kind::Metric { .. }, RuleAction::RemapSpan(_)) => {
             return err("метрику не превратить в спан: у них разные виды записей".to_owned());
         }
         (Kind::Event { .. }, RuleAction::RemapSpan(_)) => {
@@ -2522,14 +2582,29 @@ mod tests {
         )
         .expect("преобразование значения — законное правило");
 
-        // И по голому id: у значения раскладку брать неоткуда, она на диске.
+        // Что правило ЧИТАЕТ, объявляет замыкание; что оно ВОЗВРАЩАЕТ,
+        // держит схема: возврат параметризован объявленным типом метрики
+        // (`IntoSampleOutcome<V>`), и отсчёт, противоречащий схеме, не
+        // соберётся. Проверить это здесь нечем — макрос порождает корректный
+        // код, отвергает его компилятор.
+
+        // А голый id держать нечем: объявленного типа у него в схеме нет, и
+        // отсчёт лёг бы на диск с типом, которому ничего не соответствует.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               metrics { Temp = 0x01 { type: f32 } }
+               migrations { 1 => { metric(0x07): |v: i64| v as f64 } }"#);
+        assert!(e.contains("нет объявленного типа значения"), "{e}");
+
+        // У метрики-перечисления объявленный тип — то, что ложится на диск,
+        // то есть код состояния: перенумеровать коды правило может.
         check(
             r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
-               metrics { Temp = 0x01 { type: f32 } }
-               migrations { 1 => { metric(0x07): |v: i64| v as f64 } }"#,
+               metrics { Link = 0x02 { states: [alarm Los = 0, Lock = 2] } }
+               migrations { 1 => { metrics::Link: |code: u64| code + 1 } }"#,
         )
-        .expect("голый id метрики годится: тип значения на диске");
+        .expect("коды состояний перенумеровываются");
     }
 
     #[test]

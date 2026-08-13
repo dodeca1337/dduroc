@@ -536,8 +536,21 @@ impl Follow<'_> {
 
     /// Запуски, выпавшие из настенного окна за неимением якоря —
     /// см. [`QueryResult::unanchored`].
-    pub fn unanchored(&self) -> &[BootCounter] {
-        &self.unanchored
+    ///
+    /// Считается по курсорам каждый раз, а не запоминается при открытии:
+    /// подписка перечисляет каталоги заново, и запуск, чьи сегменты нашлись
+    /// позже, обязан попасть в ответ — иначе о нём не сказал бы никто.
+    pub fn unanchored(&self) -> Vec<BootCounter> {
+        let mut out: Vec<BootCounter> = Vec::new();
+        for c in &self.cursors {
+            for boot in c.unanchored() {
+                if !out.contains(boot) {
+                    out.push(*boot);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Сколько записей уже отдано.
