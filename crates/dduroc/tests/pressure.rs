@@ -568,3 +568,63 @@ fn a_class_can_live_on_its_own_root() {
         "{e}"
     );
 }
+
+/// Сколько дескрипторов процесса указывает внутрь дерева.
+fn open_fds_under(dir: &Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("procfs смонтирована")
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter(|target| target.starts_with(dir))
+        .count()
+}
+
+#[test]
+fn a_query_does_not_hold_a_descriptor_per_channel() {
+    // Слияние по времени требует головы от КАЖДОГО курсора, а курсор заводится
+    // на каждую пару (неймспейс, канал). Пока курсор держал открытый сегмент,
+    // один запрос стоил дескриптора на канал: на заявленных двадцати четырёх
+    // тысячах неймспейсов это десятки тысяч открытых файлов сверх тех, что
+    // держит writer, — то есть отказ по `ulimit` на ровном месте.
+    //
+    // Ста неймспейсов хватает, чтобы отличить «на канал» от «на чтение»:
+    // разница между сотней и единицами не тонет ни в каком шуме.
+    const NAMESPACES: usize = 100;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        Store::open(StoreConfig::new(dir.path()).with_budget_per_class(64 * 1024 * 1024)).unwrap();
+
+    let mut handles = Vec::with_capacity(NAMESPACES);
+    for i in 0..NAMESPACES {
+        let ns = store
+            .namespace(&format!("svc-{i:04}"), pressure::SCHEMA)
+            .unwrap();
+        ns.log(pressure::events::Mark);
+        handles.push(ns);
+    }
+    store.sync().unwrap();
+
+    let before = open_fds_under(dir.path());
+    let reader = store.reader();
+    let mut stream = reader.stream(&Query::new().order(Order::Oldest)).unwrap();
+    // Первая запись означает, что курсоры заряжены: голову спросили у всех.
+    let first = stream.next().expect("записи есть");
+    let held = open_fds_under(dir.path()).saturating_sub(before);
+    assert_eq!(first.namespace.as_ref(), "svc-0000");
+    assert!(
+        held <= 2,
+        "поток держит {held} дескрипторов на {NAMESPACES} неймспейсов — \
+         значит, по одному на канал"
+    );
+
+    // И читает при этом всё: экономия дескрипторов не имеет права стоить
+    // записей.
+    let seen = 1 + stream.by_ref().count();
+    assert_eq!(seen, NAMESPACES, "прочитаны все неймспейсы");
+    assert!(stream.damaged().is_empty(), "{:?}", stream.damaged());
+
+    drop(stream);
+    drop(handles);
+    store.shutdown();
+}

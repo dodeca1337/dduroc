@@ -602,9 +602,18 @@ pub fn seal_orphan(path: &Path, expect_store: Option<u64>) -> Result<Option<Reco
 }
 
 /// Сегмент, открытый на чтение.
+///
+/// Дескриптор держится **только на время чтения** и отпускается
+/// [`SegmentReader::detach`]: всё, что стоит обращения к носителю — заголовок,
+/// footer, границы данных, — разбирается один раз и живёт в памяти, а
+/// открыть файл заново стоит одного вызова. Читатель заводит курсор на каждую
+/// пару (неймспейс, канал), и при заявленных двадцати четырёх тысячах
+/// неймспейсов постоянный дескриптор у каждого — это десятки тысяч открытых
+/// файлов на один запрос.
 #[derive(Debug)]
 pub struct SegmentReader {
-    file: File,
+    /// `None` — дескриптор отпущен; чтение откроет файл заново.
+    file: Option<File>,
     path: PathBuf,
     len: u64,
     header: SegmentHeader,
@@ -626,49 +635,98 @@ impl SegmentReader {
             reason: format!("заголовок сегмента: {e}"),
         })?;
 
-        // Двухфазное чтение footer'а: сначала трейлер фиксированного размера,
-        // из него — длина, потом сам footer. Так не читается лишнего.
-        let mut footer_bytes = None;
-        let mut data_end = len;
-        if len >= (SegmentHeader::SIZE + Trailer::SIZE) as u64 {
-            let mut tail = [0u8; Trailer::SIZE];
-            file.read_exact_at(&mut tail, len - Trailer::SIZE as u64)
-                .ctx_path("чтение трейлера", path)?;
-            if let Ok(Some(trailer)) = Trailer::parse(&tail) {
-                let total = trailer.total_len();
-                // Длина из трейлера управляет и размером чтения, и границей
-                // данных, а сам трейлер сверяется только по сигнатуре.
-                // Поэтому footer принимается лишь после проверки CRC: иначе
-                // испорченное поле длины молча отрезало бы часть блоков,
-                // выдав усечённый сегмент за целый.
-                // Границы две, и обе обязательны. Размер файла отсекает
-                // заведомо невозможное, но у сегмента в четверть гигабайта он
-                // разрешил бы четвертьгигабайтное чтение по одному числу из
-                // хвоста — а трейлер сверен только по сигнатуре, и подобрать
-                // её ничего не стоит. Потолок ограничивает footer тем, каким
-                // он бывает: индекс блока стоит единицы байт, и даже сегмент,
-                // набитый минимальными блоками, не даёт больше нескольких
-                // мегабайт.
-                if total <= len - SegmentHeader::SIZE as u64 && total <= MAX_FOOTER {
-                    let mut buf = vec![0u8; total as usize];
-                    file.read_exact_at(&mut buf, len - total)
-                        .ctx_path("чтение footer", path)?;
-                    if matches!(dduroc_format::Footer::parse(&buf), Ok(Some(_))) {
-                        data_end = len - total;
-                        footer_bytes = Some(buf);
-                    }
-                }
-            }
-        }
+        let (footer_bytes, data_end) = Self::probe_tail(&file, path, len)?;
 
         Ok(Self {
-            file,
+            file: Some(file),
             path: path.to_owned(),
             len,
             header,
             footer_bytes,
             data_end,
         })
+    }
+
+    /// Перечитать хвост файла, не разбирая заголовок заново.
+    ///
+    /// Нужно подписке: сегмент под ней растёт (новые блоки) и меняет длину
+    /// (запечатывание обрезает преаллокацию и дописывает footer, отпускание по
+    /// бездействию — просто обрезает). Заголовок при этом неизменен по
+    /// определению — сегмент не меняет ни запуска, ни базы, — поэтому его
+    /// чтение и разбор здесь не повторяются.
+    pub fn refresh(&mut self) -> Result<()> {
+        self.attach()?;
+        let file = self.file.as_ref().expect("после attach дескриптор есть");
+        let len = file.metadata().ctx_path("stat", &self.path)?.len();
+        let (footer_bytes, data_end) = Self::probe_tail(file, &self.path, len)?;
+        self.len = len;
+        self.footer_bytes = footer_bytes;
+        self.data_end = data_end;
+        Ok(())
+    }
+
+    /// Двухфазное чтение footer'а: сначала трейлер фиксированного размера, из
+    /// него — длина, потом сам footer. Так не читается лишнего.
+    ///
+    /// Возвращает байты footer'а (если сегмент запечатан) и границу данных.
+    fn probe_tail(file: &File, path: &Path, len: u64) -> Result<(Option<Vec<u8>>, u64)> {
+        if len < (SegmentHeader::SIZE + Trailer::SIZE) as u64 {
+            return Ok((None, len));
+        }
+        let mut tail = [0u8; Trailer::SIZE];
+        file.read_exact_at(&mut tail, len - Trailer::SIZE as u64)
+            .ctx_path("чтение трейлера", path)?;
+        let Ok(Some(trailer)) = Trailer::parse(&tail) else {
+            return Ok((None, len));
+        };
+        let total = trailer.total_len();
+        // Длина из трейлера управляет и размером чтения, и границей данных, а
+        // сам трейлер сверяется только по сигнатуре. Поэтому footer
+        // принимается лишь после проверки CRC: иначе испорченное поле длины
+        // молча отрезало бы часть блоков, выдав усечённый сегмент за целый.
+        // Границы две, и обе обязательны. Размер файла отсекает заведомо
+        // невозможное, но у сегмента в четверть гигабайта он разрешил бы
+        // четвертьгигабайтное чтение по одному числу из хвоста — а трейлер
+        // сверен только по сигнатуре, и подобрать её ничего не стоит. Потолок
+        // ограничивает footer тем, каким он бывает: индекс блока стоит единицы
+        // байт, и даже сегмент, набитый минимальными блоками, не даёт больше
+        // нескольких мегабайт.
+        if total > len - SegmentHeader::SIZE as u64 || total > MAX_FOOTER {
+            return Ok((None, len));
+        }
+        let mut buf = vec![0u8; total as usize];
+        file.read_exact_at(&mut buf, len - total)
+            .ctx_path("чтение footer", path)?;
+        if matches!(dduroc_format::Footer::parse(&buf), Ok(Some(_))) {
+            Ok((Some(buf), len - total))
+        } else {
+            Ok((None, len))
+        }
+    }
+
+    /// Отпустить дескриптор, сохранив всё разобранное.
+    ///
+    /// Разбор от этого не теряется: заголовок, footer и границы данных лежат
+    /// в памяти, а чтение блока откроет файл заново. Читателю это позволяет
+    /// держать курсор на каждый канал, не держа на каждый по открытому файлу.
+    ///
+    /// Цена — одно открытие на порцию чтения (не на блок: за одно открытие
+    /// курсор дочитывает столько блоков, сколько ему понадобилось). Плата за
+    /// это — **окно**: файл, вытесненный ротацией между порциями, откроется
+    /// уже не по этому имени. Для живого чтения это то же штатное событие, что
+    /// и сегмент, исчезнувший между листингом и открытием: историю убрал сам
+    /// движок. Дампу ротация не грозит вовсе.
+    pub fn detach(&mut self) {
+        self.file = None;
+    }
+
+    /// Убедиться, что файл открыт.
+    fn attach(&mut self) -> Result<()> {
+        if self.file.is_none() {
+            self.file =
+                Some(File::open(&self.path).ctx_path("повторное открытие сегмента", &self.path)?);
+        }
+        Ok(())
     }
 
     pub fn header(&self) -> SegmentHeader {
@@ -700,13 +758,14 @@ impl SegmentReader {
     /// Прочитать блок по смещению в `buf`. `Ok(None)` — конец данных.
     ///
     /// Возвращает смещение следующего блока.
-    pub fn read_block_at(&self, offset: u64, buf: &mut Vec<u8>) -> Result<Option<u64>> {
+    pub fn read_block_at(&mut self, offset: u64, buf: &mut Vec<u8>) -> Result<Option<u64>> {
         if offset >= self.data_end || self.data_end - offset < BlockHeader::SIZE as u64 {
             return Ok(None);
         }
+        self.attach()?;
+        let file = self.file.as_ref().expect("после attach дескриптор есть");
         let mut hdr = [0u8; BlockHeader::SIZE];
-        self.file
-            .read_exact_at(&mut hdr, offset)
+        file.read_exact_at(&mut hdr, offset)
             .ctx_path("чтение заголовка блока", &self.path)?;
         let Some(header) = BlockHeader::parse(&hdr).map_err(|e| Error::Corrupt {
             path: self.path.clone(),
@@ -726,8 +785,7 @@ impl SegmentReader {
 
         buf.clear();
         buf.resize(total as usize, 0);
-        self.file
-            .read_exact_at(buf, offset)
+        file.read_exact_at(buf, offset)
             .ctx_path("чтение блока", &self.path)?;
         Ok(Some(offset + total))
     }
@@ -744,7 +802,7 @@ impl SegmentReader {
     /// возвращаются. Иначе один битый заголовок в хвосте незапечатанного
     /// сегмента — обычное следствие обрыва питания — прятал бы от читателя
     /// весь сегмент целиком.
-    pub fn block_offsets(&self) -> Result<Vec<u64>> {
+    pub fn block_offsets(&mut self) -> Result<Vec<u64>> {
         if let Some(footer) = self.footer() {
             return Ok(footer.blocks.iter().map(|b| b.offset).collect());
         }
@@ -759,7 +817,7 @@ impl SegmentReader {
     /// причина, и молчать о нём нельзя: дальше по файлу лежат валидные блоки,
     /// между которыми образовалась дыра, а ответ без единого признака выглядел
     /// бы полным.
-    pub fn scan_block_offsets(&self) -> (Vec<u64>, Option<(u64, String)>) {
+    pub fn scan_block_offsets(&mut self) -> (Vec<u64>, Option<(u64, String)>) {
         let scan = self.scan_block_offsets_from(Self::first_block_offset(), 0);
         (scan.offsets, scan.stopped)
     }
@@ -774,7 +832,7 @@ impl SegmentReader {
     /// `expected_seq` продолжает нумерацию блоков: она своя у каждого сегмента
     /// и начинается с нуля, поэтому частичный скан обязан принести её с собой —
     /// иначе продолжение объявляло бы разрыв нумерации на первом же блоке.
-    pub fn scan_block_offsets_from(&self, start: u64, expected_seq: u32) -> BlockScan {
+    pub fn scan_block_offsets_from(&mut self, start: u64, expected_seq: u32) -> BlockScan {
         let mut scan = BlockScan {
             offsets: Vec::new(),
             end: start,
@@ -1094,7 +1152,7 @@ mod tests {
         assert_eq!(rec.reclaimed, 32 * 1024 - rec.size_bytes);
 
         // Footer собран тем же обходом, которым искался конец данных.
-        let r = SegmentReader::open(&path).unwrap();
+        let mut r = SegmentReader::open(&path).unwrap();
         assert!(r.is_sealed());
         let footer = r.footer().expect("footer читается");
         assert_eq!(footer.blocks.len(), 2);
@@ -1180,7 +1238,7 @@ mod tests {
         let path = w.path().to_owned();
         w.close_unsealed().unwrap();
 
-        let r = SegmentReader::open(&path).unwrap();
+        let mut r = SegmentReader::open(&path).unwrap();
         let (offsets, stopped) = r.scan_block_offsets();
         assert_eq!(offsets.len(), 1, "уцелевший блок остаётся в выборке");
         let (_, reason) = stopped.expect("разрыв обязан быть назван");
@@ -1208,7 +1266,7 @@ mod tests {
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size < 64 * 1024, "хвост преаллокации обрезан: {size}");
 
-        let r = SegmentReader::open(&path).unwrap();
+        let mut r = SegmentReader::open(&path).unwrap();
         assert!(r.is_sealed());
         let footer = r.footer().expect("footer читается");
         assert_eq!(footer.blocks.len(), 1);
@@ -1227,7 +1285,7 @@ mod tests {
         // Закрываем без footer'а — как после обрыва питания.
         w.close_unsealed().unwrap();
 
-        let r = SegmentReader::open(&path).unwrap();
+        let mut r = SegmentReader::open(&path).unwrap();
         assert!(!r.is_sealed());
         assert_eq!(r.block_offsets().unwrap(), vec![o1, o2], "скан нашёл блоки");
 

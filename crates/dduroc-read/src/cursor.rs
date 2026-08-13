@@ -249,7 +249,7 @@ impl SegmentCursor {
         migrations: Option<MigrationCtx>,
         liveness: Liveness,
     ) -> Result<Self> {
-        let reader = SegmentReader::open(path).map_err(ReadError::Engine)?;
+        let mut reader = SegmentReader::open(path).map_err(ReadError::Engine)?;
         if let Some(id) = expect_store
             && reader.header().store_id != id
         {
@@ -353,6 +353,10 @@ impl SegmentCursor {
         if reverse {
             offsets.reverse();
         }
+        // Дескриптор отпускается сразу: всё, что стоило обращения к носителю,
+        // уже разобрано, а курсор заводится на каждый канал — держать за
+        // каждым по открытому файлу нельзя (см. [`SegmentReader::detach`]).
+        reader.detach();
         Ok(Self {
             reader,
             path: path.to_owned(),
@@ -374,17 +378,18 @@ impl SegmentCursor {
 
     /// Дочитать хвост сегмента, который пишется прямо сейчас.
     ///
-    /// `true` — появились новые блоки. Читатель сегмента открывается заново, а
-    /// не переиспользуется: у открытого запомнены длина файла и конец данных, а
-    /// под ним файл и растёт (новые блоки), и укорачивается (сегмент отпущен по
-    /// бездействию либо запечатан). Открытие стоит трёх системных вызовов —
-    /// дешевле любой попытки угадать, что из этого случилось.
+    /// `true` — появились новые блоки. Хвост перечитывается, а не досчитывается
+    /// по памяти: под курсором файл и растёт (новые блоки), и укорачивается
+    /// (сегмент отпущен по бездействию либо запечатан). Заголовок при этом
+    /// неизменен по определению, поэтому перечитывается только хвост
+    /// ([`SegmentReader::refresh`]) — подписка зовёт это на каждый курсор при
+    /// каждом пробуждении, и лишний разбор заголовка умножался бы на их число.
     pub fn extend(&mut self) -> bool {
         if self.sealed || self.reverse {
             return false;
         }
-        let reader = match SegmentReader::open(&self.path) {
-            Ok(r) => r,
+        match self.reader.refresh() {
+            Ok(()) => {}
             Err(dduroc_engine::Error::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
@@ -398,16 +403,22 @@ impl SegmentCursor {
             // преходящим, и объявлять сегмент законченным из-за него значило
             // бы оглохнуть на этом канале навсегда.
             Err(_) => return false,
-        };
-        let grew = match reader.footer() {
-            Some(footer) => {
+        }
+        // Индекс снимается отдельным шагом: он одалживает байты footer'а у
+        // читателя, а скан хвоста требует его же на запись.
+        let sealed_offsets: Option<Vec<u64>> = self
+            .reader
+            .footer()
+            .map(|f| f.blocks.iter().map(|b| b.offset).collect());
+        let grew = match sealed_offsets {
+            Some(blocks) => {
                 // Сегмент запечатан: индекс блоков стал авторитетным, и
                 // недописанности в нём больше нет — значит, и терпеть её
                 // больше нельзя.
                 let before = self.offsets.len();
-                for b in &footer.blocks {
-                    if b.offset >= self.scan_end {
-                        self.offsets.push(b.offset);
+                for offset in blocks {
+                    if offset >= self.scan_end {
+                        self.offsets.push(offset);
                     }
                 }
                 self.sealed = true;
@@ -415,7 +426,9 @@ impl SegmentCursor {
                 self.offsets.len() != before
             }
             None => {
-                let scan = reader.scan_block_offsets_from(self.scan_end, self.expected_seq);
+                let scan = self
+                    .reader
+                    .scan_block_offsets_from(self.scan_end, self.expected_seq);
                 let grew = !scan.offsets.is_empty();
                 self.offsets.extend_from_slice(&scan.offsets);
                 self.scan_end = scan.end;
@@ -426,7 +439,7 @@ impl SegmentCursor {
                 grew
             }
         };
-        self.reader = reader;
+        self.reader.detach();
         grew
     }
 
@@ -441,7 +454,8 @@ impl SegmentCursor {
 
     /// Курсор, который не отдаст ни записи, — для сегментов, которые нельзя
     /// разбирать. Повреждения при этом доносятся как обычно.
-    fn empty(reader: SegmentReader, path: &Path, reverse: bool, damaged: Vec<Damage>) -> Self {
+    fn empty(mut reader: SegmentReader, path: &Path, reverse: bool, damaged: Vec<Damage>) -> Self {
+        reader.detach();
         Self {
             reader,
             path: path.to_owned(),
@@ -558,7 +572,20 @@ impl SegmentCursor {
     }
 
     /// Загрузить следующий блок. `false` — блоков больше нет.
+    ///
+    /// Дескриптор живёт ровно столько, сколько идёт чтение, и отпускается на
+    /// выходе: курсор заводится на каждый канал, и постоянный файл у каждого
+    /// означал бы десятки тысяч открытых дескрипторов на один запрос
+    /// (см. [`SegmentReader::detach`]). Открытие платится раз на порцию, а не
+    /// на блок: за один заход сюда прочитывается столько блоков, сколько
+    /// понадобилось, чтобы набрать непустую выборку.
     fn fill(&mut self) -> bool {
+        let got = self.fill_blocks();
+        self.reader.detach();
+        got
+    }
+
+    fn fill_blocks(&mut self) -> bool {
         let mut buf = Vec::new();
         while self.next_block < self.offsets.len() {
             let offset = self.offsets[self.next_block];
@@ -585,6 +612,15 @@ impl SegmentCursor {
                 Err(e) => {
                     if defer_tear {
                         self.next_block -= 1;
+                        return false;
+                    }
+                    // Файла не стало между порциями: ротация вытеснила сегмент,
+                    // пока курсор отдавал прочитанное. То же штатное событие
+                    // живого хранилища, что и сегмент, исчезнувший между
+                    // листингом и открытием, — историю убрал сам движок, и
+                    // «пропавших» данных нет. Дальше в этом файле читать нечего.
+                    if self.liveness.is_live() && is_gone(&e) {
+                        self.next_block = self.offsets.len();
                         return false;
                     }
                     // Битый блок не обрывает сегмент: остальные блоки
@@ -1065,7 +1101,12 @@ impl ChannelCursor {
     }
 }
 
-/// Файла не существует — сегмент исчез между листингом и открытием.
+/// Файла не существует — сегмент исчез под курсором.
+fn is_gone(e: &dduroc_engine::Error) -> bool {
+    matches!(e, dduroc_engine::Error::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// То же для ошибки чтения — сегмент исчез между листингом и открытием.
 fn is_not_found(e: &ReadError) -> bool {
     matches!(
         e,

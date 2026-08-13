@@ -1446,7 +1446,7 @@ mod tests {
             if path.extension().is_none_or(|x| x != "seg") {
                 continue;
             }
-            let reader = crate::segment::SegmentReader::open(&path).unwrap();
+            let mut reader = crate::segment::SegmentReader::open(&path).unwrap();
             assert_eq!(
                 reader.header().protocol_version.0,
                 2,

@@ -351,7 +351,7 @@ fn run_channel(
 
     for name in crate::rotation::Inventory::scan_names(dir)? {
         let path = dir.join(name.to_string());
-        let reader = match SegmentReader::open(&path) {
+        let mut reader = match SegmentReader::open(&path) {
             Ok(r) => r,
             // Файл исчез под ногами — ротация работает параллельно.
             Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -389,7 +389,7 @@ fn run_channel(
             continue;
         }
 
-        let rewrite = match rewrite_segment(&reader, &path, schema.version, &steps) {
+        let rewrite = match rewrite_segment(&mut reader, &path, schema.version, &steps) {
             Ok(r) => r,
             Err(e) => {
                 // Оригинал не тронут; недописанный tmp подметёт следующая
@@ -438,7 +438,7 @@ struct Rewrite {
 /// выпадает). Имя и `base` тоже: даже если головные записи удалены, отбор
 /// сегментов по имени от этого лишь консервативнее — см. SPEC.
 fn rewrite_segment(
-    reader: &SegmentReader,
+    reader: &mut SegmentReader,
     path: &Path,
     to: ProtocolVersion,
     steps: &[&Migration],

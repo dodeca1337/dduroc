@@ -259,7 +259,7 @@ fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
         .map(|e| e.path())
         .find(|p| p.extension().is_some_and(|x| x == "seg"))
         .expect("активный сегмент");
-    let seg = SegmentReader::open(&seg_path).unwrap();
+    let mut seg = SegmentReader::open(&seg_path).unwrap();
     let (offsets, stopped) = seg.scan_block_offsets();
     assert!(stopped.is_none(), "до вмешательства сегмент цел");
     let mut buf = Vec::new();
