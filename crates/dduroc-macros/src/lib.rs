@@ -54,7 +54,13 @@
 //!             // ключей — разойтись с фактическим поведением им не из чего.
 //!             v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) },
 //!             event(0x05): drop,               // тип удалён — имени больше нет
-//!             metric(0x07): metrics::Temp,     // ремап id, payload как был
+//!             metric(0x07): metrics::Temp,     // ремап id, значение как было
+//!             // Значение самоописуемо: тип называет само замыкание, и
+//!             // history метрике не нужна.
+//!             metrics::Vswr: |v: u64| v as f32 / 10.0,
+//!             // У спана меняется только вид: номер и родитель — личность
+//!             // записи, и удалить её начало правило не даст.
+//!             span(0x07): spans::Calibration,
 //!         },
 //!         // Люк: сырой fn. Затронутые типы объявляются руками; не объявлены
 //!         // — шаг считается затрагивающим всё.
@@ -161,6 +167,7 @@ enum StepDef {
 struct Touches {
     events: Vec<Ident>,
     metrics: Vec<Ident>,
+    spans: Vec<Ident>,
 }
 
 /// Одно правило типизированного шага: `ключ: действие`.
@@ -181,6 +188,10 @@ enum RuleKey {
     CurrentMetric { name: Ident },
     /// `metric(0x07)` — голый id метрики.
     RawMetric { id: u16, span: proc_macro2::Span },
+    /// `spans::Calibration` — текущий вид спана.
+    CurrentSpan { name: Ident },
+    /// `span(0x03)` — голый id вида: вид удалён из схемы, имени больше нет.
+    RawSpan { id: u16, span: proc_macro2::Span },
 }
 
 impl RuleKey {
@@ -188,8 +199,11 @@ impl RuleKey {
         match self {
             RuleKey::HistoryEvent { name, .. }
             | RuleKey::CurrentEvent { name }
-            | RuleKey::CurrentMetric { name } => name.span(),
-            RuleKey::RawEvent { span, .. } | RuleKey::RawMetric { span, .. } => *span,
+            | RuleKey::CurrentMetric { name }
+            | RuleKey::CurrentSpan { name } => name.span(),
+            RuleKey::RawEvent { span, .. }
+            | RuleKey::RawMetric { span, .. }
+            | RuleKey::RawSpan { span, .. } => *span,
         }
     }
 }
@@ -204,6 +218,8 @@ enum RuleAction {
     RemapEvent(Ident),
     /// `metrics::New` — сменить метрику отсчёта.
     RemapMetric(Ident),
+    /// `spans::New` — переименовать вид спана.
+    RemapSpan(Ident),
 }
 
 /// Раскладки изменившихся типов, как они были в версии `version`, — то, что
@@ -707,12 +723,13 @@ fn parse_touches(input: ParseStream) -> syn::Result<Touches> {
         match key.to_string().as_str() {
             "events" => out.events = parse_ident_list(&content)?,
             "metrics" => out.metrics = parse_ident_list(&content)?,
+            "spans" => out.spans = parse_ident_list(&content)?,
             other => {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
                         "у шага миграции неизвестный ключ `{other}`: ожидались \
-                         events, metrics"
+                         events, metrics, spans"
                     ),
                 ));
             }
@@ -755,9 +772,13 @@ fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
                 id,
                 span: lit.span(),
             }),
+            "span" => Ok(RuleKey::RawSpan {
+                id,
+                span: lit.span(),
+            }),
             other => Err(syn::Error::new(
                 kind.span(),
-                format!("неизвестный вид ключа `{other}(..)`: ожидались event, metric"),
+                format!("неизвестный вид ключа `{other}(..)`: ожидались event, metric, span"),
             )),
         };
     }
@@ -767,7 +788,8 @@ fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
     if path.segments.len() != 2 {
         return bad(
             "ключ правила — путь из двух сегментов: `v1::Тип`, `events::Тип`, \
-             `metrics::Метрика`, либо голый id: `event(0x05)`, `metric(0x07)`",
+             `metrics::Метрика`, `spans::Вид`, либо голый id: `event(0x05)`, \
+             `metric(0x07)`, `span(0x03)`",
         );
     }
     let head = path.segments[0].ident.to_string();
@@ -778,12 +800,15 @@ fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
     if head == "metrics" {
         return Ok(RuleKey::CurrentMetric { name });
     }
+    if head == "spans" {
+        return Ok(RuleKey::CurrentSpan { name });
+    }
     if let Some(digits) = head.strip_prefix('v')
         && let Ok(version) = digits.parse::<u16>()
     {
         return Ok(RuleKey::HistoryEvent { version, name });
     }
-    bad("первый сегмент ключа — `v<N>` (раскладка из history), `events` или `metrics`")
+    bad("первый сегмент ключа — `v<N>` (раскладка из history), `events`, `metrics` или `spans`")
 }
 
 /// Действие правила: `drop`, путь-ремап или замыкание/функция.
@@ -802,6 +827,9 @@ fn parse_rule_action(input: ParseStream) -> syn::Result<RuleAction> {
             }
             if head == "metrics" {
                 return Ok(RuleAction::RemapMetric(name));
+            }
+            if head == "spans" {
+                return Ok(RuleAction::RemapSpan(name));
             }
         }
     }
@@ -1695,8 +1723,8 @@ fn codegen_raw_step(
     func: &syn::Path,
     touches: &Option<Touches>,
 ) -> syn::Result<TokenStream2> {
-    let (all, events, metrics) = match touches {
-        None => (quote!(true), Vec::new(), Vec::new()),
+    let (all, events, metrics, spans) = match touches {
+        None => (quote!(true), Vec::new(), Vec::new(), Vec::new()),
         Some(t) => {
             let events = t
                 .events
@@ -1722,7 +1750,15 @@ fn codegen_raw_step(
                     Ok(quote!(::dduroc::MetricId(#id)))
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
-            (quote!(false), events, metrics)
+            let spans = t
+                .spans
+                .iter()
+                .map(|name| {
+                    let id = lookup_id(name, input.spans.iter().map(|s| (&s.name, s.id)), "спан")?;
+                    Ok(quote!(::dduroc::SpanKindId(#id)))
+                })
+                .collect::<syn::Result<Vec<_>>>()?;
+            (quote!(false), events, metrics, spans)
         }
     };
     Ok(quote! {
@@ -1731,6 +1767,7 @@ fn codegen_raw_step(
             touches_all: #all,
             events: &[#(#events),*],
             metrics: &[#(#metrics),*],
+            spans: &[#(#spans),*],
             migrate: #func,
         }
     })
@@ -1754,17 +1791,25 @@ fn codegen_rules_step(
 
     let mut event_rules: Vec<ResolvedRule> = Vec::new();
     let mut metric_rules: Vec<ResolvedRule> = Vec::new();
+    let mut span_rules: Vec<ResolvedRule> = Vec::new();
     for rule in rules {
         resolve_rule(
             input,
             rule,
             &mut event_rules,
             &mut metric_rules,
+            &mut span_rules,
             used_history,
         )?;
     }
     // Два правила на один старый id — неоднозначность, а не приоритет.
-    for (what, list) in [("событие", &event_rules), ("метрику", &metric_rules)] {
+    // Корзины разные: пространства идентификаторов у событий, метрик и видов
+    // спанов свои, и общая корзина отвергала бы законное совпадение номеров.
+    for (what, list) in [
+        ("событие", &event_rules),
+        ("метрику", &metric_rules),
+        ("вид спана", &span_rules),
+    ] {
         let mut seen: HashMap<u16, ()> = HashMap::new();
         for r in list {
             if seen.insert(r.old_id, ()).is_some() {
@@ -1795,8 +1840,16 @@ fn codegen_rules_step(
             quote!(::dduroc::MetricId(#id))
         })
         .collect();
+    let span_ids: Vec<TokenStream2> = span_rules
+        .iter()
+        .map(|r| {
+            let id = r.old_id;
+            quote!(::dduroc::SpanKindId(#id))
+        })
+        .collect();
     let event_arms: Vec<TokenStream2> = event_rules.iter().map(|r| r.arm.clone()).collect();
     let metric_arms: Vec<TokenStream2> = metric_rules.iter().map(|r| r.arm.clone()).collect();
+    let span_arms: Vec<TokenStream2> = span_rules.iter().map(|r| r.arm.clone()).collect();
 
     let desc = quote! {
         ::dduroc::Migration {
@@ -1804,6 +1857,7 @@ fn codegen_rules_step(
             touches_all: false,
             events: &[#(#event_ids),*],
             metrics: &[#(#metric_ids),*],
+            spans: &[#(#span_ids),*],
             migrate: #fn_name,
         }
     };
@@ -1831,6 +1885,14 @@ fn codegen_rules_step(
                     )),
                 };
             }
+            if let ::core::option::Option::Some(__k) = __r.span_kind() {
+                return match __k.0 {
+                    #(#span_arms)*
+                    _ => ::core::result::Result::Ok(::core::option::Option::Some(
+                        ::dduroc::MigrationOutcome::AsIs,
+                    )),
+                };
+            }
             ::core::result::Result::Ok(::core::option::Option::Some(
                 ::dduroc::MigrationOutcome::AsIs,
             ))
@@ -1846,6 +1908,7 @@ fn resolve_rule(
     rule: &RuleDef,
     event_rules: &mut Vec<ResolvedRule>,
     metric_rules: &mut Vec<ResolvedRule>,
+    span_rules: &mut Vec<ResolvedRule>,
     used_history: &mut HashMap<(u16, String), bool>,
 ) -> syn::Result<()> {
     let span = rule.key.span();
@@ -1855,6 +1918,7 @@ fn resolve_rule(
     enum Kind {
         Event { decode: Option<TokenStream2> },
         Metric,
+        Span,
     }
     let (old_id, kind) = match &rule.key {
         RuleKey::HistoryEvent { version, name } => {
@@ -1899,6 +1963,11 @@ fn resolve_rule(
             Kind::Metric,
         ),
         RuleKey::RawMetric { id, .. } => (*id, Kind::Metric),
+        RuleKey::CurrentSpan { name } => (
+            lookup_id(name, input.spans.iter().map(|s| (&s.name, s.id)), "спан")?,
+            Kind::Span,
+        ),
+        RuleKey::RawSpan { id, .. } => (*id, Kind::Span),
     };
 
     match (kind, &rule.action) {
@@ -1970,16 +2039,60 @@ fn resolve_rule(
                 },
             });
         }
-        (Kind::Metric, RuleAction::Map(_)) => {
-            return err(
-                "значения отсчётов правилами не преобразуются — метрике доступны \
-                 только drop и ремап (`metrics::Другая`); преобразование значений \
-                 выразимо сырым fn, но и ему пока недоступно"
-                    .to_owned(),
-            );
+        (Kind::Metric, RuleAction::Map(expr)) => {
+            metric_rules.push(ResolvedRule {
+                old_id,
+                // Тип значения объявляет само замыкание: значение на диске
+                // самоописуемо, и `history` метрике не нужна. Ремап id
+                // отдельным правилом — здесь метрика остаётся своей.
+                arm: quote! {
+                    #old_id => {
+                        let __v = __r.value().ok_or(::dduroc::DecodeError)?;
+                        ::dduroc::__migrate_value(#expr, __v, ::dduroc::MetricId(#old_id))
+                    }
+                },
+            });
         }
         (Kind::Metric, RuleAction::RemapEvent(_)) => {
             return err("метрику не превратить в событие: у них разные виды записей".to_owned());
+        }
+        (Kind::Metric, RuleAction::RemapSpan(_)) => {
+            return err("метрику не превратить в спан: у них разные виды записей".to_owned());
+        }
+        (Kind::Event { .. }, RuleAction::RemapSpan(_)) => {
+            return err("событие не превратить в спан: у них разные виды записей".to_owned());
+        }
+        (Kind::Span, RuleAction::RemapSpan(target)) => {
+            let target_id = lookup_id(target, input.spans.iter().map(|s| (&s.name, s.id)), "спан")?;
+            span_rules.push(ResolvedRule {
+                old_id,
+                arm: quote! {
+                    #old_id => ::core::result::Result::Ok(::core::option::Option::Some(
+                        ::dduroc::MigrationOutcome::SpanKind(::dduroc::SpanKindId(#target_id)),
+                    )),
+                },
+            });
+        }
+        (Kind::Span, RuleAction::Drop) => {
+            return err(
+                "начало спана не удаляется: на него ссылаются его конец, его \
+                 сообщения и его дочерние спаны, а переписать эти ссылки цепочке \
+                 нечем — остались бы висячие. Виду спана доступен только ремап \
+                 (`spans::Другой`)"
+                    .to_owned(),
+            );
+        }
+        (Kind::Span, RuleAction::Map(_)) => {
+            return err(
+                "у спана нет полей: он несёт только вид, номер и родителя, и \
+                 декодировать в нём нечего. Доступен ремап вида (`spans::Другой`)"
+                    .to_owned(),
+            );
+        }
+        (Kind::Span, RuleAction::RemapEvent(_) | RuleAction::RemapMetric(_)) => {
+            return err(
+                "спан не превратить в событие или метрику: у них разные виды записей".to_owned(),
+            );
         }
     }
     Ok(())
@@ -2053,12 +2166,20 @@ fn clone_migration(m: &MigrationDef) -> MigrationDef {
                                 id: *id,
                                 span: *span,
                             },
+                            RuleKey::CurrentSpan { name } => {
+                                RuleKey::CurrentSpan { name: name.clone() }
+                            }
+                            RuleKey::RawSpan { id, span } => RuleKey::RawSpan {
+                                id: *id,
+                                span: *span,
+                            },
                         },
                         action: match &r.action {
                             RuleAction::Drop => RuleAction::Drop,
                             RuleAction::Map(e) => RuleAction::Map(e.clone()),
                             RuleAction::RemapEvent(i) => RuleAction::RemapEvent(i.clone()),
                             RuleAction::RemapMetric(i) => RuleAction::RemapMetric(i.clone()),
+                            RuleAction::RemapSpan(i) => RuleAction::RemapSpan(i.clone()),
                         },
                     })
                     .collect(),
@@ -2389,14 +2510,87 @@ mod tests {
     }
 
     #[test]
-    fn metric_values_cannot_be_mapped() {
-        // Значения отсчётов правилами не преобразуются: метрике доступны
-        // только drop и ремап. Замыкание здесь — ошибка объявления.
-        let e = err(r#"name: radio, version: 2, languages: [en],
+    fn metric_values_are_mapped_by_a_closure_that_names_its_type() {
+        // Значение отсчёта самоописуемо — тип лежит в самой записи, — поэтому
+        // правилу не нужна ни history, ни объявление прежнего типа: тип
+        // называет параметр замыкания, он же говорит, что ожидалось на диске.
+        check(
+            r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                metrics { Temp = 0x01 { type: f32 } }
-               migrations { 1 => { metrics::Temp: |v| v } }"#);
-        assert!(e.contains("не преобразуются"), "{e}");
+               migrations { 1 => { metrics::Temp: |v: f32| v * 10.0 } }"#,
+        )
+        .expect("преобразование значения — законное правило");
+
+        // И по голому id: у значения раскладку брать неоткуда, она на диске.
+        check(
+            r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               metrics { Temp = 0x01 { type: f32 } }
+               migrations { 1 => { metric(0x07): |v: i64| v as f64 } }"#,
+        )
+        .expect("голый id метрики годится: тип значения на диске");
+    }
+
+    #[test]
+    fn span_kinds_are_renamed_but_never_deleted() {
+        // Ремап вида — законное правило.
+        check(
+            r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               spans { Calib = 0x01, Calibration = 0x02 }
+               migrations { 1 => { spans::Calib: spans::Calibration } }"#,
+        )
+        .expect("переименование вида спана");
+
+        // И по голому id: вид мог исчезнуть из схемы вместе с именем.
+        check(
+            r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               spans { Calibration = 0x02 }
+               migrations { 1 => { span(0x01): spans::Calibration } }"#,
+        )
+        .expect("голый id вида спана");
+
+        // А вот удаление — нет: на начало спана ссылаются его конец, его
+        // сообщения и его дети, и переписать эти ссылки цепочке нечем.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               spans { Calib = 0x01 }
+               migrations { 1 => { spans::Calib: drop } }"#);
+        assert!(e.contains("висячие"), "{e}");
+
+        // Замыкание тоже нет: декодировать у спана нечего.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               spans { Calib = 0x01 }
+               migrations { 1 => { spans::Calib: |s| s } }"#);
+        assert!(e.contains("нет полей"), "{e}");
+    }
+
+    #[test]
+    fn span_kinds_have_their_own_id_space_in_rules() {
+        // Номера видов спанов, событий и метрик живут в разных пространствах:
+        // общая корзина проверок отвергала бы законное совпадение номеров.
+        check(
+            r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               metrics { Temp = 0x01 { type: f32 } }
+               spans { Calib = 0x01, Calibration = 0x02 }
+               migrations { 1 => {
+                   events::E: drop,
+                   metrics::Temp: drop,
+                   spans::Calib: spans::Calibration,
+               } }"#,
+        )
+        .expect("три правила с id 0x01 в трёх пространствах");
+
+        // А два правила на один вид — по-прежнему неоднозначность.
+        let e = err(r#"name: radio, version: 2, languages: [en],
+               events { E = 0x01 { level: Info, en: "x" } }
+               spans { Calib = 0x01, A = 0x02, B = 0x03 }
+               migrations { 1 => { spans::Calib: spans::A, span(0x01): spans::B } }"#);
+        assert!(e.contains("неоднозначно"), "{e}");
     }
 
     #[test]
@@ -2490,7 +2684,7 @@ mod tests {
 
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
-               migrations { 1 => { span(0x01): drop } }"#);
-        assert!(e.contains("event, metric"), "{e}");
+               migrations { 1 => { bucket(0x01): drop } }"#);
+        assert!(e.contains("event, metric, span"), "{e}");
     }
 }

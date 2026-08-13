@@ -172,7 +172,7 @@ pub use dduroc_engine::writer::QueueSizes;
 pub use dduroc_engine::{Clock, Error, Result};
 pub use dduroc_format::{
     BootCounter, BootTime, Compression, EventId, Level, MetricId, Micros, ProtocolVersion, SpanId,
-    SpanKindId, ValueType,
+    SpanKindId, Value, ValueType,
 };
 
 /// Всё, что нужно для записи, и мост к чтению своего же хранилища
@@ -247,6 +247,106 @@ impl<E: EventShape> IntoMigrationOutcome for Option<E> {
             None => Ok(None),
         }
     }
+}
+
+/// Тип значения отсчёта глазами правила миграции.
+///
+/// Значение самоописуемо — тип лежит в самой записи, — поэтому правилу не
+/// нужна ни `history`, ни объявление прежнего типа: достаточно назвать тип
+/// параметра замыкания, и он же скажет, что на диске ожидалось.
+///
+/// Проверка строгая: правило, объявившее `f32`, на записи с `u64` отказывает,
+/// а не приводит молча. Приведение здесь было бы догадкой о том, что имел в
+/// виду автор схемы, и цена ошибки — тихо переписанная история.
+#[diagnostic::on_unimplemented(
+    message = "значением отсчёта такой тип не бывает: `{Self}`",
+    label = "здесь нужен один из типов, которыми бывает `type:` метрики",
+    note = "это f32, f64, i64, u64, bool или Vec<u8> для `type: blob`"
+)]
+pub trait SampleValue: Sized {
+    /// Прочитать значение так, как оно лежит на диске.
+    fn from_wire(value: Value<'_>) -> std::result::Result<Self, DecodeError>;
+    /// Отдать значение в том виде, в котором оно ляжет обратно.
+    fn into_wire(self) -> OwnedValue;
+}
+
+macro_rules! impl_sample_value {
+    ($($t:ty => $variant:ident),* $(,)?) => { $(
+        impl SampleValue for $t {
+            fn from_wire(value: Value<'_>) -> std::result::Result<Self, DecodeError> {
+                match value {
+                    Value::$variant(v) => Ok(v),
+                    _ => Err(DecodeError),
+                }
+            }
+            fn into_wire(self) -> OwnedValue {
+                OwnedValue::$variant(self)
+            }
+        }
+    )* };
+}
+
+impl_sample_value!(f32 => F32, f64 => F64, i64 => I64, u64 => U64, bool => Bool);
+
+impl SampleValue for Vec<u8> {
+    fn from_wire(value: Value<'_>) -> std::result::Result<Self, DecodeError> {
+        match value {
+            Value::Blob(b) => Ok(b.to_vec()),
+            _ => Err(DecodeError),
+        }
+    }
+    fn into_wire(self) -> OwnedValue {
+        OwnedValue::Blob(Payload::from_vec(self))
+    }
+}
+
+/// Приведение возврата правила-преобразователя значения к исходу шага.
+///
+/// Замыкание возвращает либо значение ([`SampleValue`]), либо `Option` от
+/// него (`None` — отсчёт удаляется). Трейт существует ровно для того, чтобы
+/// генерируемый код принимал и то, и другое.
+pub trait IntoSampleOutcome {
+    /// Превратить возврат правила в исход шага для метрики `metric`.
+    fn into_sample_outcome(
+        self,
+        metric: MetricId,
+    ) -> std::result::Result<Option<MigrationOutcome>, DecodeError>;
+}
+
+impl<V: SampleValue> IntoSampleOutcome for V {
+    fn into_sample_outcome(
+        self,
+        metric: MetricId,
+    ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+        Ok(Some(MigrationOutcome::Sample {
+            metric,
+            value: self.into_wire(),
+        }))
+    }
+}
+
+impl<V: SampleValue> IntoSampleOutcome for Option<V> {
+    fn into_sample_outcome(
+        self,
+        metric: MetricId,
+    ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+        match self {
+            Some(v) => v.into_sample_outcome(metric),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Вызвать преобразование значения из типизированного правила. Только для
+/// макроса. Существует по той же причине, что и [`__migrate_map`]: тип
+/// параметра замыкания должен быть известен до проверки его тела.
+#[doc(hidden)]
+pub fn __migrate_value<T: SampleValue, O: IntoSampleOutcome>(
+    map: impl FnOnce(T) -> O,
+    value: Value<'_>,
+    metric: MetricId,
+) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+    map(T::from_wire(value)?).into_sample_outcome(metric)
 }
 
 /// Вызвать преобразование типизированного правила. Только для макроса.

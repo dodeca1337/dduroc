@@ -196,3 +196,104 @@ fn old_fixtures_are_written_with_the_generated_history_types() {
         "id раскладки — старый, из history"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Спаны и значения отсчётов
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Вчерашняя прошивка: уровень писался десятыми долями в целых, а вид спана
+/// назывался иначе.
+mod tenths {
+    dduroc::schema! {
+        name: gauge,
+        version: 1,
+        languages: [en],
+
+        events { Mark = 0x01 { level: Info, en: "mark" } }
+        metrics { Level = 0x02 { type: u64 } }
+        spans { Calib = 0x01 }
+    }
+}
+
+/// Сегодняшняя: уровень стал вещественным в своих единицах, вид спана
+/// переименован. Прежнего имени в схеме больше нет — ключ по голому id.
+mod units {
+    dduroc::schema! {
+        name: gauge,
+        version: 2,
+        languages: [en],
+
+        events { Mark = 0x01 { level: Info, en: "mark" } }
+        metrics { Level = 0x02 { type: f32, unit: "dB" } }
+        spans { Calibration = 0x02 }
+
+        migrations {
+            1 => {
+                metrics::Level: |v: u64| v as f32 / 10.0,
+                span(0x01): spans::Calibration,
+            },
+        }
+    }
+}
+
+/// Отсчёты и виды спанов в порядке чтения.
+fn levels_and_spans(root: &std::path::Path) -> (Vec<f32>, Vec<Option<&'static str>>) {
+    let reader = Reader::open_dump([root], &[units::gauge::SCHEMA]).unwrap();
+    let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
+    assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
+    let mut levels = Vec::new();
+    let mut kinds = Vec::new();
+    for e in &result.entries {
+        match &e.kind {
+            EntryKind::Sample {
+                value: OwnedSampleValue::F32(v),
+                ..
+            } => levels.push(*v),
+            EntryKind::SpanStart { kind_name, .. } => kinds.push(*kind_name),
+            _ => {}
+        }
+    }
+    (levels, kinds)
+}
+
+#[test]
+fn a_span_kind_and_a_sample_value_migrate_like_everything_else() {
+    // Событиям миграции были доступны давно, отсчётам — только смена
+    // идентификатора, спанам — ничего. Между тем «величина стала писаться в
+    // своих единицах» и «вид спана переименован» — обычные правки схемы, и
+    // без них история оставалась бы в прежней раскладке навсегда.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 << 20);
+
+    {
+        let store = Store::open(cfg.clone()).unwrap();
+        let ns = store.namespace("orc-0", tenths::gauge::SCHEMA).unwrap();
+        let cal = ns.span(tenths::gauge::spans::Calib);
+        let level = ns.series(tenths::gauge::metrics::Level).unwrap();
+        level.sample(365);
+        level.sample(700);
+        cal.close().unwrap();
+        ns.sync().unwrap();
+        store.shutdown();
+    }
+
+    let store = Store::open(cfg).unwrap();
+    let ns = store.namespace("orc-0", units::gauge::SCHEMA).unwrap();
+    assert_eq!(ns.pending_migration(), Some((1, 2)));
+
+    // Чтение через шаги — до всякого прогона.
+    let expected = (vec![36.5f32, 70.0], vec![Some("Calibration")]);
+    assert_eq!(levels_and_spans(dir.path()), expected, "чтение через шаги");
+
+    // Физический прогон. Сегмент со спанами переписывается всегда: множества
+    // видов спанов в footer'е нет, и «в этом сегменте таких спанов нет»
+    // сказать нечем.
+    let report = ns.migrate().expect("прогон проходит");
+    assert_eq!(report.rewritten, 1, "{report:?}");
+    assert_eq!(report.records_dropped, 0, "спаны не удаляются: {report:?}");
+    assert_eq!(ns.pending_migration(), None);
+
+    // И тот же ответ после прогона: прогон меняет носитель, а не ответ.
+    assert_eq!(levels_and_spans(dir.path()), expected, "ответ не изменился");
+    store.shutdown();
+}

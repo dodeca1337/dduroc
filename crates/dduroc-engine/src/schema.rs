@@ -415,6 +415,13 @@ pub struct Migration {
     /// переписывать не нужно — прямая экономия ресурса флеша.
     pub events: &'static [EventId],
     pub metrics: &'static [MetricId],
+    /// Виды спанов, затронутые шагом.
+    ///
+    /// В отличие от событий и метрик, экономии на сегментах они не дают:
+    /// множества видов спанов в footer'е нет, и ответить «в этом сегменте
+    /// таких спанов не бывает» не по чему. Шаг со спанами переписывает
+    /// сегмент всегда — см. [`Migration::touches`].
+    pub spans: &'static [SpanKindId],
     /// Преобразование одной записи. `Ok(None)` — запись удаляется.
     pub migrate: fn(MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError>,
 }
@@ -426,7 +433,13 @@ impl Migration {
     /// footer'е отвечают на него без чтения блоков, а `touches_all` —
     /// без чтения вовсе.
     pub fn touches(&self, footer: &dduroc_format::Footer) -> bool {
-        self.touches_all || footer.touches(self.events, self.metrics)
+        // Шаг, трогающий виды спанов, переписывает сегмент безусловно.
+        // Footer знает множества событий и метрик, но не спанов: спросить
+        // «есть ли здесь такой спан» не у кого, а решить «нет» наугад значило
+        // бы навсегда оставить эти записи в прежней раскладке — притом молча,
+        // потому что прогон отчитается об успехе и заштампует мету. Лишняя
+        // перезапись стоит одного цикла флеша, пропуск — необратим.
+        self.touches_all || !self.spans.is_empty() || footer.touches(self.events, self.metrics)
     }
 }
 
@@ -437,6 +450,7 @@ impl std::fmt::Debug for Migration {
             .field("touches_all", &self.touches_all)
             .field("events", &self.events)
             .field("metrics", &self.metrics)
+            .field("spans", &self.spans)
             .finish_non_exhaustive()
     }
 }
@@ -464,6 +478,29 @@ impl MigrationInput<'_> {
     pub fn metric_id(&self) -> Option<MetricId> {
         match &self.record {
             dduroc_format::Record::Sample(s) => Some(s.metric),
+            _ => None,
+        }
+    }
+
+    /// Вид спана. `None` — запись не начало спана.
+    ///
+    /// У конца спана вида нет: он ссылается на уже начатый по номеру, и
+    /// переименование вида его не касается.
+    pub fn span_kind(&self) -> Option<SpanKindId> {
+        match &self.record {
+            dduroc_format::Record::SpanStart(s) => Some(s.kind),
+            _ => None,
+        }
+    }
+
+    /// Значение отсчёта. `None` — запись не отсчёт.
+    ///
+    /// Значение самоописуемо: тип лежит в самой записи, а не берётся из
+    /// схемы. Поэтому шаг видит то, что писали, — даже если с тех пор в схеме
+    /// у метрики объявлен другой тип.
+    pub fn value(&self) -> Option<dduroc_format::Value<'_>> {
+        match &self.record {
+            dduroc_format::Record::Sample(s) => Some(s.value),
             _ => None,
         }
     }
@@ -500,13 +537,31 @@ impl MigrationInput<'_> {
 /// одноимённым типом читателя (владеющая копия wire-записи) — при импорте
 /// обоих крейтов они были неразличимы.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum MigrationOutcome {
     /// Оставить как есть.
     AsIs,
     /// Заменить тип и/или payload сообщения.
     Message { event: EventId, payload: Vec<u8> },
-    /// Заменить метрику сэмпла.
+    /// Заменить метрику сэмпла, не трогая значение.
+    ///
+    /// Остаётся отдельным исходом ради значения: ремап не копирует его вовсе,
+    /// а мегабайтный спектр стоил бы копии на каждой записи.
     SampleMetric(MetricId),
+    /// Заменить значение отсчёта (и, если нужно, метрику).
+    ///
+    /// Значение владеющее: у исхода шага нет времени жизни, связывающего его
+    /// с входной записью, — заимствовать байты блока ему не из чего.
+    Sample {
+        metric: MetricId,
+        value: crate::staged::OwnedValue,
+    },
+    /// Переименовать вид спана.
+    ///
+    /// Только вид: номер спана и его родитель — личность записи, на которую
+    /// ссылаются её сообщения и дочерние спаны, и переписать эти ссылки
+    /// цепочке нечем.
+    SpanKind(SpanKindId),
 }
 
 /// Схема неймспейса.
@@ -1133,6 +1188,7 @@ mod tests {
             touches_all: true,
             events: &[],
             metrics: &[],
+            spans: &[],
             migrate: noop,
         }];
 
@@ -1161,6 +1217,7 @@ mod tests {
                 touches_all: true,
                 events: &[],
                 metrics: &[],
+                spans: &[],
                 migrate: noop,
             },
             Migration {
@@ -1168,6 +1225,7 @@ mod tests {
                 touches_all: true,
                 events: &[],
                 metrics: &[],
+                spans: &[],
                 migrate: noop,
             },
         ];

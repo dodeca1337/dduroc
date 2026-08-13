@@ -102,10 +102,39 @@ pub enum OwnedChained<'a> {
         span: Option<SpanId>,
         payload: Vec<u8>,
     },
+    /// Спан с переименованным видом.
+    ///
+    /// `span` и `parent` шаг не трогает: это личность записи, на которую
+    /// ссылаются её сообщения и дочерние спаны, и переписать эти ссылки
+    /// цепочке нечем.
+    SpanStart(dduroc_format::record::SpanStart),
     Sample {
         metric: MetricId,
-        original: Sample<'a>,
+        value: ChainedValue<'a>,
     },
+}
+
+/// Значение сэмпла на середине цепочки.
+///
+/// Ремап идентификатора значения не касается, и копировать его незачем —
+/// мегабайтный спектр стоил бы копии на каждой записи. Преобразование
+/// значения, наоборот, обязано владеть результатом: у исхода шага нет
+/// времени жизни, связывающего его с входной записью.
+#[derive(Debug)]
+pub enum ChainedValue<'a> {
+    /// Значение исходной записи: байты не копировались.
+    Same(dduroc_format::Value<'a>),
+    /// Значение, посчитанное шагом.
+    Owned(crate::staged::OwnedValue),
+}
+
+impl ChainedValue<'_> {
+    pub fn as_value(&self) -> dduroc_format::Value<'_> {
+        match self {
+            ChainedValue::Same(v) => *v,
+            ChainedValue::Owned(v) => v.as_value(),
+        }
+    }
 }
 
 impl OwnedChained<'_> {
@@ -120,9 +149,10 @@ impl OwnedChained<'_> {
                 span: *span,
                 payload,
             }),
-            OwnedChained::Sample { metric, original } => Record::Sample(Sample {
+            OwnedChained::SpanStart(s) => Record::SpanStart(*s),
+            OwnedChained::Sample { metric, value } => Record::Sample(Sample {
                 metric: *metric,
-                value: original.value,
+                value: value.as_value(),
             }),
         }
     }
@@ -147,7 +177,8 @@ pub enum ChainErrorKind {
     #[error("payload не разобрался")]
     Decode,
     /// Шаг вернул исход, не применимый к виду записи: `SampleMetric` для
-    /// сообщения или `Message` для текста. Ошибка кода шага, а не данных.
+    /// сообщения, `Message` для текста, `SpanKind` для отсчёта. Ошибка кода
+    /// шага, а не данных.
     #[error("исход шага не применим к виду записи")]
     WrongOutcome,
     /// В цепочке нет шага с этой версии: схема не проходила валидацию.
@@ -166,9 +197,10 @@ fn step_applies(step: &Migration, record: &Record<'_>) -> bool {
     match record {
         Record::Message(m) => step.events.contains(&m.event),
         Record::Sample(s) => step.metrics.contains(&s.metric),
-        Record::SpanStart(_) | Record::SpanEnd { .. } | Record::Text(_) | Record::Ext { .. } => {
-            false
-        }
+        Record::SpanStart(s) => step.spans.contains(&s.kind),
+        // Конец спана вида не несёт — он есть только у начала, — и множеством
+        // видов не отбирается ни при каких обстоятельствах.
+        Record::SpanEnd { .. } | Record::Text(_) | Record::Ext { .. } => false,
     }
 }
 
@@ -213,16 +245,35 @@ pub fn apply<'a>(
                 })
             }
             Some(MigrationOutcome::SampleMetric(metric)) => match current {
-                // Ремап поверх ремапа: значение так и заимствует исходный
-                // буфер, меняется только идентификатор.
-                Chained::Owned(OwnedChained::Sample { original, .. }) => {
-                    Chained::Owned(OwnedChained::Sample { metric, original })
+                // Ремап поверх чего угодно: значение остаётся тем, что оставил
+                // предыдущий шаг, меняется только идентификатор.
+                Chained::Owned(OwnedChained::Sample { value, .. }) => {
+                    Chained::Owned(OwnedChained::Sample { metric, value })
                 }
-                Chained::Same(Record::Sample(original)) => {
-                    Chained::Owned(OwnedChained::Sample { metric, original })
-                }
+                Chained::Same(Record::Sample(original)) => Chained::Owned(OwnedChained::Sample {
+                    metric,
+                    value: ChainedValue::Same(original.value),
+                }),
                 _ => return Err(failed(ChainErrorKind::WrongOutcome)),
             },
+            Some(MigrationOutcome::Sample { metric, value }) => {
+                if !matches!(viewed, Record::Sample(_)) {
+                    return Err(failed(ChainErrorKind::WrongOutcome));
+                }
+                Chained::Owned(OwnedChained::Sample {
+                    metric,
+                    value: ChainedValue::Owned(value),
+                })
+            }
+            Some(MigrationOutcome::SpanKind(kind)) => {
+                let Record::SpanStart(start) = viewed else {
+                    return Err(failed(ChainErrorKind::WrongOutcome));
+                };
+                Chained::Owned(OwnedChained::SpanStart(dduroc_format::record::SpanStart {
+                    kind,
+                    ..start
+                }))
+            }
         };
     }
     Ok(current)
@@ -523,11 +574,25 @@ mod tests {
         metrics: &'static [MetricId],
         migrate: fn(MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError>,
     ) -> Migration {
+        step_of(from, events, metrics, &[], migrate)
+    }
+
+    #[allow(unused_imports)]
+    use dduroc_format::SpanKindId;
+
+    fn step_of(
+        from: u16,
+        events: &'static [EventId],
+        metrics: &'static [MetricId],
+        spans: &'static [SpanKindId],
+        migrate: fn(MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError>,
+    ) -> Migration {
         Migration {
             from,
-            touches_all: events.is_empty() && metrics.is_empty(),
+            touches_all: events.is_empty() && metrics.is_empty() && spans.is_empty(),
             events,
             metrics,
+            spans,
             migrate,
         }
     }
@@ -644,6 +709,131 @@ mod tests {
     }
 
     #[test]
+    fn a_span_kind_is_renamed_and_its_identity_is_left_alone() {
+        // Вид спана — то немногое, что у него есть помимо личности. Номер и
+        // родитель личностью и являются: на них ссылаются конец спана, его
+        // сообщения и его дети, и цепочке эти ссылки не переписать.
+        fn rename(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::SpanKind(SpanKindId(0x42))))
+        }
+        let s = step_of(1, &[], &[], &[SpanKindId(1)], rename);
+        let steps = [&s];
+
+        let start = Record::SpanStart(dduroc_format::record::SpanStart {
+            span: SpanId(11),
+            kind: SpanKindId(1),
+            parent: Some(SpanId(3)),
+        });
+        match apply(&steps, start).unwrap() {
+            Chained::Owned(OwnedChained::SpanStart(s)) => {
+                assert_eq!(s.kind, SpanKindId(0x42), "вид переименован");
+                assert_eq!(s.span, SpanId(11), "номер — личность записи");
+                assert_eq!(s.parent, Some(SpanId(3)), "родитель тоже");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Конец спана вида не несёт и множеством видов не отбирается: он
+        // ссылается на уже начатый спан по номеру.
+        let end = Record::SpanEnd { span: SpanId(11) };
+        assert!(matches!(apply(&steps, end).unwrap(), Chained::Same(_)));
+
+        // Спан другого вида шаг не видит — множество связывающее.
+        let other_kind = Record::SpanStart(dduroc_format::record::SpanStart {
+            span: SpanId(12),
+            kind: SpanKindId(9),
+            parent: None,
+        });
+        assert!(matches!(
+            apply(&steps, other_kind).unwrap(),
+            Chained::Same(_)
+        ));
+    }
+
+    #[test]
+    fn a_transformed_value_survives_a_remap_on_top_of_it() {
+        // Преобразование значения и ремап идентификатора — разные шаги, и
+        // сложиться они обязаны в любом порядке: иначе законная цепочка
+        // объявлялась бы ошибкой кода шага.
+        fn scale(r: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            let Some(Value::U64(v)) = r.value() else {
+                return Err(DecodeError);
+            };
+            Ok(Some(MigrationOutcome::Sample {
+                metric: MetricId(0x10),
+                value: crate::staged::OwnedValue::F64(v as f64 / 10.0),
+            }))
+        }
+        fn rename(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::SampleMetric(MetricId(0x20))))
+        }
+        let s1 = step(1, &[], &[MetricId(0x10)], scale);
+        let s2 = step(2, &[], &[MetricId(0x10)], rename);
+
+        let out = apply(&[&s1, &s2], sample(0x10, 365)).unwrap();
+        match out.record() {
+            Some(Record::Sample(s)) => {
+                assert_eq!(s.metric, MetricId(0x20), "ремап поверх преобразования");
+                assert_eq!(s.value, Value::F64(36.5), "значение пережило ремап");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_outcome_that_does_not_fit_the_record_is_a_defect_not_a_no_op() {
+        // Исход, не применимый к виду записи, — ошибка кода шага. Промолчать
+        // о ней нельзя: запись осталась бы в прежней раскладке, а прогон
+        // отчитался бы об успехе и заштамповал мету.
+        fn span_kind(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::SpanKind(SpanKindId(1))))
+        }
+        let s = step(1, &[], &[MetricId(1)], span_kind);
+        let e = apply(&[&s], sample(1, 5)).unwrap_err();
+        assert_eq!(e.kind, ChainErrorKind::WrongOutcome);
+
+        fn value(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::Sample {
+                metric: MetricId(1),
+                value: crate::staged::OwnedValue::U64(1),
+            }))
+        }
+        let s = step(1, &[EventId(1)], &[], value);
+        let e = apply(&[&s], msg(1, &[1])).unwrap_err();
+        assert_eq!(e.kind, ChainErrorKind::WrongOutcome);
+    }
+
+    #[test]
+    fn a_step_that_touches_spans_rewrites_every_segment() {
+        // Множества видов спанов в footer'е нет — спросить «есть ли здесь
+        // такой спан» не у кого. Решить «нет» наугад значило бы навсегда
+        // оставить эти записи в прежней раскладке, притом молча: прогон
+        // отчитается об успехе и заштампует мету, а следующий проход эти
+        // сегменты пропустит.
+        fn noop(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
+            Ok(Some(MigrationOutcome::AsIs))
+        }
+        let footer = dduroc_format::Footer {
+            blocks: Vec::new(),
+            events: vec![EventId(7)],
+            metrics: vec![MetricId(7)],
+            min: dduroc_format::Micros(0),
+            max: dduroc_format::Micros(0),
+        };
+
+        let spans_step = step_of(1, &[], &[], &[SpanKindId(1)], noop);
+        assert!(
+            spans_step.touches(&footer),
+            "шаг со спанами обязан переписать сегмент, что бы ни лежало в footer'е"
+        );
+
+        // А без спанов правило прежнее: не нашлось ни одного объявленного
+        // типа — сегмент не трогаем.
+        let events_step = step(1, &[EventId(1)], &[], noop);
+        assert!(!events_step.touches(&footer));
+    }
+
+    #[test]
     fn metric_remap_keeps_the_value_bytes() {
         fn remap(_: MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError> {
             Ok(Some(MigrationOutcome::SampleMetric(MetricId(0x20))))
@@ -707,6 +897,7 @@ mod tests {
                 touches_all: true,
                 events: &[],
                 metrics: &[],
+                spans: &[],
                 migrate: asis,
             },
             Migration {
@@ -714,6 +905,7 @@ mod tests {
                 touches_all: true,
                 events: &[],
                 metrics: &[],
+                spans: &[],
                 migrate: asis,
             },
         ];
@@ -732,6 +924,7 @@ mod tests {
             touches_all: true,
             events: &[],
             metrics: &[],
+            spans: &[],
             migrate: asis,
         }];
         let schema = minimal_schema_with_migrations(3, GAPPY);

@@ -1653,6 +1653,7 @@ mod tests {
             touches_all: false,
             events: &[EventId(1), EventId(2)],
             metrics: &[MetricId(0x10)],
+            spans: &[],
             migrate: step1,
         }];
         let ctx = MigrationCtx {
@@ -1817,6 +1818,7 @@ mod tests {
             touches_all: false,
             events: &[EventId(1)],
             metrics: &[],
+            spans: &[],
             migrate: broken,
         }];
 

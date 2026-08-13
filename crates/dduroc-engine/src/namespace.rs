@@ -1303,6 +1303,7 @@ mod tests {
             touches_all: true,
             events: &[],
             metrics: &[],
+            spans: &[],
             migrate: noop,
         }];
 
@@ -1393,6 +1394,7 @@ mod tests {
             touches_all: false,
             events: &[EventId(1)],
             metrics: &[MetricId(1)],
+            spans: &[],
             migrate: step,
         }];
 
@@ -1500,6 +1502,7 @@ mod tests {
             // Шаг затрагивает только Alarm — его в истории не будет.
             events: &[EventId(2)],
             metrics: &[],
+            spans: &[],
             migrate: nope,
         }];
 
