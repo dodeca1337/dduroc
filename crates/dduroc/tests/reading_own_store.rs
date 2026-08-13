@@ -83,6 +83,69 @@ fn a_reader_of_the_store_sees_the_class_that_lives_on_another_medium() {
     store.shutdown();
 }
 
+mod other {
+    // Чужая схема с ТЕМ ЖЕ id 0x01, но другим типом под ним: коллизия
+    // идентификаторов между схемами — штатная ситуация, id уникален только
+    // в пределах своей схемы.
+    dduroc::schema! {
+        name: other,
+        version: 1,
+        languages: [ru],
+        events {
+            Boom = 0x01 { level: Info, ru: "бум {code}", code: u8 },
+        }
+    }
+}
+
+#[test]
+fn an_entry_decodes_back_into_the_type_it_was_written_as() {
+    // `render` отдаёт текст; здесь — обратный путь к ПОЛЯМ. Тип сверяется
+    // по схеме неймспейса записи: совпадение id — ещё не совпадение типа.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
+    let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
+    ns.log(split::events::Ping { seq: 7 });
+    // Одноимённый id из ЧУЖОЙ схемы — в соседнем неймспейсе.
+    let foreign = store.namespace("other-0", other::other::SCHEMA).unwrap();
+    foreign.log(other::other::events::Boom { code: 3 });
+    // Запись, объявляющая себя Ping, но с неразборным payload'ом.
+    ns.try_log_raw(dduroc::EventId(0x01), &[0xFF], None)
+        .unwrap();
+    ns.sync().unwrap();
+    foreign.sync().unwrap();
+
+    let reader = store.reader();
+    let got = reader
+        .query(&Query::new().kinds(KindFilter::LOGS).order(Order::Oldest))
+        .unwrap();
+
+    let pings: Vec<_> = got
+        .entries
+        .iter()
+        .filter_map(|e| reader.decode::<split::events::Ping>(e))
+        .collect();
+    assert_eq!(
+        pings.len(),
+        2,
+        "Ping из своего неймспейса — да; Boom с тем же id — нет"
+    );
+    assert_eq!(pings[0], Ok(split::events::Ping { seq: 7 }));
+    assert_eq!(
+        pings[1],
+        Err(dduroc::DecodeError),
+        "неразборный payload — не молчание, а ошибка"
+    );
+    // Чужой Boom разбирается своим типом — в своём неймспейсе.
+    assert_eq!(
+        got.entries
+            .iter()
+            .filter_map(|e| reader.decode::<other::other::events::Boom>(e))
+            .collect::<Vec<_>>(),
+        [Ok(other::other::events::Boom { code: 3 })]
+    );
+    store.shutdown();
+}
+
 #[test]
 fn an_unknown_directory_under_a_namespace_is_reported_not_hidden() {
     // Канал — это класс хранения, и перечисление каналов типизировано.

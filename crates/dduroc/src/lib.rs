@@ -178,12 +178,12 @@ pub use dduroc_format::{
 /// Всё, что нужно для записи, и мост к чтению своего же хранилища
 /// ([`StoreExt::reader`]): типы и трейты одной строкой.
 pub mod prelude {
-    #[cfg(feature = "read")]
-    pub use crate::StoreExt;
     pub use crate::{
         BootTime, Event, Level, MetricLimits, MetricState, NamespaceExt, OwnedValue, Severity,
         SpanExt, Store, StoreConfig, SyncSource, Thresholds,
     };
+    #[cfg(feature = "read")]
+    pub use crate::{ReaderExt, StoreExt};
     /// Настенное время нужно ровно для [`crate::Store::record_sync`], но нужно
     /// почти всегда: без синхронизации у записей есть только относительное
     /// время.
@@ -357,6 +357,55 @@ impl StoreExt for std::sync::Arc<Store> {
     #[inline]
     fn reader(&self) -> read::Reader {
         read::Reader::of_store(self)
+    }
+}
+
+/// Расширение [`read::Reader`] типизированным разбором событий.
+///
+/// [`read::Reader::render`] отдаёт текст по шаблону; здесь — обратный путь к
+/// **полям**: `payload` записи разбирается в тот же тип, которым событие
+/// писалось. Живёт на читателе, а не на записи, потому что идентификатор
+/// события уникален лишь в пределах схемы: у записи чужого неймспейса под
+/// тем же id может жить другой тип, и разбирать его чужой раскладкой значило
+/// бы получить правдоподобные и неверные поля. Читатель знает схему
+/// неймспейса записи и сверяет тип по ней.
+#[cfg(feature = "read")]
+pub trait ReaderExt {
+    /// Поля события, если запись — событие `E`.
+    ///
+    /// `None` — запись не является событием `E`: другой тип, телеметрия,
+    /// текст, спан, либо неймспейс записи живёт под другой схемой (или
+    /// схема читателю неизвестна — выдумывать разбор он не станет).
+    /// `Some(Err)` — запись объявляет себя `E`, но поля не разобрались:
+    /// это порча или расхождение раскладки, о котором нельзя молчать.
+    ///
+    /// Сегменты прежних версий приведены к текущей раскладке ещё при чтении
+    /// (миграции), поэтому `E` — всегда тип **текущей** схемы.
+    fn decode<E: Event + serde::de::DeserializeOwned>(
+        &self,
+        entry: &read::Entry,
+    ) -> Option<std::result::Result<E, DecodeError>>;
+}
+
+#[cfg(feature = "read")]
+impl ReaderExt for read::Reader {
+    fn decode<E: Event + serde::de::DeserializeOwned>(
+        &self,
+        entry: &read::Entry,
+    ) -> Option<std::result::Result<E, DecodeError>> {
+        let read::EntryKind::Message { event, payload, .. } = &entry.kind else {
+            return None;
+        };
+        if *event != E::ID {
+            return None;
+        }
+        // Совпадение id — ещё не совпадение типа: id уникален в пределах
+        // схемы. Тип подтверждает схема неймспейса самой записи.
+        let schema = self.schema_of(&entry.namespace)?;
+        if schema.event(*event)?.name != E::NAME {
+            return None;
+        }
+        Some(postcard::from_bytes(payload).map_err(|_| DecodeError))
     }
 }
 
