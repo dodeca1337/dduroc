@@ -98,11 +98,20 @@ impl ChannelConfig {
 
     /// Проверить конфигурацию; `class` — чей это канал в сообщении об ошибке.
     pub fn validate(&self, class: crate::schema::StorageClass) -> Result<()> {
-        let bad = |reason| Error::BadChannel {
+        self.check().map_err(|reason| Error::BadChannel {
             class,
             namespace: None,
             reason,
-        };
+        })
+    }
+
+    /// Та же проверка, но одной причиной без адреса.
+    ///
+    /// Адресов у одной и той же негодной настройки два: класс хранилища и
+    /// класс группы неймспейсов ([`crate::store::GroupPolicy`]). Причина у них
+    /// общая, и второй её копии быть не должно — разъехавшись, копии объявляли
+    /// бы негодным разное.
+    pub(crate) fn check(&self) -> std::result::Result<(), &'static str> {
         // Бюджет меньше двух сегментов означает, что при запечатывании
         // единственного сегмента ротация немедленно удалила бы его — канал
         // не хранил бы ничего.
@@ -111,19 +120,13 @@ impl ChannelConfig {
         // приложения, и обычное переполнило бы u64 паникой в debug там, где
         // ответ очевиден — такой бюджет заведомо мал.
         if self.budget_bytes < self.segment_bytes.saturating_mul(2) {
-            return Err(bad(
-                "бюджет меньше двух сегментов — ротация съедала бы данные сразу",
-            ));
+            return Err("бюджет меньше двух сегментов — ротация съедала бы данные сразу");
         }
         if self.block_max_bytes < 512 {
-            return Err(bad(
-                "слишком маленький блок: накладные расходы съедят экономию",
-            ));
+            return Err("слишком маленький блок: накладные расходы съедят экономию");
         }
         if (self.block_max_bytes as u64) * 2 > self.segment_bytes {
-            return Err(bad(
-                "блок сопоставим с сегментом — сегмент не вместит и пары блоков",
-            ));
+            return Err("блок сопоставим с сегментом — сегмент не вместит и пары блоков");
         }
         Ok(())
     }
@@ -131,6 +134,89 @@ impl ChannelConfig {
     /// Сколько сегментов помещается в бюджет.
     pub fn max_segments(&self) -> u64 {
         (self.budget_bytes / self.segment_bytes).max(1)
+    }
+}
+
+/// Чем группа неймспейсов может отличаться от общих настроек класса.
+///
+/// Здесь нет ни `budget_bytes`, ни `custom_root`, и это не упущение. Бюджет и
+/// носитель — свойства **класса**, общие на всё хранилище: «вся телеметрия —
+/// столько-то, критика — на защищённом разделе». Дать их группе значило бы
+/// либо поднять потолок занятости выше объявленного (лишний бюджет сверх
+/// класса), либо развести один класс по двум носителям, где его общий бюджет
+/// перестал бы что-либо означать. Личный предел у группы всё же есть — это
+/// квота ([`GroupPolicy::limit_bytes`]), предел ВНУТРИ бюджета класса.
+///
+/// Остальное — свойства каждого пишущего канала по отдельности, и группе они
+/// принадлежат по праву: тяжёлой телеметрии оркестраторов уместен свой размер
+/// сегмента, редкому диагностическому сервису — своя задержка выталкивания.
+///
+/// Незаданное наследуется от класса; строится цепочкой, как и всё остальное.
+///
+/// [`GroupPolicy::limit_bytes`]: crate::store::GroupPolicy::limit_bytes
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[must_use]
+pub struct ChannelOverride {
+    pub segment_bytes: Option<u64>,
+    pub block_max_bytes: Option<usize>,
+    pub flush_interval: Option<Duration>,
+    pub sync_interval: Option<Duration>,
+    pub compression: Option<Compression>,
+}
+
+impl ChannelOverride {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Свой размер сегмента (он же — шаг преаллокации).
+    pub fn segment_bytes(mut self, bytes: u64) -> Self {
+        self.segment_bytes = Some(bytes);
+        self
+    }
+
+    /// Свой порог закрытия блока.
+    pub fn block_max_bytes(mut self, bytes: usize) -> Self {
+        self.block_max_bytes = Some(bytes);
+        self
+    }
+
+    /// Своя максимальная задержка выталкивания неполного блока.
+    pub fn flush_interval(mut self, every: Duration) -> Self {
+        self.flush_interval = Some(every);
+        self
+    }
+
+    /// Свой интервал синхронизации. У критического класса допустим только
+    /// нулевой: немедленность — его определение, а не настройка.
+    pub fn sync_interval(mut self, every: Duration) -> Self {
+        self.sync_interval = Some(every);
+        self
+    }
+
+    /// Своё сжатие.
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+
+    /// Наложить на настройки класса.
+    pub(crate) fn apply_to(&self, config: &mut ChannelConfig) {
+        if let Some(v) = self.segment_bytes {
+            config.segment_bytes = v;
+        }
+        if let Some(v) = self.block_max_bytes {
+            config.block_max_bytes = v;
+        }
+        if let Some(v) = self.flush_interval {
+            config.flush_interval = v;
+        }
+        if let Some(v) = self.sync_interval {
+            config.sync_interval = v;
+        }
+        if let Some(v) = self.compression {
+            config.compression = v;
+        }
     }
 }
 

@@ -155,7 +155,7 @@ pub use serde;
 pub use serde_json;
 
 pub use dduroc_engine::MigrationReport;
-pub use dduroc_engine::channel::ChannelConfig;
+pub use dduroc_engine::channel::{ChannelConfig, ChannelOverride};
 pub use dduroc_engine::epochs::SyncSource;
 pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, SeverityFn, StateStatus};
 pub use dduroc_engine::metric::{Blob, Metric, MetricState, MetricValue, NumericValue, Untyped};
@@ -167,7 +167,7 @@ pub use dduroc_engine::schema::{
 };
 pub use dduroc_engine::staged::{OwnedValue, Payload};
 pub use dduroc_engine::stats::Stats;
-pub use dduroc_engine::store::{NsQuota, Store, StoreConfig};
+pub use dduroc_engine::store::{GroupPolicy, NsQuota, Store, StoreConfig, in_group};
 pub use dduroc_engine::writer::QueueSizes;
 pub use dduroc_engine::{Clock, Error, Result};
 pub use dduroc_format::{

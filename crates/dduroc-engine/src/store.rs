@@ -1,6 +1,6 @@
 //! Хранилище: корень, блокировка, эпохи и writer.
 
-use crate::channel::{ChannelConfig, validate_component};
+use crate::channel::{ChannelConfig, ChannelOverride, validate_component};
 use crate::clock::{Clock, boottime_us};
 use crate::epochs::{EpochStore, SyncSource};
 use crate::error::{Error, IoContext, Result};
@@ -68,6 +68,13 @@ pub struct StoreConfig {
     pub default_budget_bytes: u64,
     /// Ёмкости очередей записи. Выделяются целиком при открытии хранилища.
     pub queues: QueueSizes,
+    /// Политики групп неймспейсов: префикс имени и то, чем группа отличается
+    /// от общих настроек классов.
+    ///
+    /// Список, а не отображение: порядок объявления ничего не решает —
+    /// выигрывает самый длинный подходящий префикс, — и от порядка обхода
+    /// хэш-таблицы настройки прибора зависеть не должны.
+    pub groups: Vec<(String, GroupPolicy)>,
 }
 
 impl StoreConfig {
@@ -78,6 +85,7 @@ impl StoreConfig {
             channels: HashMap::new(),
             default_budget_bytes: 64 * 1024 * 1024,
             queues: QueueSizes::default(),
+            groups: Vec::new(),
         }
     }
 
@@ -106,15 +114,55 @@ impl StoreConfig {
         self
     }
 
-    fn config_for(&self, class: StorageClass) -> ChannelConfig {
-        if let Some(c) = self.channels.get(&class) {
-            return c.clone();
+    /// Задать политику группе неймспейсов — тех, чьё имя начинается с
+    /// `prefix`.
+    ///
+    /// Группа здесь и группа в запросе чтения (`Query::group`) — одно и то же
+    /// множество: правило отбора общее ([`in_group`]). Иначе «журналы
+    /// оркестраторов» и «настройки оркестраторов» обозначали бы разное.
+    ///
+    /// Совпало несколько префиксов — выигрывает самый длинный: `orc-radio-`
+    /// уточняет `orc-`, а не спорит с ним. Настройки неймспейса, заданные при
+    /// открытии (квота), бьют групповые: они конкретнее.
+    pub fn group(mut self, prefix: impl Into<String>, policy: GroupPolicy) -> Self {
+        self.groups.push((prefix.into(), policy));
+        self
+    }
+
+    /// Политика группы, которой принадлежит неймспейс: самый длинный из
+    /// подходящих префиксов.
+    fn policy_for(&self, namespace: &str) -> Option<&GroupPolicy> {
+        self.groups
+            .iter()
+            .filter(|(prefix, _)| in_group(prefix, namespace))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, policy)| policy)
+    }
+
+    /// Настройки канала: класс, поверх него — группа неймспейса.
+    ///
+    /// `namespace: None` — настройки самого класса, без чьих-либо уточнений.
+    /// Именно они, а не групповые, отвечают за бюджет и носитель: то и другое
+    /// общее на весь класс, и группа их не задаёт (см. [`ChannelOverride`]).
+    fn config_for(&self, namespace: Option<&str>, class: StorageClass) -> ChannelConfig {
+        let mut config = match self.channels.get(&class) {
+            Some(c) => c.clone(),
+            None if class == StorageClass::Critical => {
+                ChannelConfig::critical(self.default_budget_bytes)
+            }
+            None => ChannelConfig::new(self.default_budget_bytes),
+        };
+        if let Some(policy) = namespace.and_then(|n| self.policy_for(n))
+            && let Some(over) = policy.channels.get(&class)
+        {
+            over.apply_to(&mut config);
         }
-        if class == StorageClass::Critical {
-            ChannelConfig::critical(self.default_budget_bytes)
-        } else {
-            ChannelConfig::new(self.default_budget_bytes)
-        }
+        config
+    }
+
+    /// Квота, положенная неймспейсу его группой.
+    fn group_quota(&self, namespace: &str, class: StorageClass) -> Option<u64> {
+        self.policy_for(namespace)?.quota.get(class)
     }
 
     /// Проверить всё, что задало приложение.
@@ -133,7 +181,8 @@ impl StoreConfig {
         // настройка: канал, ради которого приложение готово ждать очередь,
         // не имеет права отставать от носителя. Молча перекрыть интервал
         // нельзя — оператор считал бы, что настройка действует.
-        if self.config_for(StorageClass::Critical).sync_interval != std::time::Duration::ZERO {
+        if self.config_for(None, StorageClass::Critical).sync_interval != std::time::Duration::ZERO
+        {
             return Err(Error::BadChannel {
                 class: StorageClass::Critical,
                 namespace: None,
@@ -143,10 +192,101 @@ impl StoreConfig {
         }
 
         for class in StorageClass::ALL {
-            let config = self.config_for(class);
+            let config = self.config_for(None, class);
             config.validate(class)?;
         }
+
+        // Группы проверяются ровно так же и по тем же правилам: настройка,
+        // негодная классу, не становится годной оттого, что её задали группе.
+        // Проверять их приходится отдельно — конфигурация группы применяется к
+        // имени, а имён при открытии хранилища ещё нет.
+        for (i, (prefix, policy)) in self.groups.iter().enumerate() {
+            let bad = |reason| Error::BadGroup {
+                prefix: prefix.clone(),
+                reason,
+            };
+            if prefix.is_empty() {
+                return Err(bad(
+                    "пустой префикс совпадает с любым именем — это настройки хранилища, \
+                     а не группы",
+                ));
+            }
+            if crate::channel::validate_component(prefix).is_err() {
+                return Err(bad(
+                    "префикс не может начать собой имя неймспейса: допустимы ASCII-буквы, \
+                     цифры, '-', '_' и '.'",
+                ));
+            }
+            if self.groups[..i].iter().any(|(p, _)| p == prefix) {
+                return Err(bad(
+                    "две политики на один префикс — какая из них действует, \
+                     ответить нечем",
+                ));
+            }
+            for (&class, over) in &policy.channels {
+                let mut config = self.config_for(None, class);
+                over.apply_to(&mut config);
+                if class == StorageClass::Critical && !config.sync_interval.is_zero() {
+                    return Err(bad(
+                        "критический канал синхронизируется сразу — в этом его смысл; \
+                         группа не имеет права это отменить",
+                    ));
+                }
+                config.check().map_err(bad)?;
+            }
+        }
         Ok(())
+    }
+}
+
+/// Принадлежит ли неймспейс группе.
+///
+/// Группа — префикс имени, и правило у записи и у чтения обязано быть одним:
+/// «журналы оркестраторов» (`Query::group`) и «квота оркестраторов»
+/// ([`StoreConfig::group`]) не имеют права обозначать разные множества.
+pub fn in_group(prefix: &str, namespace: &str) -> bool {
+    namespace.starts_with(prefix)
+}
+
+/// Чем группа неймспейсов отличается от общих настроек хранилища.
+///
+/// Настройки каналов задаются на всё хранилище, по классу хранения, — и это
+/// верно ровно до тех пор, пока неймспейсы однородны. Двадцать четыре тысячи
+/// однородными не бывают: у оркестраторов телеметрия тяжёлая и её не жалко,
+/// у диагностического сервиса записи редкие и терять их нельзя. Группа даёт
+/// сказать это один раз про всех, кого объединяет префикс имени, вместо того
+/// чтобы повторять при каждом открытии неймспейса.
+///
+/// Что группа задать НЕ может — бюджет класса и его носитель:
+/// см. [`ChannelOverride`].
+#[derive(Debug, Clone, Default)]
+#[must_use]
+pub struct GroupPolicy {
+    channels: HashMap<StorageClass, ChannelOverride>,
+    quota: NsQuota,
+}
+
+impl GroupPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Чем каналы этого класса у группы отличаются от общих.
+    pub fn channel(mut self, class: StorageClass, over: ChannelOverride) -> Self {
+        self.channels.insert(class, over);
+        self
+    }
+
+    /// Личная квота **каждому** неймспейсу группы.
+    ///
+    /// Именно каждому, а не всей группе вместе: общий котёл на группу — это
+    /// бюджет, а бюджет принадлежит классу и делится по возрасту сегментов на
+    /// всё хранилище. Квота же — предел внутри бюджета, и она про один
+    /// неймспейс: «ни один оркестратор не занимает больше гигабайта
+    /// телеметрии». Квота, заданная при открытии неймспейса, бьёт групповую.
+    pub fn limit_bytes(mut self, class: StorageClass, bytes: u64) -> Self {
+        self.quota = self.quota.limit_bytes(class, bytes);
+        self
     }
 }
 
@@ -243,7 +383,7 @@ impl Store {
         let mut scan_roots = vec![config.root.clone()];
         let mut groups = Vec::with_capacity(StorageClass::ALL.len());
         for class in StorageClass::ALL {
-            let cfg = config.config_for(class);
+            let cfg = config.config_for(None, class);
             let base = cfg
                 .custom_root
                 .clone()
@@ -448,8 +588,12 @@ impl Store {
         // носителе; группа бюджета и есть класс.
         let mut specs = Vec::with_capacity(classes.len());
         for class in &classes {
-            let config = self.config.config_for(*class);
-            let personal = quota.get(*class);
+            let config = self.config.config_for(Some(name), *class);
+            // Квота неймспейса бьёт групповую: она конкретнее. Групповая —
+            // «ни один оркестратор не занимает больше», личная — про этого.
+            let personal = quota
+                .get(*class)
+                .or_else(|| self.config.group_quota(name, *class));
             if let Some(q) = personal
                 && q < config.segment_bytes.saturating_mul(2)
             {
@@ -882,6 +1026,143 @@ mod tests {
     /// Момент времени из миллисекунд эпохи.
     fn utc_ms(ms: i64) -> DateTime<Utc> {
         DateTime::from_timestamp_millis(ms).expect("миллисекунды в пределах эпохи")
+    }
+
+    #[test]
+    fn the_longest_matching_group_wins_and_the_namespace_beats_them_all() {
+        // Префиксы вкладываются друг в друга: `orc-radio-` уточняет `orc-`, а
+        // не спорит с ним. Зависеть от порядка объявления или от обхода
+        // хэш-таблицы такой ответ не имеет права.
+        let cfg = StoreConfig::new("/tmp/nowhere")
+            .group(
+                "orc-",
+                GroupPolicy::new()
+                    .channel(
+                        StorageClass::Default,
+                        ChannelOverride::new().segment_bytes(2 << 20),
+                    )
+                    .limit_bytes(StorageClass::Default, 100 << 20),
+            )
+            .group(
+                "orc-radio-",
+                GroupPolicy::new().channel(
+                    StorageClass::Default,
+                    ChannelOverride::new().segment_bytes(1 << 20),
+                ),
+            );
+
+        let seg = |ns| {
+            cfg.config_for(Some(ns), StorageClass::Default)
+                .segment_bytes
+        };
+        assert_eq!(seg("orc-radio-0"), 1 << 20, "выигрывает длинный префикс");
+        assert_eq!(seg("orc-power-0"), 2 << 20);
+        assert_eq!(seg("diag-0"), 8 << 20, "чужому — общие настройки класса");
+        assert_eq!(
+            cfg.config_for(None, StorageClass::Default).segment_bytes,
+            8 << 20,
+            "без имени группы не спрашиваются вовсе"
+        );
+
+        // Квота наследуется от ближайшей группы, у которой она есть.
+        assert_eq!(
+            cfg.group_quota("orc-power-0", StorageClass::Default),
+            Some(100 << 20)
+        );
+        assert_eq!(cfg.group_quota("diag-0", StorageClass::Default), None);
+    }
+
+    #[test]
+    fn the_class_keeps_its_budget_and_its_medium_whatever_a_group_says() {
+        // Бюджет и носитель — свойства класса, общие на всё хранилище. Группа
+        // задать их не может по построению: в `ChannelOverride` этих полей
+        // нет. Проверяется здесь то, что резолв их и не трогает — иначе
+        // потолок занятости, объявленный классом, перестал бы быть потолком.
+        let vault = std::path::PathBuf::from("/tmp/vault");
+        let cfg = StoreConfig::new("/tmp/nowhere")
+            .channel(
+                StorageClass::Default,
+                ChannelConfig {
+                    custom_root: Some(vault.clone()),
+                    ..ChannelConfig::new(32 << 20)
+                },
+            )
+            .group(
+                "orc-",
+                GroupPolicy::new().channel(
+                    StorageClass::Default,
+                    ChannelOverride::new()
+                        .segment_bytes(2 << 20)
+                        .compression(dduroc_format::Compression::None),
+                ),
+            );
+
+        let grouped = cfg.config_for(Some("orc-0"), StorageClass::Default);
+        assert_eq!(grouped.segment_bytes, 2 << 20, "своё — своё");
+        assert_eq!(grouped.compression, dduroc_format::Compression::None);
+        assert_eq!(grouped.budget_bytes, 32 << 20, "бюджет остался классовым");
+        assert_eq!(grouped.custom_root, Some(vault), "носитель тоже");
+    }
+
+    #[test]
+    fn a_group_is_refused_for_what_a_class_would_be_refused_for() {
+        let base = || StoreConfig::new("/tmp/nowhere").with_budget_per_class(64 << 20);
+
+        // Настройка, негодная классу, не становится годной оттого, что её
+        // задали группе: сегмент больше половины бюджета — ротация съедала бы
+        // данные сразу после запечатывания.
+        let e = base()
+            .group(
+                "orc-",
+                GroupPolicy::new().channel(
+                    StorageClass::Default,
+                    ChannelOverride::new().segment_bytes(60 << 20),
+                ),
+            )
+            .validate()
+            .unwrap_err();
+        assert!(matches!(e, Error::BadGroup { .. }), "{e}");
+
+        // Немедленность критического канала — его определение, и отменить её
+        // группе не позволено ровно так же, как хранилищу.
+        let e = base()
+            .group(
+                "orc-",
+                GroupPolicy::new().channel(
+                    StorageClass::Critical,
+                    ChannelOverride::new().sync_interval(std::time::Duration::from_secs(5)),
+                ),
+            )
+            .validate()
+            .unwrap_err();
+        assert!(matches!(e, Error::BadGroup { .. }), "{e}");
+
+        // Префикс, которым не может начаться ни одно имя, — мёртвая настройка:
+        // оператор считал бы, что она действует.
+        assert!(base().group("orc/", GroupPolicy::new()).validate().is_err());
+        assert!(base().group("", GroupPolicy::new()).validate().is_err());
+
+        // Две политики на один префикс: какая действует — ответить нечем.
+        let e = base()
+            .group("orc-", GroupPolicy::new())
+            .group("orc-", GroupPolicy::new())
+            .validate()
+            .unwrap_err();
+        assert!(matches!(e, Error::BadGroup { .. }), "{e}");
+
+        // Годная группа проходит.
+        base()
+            .group(
+                "orc-",
+                GroupPolicy::new()
+                    .channel(
+                        StorageClass::Default,
+                        ChannelOverride::new().segment_bytes(2 << 20),
+                    )
+                    .limit_bytes(StorageClass::Telemetry, 8 << 20),
+            )
+            .validate()
+            .expect("годная политика группы");
     }
 
     #[test]

@@ -211,7 +211,9 @@ impl NsSelect {
         match self {
             NsSelect::All => true,
             NsSelect::Names(names) => names.iter().any(|n| n == name),
-            NsSelect::Group(prefix) => name.starts_with(prefix.as_str()),
+            // Правило одно на чтение и на запись: «журналы оркестраторов» и
+            // «настройки оркестраторов» обязаны обозначать одно множество.
+            NsSelect::Group(prefix) => dduroc_engine::store::in_group(prefix, name),
         }
     }
 }

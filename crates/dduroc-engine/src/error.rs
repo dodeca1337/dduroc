@@ -44,6 +44,12 @@ pub enum Error {
         class: crate::schema::StorageClass,
     },
 
+    #[error("недопустимая политика группы {prefix:?}: {reason}")]
+    BadGroup {
+        prefix: String,
+        reason: &'static str,
+    },
+
     #[error(
         "недопустимый канал {class}{}: {reason}",
         namespace.as_deref().map(|n| format!(" неймспейса {n:?}")).unwrap_or_default()

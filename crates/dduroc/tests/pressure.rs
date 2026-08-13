@@ -9,7 +9,9 @@
 //! режим работы библиотеки.
 
 use dduroc::prelude::*;
-use dduroc::{ChannelConfig, NsQuota, QueueSizes, StorageClass, StoreConfig};
+use dduroc::{
+    ChannelConfig, ChannelOverride, GroupPolicy, NsQuota, QueueSizes, StorageClass, StoreConfig,
+};
 use dduroc_read::{EntryKind, Order, Query, Reader};
 use std::path::Path;
 use std::sync::Arc;
@@ -192,6 +194,72 @@ fn the_class_budget_is_shared_across_namespaces() {
             "{name} вытеснен целиком: вытеснение обязано идти по возрасту"
         );
     }
+}
+
+#[test]
+fn a_group_hands_its_namespaces_their_own_segments_and_quota() {
+    // Настройки каналов задаются на всё хранилище, и это верно ровно до тех
+    // пор, пока неймспейсы однородны. Группа — способ сказать «у
+    // оркестраторов телеметрия своя» один раз, а не при каждом открытии
+    // неймспейса. Проверяется, что сказанное доезжает до носителя: и предел
+    // занятости, и размер сегмента.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(
+        StoreConfig::new(dir.path())
+            .with_budget_per_class(64 << 20)
+            .group(
+                "orc-",
+                GroupPolicy::new()
+                    .channel(
+                        StorageClass::Default,
+                        ChannelOverride::new()
+                            .segment_bytes(64 << 10)
+                            .block_max_bytes(4 << 10),
+                    )
+                    .limit_bytes(StorageClass::Default, 256 << 10),
+            ),
+    )
+    .unwrap();
+
+    let grouped = store.namespace("orc-radio-0", pressure::SCHEMA).unwrap();
+    let outsider = store.namespace("diag-0", pressure::SCHEMA).unwrap();
+    for ns in [&grouped, &outsider] {
+        let bulk = ns.series(pressure::metrics::Bulk).unwrap();
+        for _ in 0..40 {
+            bulk.sample(noise(16 << 10));
+        }
+        ns.sync().unwrap();
+    }
+
+    let channel = |name: &str| dir.path().join(name).join("default");
+    let occupied = bytes_under(&channel("orc-radio-0"));
+    let outside = bytes_under(&channel("diag-0"));
+
+    // Квота группы держит своих: предел плюс активный сегмент, который
+    // вытеснить нельзя, — его преаллокация и есть гарантия ENOSPC.
+    assert!(
+        occupied <= (256 << 10) + (64 << 10),
+        "квота группы не удержала: {occupied} Б"
+    );
+    // Чужой квоты не унаследовал и черпает из общего бюджета класса.
+    assert!(
+        outside > occupied,
+        "неймспейс вне группы не должен подчиняться её квоте: {outside} Б против {occupied} Б"
+    );
+
+    // Размер сегмента тоже групповой: у чужого он общий, восьмимегабайтный,
+    // и весь его объём улёгся в один файл.
+    let files = |name: &str| {
+        std::fs::read_dir(channel(name))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "seg"))
+            })
+            .count()
+    };
+    assert!(files("orc-radio-0") > 1, "мелкие сегменты группы");
+    assert_eq!(files("diag-0"), 1, "общий сегмент вмещает всё разом");
 }
 
 #[test]
