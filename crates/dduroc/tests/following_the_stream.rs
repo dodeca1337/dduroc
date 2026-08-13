@@ -129,6 +129,16 @@ fn a_namespace_raised_later_joins_the_subscription() {
     let got = take(&mut tail, 1);
     assert_eq!(&*got[0].namespace, "orc-b", "подхвачен поздний неймспейс");
     assert_eq!(reader.render(&got[0], "ru").as_deref(), Some("поднялся"));
+
+    // И следующий — сразу за ним. Обход корней ограничен по частоте (он
+    // перечисляет всё хранилище), поэтому этот заведомо попадает в отложенные:
+    // долг обязан быть отдан, а не потерян. Иначе сервис, поднявшийся
+    // вплотную за другим, не появился бы никогда.
+    let later = store.namespace("orc-c", latecomer::SCHEMA).unwrap();
+    later.log(latecomer::events::Hello);
+    later.sync().unwrap();
+    let got = take(&mut tail, 1);
+    assert_eq!(&*got[0].namespace, "orc-c", "отложенный обход состоялся");
 }
 
 #[test]

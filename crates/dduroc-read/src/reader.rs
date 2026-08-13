@@ -342,6 +342,12 @@ impl EntryStream<'_> {
     }
 }
 
+/// Не чаще этого подписка обходит корни в поисках новых неймспейсов.
+///
+/// Задержка появления сервиса на живом экране; выбрана так, чтобы её не
+/// замечал человек, но замечал прибор с тысячами неймспейсов.
+const ADOPT_EVERY: Duration = Duration::from_millis(500);
+
 /// Что подписка отдала на этот раз.
 #[derive(Debug)]
 pub enum Tail {
@@ -410,6 +416,13 @@ pub struct Follow<'a> {
     pulse: Arc<dduroc_engine::pulse::Pulse>,
     seen: dduroc_engine::pulse::Beat,
     seeds: std::vec::IntoIter<Entry>,
+    /// Когда корни в последний раз обходились ради новых неймспейсов.
+    /// `None` — ещё ни разу.
+    last_adopt: Option<Instant>,
+    /// Каталоги менялись, а обход отложен по частоте: его долг не имеет права
+    /// пропасть — неймспейс, о котором объявили один раз, иначе не
+    /// подхватился бы никогда.
+    adopt_due: bool,
     limit: usize,
     yielded: usize,
     ended: bool,
@@ -444,7 +457,20 @@ impl Follow<'_> {
                 self.ended = true;
                 return Tail::Ended;
             }
-            let rest = deadline.saturating_duration_since(Instant::now());
+            if self.adopt_if_due() {
+                continue;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Tail::Idle;
+            }
+            // Ожидание укорачивается до срока отложенного обхода: иначе
+            // подписка с длинным таймаутом узнала бы о новом сервисе только
+            // после того, как кто-нибудь что-нибудь напишет.
+            let mut rest = deadline - now;
+            if let Some(at) = self.adopt_deadline() {
+                rest = rest.min(at);
+            }
             let beat = self.pulse.wait(self.seen, rest);
             if beat == self.seen {
                 // Поток writer'а, снятый паникой, отметку о закрытии выставить
@@ -453,6 +479,11 @@ impl Follow<'_> {
                 if !self.reader.writer_alive() {
                     self.ended = true;
                     return Tail::Ended;
+                }
+                // Проснулись раньше своего срока — значит, ради отложенного
+                // обхода: тишиной это объявлять рано.
+                if Instant::now() < deadline {
+                    continue;
                 }
                 return Tail::Idle;
             }
@@ -534,17 +565,55 @@ impl Follow<'_> {
     fn refresh(&mut self, shape_changed: bool) {
         self.epochs = self.reader.epochs_now().into_owned();
         if shape_changed {
-            self.adopt_new_channels();
+            self.adopt_due = true;
         }
+        self.rearm(shape_changed);
+    }
+
+    /// Дочитать курсоры и вернуть в кучу тех, кто из неё выпал.
+    ///
+    /// Выпадает курсор, исчерпавшийся до подхода новых данных, и вернуть его
+    /// туда больше нечему — в том числе только что открытому курсору нового
+    /// неймспейса: без этого он лежал бы с данными мимо слияния.
+    fn rearm(&mut self, relist: bool) {
         for idx in 0..self.cursors.len() {
             // Обход каталога — только когда хранилище объявило, что каталоги
             // менялись: пока писатель льёт в тот же файл, подписка обходится
             // одним чтением хвоста.
-            self.cursors[idx].extend(shape_changed);
+            self.cursors[idx].extend(relist);
             if !self.queued[idx] {
                 self.requeue(idx);
             }
         }
+    }
+
+    /// Обойти корни, если пора. `true` — обошли, стоит посмотреть заново.
+    ///
+    /// Обход — самое дорогое, что делает подписка (перечисление корня и чтение
+    /// меты у каждого подходящего каталога), а заводится он от смены
+    /// устройства хранилища, то есть от каждой ротации. Поэтому он ограничен
+    /// по частоте, но не отменяется: долг помнится и отдаётся, когда срок
+    /// подойдёт.
+    fn adopt_if_due(&mut self) -> bool {
+        if !self.adopt_due || self.adopt_deadline().is_some() {
+            return false;
+        }
+        self.adopt_due = false;
+        self.last_adopt = Some(Instant::now());
+        self.adopt_new_channels();
+        self.rearm(true);
+        true
+    }
+
+    /// Сколько ещё ждать до отложенного обхода. `None` — ждать нечего.
+    fn adopt_deadline(&self) -> Option<Duration> {
+        if !self.adopt_due {
+            return None;
+        }
+        let at = self.last_adopt?;
+        ADOPT_EVERY
+            .checked_sub(at.elapsed())
+            .filter(|d| !d.is_zero())
     }
 
     /// Объявить повреждение обхода, если о нём ещё не говорили.
@@ -992,6 +1061,22 @@ impl Reader {
     ///
     /// Нечитаемая мета и каталоги неизвестных классов копятся в `damaged`.
     fn scan_namespaces(&self, damaged: &mut Vec<Damage>) -> Result<Vec<NsScan>> {
+        self.scan_namespaces_matching(damaged, |_| true)
+    }
+
+    /// То же, но с отбором по имени **до** чтения метаданных.
+    ///
+    /// Имя неймспейса — это имя каталога, и запрос почти всегда отбирает по
+    /// нему: один сервис, одна группа. Читать `ns-meta` у всех, чтобы потом
+    /// выбросить почти всех, — файловая операция на каждый из заявленных
+    /// двадцати четырёх тысяч каталогов; на пути подписки, которая обходит
+    /// корни на каждую смену устройства хранилища, это разница между «дёшево»
+    /// и «неприемлемо».
+    fn scan_namespaces_matching(
+        &self,
+        damaged: &mut Vec<Damage>,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<Vec<NsScan>> {
         let mut out = Vec::new();
         let roots = self.all_roots();
         let main_root = &roots[0];
@@ -1014,6 +1099,9 @@ impl Reader {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
+            if !wanted(name) {
+                continue;
+            }
             let Some(meta) = read_ns_meta(&path) else {
                 // Каталог без метаданных — не неймспейс (чужая директория в
                 // корне хранилища). Каталог с НЕЧИТАЕМОЙ метой — это
@@ -1233,6 +1321,8 @@ impl Reader {
             pulse,
             seen,
             seeds: seeds.into_iter(),
+            last_adopt: None,
+            adopt_due: false,
             limit: q.limit.unwrap_or(usize::MAX),
             yielded: 0,
             ended: false,
@@ -1412,10 +1502,7 @@ impl Reader {
         let mut schemas = Vec::new();
         let mut damaged = Vec::new();
 
-        for ns in self.scan_namespaces(&mut damaged)? {
-            if !q.namespaces.matches(&ns.name) {
-                continue;
-            }
+        for ns in self.scan_namespaces_matching(&mut damaged, |name| q.namespaces.matches(name))? {
             let schema = self.schema_by_name(&ns.schema_name);
             let ns_name: std::sync::Arc<str> = std::sync::Arc::from(ns.name.as_str());
             let mut scope = crate::cursor::ChannelScope {
