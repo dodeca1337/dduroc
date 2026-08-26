@@ -1,23 +1,23 @@
-//! Footer запечатанного сегмента: индекс блоков и множества встреченных типов.
+//! The footer of a sealed segment: the block index and the sets of types seen.
 //!
 //! ```text
-//! [индекс блоков] [event_id'ы] [metric_id'ы] [Trailer 32B]
+//! [block index] [event_ids] [metric_ids] [Trailer 32B]
 //! ```
 //!
-//! Footer — **оптимизация, а не необходимость**: он позволяет найти блок по
-//! времени без чтения тел и понять, какие типы есть в сегменте, не сканируя
-//! его. Если footer повреждён или отсутствует (сегмент активен либо оборвано
-//! питание при seal'е), читатель деградирует к последовательному обходу
-//! заголовков блоков — данные не теряются.
+//! The footer is an **optimization, not a necessity**: it makes it possible to
+//! find a block by time without reading any bodies, and to learn which types a
+//! segment holds without scanning it. If the footer is damaged or missing (the
+//! segment is active, or power was lost during the seal), the reader degrades
+//! to a sequential walk of the block headers — no data is lost.
 //!
-//! Множества типов нужны миграции: сегмент, не содержащий затронутых
-//! `event_id`/`metric_id`, переписывать не нужно — экономия ресурса флеша.
-//! Множество метрик заодно отвечает на вопрос «какая телеметрия есть в этом
-//! сегменте» — ради него таблица серий и существовала, пока идентичность ряда
-//! была парой `(метрика, рантайм-тэги)`. Тэгов больше нет, идентичность равна
-//! метрике, и множества идентификаторов достаточно.
+//! The type sets are what migrations need: a segment that holds none of the
+//! affected `event_id`/`metric_id` values needs no rewriting, which saves flash
+//! wear. The metric set also answers the question "what telemetry is in this
+//! segment" — the very question the series table existed for while a series was
+//! identified by the pair `(metric, runtime tags)`. There are no tags any more,
+//! a series is identified by its metric, and a set of identifiers suffices.
 //!
-//! Признак запечатанности — сигнатура в последних четырёх байтах файла.
+//! Sealedness is marked by a signature in the file's last four bytes.
 
 use crate::block::BlockHeader;
 use crate::cursor::Cursor;
@@ -26,28 +26,28 @@ use crate::ids::{EventId, MetricId, Micros};
 use crate::segment::SegmentHeader;
 use crate::varint;
 
-/// Сигнатура в последних 4 байтах запечатанного сегмента.
+/// The signature in the last 4 bytes of a sealed segment.
 pub const FOOTER_MAGIC: [u8; 4] = *b"DFTR";
 
-/// Запись индекса блоков.
+/// An entry of the block index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockIndexEntry {
-    /// Смещение блока от начала файла.
+    /// The block's offset from the start of the file.
     pub offset: u64,
-    /// Время первой записи блока.
+    /// Time of the block's first record.
     pub base: Micros,
     pub count: u16,
 }
 
-/// Хвостовой блок footer'а фиксированного размера.
+/// The fixed-size trailing block of the footer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Trailer {
-    /// Длина секций footer'а до трейлера.
+    /// Length of the footer sections before the trailer.
     pub sections_len: u32,
     pub block_count: u32,
-    /// Время первой записи сегмента.
+    /// Time of the segment's first record.
     pub min: Micros,
-    /// Время последней записи сегмента.
+    /// Time of the segment's last record.
     pub max: Micros,
     pub crc: u32,
 }
@@ -55,29 +55,33 @@ pub struct Trailer {
 impl Trailer {
     pub const SIZE: usize = 32;
 
-    /// Разобрать трейлер из последних [`Trailer::SIZE`] байт файла.
-    /// `Ok(None)` — сегмент не запечатан (нет сигнатуры).
+    /// Parse the trailer from the file's last [`Trailer::SIZE`] bytes.
+    /// `Ok(None)` means the segment is not sealed (no signature).
     pub fn parse(last_bytes: &[u8]) -> Result<Option<Self>> {
         let raw: &[u8; Self::SIZE] = last_bytes
             .get(last_bytes.len().wrapping_sub(Self::SIZE)..)
             .and_then(|s| s.try_into().ok())
             .ok_or(Error::Truncated)?;
 
-        let magic: [u8; 4] = raw[28..32].try_into().expect("срез 4 байта");
+        let magic: [u8; 4] = raw[28..32].try_into().expect("a 4-byte slice");
         if magic != FOOTER_MAGIC {
             return Ok(None);
         }
 
         Ok(Some(Self {
-            sections_len: u32::from_le_bytes(raw[0..4].try_into().expect("срез 4 байта")),
-            block_count: u32::from_le_bytes(raw[4..8].try_into().expect("срез 4 байта")),
-            min: Micros(u64::from_le_bytes(raw[8..16].try_into().expect("срез 8"))),
-            max: Micros(u64::from_le_bytes(raw[16..24].try_into().expect("срез 8"))),
-            crc: u32::from_le_bytes(raw[24..28].try_into().expect("срез 4 байта")),
+            sections_len: u32::from_le_bytes(raw[0..4].try_into().expect("a 4-byte slice")),
+            block_count: u32::from_le_bytes(raw[4..8].try_into().expect("a 4-byte slice")),
+            min: Micros(u64::from_le_bytes(
+                raw[8..16].try_into().expect("an 8-byte slice"),
+            )),
+            max: Micros(u64::from_le_bytes(
+                raw[16..24].try_into().expect("an 8-byte slice"),
+            )),
+            crc: u32::from_le_bytes(raw[24..28].try_into().expect("a 4-byte slice")),
         }))
     }
 
-    /// Полный размер footer'а на диске (секции + трейлер).
+    /// The footer's full size on disk (sections plus trailer).
     pub fn total_len(&self) -> u64 {
         u64::from(self.sections_len) + Self::SIZE as u64
     }
@@ -92,26 +96,26 @@ impl Trailer {
     }
 }
 
-/// Разобранный footer.
+/// A parsed footer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Footer {
     pub blocks: Vec<BlockIndexEntry>,
-    /// Типы сообщений, встречающиеся в сегменте (возрастающий порядок).
+    /// Message types occurring in the segment (ascending order).
     pub events: Vec<EventId>,
-    /// Метрики, встречающиеся в сегменте (возрастающий порядок).
+    /// Metrics occurring in the segment (ascending order).
     ///
-    /// Отвечает и на вопрос миграции «затронут ли сегмент», и на вопрос
-    /// читателя «какая телеметрия здесь есть»: идентичность ряда равна
-    /// метрике, поэтому перечислить метрики значит перечислить ряды.
+    /// This answers both the migration's question "is this segment affected"
+    /// and the reader's "what telemetry is in here": a series is identified by
+    /// its metric, so listing the metrics is listing the series.
     pub metrics: Vec<MetricId>,
     pub min: Micros,
     pub max: Micros,
 }
 
 impl Footer {
-    /// Разобрать footer из хвоста файла. `bytes` обязан **заканчиваться**
-    /// последним байтом файла и содержать footer целиком
-    /// (длина известна из [`Trailer::parse`]).
+    /// Parse a footer from the tail of a file. `bytes` must **end** at the
+    /// file's last byte and contain the whole footer (its length is known from
+    /// [`Trailer::parse`]).
     pub fn parse(bytes: &[u8]) -> Result<Option<Self>> {
         let Some(trailer) = Trailer::parse(bytes)? else {
             return Ok(None);
@@ -138,13 +142,14 @@ impl Footer {
 
         let mut c = Cursor::new(sections);
 
-        // Индекс блоков: дельты смещений от конца заголовка сегмента и
-        // дельты времени от предыдущего блока.
+        // The block index: offset deltas from the end of the segment header and
+        // time deltas from the previous block.
         //
-        // Ёмкость НИКОГДА не выделяется по счётчику из файла: CRC32C — не
-        // подпись, его пересчитывает кто угодно, а `block_count` в трейлере
-        // напрямую управлял бы размером аллокации. Потолок — сколько записей
-        // физически помещается в секции (минимум 3 байта на запись).
+        // Capacity is NEVER allocated from a counter taken out of a file:
+        // CRC32C is not a signature, anyone can recompute it, and `block_count`
+        // in the trailer would drive the size of the allocation directly. The
+        // ceiling is how many entries physically fit in the sections (at least
+        // 3 bytes each).
         let mut blocks = Vec::with_capacity(bounded(trailer.block_count, sections.len(), 3));
         let mut offset = SegmentHeader::SIZE as u64;
         let mut base = 0u64;
@@ -168,9 +173,9 @@ impl Footer {
             .map(|v| MetricId(v as u16))
             .collect();
 
-        // Секции обязаны быть разобраны без остатка: длина в трейлере
-        // согласована с CRC, поэтому лишние байты означают не запас, а
-        // несоответствие содержимого заявленной структуре.
+        // The sections must parse with nothing left over: the length in the
+        // trailer is covered by the CRC, so surplus bytes mean not slack but
+        // content that does not match the declared structure.
         if c.pos() != sections.len() {
             return Err(Error::LimitExceeded {
                 what: "footer sections",
@@ -188,28 +193,27 @@ impl Footer {
         }))
     }
 
-    /// Индекс блока, который может содержать записи со временем `at`:
-    /// последний блок с `base <= at`. `None` — `at` раньше первого блока.
-    /// Индекс блока, который может содержать записи со временем `at`:
-    /// **первый** из блоков с одинаковой базой, не превышающей `at`.
+    /// Index of the block that may hold records with time `at`: the **first**
+    /// of the blocks whose base does not exceed `at`. `None` means `at` is
+    /// earlier than the first block.
     ///
-    /// Бинарный поиск на дубликатах отдаёт произвольное совпадение, поэтому
-    /// используется граница разбиения: блоки с равной базой — обычное дело
-    /// (пачка записей одной микросекунды), и начать с середины такой группы
-    /// значило бы потерять её начало.
+    /// Binary search over duplicates returns an arbitrary match, so a partition
+    /// point is used instead: blocks sharing a base are ordinary (a burst of
+    /// records within one microsecond), and starting in the middle of such a
+    /// group would lose its beginning.
     pub fn block_for_time(&self, at: Micros) -> Option<usize> {
         let first_after = self.blocks.partition_point(|b| b.base <= at);
         if first_after == 0 {
             return None;
         }
-        // Отступаем к началу группы блоков с той же базой.
+        // Step back to the start of the group of blocks sharing that base.
         let base = self.blocks[first_after - 1].base;
         let start = self.blocks[..first_after].partition_point(|b| b.base < base);
         Some(start)
     }
 
-    /// Пересекается ли сегмент с указанными типами — критерий для миграции:
-    /// не пересекается ⇒ переписывать сегмент не нужно.
+    /// Whether the segment intersects the given types — the migration's
+    /// criterion: no intersection means the segment need not be rewritten.
     pub fn touches(&self, events: &[EventId], metrics: &[MetricId]) -> bool {
         events.iter().any(|e| self.events.binary_search(e).is_ok())
             || metrics
@@ -218,30 +222,33 @@ impl Footer {
     }
 }
 
-/// Безопасная стартовая ёмкость: не больше, чем физически влезло бы в
-/// `available` байт при `min_entry` байтах на элемент.
+/// A safe starting capacity: no more than would physically fit in
+/// `available` bytes at `min_entry` bytes per element.
 ///
-/// Разбор всё равно упрётся в конец секций и вернёт ошибку, но выделять
-/// гигабайты по счётчику из недоверенного файла нельзя: на armv7 это паника
-/// «capacity overflow», на 64-битном вьюере — OOM-killer.
+/// Parsing will run into the end of the sections and return an error anyway,
+/// but allocating gigabytes from a counter in an untrusted file is not an
+/// option: on armv7 that is a "capacity overflow" panic, on a 64-bit viewer
+/// the OOM killer.
 fn bounded(count: u32, available: usize, min_entry: usize) -> usize {
     (count as usize)
         .min(available / min_entry.max(1))
         .min(PREALLOC_MAX)
 }
 
-/// Потолок предварительного выделения по счётчику из файла.
+/// The ceiling on preallocation driven by a counter from a file.
 ///
-/// Одного [`bounded`] мало: он считает, сколько элементов физически влезло бы
-/// в секции, но влезает-то на диске, а в памяти элемент крупнее — индекс
-/// блоков втрое (три varint'а против двадцати четырёх байт), множество id
-/// ввосьмеро (байт против `u64`). Без потолка секция в шестьдесят мегабайт
-/// требовала бы полгигабайта, и файл с валидным CRC (а CRC32C — не подпись,
-/// его пересчитывает кто угодно) укладывал бы вьюер OOM-killer'ом.
+/// [`bounded`] alone is not enough: it counts how many elements would
+/// physically fit in the sections, but they fit *on disk*, and in memory an
+/// element is larger — the block index by three (three varints against
+/// twenty-four bytes), an id set by eight (a byte against a `u64`). Without
+/// the ceiling, a sixty-megabyte section would demand half a gigabyte, and a
+/// file with a valid CRC (and CRC32C is not a signature — anyone can
+/// recompute it) would lay the viewer out under the OOM killer.
 ///
-/// Потолок разрывает связь между числом из файла и размером аллокации.
-/// Вектор дорастёт сам, если данных действительно столько: ни один разбор от
-/// этого не откажет, а лишние реаллокации на фоне чтения файла не видны.
+/// The ceiling breaks the link between a number in a file and the size of an
+/// allocation. The vector grows on its own if the data really is that large:
+/// no parse fails because of it, and the extra reallocations are invisible
+/// next to reading the file.
 const PREALLOC_MAX: usize = 4096;
 
 fn read_id_set(c: &mut Cursor<'_>, what: &'static str, available: usize) -> Result<Vec<u64>> {
@@ -250,8 +257,8 @@ fn read_id_set(c: &mut Cursor<'_>, what: &'static str, available: usize) -> Resu
     let mut prev = 0u64;
     for i in 0..n {
         let delta = c.varint()?;
-        // Первый элемент — абсолютное значение, дальше строго возрастающие
-        // дельты: нулевая дельта означала бы дубль в множестве.
+        // The first element is an absolute value, the rest are strictly
+        // increasing deltas: a zero delta would mean a duplicate in the set.
         if i > 0 && delta == 0 {
             return Err(Error::ReservedValue);
         }
@@ -269,18 +276,17 @@ fn read_id_set(c: &mut Cursor<'_>, what: &'static str, available: usize) -> Resu
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Сборка
+// Assembly
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Накопитель footer'а: движок кормит его по мере записи блоков, а при seal'е
-/// получает готовые байты.
-/// Отсортированное множество идентификаторов на плоском векторе.
+/// A sorted set of identifiers on a flat vector.
 ///
-/// Не `BTreeSet`, потому что `insert` вызывается **на каждую запись**: у
-/// сообщения — его тип, у отсчёта — его метрика. Типов в схеме сотни, то есть
-/// множество крошечное, и на таком размере непрерывная память с бинарным
-/// поиском заметно быстрее дерева с его разыменованиями. Плюс дешёвая защёлка
-/// на последнее добавленное: подряд идущие записи одного типа — обычное дело.
+/// Not a `BTreeSet`, because `insert` is called **on every record**: a
+/// message brings its type, a sample its metric. A schema has hundreds of
+/// types, so the set is tiny, and at that size contiguous memory with a
+/// binary search is noticeably faster than a tree with its indirections.
+/// Plus a cheap latch on the last insert: consecutive records of one type are
+/// ordinary.
 #[derive(Debug, Default)]
 struct IdSet {
     ids: Vec<u16>,
@@ -313,20 +319,22 @@ impl IdSet {
     }
 }
 
+/// The footer accumulator: the engine feeds it as blocks are written and
+/// gets the finished bytes back at seal time.
 #[derive(Debug, Default)]
 pub struct FooterBuilder {
     blocks: Vec<BlockIndexEntry>,
     events: IdSet,
     metrics: IdSet,
-    /// Типы, встреченные в **ещё не записанном** блоке.
+    /// Types seen in a block that has **not been written yet**.
     ///
-    /// Отдельная ступень, потому что блок не обязан лечь в тот сегмент, над
-    /// которым он собирался: не поместившийся блок переезжает в свежий
-    /// (см. правила записи в SPEC §5). Без ступени его типы оказывались бы в
-    /// footer'е сегмента, где блока **нет**, и отсутствовали бы в том, где он
-    /// есть, — а по этим множествам миграция решает, переписывать ли сегмент,
-    /// и читатель судит, есть ли в нём нужная телеметрия. Оба ответа
-    /// оказывались бы неверными.
+    /// A separate stage, because a block need not land in the segment it was
+    /// assembled over: a block that does not fit moves to a fresh one (see the
+    /// write rules in SPEC §5). Without the stage its types would end up in the
+    /// footer of a segment that does **not** hold the block, and be missing
+    /// from the one that does — and these sets are what a migration uses to
+    /// decide whether to rewrite a segment and what a reader uses to judge
+    /// whether the telemetry it wants is there. Both answers would be wrong.
     pending_events: IdSet,
     pending_metrics: IdSet,
     min: Option<Micros>,
@@ -338,15 +346,15 @@ impl FooterBuilder {
         Self::default()
     }
 
-    /// Зарегистрировать записанный блок.
+    /// Register a written block.
     ///
-    /// Индекс обязан оставаться неубывающим по времени: по нему делается
-    /// бинарный поиск, а `build` кодирует дельты. Блок с базой раньше
-    /// предыдущей (переупорядочивание записей между потоками) не отбрасывается
-    /// — его база подтягивается к предыдущей, чтобы индекс остался
-    /// сортированным, а фактический минимум учитывается в `min` отдельно.
-    /// Типы накопленного блока переходят в множества сегмента здесь же:
-    /// блок записан, значит его типы в этом сегменте есть — и ровно в этом.
+    /// The index has to stay non-decreasing in time: it is binary-searched, and
+    /// `build` encodes deltas. A block whose base precedes the previous one
+    /// (records reordered between threads) is not discarded — its base is
+    /// pulled up to the previous one so the index stays sorted, while the
+    /// actual minimum is accounted for separately in `min`. The accumulated
+    /// block's types move into the segment's sets right here: the block has
+    /// been written, so its types are in this segment, and in exactly this one.
     pub fn add_block(&mut self, offset: u64, header: &BlockHeader, last: Micros) {
         for id in self.pending_events.iter() {
             self.events.insert(id);
@@ -362,9 +370,10 @@ impl FooterBuilder {
             base: Micros(header.base.0.max(prev)),
             count: header.count,
         });
-        // Минимум и максимум — по фактическим значениям, а не по первому и
-        // последнему блоку: иначе отбор сегментов по диапазону времени молча
-        // выбрасывал бы сегмент, содержащий искомые записи.
+        // The minimum and the maximum come from the actual values rather than
+        // from the first and last block: otherwise selecting segments by time
+        // range would silently throw away a segment that holds the records
+        // sought.
         self.min = Some(match self.min {
             Some(m) => Micros(m.0.min(header.base.0)),
             None => header.base,
@@ -372,27 +381,29 @@ impl FooterBuilder {
         self.max = Micros(self.max.0.max(last.0).max(header.base.0));
     }
 
-    /// Отметить встреченный тип сообщения. Вызывается на каждую запись.
+    /// Note a message type that was seen. Called on every record.
     ///
-    /// Попадает в ступень незакрытого блока и переходит в множество сегмента
-    /// в [`Self::add_block`] — то есть тогда, когда известно, в какой сегмент
-    /// блок лёг.
+    /// It lands in the stage of the unclosed block and moves into the segment's
+    /// set in [`Self::add_block`] — that is, once it is known which segment the
+    /// block landed in.
     #[inline]
     pub fn add_event(&mut self, id: EventId) {
         self.pending_events.insert(id.0);
     }
 
-    /// Отметить встреченную метрику. Вызывается на каждый отсчёт.
+    /// Note a metric that was seen. Called on every sample.
     ///
-    /// Множество отвечает и миграции («затронут ли сегмент»), и читателю
-    /// («какая телеметрия здесь есть»). Пустым оно быть не должно ни в одном
-    /// сегменте с телеметрией — иначе миграция молча пропустила бы историю.
+    /// The set answers both the migration ("is this segment affected") and the
+    /// reader ("what telemetry is in here"). It must not be empty in any
+    /// segment that holds telemetry — otherwise a migration would silently skip
+    /// history.
     #[inline]
     pub fn add_metric(&mut self, id: MetricId) {
         self.pending_metrics.insert(id.0);
     }
 
-    /// Забыть типы незакрытого блока: блок отброшен и никуда не ляжет.
+    /// Forget the unclosed block's types: the block is discarded and will land
+    /// nowhere.
     pub fn discard_pending(&mut self) {
         self.pending_events.clear();
         self.pending_metrics.clear();
@@ -406,7 +417,7 @@ impl FooterBuilder {
         self.blocks.is_empty()
     }
 
-    /// Собрать байты footer'а (секции + трейлер).
+    /// Assemble the footer bytes (sections plus trailer).
     pub fn build(&self) -> Vec<u8> {
         let mut sections = Vec::new();
 
@@ -431,8 +442,8 @@ impl FooterBuilder {
             crc: 0,
         };
 
-        // CRC считается по секциям и первым 24 байтам трейлера — то есть по
-        // всему footer'у, кроме самого поля CRC и сигнатуры.
+        // The CRC covers the sections and the trailer's first 24 bytes — that
+        // is, the whole footer except the CRC field itself and the signature.
         let mut trailer_bytes = Vec::with_capacity(Trailer::SIZE);
         trailer.write(&mut trailer_bytes);
         let crc = crc32c::crc32c_append(crc32c::crc32c(&sections), &trailer_bytes[..24]);
@@ -443,12 +454,12 @@ impl FooterBuilder {
         out
     }
 
-    /// Начать footer нового сегмента.
+    /// Begin the footer of a new segment.
     ///
-    /// Ступень незакрытого блока **сохраняется**: сегмент меняют как раз
-    /// потому, что блок в прежний не поместился, и его типы обязаны уехать
-    /// вместе с ним. Блок, который решили не писать вовсе, снимается
-    /// отдельным [`Self::discard_pending`].
+    /// The unclosed block's stage is **kept**: the segment is being changed
+    /// precisely because the block did not fit the previous one, and its types
+    /// have to travel with it. A block that is not to be written at all is
+    /// cleared by a separate [`Self::discard_pending`].
     pub fn reset(&mut self) {
         self.blocks.clear();
         self.events.clear();
@@ -457,14 +468,14 @@ impl FooterBuilder {
         self.max = Micros(0);
     }
 
-    /// Отдать слак индекса, сохранив накопленное.
+    /// Give back the index's slack, keeping what has accumulated.
     ///
-    /// Индекс блоков растёт на запись за каждый flush и после `reset`
-    /// сохраняет пиковую ёмкость: критический канал с 8-КиБ блоками при
-    /// 256-МиБ сегменте накапливает до ~770 КиБ на канал — навсегда.
-    /// Живые записи открытого сегмента при этом нужны до самого seal, поэтому
-    /// здесь именно `shrink_to_fit`, а не сброс. Вызывается движком при
-    /// бездействии канала.
+    /// The block index grows by one entry per flush and keeps its peak capacity
+    /// after `reset`: a critical channel with 8 KiB blocks and a 256 MiB
+    /// segment accumulates up to ~770 KiB per channel — forever. The live
+    /// entries of an open segment are needed right up to the seal, so this is
+    /// `shrink_to_fit` rather than a reset. The engine calls it when a channel
+    /// goes idle.
     pub fn shrink_to_fit(&mut self) {
         self.blocks.shrink_to_fit();
         self.events.ids.shrink_to_fit();
@@ -500,8 +511,8 @@ mod tests {
         }
     }
 
-    /// Порядок как у writer'а: типы приходят с записями собираемого блока и
-    /// закрепляются за сегментом, когда блок в него лёг.
+    /// The same order the writer uses: types arrive with the records of the
+    /// block being assembled and are pinned to a segment once the block lands.
     fn sample_builder() -> FooterBuilder {
         let mut b = FooterBuilder::new();
         b.add_event(EventId(1));
@@ -509,9 +520,9 @@ mod tests {
         b.add_block(32, &header(1_000, 5), Micros(1_900));
 
         b.add_event(EventId(300));
-        b.add_event(EventId(1)); // дубли схлопываются
+        b.add_event(EventId(1)); // duplicates collapse
         b.add_metric(MetricId(6));
-        b.add_metric(MetricId(5)); // дубли схлопываются
+        b.add_metric(MetricId(5)); // duplicates collapse
         b.add_block(200, &header(2_000, 7), Micros(2_500));
 
         b.add_block(512, &header(9_000, 3), Micros(9_100));
@@ -520,46 +531,51 @@ mod tests {
 
     #[test]
     fn types_of_a_relocated_block_follow_it_to_the_new_segment() {
-        // Блок, не поместившийся в сегмент, переезжает в свежий (SPEC §5).
-        // Его типы обязаны переехать вместе с ним: по этим множествам
-        // миграция решает, переписывать ли сегмент, а читатель — есть ли в
-        // нём нужная телеметрия. Оставь их в старом footer'е — и оба ответа
-        // окажутся неверными: старый сегмент объявит типы, которых в нём нет,
-        // новый умолчит о тех, которые в нём есть, и миграция обойдёт
-        // стороной ровно ту историю, ради которой написана.
+        // A block that did not fit its segment moves to a fresh one (SPEC §5).
+        // Its types have to move with it: a migration uses these sets to decide
+        // whether to rewrite a segment, and a reader to decide whether the
+        // telemetry it wants is there. Leave them in the old footer and both
+        // answers go wrong: the old segment declares types it does not hold,
+        // the new one stays silent about types it does, and the migration walks
+        // past exactly the history it was written for.
         let mut b = FooterBuilder::new();
 
-        // Первый блок лёг в текущий сегмент.
+        // The first block landed in the current segment.
         b.add_event(EventId(1));
         b.add_block(32, &header(1_000, 5), Micros(1_100));
 
-        // Второй собран, но в сегмент не влез: типы уже отмечены.
+        // The second is assembled but did not fit: its types are already noted.
         b.add_event(EventId(7));
         b.add_metric(MetricId(3));
 
-        // Сегмент запечатывается БЕЗ него.
-        let sealed = Footer::parse(&b.build()).unwrap().expect("запечатан");
+        // The segment is sealed WITHOUT it.
+        let sealed = Footer::parse(&b.build()).unwrap().expect("sealed");
         assert_eq!(
             sealed.events,
             vec![EventId(1)],
-            "в старом сегменте только типы блоков, которые в нём лежат"
+            "the old segment holds only the types of the blocks that are in it"
         );
         assert!(sealed.metrics.is_empty());
 
-        // Новый сегмент, тот же накопитель — и переехавший блок ложится сюда.
+        // A new segment, the same accumulator — and the travelling block lands
+        // here.
         b.reset();
         b.add_block(32, &header(2_000, 9), Micros(2_100));
-        let fresh = Footer::parse(&b.build()).unwrap().expect("запечатан");
-        assert_eq!(fresh.events, vec![EventId(7)], "типы уехали с блоком");
+        let fresh = Footer::parse(&b.build()).unwrap().expect("sealed");
+        assert_eq!(
+            fresh.events,
+            vec![EventId(7)],
+            "the types travelled with the block"
+        );
         assert_eq!(fresh.metrics, vec![MetricId(3)]);
         assert_eq!(fresh.blocks.len(), 1);
     }
 
     #[test]
     fn a_discarded_block_leaves_its_types_nowhere() {
-        // Блок крупнее целого сегмента отбрасывается, и его типов нет ни в
-        // одном сегменте — объявить их значило бы отправить миграцию
-        // переписывать сегмент ради записей, которых там нет.
+        // A block larger than a whole segment is discarded, and its types are
+        // in no segment at all — declaring them would send a migration to
+        // rewrite a segment for records that are not there.
         let mut b = FooterBuilder::new();
         b.add_event(EventId(1));
         b.add_block(32, &header(1_000, 5), Micros(1_100));
@@ -571,24 +587,24 @@ mod tests {
         b.add_event(EventId(2));
         b.add_block(200, &header(2_000, 5), Micros(2_100));
 
-        let footer = Footer::parse(&b.build()).unwrap().expect("запечатан");
+        let footer = Footer::parse(&b.build()).unwrap().expect("sealed");
         assert_eq!(footer.events, vec![EventId(1), EventId(2)]);
         assert!(
             footer.metrics.is_empty(),
-            "метрика была только у отброшенного"
+            "the metric belonged only to the discarded block"
         );
     }
 
     #[test]
     fn footer_larger_than_the_prealloc_cap_still_parses() {
-        // Предварительное выделение ограничено потолком, чтобы счётчик из
-        // недоверенного файла не управлял размером аллокации. Потолок обязан
-        // быть только подсказкой: настоящий сегмент на 256 МиБ с блоками по
-        // 64 КиБ даёт четыре тысячи записей индекса, и разбор такого footer'а
-        // должен пройти целиком, дорастив вектор сам.
+        // Preallocation is bounded by the ceiling so that a counter from an
+        // untrusted file cannot drive the size of an allocation. The ceiling
+        // has to be a hint only: a real 256 MiB segment with 64 KiB blocks
+        // gives four thousand index entries, and parsing such a footer has to
+        // run to the end, growing the vector on its own.
         let n = PREALLOC_MAX * 2 + 7;
         let mut b = FooterBuilder::new();
-        // Множества id тоже крупнее потолка: пространство u16 это позволяет.
+        // The id sets exceed the ceiling too: the u16 space allows it.
         for id in 1..=(PREALLOC_MAX as u16 + 500) {
             b.add_event(EventId(id));
         }
@@ -600,7 +616,9 @@ mod tests {
             );
         }
         let bytes = b.build();
-        let footer = Footer::parse(&bytes).unwrap().expect("сегмент запечатан");
+        let footer = Footer::parse(&bytes)
+            .unwrap()
+            .expect("the segment is sealed");
         assert_eq!(footer.blocks.len(), n);
         assert_eq!(footer.blocks[n - 1].offset, 32 + (n as u64 - 1) * 64);
         assert_eq!(footer.events.len(), PREALLOC_MAX + 500);
@@ -610,16 +628,16 @@ mod tests {
 
     #[test]
     fn a_forged_count_cannot_drive_the_allocation() {
-        // Ради чего потолок и заведён: `block_count` лежит в трейлере, а
-        // трейлер защищён только CRC32C — не подписью, его пересчитывает кто
-        // угодно. Число оттуда не имеет права управлять размером аллокации:
-        // на armv7 это паника «capacity overflow», на 64-битном вьюере —
-        // OOM-killer.
+        // What the ceiling exists for: `block_count` sits in the trailer, and
+        // the trailer is protected only by CRC32C — not a signature; anyone can
+        // recompute it. A number from there has no right to drive the size of
+        // an allocation: on armv7 that is a "capacity overflow" panic, on a
+        // 64-bit viewer the OOM killer.
         //
-        // Собираем правдоподобный footer, подменяем счётчик блоков на
-        // заведомо невозможный и пересчитываем CRC — ровно то, что сделал бы
-        // подсунутый дамп. Разбор обязан отказать по нехватке байт, а не
-        // попытаться выделить память под объявленное.
+        // Assemble a plausible footer, swap the block counter for a knowably
+        // impossible one and recompute the CRC — exactly what a planted dump
+        // would do. Parsing has to refuse for want of bytes rather than try to
+        // allocate what was declared.
         let bytes = sample_builder().build();
         let mut forged = bytes.clone();
         let trailer_at = forged.len() - Trailer::SIZE;
@@ -633,22 +651,24 @@ mod tests {
         };
         forged[trailer_at + 24..trailer_at + 28].copy_from_slice(&crc.to_le_bytes());
 
-        // CRC сходится — значит разбор дошёл до чтения записей и остановился
-        // на исчерпании секций, а не на проверке целостности.
+        // The CRC agrees, so parsing did reach the records and stopped on
+        // running out of section bytes rather than on an integrity check.
         assert!(
             matches!(Footer::parse(&forged), Err(Error::Truncated)),
-            "счётчик из файла обязан упереться в реальные байты"
+            "a counter from a file must run into the real bytes"
         );
         assert!(
             bounded(u32::MAX, forged.len(), 3) <= PREALLOC_MAX,
-            "и не имеет права заказать больше потолка"
+            "and has no right to ask for more than the ceiling"
         );
     }
 
     #[test]
     fn roundtrip() {
         let bytes = sample_builder().build();
-        let footer = Footer::parse(&bytes).unwrap().expect("сегмент запечатан");
+        let footer = Footer::parse(&bytes)
+            .unwrap()
+            .expect("the segment is sealed");
 
         assert_eq!(footer.blocks.len(), 3);
         assert_eq!(footer.blocks[0].offset, 32);
@@ -665,23 +685,24 @@ mod tests {
 
     #[test]
     fn metric_set_answers_what_telemetry_is_here() {
-        // Ради этого вопроса и существовала таблица серий, пока идентичность
-        // ряда была парой «метрика + рантайм-тэги». Тэгов нет, идентичность
-        // равна метрике, и множества идентификаторов достаточно — притом оно
-        // уже было в footer'е ради миграций.
+        // This is the question the series table existed for while a series was
+        // identified by the pair "metric plus runtime tags". There are no tags,
+        // a series is identified by its metric, and a set of identifiers
+        // suffices — and it was already in the footer for the migrations' sake.
         let bytes = sample_builder().build();
         let f = Footer::parse(&bytes).unwrap().unwrap();
         assert_eq!(f.metrics, vec![MetricId(5), MetricId(6)]);
         assert!(f.metrics.binary_search(&MetricId(5)).is_ok());
         assert!(
             f.metrics.binary_search(&MetricId(7)).is_err(),
-            "чего нет в сегменте — того нет и во множестве"
+            "what is not in the segment is not in the set either"
         );
     }
 
     #[test]
     fn trailer_reports_size_for_two_phase_read() {
-        // Читатель сначала берёт 32 байта, узнаёт длину, потом дочитывает.
+        // A reader takes 32 bytes first, learns the length, then reads the
+        // rest.
         let bytes = sample_builder().build();
         let trailer = Trailer::parse(&bytes).unwrap().unwrap();
         assert_eq!(trailer.total_len(), bytes.len() as u64);
@@ -709,29 +730,29 @@ mod tests {
     fn block_lookup_by_time() {
         let bytes = sample_builder().build();
         let f = Footer::parse(&bytes).unwrap().unwrap();
-        assert_eq!(f.block_for_time(Micros(0)), None, "раньше первого блока");
         assert_eq!(
-            f.block_for_time(Micros(1_000)),
-            Some(0),
-            "точное совпадение"
+            f.block_for_time(Micros(0)),
+            None,
+            "earlier than the first block"
         );
-        assert_eq!(f.block_for_time(Micros(1_500)), Some(0), "внутри первого");
+        assert_eq!(f.block_for_time(Micros(1_000)), Some(0), "an exact match");
+        assert_eq!(f.block_for_time(Micros(1_500)), Some(0), "inside the first");
         assert_eq!(f.block_for_time(Micros(2_000)), Some(1));
         assert_eq!(f.block_for_time(Micros(8_999)), Some(1));
         assert_eq!(f.block_for_time(Micros(9_000)), Some(2));
         assert_eq!(
             f.block_for_time(Micros(u64::MAX)),
             Some(2),
-            "после последнего"
+            "after the last"
         );
     }
 
     #[test]
     fn lookup_returns_start_of_equal_base_group() {
-        // Блоки с одинаковой базой — обычное дело: пачка записей одной
-        // микросекунды. Бинарный поиск на дубликатах отдаёт произвольное
-        // совпадение, и начать с середины группы значило бы потерять её
-        // начало.
+        // Blocks sharing a base are ordinary: a burst of records within one
+        // microsecond. Binary search over duplicates returns an arbitrary
+        // match, and starting in the middle of a group would lose its
+        // beginning.
         let mut b = FooterBuilder::new();
         for (i, base) in [100u64, 500, 500, 500, 900].into_iter().enumerate() {
             b.add_block(32 + i as u64 * 64, &header(base, 1), Micros(base + 10));
@@ -739,8 +760,12 @@ mod tests {
         let bytes = b.build();
         let f = Footer::parse(&bytes).unwrap().unwrap();
 
-        assert_eq!(f.block_for_time(Micros(500)), Some(1), "начало группы");
-        assert_eq!(f.block_for_time(Micros(700)), Some(1), "внутри группы");
+        assert_eq!(
+            f.block_for_time(Micros(500)),
+            Some(1),
+            "the start of the group"
+        );
+        assert_eq!(f.block_for_time(Micros(700)), Some(1), "inside the group");
         assert_eq!(f.block_for_time(Micros(900)), Some(4));
         assert_eq!(f.block_for_time(Micros(50)), None);
     }
@@ -749,16 +774,19 @@ mod tests {
     fn migration_can_skip_untouched_segments() {
         let bytes = sample_builder().build();
         let f = Footer::parse(&bytes).unwrap().unwrap();
-        assert!(f.touches(&[EventId(300)], &[]), "тип есть в сегменте");
+        assert!(
+            f.touches(&[EventId(300)], &[]),
+            "the type is in the segment"
+        );
         assert!(f.touches(&[], &[MetricId(6)]));
         assert!(
             !f.touches(&[EventId(2), EventId(299)], &[MetricId(7)]),
-            "затронутых типов нет — сегмент не переписываем"
+            "none of the affected types are here, so the segment is not rewritten"
         );
     }
 
-    /// Собрать footer с произвольным трейлером и корректным CRC —
-    /// имитация файла, подготовленного злонамеренно или испорченного.
+    /// Assemble a footer with an arbitrary trailer and a correct CRC — an
+    /// imitation of a file prepared maliciously or damaged.
     fn forge(sections: Vec<u8>, mut trailer: Trailer) -> Vec<u8> {
         trailer.sections_len = sections.len() as u32;
         let mut tb = Vec::new();
@@ -771,10 +799,10 @@ mod tests {
 
     #[test]
     fn absurd_counts_do_not_allocate() {
-        // CRC32C — не подпись: кто угодно пересчитает его после правки
-        // счётчиков. Разбор обязан устоять, а не выделять гигабайты по
-        // числу из файла (на armv7 это паника «capacity overflow»,
-        // на 64-битном вьюере — OOM-killer).
+        // CRC32C is not a signature: anyone can recompute it after editing the
+        // counters. Parsing has to hold, not allocate gigabytes from a number
+        // in a file (on armv7 that is a "capacity overflow" panic, on a 64-bit
+        // viewer the OOM killer).
         let bytes = forge(
             Vec::new(),
             Trailer {
@@ -786,14 +814,10 @@ mod tests {
             },
         );
         let err = Footer::parse(&bytes).unwrap_err();
-        assert!(
-            err.is_torn_tail(),
-            "ожидалась ошибка разбора, получено {err}"
-        );
+        assert!(err.is_torn_tail(), "expected a parse error, got {err}");
 
-        // То же для множеств идентификаторов.
-        // Число блоков берётся из трейлера, поэтому секции начинаются сразу
-        // с множества событий.
+        // The same for the identifier sets. The block count is taken from the
+        // trailer, so the sections begin straight away with the event set.
         let empty_trailer = Trailer {
             sections_len: 0,
             block_count: 0,
@@ -803,23 +827,24 @@ mod tests {
         };
 
         let mut sections = Vec::new();
-        varint::write_u64(&mut sections, u64::from(u32::MAX)); // «событий» — 4 млрд
+        varint::write_u64(&mut sections, u64::from(u32::MAX)); // "events" — four billion
         assert!(Footer::parse(&forge(sections, empty_trailer)).is_err());
 
         let mut sections = Vec::new();
-        varint::write_u64(&mut sections, 0); // событий нет
-        varint::write_u64(&mut sections, u64::from(u32::MAX)); // «метрик» — 4 млрд
+        varint::write_u64(&mut sections, 0); // no events
+        varint::write_u64(&mut sections, u64::from(u32::MAX)); // "metrics" — four billion
         assert!(Footer::parse(&forge(sections, empty_trailer)).is_err());
     }
 
     #[test]
     fn trailing_garbage_in_footer_rejected() {
-        // Лишние байты после разобранных секций означают, что footer описан
-        // не тем, чем кажется: длина секций из трейлера согласована с CRC,
-        // поэтому расхождение — признак подделки или порчи, а не запаса.
+        // Surplus bytes after the parsed sections mean the footer is not what
+        // it appears to be: the section length from the trailer is covered by
+        // the CRC, so a discrepancy is a sign of forgery or damage, not of
+        // slack.
         let mut sections = Vec::new();
-        varint::write_u64(&mut sections, 0); // событий нет
-        varint::write_u64(&mut sections, 0); // метрик нет
+        varint::write_u64(&mut sections, 0); // no events
+        varint::write_u64(&mut sections, 0); // no metrics
         sections.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
 
         let bytes = forge(
@@ -834,19 +859,19 @@ mod tests {
         );
         assert!(
             Footer::parse(&bytes).is_err(),
-            "хвост в секциях footer'а обязан отвергаться"
+            "a tail in the footer sections must be rejected"
         );
     }
 
     #[test]
     fn index_stays_sorted_and_bounds_are_exact() {
-        // Записи могут прийти к writer'у переупорядоченными между потоками:
-        // индекс обязан остаться неубывающим (по нему идёт бинарный поиск),
-        // а min/max — отражать фактические границы, иначе отбор сегментов
-        // по диапазону молча выбросил бы сегмент с нужными записями.
+        // Records may reach the writer reordered between threads: the index has
+        // to stay non-decreasing (it is binary-searched), and min/max have to
+        // reflect the actual bounds, or selecting segments by range would
+        // silently throw away a segment holding the records sought.
         let mut b = FooterBuilder::new();
         b.add_block(32, &header(5_000, 1), Micros(5_100));
-        b.add_block(100, &header(1_000, 1), Micros(1_100)); // «из прошлого»
+        b.add_block(100, &header(1_000, 1), Micros(1_100)); // "from the past"
         b.add_block(200, &header(9_000, 1), Micros(9_100));
 
         let bytes = b.build();
@@ -855,11 +880,11 @@ mod tests {
         let bases: Vec<u64> = f.blocks.iter().map(|e| e.base.0).collect();
         assert!(
             bases.windows(2).all(|w| w[0] <= w[1]),
-            "индекс обязан быть неубывающим: {bases:?}"
+            "the index must be non-decreasing: {bases:?}"
         );
-        assert_eq!(f.min, Micros(1_000), "min — фактический минимум");
+        assert_eq!(f.min, Micros(1_000), "min is the actual minimum");
         assert_eq!(f.max, Micros(9_100));
-        // Смещения не искажены подтягиванием времени.
+        // The offsets are not distorted by pulling the time up.
         assert_eq!(
             f.blocks.iter().map(|e| e.offset).collect::<Vec<_>>(),
             vec![32, 100, 200]
@@ -879,14 +904,15 @@ mod tests {
 
     #[test]
     fn duplicate_ids_in_set_rejected() {
-        // Число блоков берётся из трейлера (0), поэтому секции начинаются
-        // сразу с множества событий. Собираем его вручную с нулевой дельтой
-        // после первого элемента — это дубль, и он обязан быть отвергнут.
+        // The block count is taken from the trailer (0), so the sections begin
+        // straight away with the event set. It is assembled by hand with a zero
+        // delta after the first element — that is a duplicate, and it has to be
+        // rejected.
         let mut sections = Vec::new();
-        varint::write_u64(&mut sections, 2); // 2 события
-        varint::write_u64(&mut sections, 5); // первое — абсолютное значение
-        varint::write_u64(&mut sections, 0); // дубль
-        varint::write_u64(&mut sections, 0); // метрик нет
+        varint::write_u64(&mut sections, 2); // 2 events
+        varint::write_u64(&mut sections, 5); // the first is an absolute value
+        varint::write_u64(&mut sections, 0); // a duplicate
+        varint::write_u64(&mut sections, 0); // no metrics
 
         let mut trailer = Trailer {
             sections_len: sections.len() as u32,

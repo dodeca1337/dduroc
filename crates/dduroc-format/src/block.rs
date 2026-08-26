@@ -1,43 +1,45 @@
-//! Блок — единица записи, flush'а и проверки целостности.
+//! A block — the unit of writing, of flushing and of integrity checking.
 //!
 //! ```text
-//! [BlockHeader 32B] [тело: записи подряд, опционально сжатое целиком]
+//! [BlockHeader 32B] [body: records back to back, optionally compressed whole]
 //! ```
 //!
-//! Блок соответствует одному батчу writer'а. CRC и сжатие амортизируются на
-//! блок, а не на запись, поэтому запись стоит единицы байт.
+//! A block corresponds to one writer batch. The CRC and the compression are
+//! amortized over a block rather than over a record, which is why a record
+//! costs a handful of bytes.
 //!
-//! # Три различимых состояния хвоста
+//! # Three distinguishable states of the tail
 //!
-//! Сегмент преаллоцирован, поэтому непрописанный хвост заполнен нулями.
-//! Заголовок устроен так, чтобы штатный конец данных, потерянный кусок и
-//! порча были **разными** диагнозами, а не одним:
+//! A segment is preallocated, so the unwritten tail is filled with zeros. The
+//! header is arranged so that a normal end of data, a lost piece and
+//! corruption are **different** diagnoses rather than one:
 //!
-//! | состояние | признак |
+//! | state | sign |
 //! |---|---|
-//! | конец данных | все 32 байта заголовка нулевые |
-//! | порча | не сошёлся magic, CRC или зарезервированные биты |
-//! | дыра | `seq` не на единицу больше предыдущего |
+//! | end of data | all 32 header bytes are zero |
+//! | corruption | the magic, the CRC or the reserved bits do not agree |
+//! | a hole | `seq` is not one greater than the previous |
 //!
-//! Наивный признак «`body_len == 0` ⇒ конец» опасен: одиночный перевёрнутый
-//! бит в поле длины неотличим от конца лога, и уже подтверждённые
-//! `fdatasync`'ом блоки молча исчезли бы без единого сообщения об ошибке.
+//! The naive rule "`body_len == 0` means the end" is dangerous: a single
+//! flipped bit in the length field is indistinguishable from the end of the
+//! log, and blocks already confirmed by `fdatasync` would vanish silently
+//! without a single error.
 
 use crate::error::{Error, Result};
 use crate::ids::Micros;
 use crate::record::{self, Record};
 use std::borrow::Cow;
 
-/// Алгоритм сжатия тела блока (младшие 2 бита `flags`).
+/// The compression algorithm of a block body (the low 2 bits of `flags`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum Compression {
     #[default]
     None = 0,
     Lz4 = 1,
-    /// Распознаётся, но кодек не встроен: zstd тянет C-зависимость, которая
-    /// осложняет кросс-сборку под armv7. Чтение такого блока — внятная
-    /// ошибка, а не мусор.
+    /// Recognized, but the codec is not built in: zstd pulls in a C dependency
+    /// that complicates cross-building for armv7. Reading such a block is a
+    /// clear error rather than garbage.
     Zstd = 2,
 }
 
@@ -54,67 +56,72 @@ impl Compression {
     }
 }
 
-/// Сигнатура заголовка блока.
+/// The block header signature.
 pub const BLOCK_MAGIC: [u8; 2] = *b"DB";
 
-/// Во сколько раз распакованное тело может превосходить сжатое.
+/// How many times larger than the compressed body the decompressed one may be.
 ///
-/// Для LZ4 это 255: минимальная последовательность, дающая максимум выхода, —
-/// токен, двухбайтовое смещение и цепочка байт длины по 255 каждый.
+/// For LZ4 that is 255: the shortest sequence yielding the most output is a
+/// token, a two-byte offset and a chain of length bytes of 255 each.
 const MAX_EXPANSION: u32 = 255;
 
-/// Заголовок блока.
+/// The block header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
-    /// Длина тела на диске (после сжатия).
+    /// Length of the body on disk (after compression).
     pub body_len: u32,
-    /// Длина тела до сжатия. Равна `body_len` при [`Compression::None`].
+    /// Length of the body before compression. Equals `body_len` for
+    /// [`Compression::None`].
     pub raw_len: u32,
-    /// Порядковый номер блока в сегменте, с нуля. Разрыв нумерации означает
-    /// потерянный блок — состояние, которое иначе неотличимо от порчи.
+    /// The block's ordinal number within the segment, from zero. A gap in the
+    /// numbering means a lost block — a state otherwise indistinguishable from
+    /// corruption.
     pub seq: u32,
-    /// Время первой записи блока.
+    /// Time of the block's first record.
     pub base: Micros,
-    /// Число записей.
+    /// The number of records.
     pub count: u16,
     pub compression: Compression,
-    /// CRC32C заголовка (первые 28 байт) и тела **как оно лежит на диске**.
+    /// CRC32C of the header (first 28 bytes) and of the body **as it lies on
+    /// disk**.
     pub crc: u32,
 }
 
 impl BlockHeader {
     pub const SIZE: usize = 32;
 
-    /// Потолок размера тела блока: 64 МиБ.
+    /// The ceiling on a block body's size: 64 MiB.
     ///
-    /// Поле вмещает u32, но принимать такие значения с диска нельзя — длина
-    /// управляет размером аллокации при чтении, а файл может быть повреждён
-    /// или получен с чужого устройства. Реальные блоки — десятки килобайт.
+    /// The field holds a u32, but such values must not be accepted from disk —
+    /// the length drives the size of an allocation at read time, and the file
+    /// may be damaged or may have come from another device. Real blocks are
+    /// tens of kilobytes.
     pub const MAX_BODY: u32 = 64 * 1024 * 1024;
 
-    /// Сериализовать заголовок.
+    /// Serialize the header.
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
         b[0..2].copy_from_slice(&BLOCK_MAGIC);
         b[2] = self.compression as u8;
-        b[3] = 0; // резерв
+        b[3] = 0; // reserved
         b[4..8].copy_from_slice(&self.body_len.to_le_bytes());
         b[8..12].copy_from_slice(&self.raw_len.to_le_bytes());
         b[12..16].copy_from_slice(&self.seq.to_le_bytes());
         b[16..24].copy_from_slice(&self.base.0.to_le_bytes());
         b[24..26].copy_from_slice(&self.count.to_le_bytes());
-        b[26] = 0; // резерв
-        b[27] = 0; // резерв
+        b[26] = 0; // reserved
+        b[27] = 0; // reserved
         b[28..32].copy_from_slice(&self.crc.to_le_bytes());
         b
     }
 
-    /// Разобрать заголовок **без** проверки CRC (тело ещё не прочитано).
+    /// Parse the header **without** checking the CRC (the body is not read
+    /// yet).
     ///
-    /// `Ok(None)` — заголовок целиком нулевой, то есть непрописанный хвост
-    /// преаллоцированного файла: штатный конец данных. Любое отклонение от
-    /// «все нули» разбирается как настоящий заголовок и обязано пройти
-    /// проверки — иначе битый бит в длине выглядел бы как конец лога.
+    /// `Ok(None)` means the header is entirely zero, that is, the unwritten
+    /// tail of a preallocated file: a normal end of data. Any deviation from
+    /// "all zeros" is parsed as a real header and has to pass the checks —
+    /// otherwise a flipped bit in a length would look like the end of the log.
     pub fn parse(input: &[u8]) -> Result<Option<Self>> {
         let raw: &[u8; Self::SIZE] = input
             .get(..Self::SIZE)
@@ -142,7 +149,7 @@ impl BlockHeader {
 
         let body_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
         let raw_len = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
-        // Длины проверяются до того, как по ним что-то выделяется.
+        // Lengths are checked before anything is allocated from them.
         if body_len == 0 || body_len > Self::MAX_BODY || raw_len > Self::MAX_BODY {
             return Err(Error::LimitExceeded {
                 what: "block body",
@@ -150,14 +157,15 @@ impl BlockHeader {
                 max: u64::from(Self::MAX_BODY),
             });
         }
-        // Потолка мало: буфер распаковки выделяется по `raw_len`, а тело в
-        // тридцать байт не может развернуться в шестьдесят четыре мегабайта.
-        // Сверяем одну длину с другой — так размер аллокации ограничен тем,
-        // что реально лежит в файле, а не только константой формата.
+        // The ceiling alone is not enough: the decompression buffer is
+        // allocated from `raw_len`, and a thirty-byte body cannot expand into
+        // sixty-four megabytes. Checking one length against the other bounds
+        // the allocation by what actually lies in the file, not merely by a
+        // format constant.
         let bound = match compression {
             Compression::None => body_len,
-            // Предел раздувания LZ4 — 255:1: последовательность «токен +
-            // смещение + байты длины» не даёт большего на байт входа.
+            // The LZ4 expansion limit is 255:1: a "token plus offset plus
+            // length bytes" sequence yields no more than that per input byte.
             Compression::Lz4 | Compression::Zstd => body_len.saturating_mul(MAX_EXPANSION),
         };
         if raw_len > bound {
@@ -173,7 +181,7 @@ impl BlockHeader {
             raw_len,
             seq: u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]),
             base: Micros(u64::from_le_bytes(
-                raw[16..24].try_into().expect("срез 8 байт"),
+                raw[16..24].try_into().expect("an 8-byte slice"),
             )),
             count: u16::from_le_bytes([raw[24], raw[25]]),
             compression,
@@ -181,7 +189,7 @@ impl BlockHeader {
         }))
     }
 
-    /// Проверить CRC заголовка вместе с телом (тело — как на диске).
+    /// Check the header CRC together with the body (the body as on disk).
     pub fn verify(&self, body_on_disk: &[u8]) -> Result<()> {
         let actual = compute_crc(self, body_on_disk);
         if actual != self.crc {
@@ -193,39 +201,39 @@ impl BlockHeader {
         Ok(())
     }
 
-    /// Полный размер блока на диске.
+    /// The block's full size on disk.
     pub fn total_len(&self) -> u64 {
         Self::SIZE as u64 + u64::from(self.body_len)
     }
 
-    /// Распаковать тело. Без сжатия — заимствование, копирования нет.
+    /// Decompress the body. Without compression this borrows, with no copy.
     pub fn decompress<'a>(&self, body_on_disk: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         match self.compression {
             Compression::None => {
                 if self.raw_len != self.body_len {
-                    return Err(Error::Decompress("raw_len != body_len без сжатия"));
+                    return Err(Error::Decompress("raw_len != body_len without compression"));
                 }
                 Ok(Cow::Borrowed(body_on_disk))
             }
             Compression::Lz4 => {
                 let raw_len = self.raw_len as usize;
                 let out = lz4_flex::block::decompress(body_on_disk, raw_len)
-                    .map_err(|_| Error::Decompress("lz4: тело повреждено"))?;
+                    .map_err(|_| Error::Decompress("lz4: the body is damaged"))?;
                 if out.len() != raw_len {
-                    return Err(Error::Decompress("lz4: длина не совпала с raw_len"));
+                    return Err(Error::Decompress("lz4: the length did not match raw_len"));
                 }
                 Ok(Cow::Owned(out))
             }
-            Compression::Zstd => Err(Error::Decompress("zstd не встроен в этот билд")),
+            Compression::Zstd => Err(Error::Decompress("zstd is not built into this build")),
         }
     }
 }
 
-/// Переставить номер блока в уже собранных байтах, пересчитав CRC.
+/// Restamp the block number in already assembled bytes, recomputing the CRC.
 ///
-/// Нужно, когда готовый блок не поместился в текущий сегмент и уезжает в
-/// новый: нумерация блоков начинается в каждом сегменте заново, а пересобирать
-/// тело ради одного поля незачем.
+/// Needed when a finished block does not fit the current segment and moves to
+/// a new one: block numbering restarts in every segment, and there is no
+/// reason to rebuild the body for the sake of one field.
 pub fn restamp_seq(bytes: &mut [u8], seq: u32) -> Result<()> {
     let Some(mut header) = BlockHeader::parse(bytes)? else {
         return Err(Error::EmptyBlock);
@@ -246,23 +254,23 @@ fn compute_crc(header: &BlockHeader, body_on_disk: &[u8]) -> u32 {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Сборка блока
+// Assembling a block
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Накопитель записей одного блока.
+/// The accumulator for one block's records.
 ///
-/// Держит тело в переиспользуемом буфере: аллокации на горячем пути записи
-/// нет — буфер растёт до рабочего размера и дальше только очищается.
+/// It keeps the body in a reusable buffer, so the hot write path allocates
+/// nothing: the buffer grows to its working size and is only cleared after.
 #[derive(Debug, Default)]
 pub struct BlockBuilder {
     base: Option<Micros>,
     last: Micros,
     count: u16,
     body: Vec<u8>,
-    /// Выход LZ4 — переиспользуется между flush'ами. Раньше `compress`
-    /// аллоцировал свежий вектор размером с тело на каждый блок: при пяти
-    /// flush'ах в секунду это сотни килобайт аллокационного трафика впустую,
-    /// а на мегабайтном blob'е — мегабайтный спайк на каждый отсчёт.
+    /// The LZ4 output, reused between flushes. `compress` used to allocate a
+    /// fresh vector the size of the body for every block: at five flushes a
+    /// second that is hundreds of kilobytes of allocation traffic wasted, and
+    /// on a megabyte blob a megabyte spike on every sample.
     lz4: Vec<u8>,
 }
 
@@ -271,7 +279,7 @@ impl BlockBuilder {
         Self::default()
     }
 
-    /// С заранее выделенной ёмкостью тела.
+    /// With the body capacity reserved up front.
     pub fn with_capacity(bytes: usize) -> Self {
         Self {
             body: Vec::with_capacity(bytes),
@@ -287,26 +295,27 @@ impl BlockBuilder {
         self.count
     }
 
-    /// Текущий размер тела (до сжатия).
+    /// The current body size (before compression).
     pub fn raw_len(&self) -> usize {
         self.body.len()
     }
 
-    /// Время первой записи блока.
+    /// Time of the block's first record.
     pub fn base(&self) -> Option<Micros> {
         self.base
     }
 
-    /// Время последней записи блока.
+    /// Time of the block's last record.
     pub fn last(&self) -> Option<Micros> {
         self.base.map(|_| self.last)
     }
 
-    /// Добавить запись со временем `at`.
+    /// Add a record with time `at`.
     ///
-    /// Время, ушедшее назад (перевод часов не влияет — источник монотонный,
-    /// но данные могут прийти из чужого потока), фиксируется как нулевая
-    /// дельта: терять запись хуже, чем потерять микросекунды разрешения.
+    /// Time that went backwards (a clock change does not matter — the source is
+    /// monotonic — but data may arrive from another thread) is recorded as a
+    /// zero delta: losing a record is worse than losing microseconds of
+    /// resolution.
     pub fn push(&mut self, at: Micros, rec: &Record<'_>) -> Result<usize> {
         if self.count == u16::MAX {
             return Err(Error::LimitExceeded {
@@ -321,14 +330,14 @@ impl BlockBuilder {
             Some(_) => at.saturating_delta(self.last),
         };
 
-        // Кодируем СНАЧАЛА, состояние двигаем ПОТОМ. Запись, которую кодек
-        // отверг, не имеет права оставить за собой базу времени: база — это
-        // время первой записи блока, и декодер приписывает её первой
-        // выжившей записи, игнорируя её собственную дельту (`BlockRecords`
-        // ниже). Отравленная база означала бы, что весь блок читается со
-        // сдвигом назад на разницу времён — молча, без ошибки и без
-        // счётчика. Сам `encode` свой буфер откатывает (`record::encode`),
-        // но сообщить накопителю об откате ему нечем.
+        // Encode FIRST, move the state AFTER. A record the codec rejected has
+        // no right to leave a time base behind it: the base is the time of the
+        // block's first record, and the decoder assigns it to the first
+        // surviving record while ignoring that record's own delta
+        // (`BlockRecords` below). A poisoned base would mean the whole block
+        // reads shifted backwards by the difference — silently, with no error
+        // and no counter. `encode` rewinds its own buffer (`record::encode`),
+        // but it has no way to tell the accumulator about the rewind.
         let n = record::encode(rec, dt, &mut self.body)?;
 
         if self.base.is_none() {
@@ -339,35 +348,36 @@ impl BlockBuilder {
         Ok(n)
     }
 
-    /// Завершить блок: дописать `[заголовок][тело]` в `out` и очистить
-    /// накопитель. Возвращает заголовок записанного блока.
+    /// Finish the block: append `[header][body]` to `out` and clear the
+    /// accumulator. Returns the header of the block written.
     ///
-    /// `seq` — порядковый номер блока в сегменте (с нуля): по разрыву
-    /// нумерации читатель отличает потерянный блок от порчи.
+    /// `seq` is the block's ordinal within the segment (from zero): a gap in
+    /// the numbering is how a reader tells a lost block from corruption.
     ///
-    /// Сжатие применяется, только если реально уменьшает тело: на коротких
-    /// блоках LZ4 нередко даёт прирост, и хранить раздутое тело незачем.
+    /// Compression is applied only when it actually shrinks the body: on short
+    /// blocks LZ4 often grows them, and there is no reason to store a bloated
+    /// body.
     pub fn finish(
         &mut self,
         seq: u32,
         compression: Compression,
         out: &mut Vec<u8>,
     ) -> Result<BlockHeader> {
-        // Признак пустоты — `count`, а не наличие базы: они обязаны
-        // совпадать (см. `push`), но пустотой блок делает именно отсутствие
-        // записей, и завязка на них исключает заголовок с `body_len == 0`
-        // физически. Такой заголовок `BlockHeader::parse` считает порчей —
-        // кодек не имеет права порождать байты, на которых сам же
-        // останавливается.
+        // Emptiness is judged by `count`, not by the presence of a base: the
+        // two have to agree (see `push`), but what makes a block empty is the
+        // absence of records, and tying the check to them makes a header with
+        // `body_len == 0` physically impossible. `BlockHeader::parse` treats
+        // such a header as corruption — a codec has no right to produce bytes
+        // it stops at itself.
         if self.count == 0 {
             return Err(Error::EmptyBlock);
         }
         let base = self.base.ok_or(Error::EmptyBlock)?;
         let len = self.body.len();
         if len > BlockHeader::MAX_BODY as usize {
-            // Накопитель сбрасывается даже при отказе: иначе переросший
-            // потолок буфер остался бы в нём навсегда, и канал заклинило бы
-            // на этой же ошибке при каждой следующей попытке.
+            // The accumulator is reset even on failure: otherwise a buffer that
+            // grew past the ceiling would stay in it forever, and the channel
+            // would jam on the same error at every following attempt.
             self.reset();
             return Err(Error::LimitExceeded {
                 what: "block body",
@@ -380,10 +390,10 @@ impl BlockBuilder {
         let compressed: Option<&[u8]> = match compression {
             Compression::None | Compression::Zstd => None,
             Compression::Lz4 => {
-                // Сжатие в переиспользуемый буфер. `len` буфера держится на
-                // высшей отметке и не сбрасывается: `resize` зануляет только
-                // прирост, поэтому повторные flush'и не платят ни аллокацией,
-                // ни memset'ом.
+                // Compression into the reusable buffer. The buffer's `len`
+                // stays at its high-water mark and is not reset: `resize`
+                // zeroes only the growth, so repeated flushes pay neither an
+                // allocation nor a memset.
                 let max = lz4_flex::block::get_maximum_output_size(len);
                 if self.lz4.len() < max {
                     self.lz4.resize(max, 0);
@@ -418,7 +428,7 @@ impl BlockBuilder {
         Ok(header)
     }
 
-    /// Сбросить накопленное, сохранив ёмкость буфера.
+    /// Drop what has accumulated, keeping the buffer capacity.
     pub fn reset(&mut self) {
         self.base = None;
         self.last = Micros(0);
@@ -426,39 +436,40 @@ impl BlockBuilder {
         self.body.clear();
     }
 
-    /// Суммарная ёмкость внутренних буферов (тело + выход сжатия), байт.
+    /// Total capacity of the internal buffers (body plus compression output),
+    /// in bytes.
     ///
-    /// Для контроля удержания: `reset` и `finish` намеренно сохраняют
-    /// ёмкость под переиспользование, и снаружи должно быть видно, сколько
-    /// её накопилось.
+    /// For tracking retention: `reset` and `finish` deliberately keep capacity
+    /// for reuse, and how much has piled up must be visible from outside.
     pub fn capacity(&self) -> usize {
         self.body.capacity() + self.lz4.capacity()
     }
 
-    /// Отдать память сверх `capacity` байт на буфер. Действует только на
-    /// пустой накопитель — недописанный блок терять нельзя.
+    /// Give back memory above `capacity` bytes per buffer. Takes effect only on
+    /// an empty accumulator — an unfinished block must not be lost.
     ///
-    /// Ёмкость буферов растёт до крупнейшего блока, прошедшего через
-    /// накопитель, и без этого вызова остаётся такой навсегда: один
-    /// мегабайтный blob закреплял бы мегабайты за каналом до конца жизни
-    /// процесса. Вызывается движком, когда канал уходит в бездействие.
+    /// Buffer capacity grows to the largest block that ever passed through the
+    /// accumulator and, without this call, stays there forever: one megabyte
+    /// blob would pin megabytes to a channel for the life of the process. The
+    /// engine calls it when a channel goes idle.
     pub fn shrink_to(&mut self, capacity: usize) {
         if self.count != 0 {
             return;
         }
         self.body.shrink_to(capacity);
-        // Содержимое выхода сжатия — мусор между flush'ами; длину надо
-        // сбросить, иначе `shrink_to` не опустит ёмкость ниже неё.
+        // The contents of the compression output are garbage between flushes;
+        // the length has to be reset, or `shrink_to` will not drop capacity
+        // below it.
         self.lz4.clear();
         self.lz4.shrink_to(capacity);
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Чтение блока
+// Reading a block
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Прочитанный и проверенный блок.
+/// A block that has been read and verified.
 #[derive(Debug)]
 pub struct Block<'a> {
     pub header: BlockHeader,
@@ -466,9 +477,10 @@ pub struct Block<'a> {
 }
 
 impl<'a> Block<'a> {
-    /// Разобрать блок из начала `input` (заголовок + тело), проверив CRC.
+    /// Parse a block from the start of `input` (header plus body), checking the
+    /// CRC.
     ///
-    /// `Ok(None)` — нулевой заголовок, то есть конец данных сегмента.
+    /// `Ok(None)` means a zero header, that is, the end of the segment's data.
     pub fn parse(input: &'a [u8]) -> Result<Option<Self>> {
         let Some(header) = BlockHeader::parse(input)? else {
             return Ok(None);
@@ -477,18 +489,19 @@ impl<'a> Block<'a> {
         let body = input
             .get(BlockHeader::SIZE..body_end)
             .ok_or(Error::Truncated)?;
-        // CRC считает `from_parts` — второй раз здесь считать нечего: он
-        // проходит по всему телу, а блоки читаются десятками тысяч.
+        // `from_parts` computes the CRC — there is nothing to compute a second
+        // time here: it walks the whole body, and blocks are read by the tens
+        // of thousands.
         Ok(Some(Self::from_parts(header, body)?))
     }
 
-    /// Собрать блок из уже разобранного заголовка и тела **как оно лежит на
-    /// диске**.
+    /// Assemble a block from an already parsed header and a body **as it lies
+    /// on disk**.
     ///
-    /// Для того, кто читает заголовок и тело по отдельности (восстановление
-    /// сегмента читает заголовок первым, чтобы отличить нулевой хвост от
-    /// данных, и только потом знает длину тела). CRC проверяется здесь же:
-    /// пропустить проверку значило бы отдать наружу непроверенные байты.
+    /// For callers that read the header and the body separately (segment
+    /// recovery reads the header first to tell a zero tail from data, and only
+    /// then knows the body length). The CRC is checked right here: skipping the
+    /// check would mean handing out unverified bytes.
     pub fn from_parts(header: BlockHeader, body_on_disk: &'a [u8]) -> Result<Self> {
         if body_on_disk.len() != header.body_len as usize {
             return Err(Error::Truncated);
@@ -500,12 +513,12 @@ impl<'a> Block<'a> {
         })
     }
 
-    /// Тело в распакованном виде.
+    /// The body, decompressed.
     pub fn body(&self) -> &[u8] {
         &self.body
     }
 
-    /// Итератор записей с абсолютным временем каждой.
+    /// An iterator over the records, each with its absolute time.
     pub fn records(&self) -> BlockRecords<'_> {
         BlockRecords {
             inner: record::iter(&self.body),
@@ -515,7 +528,7 @@ impl<'a> Block<'a> {
     }
 }
 
-/// Записи блока с восстановленным абсолютным временем.
+/// A block's records with absolute time restored.
 #[derive(Debug)]
 pub struct BlockRecords<'a> {
     inner: record::RecordIter<'a>,
@@ -531,7 +544,7 @@ impl<'a> Iterator for BlockRecords<'a> {
             Ok(f) => f,
             Err(e) => return Some(Err(e)),
         };
-        // Первая запись задаёт базу; у неё дельта нулевая по построению.
+        // The first record sets the base; its delta is zero by construction.
         if !self.first {
             match self.at.checked_add_delta(framed.dt) {
                 Some(t) => self.at = t,
@@ -570,12 +583,12 @@ mod tests {
         assert_eq!(header.count, 3);
         assert_eq!(header.base, Micros(1_000));
         assert_eq!(out.len() as u64, header.total_len());
-        assert!(b.is_empty(), "после finish накопитель пуст");
+        assert!(b.is_empty(), "after finish the accumulator is empty");
 
-        let block = Block::parse(&out).unwrap().expect("блок есть");
+        let block = Block::parse(&out).unwrap().expect("there is a block");
         let recs: Vec<_> = block.records().map(|r| r.unwrap()).collect();
         assert_eq!(recs.len(), 3);
-        // Абсолютное время восстановлено из дельт.
+        // Absolute time restored from the deltas.
         assert_eq!(recs[0].0, Micros(1_000));
         assert_eq!(recs[1].0, Micros(1_500));
         assert_eq!(recs[2].0, Micros(9_000));
@@ -585,7 +598,7 @@ mod tests {
 
     #[test]
     fn lz4_roundtrip_and_only_when_smaller() {
-        // Хорошо сжимаемое тело: сотня одинаковых сообщений.
+        // A highly compressible body: a hundred identical messages.
         let mut b = BlockBuilder::new();
         for i in 0..100 {
             b.push(Micros(i * 10), &msg(7, &[0xAA; 16])).unwrap();
@@ -595,7 +608,7 @@ mod tests {
         assert_eq!(header.compression, Compression::Lz4);
         assert!(
             header.body_len < header.raw_len,
-            "сжатие обязано уменьшить тело: {} → {}",
+            "compression must shrink the body: {} → {}",
             header.raw_len,
             header.body_len
         );
@@ -604,7 +617,7 @@ mod tests {
         assert_eq!(block.records().count(), 100);
         assert_eq!(block.body().len(), header.raw_len as usize);
 
-        // Несжимаемое тело: LZ4 не должен раздувать блок.
+        // An incompressible body: LZ4 must not inflate the block.
         let mut b = BlockBuilder::new();
         let noise: Vec<u8> = (0..64u16)
             .map(|i| (i.wrapping_mul(7919) >> 3) as u8)
@@ -621,12 +634,13 @@ mod tests {
 
     #[test]
     fn rejected_record_leaves_no_trace_in_the_accumulator() {
-        // База блока — время его ПЕРВОЙ записи, и декодер приписывает её
-        // первой записи безусловно, игнорируя её собственную дельту. Значит
-        // запись, которую кодек отверг, не имеет права выставить базу: она
-        // стала бы базой блока, которого не видела, и весь блок прочитался бы
-        // со сдвигом назад — без ошибки, без счётчика, без следа в файле.
-        // Дефект был достижим из публичного API через `SpanId(0)`.
+        // A block's base is the time of its FIRST record, and the decoder
+        // assigns it to the first record unconditionally, ignoring that
+        // record's own delta. So a record the codec rejected has no right to
+        // set the base: it would become the base of a block it never entered,
+        // and the whole block would read shifted backwards — with no error, no
+        // counter and no trace in the file. The defect was reachable from the
+        // public API via `SpanId(0)`.
         use crate::ids::SpanId;
 
         let mut b = BlockBuilder::new();
@@ -639,61 +653,75 @@ mod tests {
             b.push(Micros(100), &bad),
             Err(Error::ReservedValue)
         ));
-        assert!(b.is_empty(), "отвергнутая запись не считается");
-        assert_eq!(b.base(), None, "и не задаёт базу времени");
+        assert!(b.is_empty(), "a rejected record does not count");
+        assert_eq!(b.base(), None, "and does not set the time base");
         assert_eq!(b.last(), None);
-        assert_eq!(b.raw_len(), 0, "буфер тела откачен кодеком");
+        assert_eq!(b.raw_len(), 0, "the body buffer was rewound by the codec");
 
-        // Накопитель на пустом ходу отдаёт EmptyBlock, а не заголовок с
-        // нулевым телом, который сам же считает порчей.
+        // On an empty run the accumulator yields EmptyBlock rather than a
+        // header with a zero body, which it would itself treat as corruption.
         let mut out = Vec::new();
         assert!(matches!(
             b.finish(0, Compression::None, &mut out),
             Err(Error::EmptyBlock)
         ));
 
-        // Следующие записи получают своё настоящее время.
+        // The following records get their own real time.
         b.push(Micros(500), &msg(2, &[1])).unwrap();
         b.push(Micros(600), &msg(3, &[2])).unwrap();
         out.clear();
         let header = b.finish(0, Compression::None, &mut out).unwrap();
-        assert_eq!(header.base, Micros(500), "база — время первой ЗАПИСАННОЙ");
+        assert_eq!(
+            header.base,
+            Micros(500),
+            "the base is the time of the first record WRITTEN"
+        );
         assert_eq!(header.count, 2);
 
-        let block = Block::parse(&out).unwrap().expect("блок есть");
+        let block = Block::parse(&out).unwrap().expect("there is a block");
         let times: Vec<Micros> = block.records().map(|r| r.unwrap().0).collect();
         assert_eq!(
             times,
             vec![Micros(500), Micros(600)],
-            "времена читаются такими, какими записаны"
+            "times read back as they were written"
         );
     }
 
     #[test]
     fn shrink_returns_peak_capacity_but_never_a_pending_block() {
-        // Ёмкость буферов — след самого крупного блока: один мегабайтный blob
-        // без возврата закреплял бы мегабайты за каналом навсегда.
+        // Buffer capacity is the imprint of the largest block: one megabyte
+        // blob with nothing given back would pin megabytes to a channel
+        // forever.
         let big = vec![0xA5u8; 1 << 20];
         let mut b = BlockBuilder::new();
         b.push(Micros(0), &msg(1, &big)).unwrap();
 
-        // Недописанный блок сжатие не трогает: терять записи нельзя.
+        // Compression does not touch an unfinished block: records must not be
+        // lost.
         let before = b.capacity();
         b.shrink_to(0);
-        assert_eq!(b.capacity(), before, "непустой накопитель не сжимается");
+        assert_eq!(
+            b.capacity(),
+            before,
+            "a non-empty accumulator does not shrink"
+        );
 
         let mut out = Vec::new();
         b.finish(0, Compression::Lz4, &mut out).unwrap();
         assert!(
             b.capacity() >= 1 << 20,
-            "после мегабайтного блока ёмкость удержана: {}",
+            "capacity held after a megabyte block: {}",
             b.capacity()
         );
 
         b.shrink_to(0);
-        assert_eq!(b.capacity(), 0, "пустой накопитель обязан отдать всё");
+        assert_eq!(
+            b.capacity(),
+            0,
+            "an empty accumulator must give everything back"
+        );
 
-        // Накопитель остаётся рабочим после возврата памяти.
+        // The accumulator stays usable after the memory is given back.
         b.push(Micros(1), &msg(2, &[1, 2, 3])).unwrap();
         let mut out = Vec::new();
         b.finish(1, Compression::None, &mut out).unwrap();
@@ -702,8 +730,8 @@ mod tests {
 
     #[test]
     fn lz4_buffer_is_reused_across_blocks() {
-        // Выход сжатия переиспользуется между flush'ами; второй блок не должен
-        // ни читать мусор первого, ни зависеть от его длины.
+        // The compression output is reused between flushes; the second block
+        // must neither read the first one's garbage nor depend on its length.
         let mut b = BlockBuilder::new();
         let mut bytes = Vec::new();
 
@@ -712,7 +740,7 @@ mod tests {
         }
         b.finish(0, Compression::Lz4, &mut bytes).unwrap();
 
-        // Второй блок заметно короче и с другим содержимым.
+        // The second block is noticeably shorter and holds different content.
         b.push(Micros(1_000), &msg(9, &[0x55; 16])).unwrap();
         let mut second = Vec::new();
         let h = b.finish(1, Compression::Lz4, &mut second).unwrap();
@@ -738,12 +766,12 @@ mod tests {
         let mut out = Vec::new();
         b.finish(0, Compression::None, &mut out).unwrap();
 
-        // Порча байта тела.
+        // A corrupted body byte.
         let last = out.len() - 1;
         out[last] ^= 0xFF;
         let err = Block::parse(&out).unwrap_err();
-        assert!(matches!(err, Error::CrcMismatch { .. }), "получено {err}");
-        assert!(err.is_torn_tail(), "битый хвост распознаётся recovery");
+        assert!(matches!(err, Error::CrcMismatch { .. }), "got {err}");
+        assert!(err.is_torn_tail(), "a torn tail is recognized by recovery");
     }
 
     #[test]
@@ -753,7 +781,7 @@ mod tests {
         let mut out = Vec::new();
         b.finish(0, Compression::None, &mut out).unwrap();
 
-        out.truncate(out.len() - 5); // обрыв питания посреди записи блока
+        out.truncate(out.len() - 5); // power lost in the middle of writing a block
         assert_eq!(Block::parse(&out).unwrap_err(), Error::Truncated);
     }
 
@@ -786,15 +814,19 @@ mod tests {
     fn non_monotonic_time_does_not_lose_records() {
         let mut b = BlockBuilder::new();
         b.push(Micros(1_000), &msg(1, &[])).unwrap();
-        b.push(Micros(900), &msg(2, &[])).unwrap(); // время «ушло назад»
+        b.push(Micros(900), &msg(2, &[])).unwrap(); // time went backwards
         b.push(Micros(1_100), &msg(3, &[])).unwrap();
         let mut out = Vec::new();
         b.finish(0, Compression::None, &mut out).unwrap();
 
         let block = Block::parse(&out).unwrap().unwrap();
         let recs: Vec<_> = block.records().map(|r| r.unwrap()).collect();
-        assert_eq!(recs.len(), 3, "ни одна запись не потеряна");
-        assert_eq!(recs[1].0, Micros(1_000), "откат схлопнут в нулевую дельту");
+        assert_eq!(recs.len(), 3, "no record is lost");
+        assert_eq!(
+            recs[1].0,
+            Micros(1_000),
+            "the step back collapses into a zero delta"
+        );
         assert_eq!(recs[2].0, Micros(1_100));
     }
 
@@ -843,20 +875,21 @@ mod tests {
             assert_eq!(
                 BlockHeader::parse(&bytes),
                 Err(Error::ReservedValue),
-                "резерв на смещении {offset}"
+                "reserved bytes at offset {offset}"
             );
         }
 
         let mut bytes = h.to_bytes();
-        bytes[2] = 0b1000_0000; // старшие биты флагов зарезервированы
+        bytes[2] = 0b1000_0000; // the high flag bits are reserved
         assert_eq!(BlockHeader::parse(&bytes), Err(Error::ReservedValue));
     }
 
     #[test]
     fn zero_body_len_is_corruption_not_end_of_data() {
-        // Ключевое отличие от наивного «body_len == 0 ⇒ конец»: одиночный
-        // перевёрнутый бит в длине не имеет права выглядеть как конец лога,
-        // иначе уже подтверждённые fdatasync'ом блоки исчезали бы молча.
+        // The key difference from the naive "`body_len == 0` means the end": a
+        // single flipped bit in a length has no right to look like the end of
+        // the log, or blocks already confirmed by fdatasync would disappear
+        // silently.
         let h = BlockHeader {
             body_len: 4096,
             raw_len: 4096,
@@ -871,10 +904,10 @@ mod tests {
         let err = BlockHeader::parse(&bytes).unwrap_err();
         assert!(
             matches!(err, Error::LimitExceeded { .. }),
-            "нулевая длина при непустом заголовке — порча, а не конец: {err}"
+            "a zero length with a non-empty header is corruption, not an end: {err}"
         );
 
-        // Терминатором остаётся только полностью нулевой заголовок.
+        // Only an entirely zero header remains a terminator.
         assert_eq!(BlockHeader::parse(&[0u8; BlockHeader::SIZE]).unwrap(), None);
     }
 
@@ -889,8 +922,8 @@ mod tests {
             compression: Compression::Lz4,
             crc: 0,
         };
-        // body_len за потолком формата: разбор обязан отказать, не пытаясь
-        // ничего выделить.
+        // A body_len past the format ceiling: parsing has to refuse without
+        // trying to allocate anything.
         let mut bytes = h.to_bytes();
         bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
@@ -898,7 +931,7 @@ mod tests {
             Err(Error::LimitExceeded { .. })
         ));
 
-        // raw_len тоже: по нему выделяется буфер распаковки.
+        // The same for raw_len: the decompression buffer is allocated from it.
         let mut bytes = h.to_bytes();
         bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(matches!(
@@ -909,10 +942,10 @@ mod tests {
 
     #[test]
     fn raw_len_is_checked_against_body_len() {
-        // raw_len в пределах потолка формата, но несоразмерна телу: тридцать
-        // байт не разворачиваются в шестьдесят четыре мегабайта. Без сверки
-        // одной длины с другой такой заголовок заставлял бы читателя выделить
-        // буфер по размеру, которого в файле нет и близко.
+        // A raw_len within the format ceiling but out of proportion to the
+        // body: thirty bytes do not expand into sixty-four megabytes. Without
+        // checking one length against the other, such a header would make a
+        // reader allocate a buffer for a size the file comes nowhere near.
         let h = BlockHeader {
             body_len: 30,
             raw_len: BlockHeader::MAX_BODY - 1,
@@ -931,17 +964,17 @@ mod tests {
                     ..
                 }
             ),
-            "получено {err}"
+            "got {err}"
         );
 
-        // Достижимое раздувание принимается: предел LZ4 — 255:1.
+        // A reachable expansion is accepted: the LZ4 limit is 255:1.
         let ok = BlockHeader {
             raw_len: 30 * 255,
             ..h
         };
         assert!(BlockHeader::parse(&ok.to_bytes()).is_ok());
 
-        // Без сжатия длины обязаны совпадать.
+        // Without compression the lengths have to match.
         let uncompressed = BlockHeader {
             body_len: 30,
             raw_len: 31,
@@ -973,9 +1006,9 @@ mod tests {
         b.finish(0, Compression::Lz4, &mut out).unwrap();
 
         restamp_seq(&mut out, 7).unwrap();
-        let block = Block::parse(&out).unwrap().expect("CRC пересчитан");
+        let block = Block::parse(&out).unwrap().expect("the CRC was recomputed");
         assert_eq!(block.header.seq, 7);
-        assert_eq!(block.records().count(), 2, "содержимое не тронуто");
+        assert_eq!(block.records().count(), 2, "the content is untouched");
     }
 
     #[test]

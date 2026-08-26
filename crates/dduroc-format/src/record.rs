@@ -1,15 +1,18 @@
-//! Записи внутри блока.
+//! Records inside a block.
 //!
-//! Каркас: `[b0: kind(4 бита) | flags(4 бита)] [Δt varint] [поля по kind]`.
+//! The frame: `[b0: kind(4 bits) | flags(4 bits)] [Δt varint] [fields by
+//! kind]`.
 //!
-//! `Δt` — микросекунды от **предыдущей записи блока** (у первой — от
-//! `base_micros` заголовка блока, т.е. обычно 0). Дельта от соседа, а не от
-//! базы: числа меньше, varint короче.
+//! `Δt` is microseconds since the **previous record in the block** (for the
+//! first one, since the block header's `base_micros`, so usually 0). A delta
+//! from the neighbour rather than from the base: smaller numbers, shorter
+//! varints.
 //!
-//! На диск попадает только динамика. Уровень, шаблоны текста, тэги сообщений,
-//! имена и единицы измерения — статические свойства типа, живут в схеме
-//! бинарника и резолвятся при чтении. Принадлежность неймспейсу и каналу
-//! имплицитна из пути файла, `boot_counter` — из заголовка сегмента.
+//! Only what varies reaches the disk. The level, text templates, message tags,
+//! names and units are static properties of the type; they live in the
+//! binary's schema and are resolved at read time. Belonging to a namespace and
+//! a channel is implicit in the file path, and `boot_counter` comes from the
+//! segment header.
 
 use crate::cursor::{Cursor, write_str};
 use crate::error::{Error, Result};
@@ -18,12 +21,12 @@ use crate::level::Level;
 use crate::value::{Value, ValueType};
 use crate::varint;
 
-/// Тип записи — старший полубайт первого байта.
+/// The record kind — the high nibble of the first byte.
 ///
-/// Перечисление, а не голые константы: несуществующий тип непредставим, а
-/// `match` по типу обязан быть полным. Число за вариантом — формат на диске,
-/// оно закреплено дискриминантом ровно затем, чтобы у имени и провода был
-/// один источник.
+/// An enum rather than bare constants: a non-existent kind is unrepresentable
+/// and a `match` on the kind has to be exhaustive. The number behind a variant
+/// is the on-disk format, pinned by the discriminant precisely so that the
+/// name and the wire have a single source.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordKind {
@@ -32,26 +35,26 @@ pub enum RecordKind {
     SpanEnd = 0x2,
     Sample = 0x4,
     Text = 0x5,
-    /// Расширение: `len varint` + байты. Единственный способ добавить
-    /// новую разновидность записи, не ломая старых читателей — они умеют
-    /// пропустить её по длине.
+    /// An extension: `len varint` plus bytes. The only way to add a new kind
+    /// of record without breaking old readers — they can skip it by length.
     Ext = 0xF,
 }
 
-/// Занят в контейнере версии 1 записью `SeriesDef`, определявшей серию
-/// как `(метрика, рантайм-тэги)`. Рантайм-тэгов больше нет, идентичность
-/// серии равна метрике, и сэмпл несёт `metric_id` напрямую. Код не
-/// переиспользуется: цена — ничего, а спутать разбор версий нельзя. В
-/// [`RecordKind`] варианта нет — это НЕ тип записи текущего формата, а
-/// отличимый диагноз в [`RecordKind::from_u8`].
+/// Taken in container version 1 by the `SeriesDef` record, which defined a
+/// series as `(metric, runtime tags)`. Runtime tags are gone, a series is
+/// identified by its metric, and a sample carries `metric_id` directly. The
+/// code is not reused: that costs nothing and makes the two versions
+/// impossible to confuse when parsing. [`RecordKind`] has no variant for it —
+/// this is NOT a record kind of the current format but a distinguishable
+/// diagnosis in [`RecordKind::from_u8`].
 const RETIRED_SERIES_DEF: u8 = 0x3;
 
 impl RecordKind {
-    /// Тип из полубайта — обратное к дискриминанту.
+    /// The kind from the nibble — the inverse of the discriminant.
     ///
-    /// Код прежней версии даёт отличимый диагноз: «неизвестный тип» отправил
-    /// бы искать порчу носителя там, где на самом деле читается сегмент
-    /// версии 1.
+    /// The code of the earlier version yields a distinguishable diagnosis:
+    /// "unknown kind" would send someone hunting for medium corruption where a
+    /// version 1 segment is in fact being read.
     pub const fn from_u8(raw: u8) -> Result<Self> {
         match raw {
             0x0 => Ok(RecordKind::Message),
@@ -66,62 +69,64 @@ impl RecordKind {
     }
 }
 
-/// Флаг наличия `span` в записи (сообщения и текст).
+/// Flag marking the presence of `span` in a record (messages and text).
 const FLAG_SPAN: u8 = 0b0001;
-/// Маска типа значения в флагах записи `Sample`.
+/// Mask of the value type in the flags of a `Sample` record.
 const SAMPLE_VTYPE_MASK: u8 = 0b0111;
 
 // ════════════════════════════════════════════════════════════════════════════
-// Записи
+// Records
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Схемное сообщение: тип + бинарные поля (postcard).
+/// A schema message: a type plus binary fields (postcard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message<'a> {
     pub event: EventId,
-    /// Спан, к которому привязано сообщение (из runtime-контекста).
+    /// The span the message is attached to (from the runtime context).
     pub span: Option<SpanId>,
-    /// Сериализованные поля события. Длина хранится явно, хотя postcard
-    /// самоописуем при известной схеме: без неё записи неизвестных типов
-    /// нельзя было бы пропустить (чужой билд, состояние до миграции).
+    /// The serialized fields of the event. The length is stored explicitly even
+    /// though postcard is self-describing given the schema: without the schema,
+    /// records of unknown types could not be skipped (a foreign build, or a
+    /// state from before a migration).
     pub payload: &'a [u8],
 }
 
-/// Начало спана.
+/// The start of a span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpanStart {
     pub span: SpanId,
     pub kind: SpanKindId,
-    /// Родитель; `None` — корневой спан.
+    /// The parent; `None` means a root span.
     pub parent: Option<SpanId>,
 }
 
-/// Отсчёт телеметрии.
+/// A telemetry sample.
 ///
-/// Идентичность ряда — это метрика, и ничего кроме: рантайм-размерностей в
-/// системе нет, а имя, единица, подписи состояний и пределы — статика схемы.
-/// Поэтому сэмпл несёт `metric_id` напрямую, без промежуточного
-/// интернирования и без записи-определения серии: одна varint-величина
-/// вместо целого механизма, который к тому же приходилось восстанавливать
-/// при чтении с середины и в обратном порядке.
+/// A series is identified by its metric and by nothing else: there are no
+/// runtime dimensions in the system, and the name, the unit, the state labels
+/// and the limits are schema statics. So a sample carries `metric_id`
+/// directly, with no intermediate interning and no series-definition record:
+/// one varint instead of a whole mechanism that on top of everything had to be
+/// reconstructed when reading from the middle or in reverse.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample<'a> {
     pub metric: MetricId,
     pub value: Value<'a>,
 }
 
-/// Свободный текст без схемы: мост из `tracing`/`log`, panic-handler.
-/// Уровень хранится в записи — резолвить его по схеме не через что.
+/// Free text without a schema: the bridge from `tracing`/`log`, a panic
+/// handler. The level is stored in the record — there is no schema to resolve
+/// it from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Text<'a> {
     pub level: Level,
     pub span: Option<SpanId>,
-    /// Источник: target из tracing, имя модуля и т.п.
+    /// The source: a tracing target, a module name and the like.
     pub target: &'a str,
     pub text: &'a str,
 }
 
-/// Одна запись блока.
+/// One record of a block.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Record<'a> {
     Message(Message<'a>),
@@ -131,22 +136,22 @@ pub enum Record<'a> {
     },
     Sample(Sample<'a>),
     Text(Text<'a>),
-    /// Нераспознанное расширение: сохранено целиком, пропускается по длине.
+    /// An unrecognized extension: kept whole, skipped by length.
     Ext {
         bytes: &'a [u8],
     },
 }
 
-/// Запись вместе с её временной дельтой.
+/// A record together with its time delta.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Framed<'a> {
-    /// Микросекунды от предыдущей записи блока.
+    /// Microseconds since the previous record in the block.
     pub dt: u64,
     pub record: Record<'a>,
 }
 
 impl Record<'_> {
-    /// Тип записи.
+    /// The record kind.
     pub const fn kind(&self) -> RecordKind {
         match self {
             Record::Message(_) => RecordKind::Message,
@@ -158,7 +163,7 @@ impl Record<'_> {
         }
     }
 
-    /// Спан записи, если она к нему привязана.
+    /// The record's span, if it is attached to one.
     pub const fn span(&self) -> Option<SpanId> {
         match self {
             Record::Message(m) => m.span,
@@ -170,13 +175,14 @@ impl Record<'_> {
     }
 }
 
-/// Записать идентификатор спана, отвергнув зарезервированный ноль.
+/// Write a span identifier, rejecting the reserved zero.
 ///
-/// Ноль означает «спана нет» и допустимым [`SpanId`] не является. Проверяется
-/// на **кодировании**, а не только на разборе: декодер такой байт отвергает, и
-/// кодек не имеет права порождать то, чего сам же не прочитает. Молча
-/// пропустив ноль, писатель получил бы блок, теряемый читателем целиком на
-/// первой же такой записи, — не одна запись, а весь остаток тела.
+/// Zero means "no span" and is not a valid [`SpanId`]. It is checked on
+/// **encoding**, not only on parsing: the decoder rejects such a byte, and a
+/// codec has no right to produce what it will not read back. Letting a zero
+/// through silently would give the writer a block that the reader loses
+/// entirely at the first such record — not one record, but the whole rest of
+/// the body.
 #[inline]
 fn write_span(out: &mut Vec<u8>, span: SpanId) -> Result<()> {
     if span.0 == SpanId::NONE_RAW {
@@ -186,7 +192,7 @@ fn write_span(out: &mut Vec<u8>, span: SpanId) -> Result<()> {
     Ok(())
 }
 
-/// Закодировать запись с дельтой `dt`. Возвращает число дописанных байт.
+/// Encode a record with delta `dt`. Returns the number of bytes appended.
 pub fn encode(record: &Record<'_>, dt: u64, out: &mut Vec<u8>) -> Result<usize> {
     let start = out.len();
 
@@ -199,10 +205,11 @@ pub fn encode(record: &Record<'_>, dt: u64, out: &mut Vec<u8>) -> Result<usize> 
     out.push(((record.kind() as u8) << 4) | flags);
     varint::write_u64(out, dt);
 
-    // Проверки живут внутри разбора, а не отдельным проходом перед ним:
-    // сэмпл — самая частая запись, и лишний разбор варианта на ней виден
-    // в замерах. Цена — откат буфера при отказе, но отказ здесь означает
-    // дефект вызывающего и случается ноль раз за жизнь процесса.
+    // The checks live inside the parsing rather than in a separate pass before
+    // it: a sample is the most frequent record there is, and an extra variant
+    // dispatch on it shows up in measurements. The price is rewinding the
+    // buffer on failure, but failure here means a defect in the caller and
+    // happens zero times in a process's life.
     if let Err(e) = encode_body(record, out) {
         out.truncate(start);
         return Err(e);
@@ -223,8 +230,8 @@ fn encode_body(record: &Record<'_>, out: &mut Vec<u8>) -> Result<()> {
         Record::SpanStart(s) => {
             write_span(out, s.span)?;
             varint::write_u64(out, u64::from(s.kind.0));
-            // `None` у родителя кодируется нулём штатно; явный `Some(0)` —
-            // то же зарезервированное значение под другим именем.
+            // A `None` parent is encoded as zero by design; an explicit
+            // `Some(0)` is the same reserved value under another name.
             match s.parent {
                 Some(parent) => write_span(out, parent)?,
                 None => {
@@ -253,8 +260,8 @@ fn encode_body(record: &Record<'_>, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Раскодировать одну запись из начала `input`.
-/// Возвращает запись и число потреблённых байт.
+/// Decode one record from the start of `input`. Returns the record and the
+/// number of bytes consumed.
 pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
     let mut c = Cursor::new(input);
     let b0 = c.u8()?;
@@ -290,9 +297,9 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
             }
         }
         RecordKind::Sample => {
-            // Тип значения дублирован во флагах: без него длину значения
-            // взять негде — у сэмпла, в отличие от сообщения и расширения,
-            // нет префикса длины.
+            // The value type is duplicated in the flags: without it there is
+            // nowhere to get the value's length from — a sample, unlike a
+            // message or an extension, has no length prefix.
             let ty = ValueType::from_u8(flags & SAMPLE_VTYPE_MASK)?;
             if flags & !SAMPLE_VTYPE_MASK != 0 {
                 return Err(Error::ReservedValue);
@@ -327,9 +334,9 @@ pub fn decode(input: &[u8]) -> Result<(Framed<'_>, usize)> {
     Ok((Framed { dt, record }, c.pos()))
 }
 
-/// Итератор по записям блока. Останавливается на конце данных; ошибку
-/// возвращает элементом (вызывающий решает, обрезать хвост или считать
-/// блок битым).
+/// An iterator over a block's records. It stops at the end of the data and
+/// returns an error as an item, leaving the caller to decide whether to trim
+/// the tail or call the block corrupt.
 pub fn iter(body: &[u8]) -> RecordIter<'_> {
     RecordIter { body, pos: 0 }
 }
@@ -341,7 +348,7 @@ pub struct RecordIter<'a> {
 }
 
 impl<'a> RecordIter<'a> {
-    /// Смещение следующей нечитанной записи в теле блока.
+    /// Offset of the next unread record within the block body.
     pub fn offset(&self) -> usize {
         self.pos
     }
@@ -360,7 +367,7 @@ impl<'a> Iterator for RecordIter<'a> {
                 Some(Ok(framed))
             }
             Err(e) => {
-                // Останавливаемся, иначе итератор зациклился бы на ошибке.
+                // Stop here, or the iterator would spin forever on the error.
                 self.pos = self.body.len();
                 Some(Err(e))
             }
@@ -377,7 +384,7 @@ fn read_span(c: &mut Cursor<'_>) -> Result<SpanId> {
 #[inline]
 fn read_flagged_span(c: &mut Cursor<'_>, flags: u8) -> Result<Option<SpanId>> {
     if flags & FLAG_SPAN == 0 {
-        // Прочие биты у этих типов пока не определены.
+        // The remaining bits are not defined yet for these kinds.
         if flags != 0 {
             return Err(Error::ReservedValue);
         }
@@ -403,10 +410,10 @@ mod tests {
 
     fn roundtrip(rec: Record<'_>, dt: u64) -> usize {
         let mut buf = Vec::new();
-        let written = encode(&rec, dt, &mut buf).expect("кодирование");
+        let written = encode(&rec, dt, &mut buf).expect("encoding");
         assert_eq!(written, buf.len());
-        let (framed, read) = decode(&buf).expect("декодирование");
-        assert_eq!(read, buf.len(), "потреблено не всё");
+        let (framed, read) = decode(&buf).expect("decoding");
+        assert_eq!(read, buf.len(), "not everything was consumed");
         assert_eq!(framed.dt, dt);
         assert_eq!(framed.record, rec);
         buf.len()
@@ -414,8 +421,8 @@ mod tests {
 
     #[test]
     fn message_sizes() {
-        // Заявленный в SPEC.md размер: kind+flags(1) + dt(1) + event(1)
-        // + payload_len(1) + payload(4) = 8 байт.
+        // The size claimed in SPEC.md: kind+flags(1) + dt(1) + event(1) +
+        // payload_len(1) + payload(4) = 8 bytes.
         let size = roundtrip(
             Record::Message(Message {
                 event: EventId(1),
@@ -424,9 +431,9 @@ mod tests {
             }),
             0,
         );
-        assert_eq!(size, 8, "типичное сообщение должно занимать 8 байт");
+        assert_eq!(size, 8, "a typical message must take 8 bytes");
 
-        // Со спаном — плюс varint span_id.
+        // With a span, plus a varint span_id.
         let size = roundtrip(
             Record::Message(Message {
                 event: EventId(1),
@@ -440,7 +447,7 @@ mod tests {
 
     #[test]
     fn sample_sizes() {
-        // f32: kind+flags(1) + dt(1) + metric_id(1) + значение(4) = 7 байт.
+        // f32: kind+flags(1) + dt(1) + metric_id(1) + value(4) = 7 bytes.
         let size = roundtrip(
             Record::Sample(Sample {
                 metric: MetricId(1),
@@ -448,10 +455,10 @@ mod tests {
             }),
             0,
         );
-        assert_eq!(size, 7, "сэмпл f32 — 7 байт");
+        assert_eq!(size, 7, "an f32 sample is 7 bytes");
 
-        // Малое u64: 1 + 1 + 1 + 1 = 4 байта. Столько же занимает и код
-        // состояния метрики-перечисления: на диске это обычный u64.
+        // A small u64: 1 + 1 + 1 + 1 = 4 bytes. An enum metric's state code
+        // takes the same: on disk it is an ordinary u64.
         let size = roundtrip(
             Record::Sample(Sample {
                 metric: MetricId(3),
@@ -459,16 +466,16 @@ mod tests {
             }),
             0,
         );
-        assert_eq!(size, 4, "сэмпл малого u64 — 4 байта");
+        assert_eq!(size, 4, "a small u64 sample is 4 bytes");
     }
 
     #[test]
     fn dropping_series_interning_did_not_cost_bytes() {
-        // Раньше сэмпл ссылался на сегментно-локальный номер серии, который
-        // нумеровался с нуля, и отдельная запись SeriesDef связывала его с
-        // метрикой. Теперь метрика лежит в самом сэмпле. Размер обязан
-        // остаться прежним для метрик, укладывающихся в один байт varint,
-        // то есть для всех id меньше 128 — а бюджет схемы это 150 метрик.
+        // A sample used to refer to a segment-local series number counted from
+        // zero, and a separate SeriesDef record tied it to a metric. Now the
+        // metric sits in the sample itself. The size has to stay the same for
+        // metrics that fit in one varint byte, that is for every id below 128 —
+        // and the schema budget is 150 metrics.
         for id in [0u16, 1, 42, 127] {
             let size = roundtrip(
                 Record::Sample(Sample {
@@ -477,10 +484,11 @@ mod tests {
                 }),
                 0,
             );
-            assert_eq!(size, 7, "metric_id {id} обязан стоить один байт");
+            assert_eq!(size, 7, "metric_id {id} must cost one byte");
         }
-        // Только id от 128 стоит второй байт — и это плата за исчезновение
-        // записи-определения серии, которая стоила десятки байт на сегмент.
+        // Only ids from 128 up cost a second byte, and that is the price of
+        // losing the series-definition record, which cost tens of bytes per
+        // segment.
         let size = roundtrip(
             Record::Sample(Sample {
                 metric: MetricId(128),
@@ -493,16 +501,16 @@ mod tests {
 
     #[test]
     fn retired_series_def_kind_is_not_decodable() {
-        // Код 0x3 занимала запись SeriesDef контейнера версии 1. Он не
-        // переиспользуется, и встретить его можно только в файле чужой
-        // версии — читатель обязан честно отказаться, а не разобрать
-        // байты как что-то другое.
+        // Code 0x3 was taken by the SeriesDef record of container version 1. It
+        // is not reused, and it can only turn up in a file of a foreign version
+        // — a reader has to refuse honestly rather than parse the bytes as
+        // something else.
         let mut buf = vec![RETIRED_SERIES_DEF << 4];
         varint::write_u64(&mut buf, 0);
         assert_eq!(
             decode(&buf),
             Err(Error::RetiredRecordKind(RETIRED_SERIES_DEF)),
-            "диагноз обязан указывать на версию формата, а не на порчу"
+            "the diagnosis must point at the format version, not at corruption"
         );
     }
 
@@ -561,7 +569,7 @@ mod tests {
                 level: Level::Error,
                 span: Some(SpanId(3)),
                 target: "panic",
-                text: "паника в потоке",
+                text: "panic in a thread",
             }),
             0,
         );
@@ -570,10 +578,10 @@ mod tests {
 
     #[test]
     fn sample_carries_no_dimensions_beyond_the_metric() {
-        // Проверка ключевого свойства модели: на диске у сэмпла нет ничего,
-        // кроме времени, метрики и значения. Любая размерность, которую
-        // захотелось бы добавить в рантайме, обязана стать отдельной
-        // метрикой схемы — иначе она начнёт занимать место в каждом отсчёте.
+        // A check of the model's key property: on disk a sample holds nothing
+        // but a time, a metric and a value. Any dimension one might want to add
+        // at runtime has to become a metric of the schema — otherwise it starts
+        // taking room in every single sample.
         let mut buf = Vec::new();
         encode(
             &Record::Sample(Sample {
@@ -590,7 +598,7 @@ mod tests {
                 ((RecordKind::Sample as u8) << 4) | ValueType::U64 as u8,
                 0,    // dt
                 0x2a, // metric_id
-                2,    // значение
+                2,    // the value
             ]
         );
     }
@@ -617,7 +625,7 @@ mod tests {
             assert_eq!(f.dt, i as u64 * 100);
             match f.record {
                 Record::Message(m) => assert_eq!(m.event, EventId(i as u16)),
-                ref other => panic!("ожидалось сообщение, получено {other:?}"),
+                ref other => panic!("expected a message, got {other:?}"),
             }
         }
     }
@@ -635,33 +643,33 @@ mod tests {
             &mut body,
         )
         .unwrap();
-        // Обрезанная вторая запись — как после обрыва питания.
+        // A truncated second record — as after a power loss.
         body.push((RecordKind::Message as u8) << 4);
 
         let results: Vec<_> = iter(&body).collect();
         assert_eq!(results.len(), 2);
         assert!(results[0].is_ok());
         let err = results[1].as_ref().unwrap_err();
-        assert!(err.is_torn_tail(), "обрыв хвоста: {err}");
+        assert!(err.is_torn_tail(), "a torn tail: {err}");
     }
 
     #[test]
     fn zero_span_id_rejected() {
-        // span_id = 0 при выставленном флаге — зарезервированное значение.
+        // span_id = 0 with the flag set: the reserved value.
         let mut buf = vec![((RecordKind::Message as u8) << 4) | FLAG_SPAN];
         varint::write_u64(&mut buf, 0); // dt
         varint::write_u64(&mut buf, 1); // event
-        varint::write_u64(&mut buf, 0); // span = 0 — недопустимо
+        varint::write_u64(&mut buf, 0); // span = 0 is not allowed
         varint::write_u64(&mut buf, 0); // payload_len
         assert_eq!(decode(&buf), Err(Error::ReservedValue));
     }
 
     #[test]
     fn encoder_refuses_to_produce_what_it_cannot_read() {
-        // Кодек обязан быть симметричен: `SpanId(0)` — зарезервированное
-        // значение, декодер его отвергает. Пропустив ноль на записи, писатель
-        // положил бы в блок запись, на которой читатель останавливается, —
-        // и потерял бы весь остаток блока, а не одну запись.
+        // The codec has to be symmetric: `SpanId(0)` is the reserved value and
+        // the decoder rejects it. Letting a zero through on write would put a
+        // record in the block that the reader stops at — losing the whole rest
+        // of the block, not one record.
         let mut buf = Vec::new();
         for rec in [
             Record::Message(Message {
@@ -688,10 +696,13 @@ mod tests {
             Record::SpanEnd { span: SpanId(0) },
         ] {
             assert_eq!(encode(&rec, 0, &mut buf), Err(Error::ReservedValue));
-            assert!(buf.is_empty(), "отказ не должен оставлять обрывок: {buf:?}");
+            assert!(
+                buf.is_empty(),
+                "a refusal must not leave a fragment behind: {buf:?}"
+            );
         }
 
-        // Корневой спан по-прежнему кодируется нулём в поле `parent`.
+        // A root span is still encoded as zero in the `parent` field.
         let n = encode(
             &Record::SpanStart(SpanStart {
                 span: SpanId(1),
@@ -701,25 +712,25 @@ mod tests {
             0,
             &mut buf,
         )
-        .expect("корневой спан законен");
+        .expect("a root span is legal");
         assert_eq!(n, buf.len());
     }
 
     #[test]
     fn unknown_kind_and_reserved_flags_rejected() {
-        // kind 0x6 не определён — читатель обязан сообщить об ошибке,
-        // а не угадывать длину.
+        // Kind 0x6 is undefined — a reader has to report an error rather than
+        // guess the length.
         let mut buf = vec![0x6 << 4];
         varint::write_u64(&mut buf, 0);
         assert_eq!(decode(&buf), Err(Error::UnknownRecordKind(0x6)));
 
-        // Ненулевые зарезервированные флаги у SpanEnd.
+        // Non-zero reserved flags on a SpanEnd.
         let mut buf = vec![((RecordKind::SpanEnd as u8) << 4) | 0b0010];
         varint::write_u64(&mut buf, 0);
         varint::write_u64(&mut buf, 1);
         assert_eq!(decode(&buf), Err(Error::ReservedValue));
 
-        // Неизвестный vtype в флагах сэмпла.
+        // An unknown vtype in a sample's flags.
         let mut buf = vec![((RecordKind::Sample as u8) << 4) | 0b0110];
         varint::write_u64(&mut buf, 0);
         varint::write_u64(&mut buf, 0);

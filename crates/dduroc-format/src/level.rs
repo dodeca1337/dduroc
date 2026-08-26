@@ -1,20 +1,21 @@
-//! Уровни серьёзности.
+//! Severity levels.
 //!
-//! У схемных сообщений уровень — **статическое свойство типа**: он объявлен
-//! в схеме, известен при компиляции и на диск не пишется (резолвится при
-//! чтении по `EventId`). В формате `Level` нужен только записям [`Text`],
-//! у которых схемы нет: чужой текст из tracing/log-моста или panic-handler'а.
+//! For schema messages the level is a **static property of the type**: it is
+//! declared in the schema, known at compile time and never written to disk
+//! (it is resolved at read time from the `EventId`). Within the format,
+//! `Level` is needed only by [`Text`] records, which have no schema: foreign
+//! text from the tracing/log bridge or from a panic handler.
 //!
 //! [`Text`]: crate::record::Text
 
 use crate::error::{Error, Result};
 
-/// Порядок — по возрастанию серьёзности: фильтр «от Warn и выше» —
-/// сравнение `>=`.
+/// Ordered by increasing severity, so a "Warn and above" filter is a `>=`
+/// comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Level {
-    /// Трассировка вызовов функций — самый подробный уровень.
+    /// Call tracing — the most detailed level.
     DevTrace = 0,
     Trace = 1,
     Debug = 2,

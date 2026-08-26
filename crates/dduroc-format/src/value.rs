@@ -1,35 +1,37 @@
-//! Значения телеметрии.
+//! Telemetry values.
 //!
-//! Тип значения объявлен у метрики в схеме и **дублируется в младших битах
-//! флагов записи** [`Sample`]: сэмпл — единственная запись без префикса длины,
-//! и `vtype` во флагах и есть источник длины значения. Без него сэмпл нечем
-//! пропустить, а пропускать нужно тому, кто не знает схемы. Дублирование
-//! бесплатно — флаги всё равно есть в первом байте записи.
+//! The value type is declared on the metric in the schema and is
+//! **duplicated in the low bits of the record flags** of [`Sample`]: a sample
+//! is the only record without a length prefix, and `vtype` in the flags is
+//! what gives the value its length. Without it a sample cannot be skipped,
+//! and skipping is exactly what a reader without the schema has to do. The
+//! duplication is free — the flags are in the record's first byte anyway.
 //!
-//! Отсюда следствие, которое надо знать: **новый `vtype` — ломающее
-//! изменение**. Читатель, не знающий кода, теряет не одну запись, а весь
-//! остаток блока.
+//! Hence a consequence worth knowing: **a new `vtype` is a breaking change**.
+//! A reader that does not know the code loses not one record but the whole
+//! rest of the block.
 //!
 //! [`Sample`]: crate::record::Sample
 
 use crate::error::{Error, Result};
 use crate::varint;
 
-/// Тип значений серии.
+/// The value type of a series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ValueType {
-    /// 4 байта, IEEE-754.
+    /// 4 bytes, IEEE-754.
     F32 = 0,
-    /// 8 байт, IEEE-754.
+    /// 8 bytes, IEEE-754.
     F64 = 1,
-    /// varint + zigzag.
+    /// varint plus zigzag.
     I64 = 2,
     /// varint.
     U64 = 3,
-    /// 1 байт (0/1).
+    /// 1 byte (0/1).
     Bool = 4,
-    /// `len` varint + байты. Составное измерение: снимок спектра и т.п.
+    /// A varint `len` plus bytes. A composite measurement: a spectrum snapshot
+    /// and the like.
     Blob = 5,
 }
 
@@ -58,7 +60,7 @@ impl ValueType {
     }
 }
 
-/// Значение одного сэмпла. Blob заимствует байты из блока — без копирования.
+/// The value of one sample. A blob borrows bytes from the block — no copying.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
     F32(f32),
@@ -81,7 +83,7 @@ impl<'a> Value<'a> {
         }
     }
 
-    /// Как f64 — для графиков. `None` для blob'ов.
+    /// As f64, for charts. `None` for blobs.
     pub fn as_f64(&self) -> Option<f64> {
         match *self {
             Value::F32(v) => Some(f64::from(v)),
@@ -111,8 +113,8 @@ impl<'a> Value<'a> {
         }
     }
 
-    /// Читает значение типа `ty` из начала `input`.
-    /// Возвращает значение и число потреблённых байт.
+    /// Reads a value of type `ty` from the start of `input`. Returns the value
+    /// and the number of bytes consumed.
     pub(crate) fn decode(ty: ValueType, input: &'a [u8]) -> Result<(Self, usize)> {
         fn fixed<const N: usize>(input: &[u8]) -> Result<[u8; N]> {
             input
@@ -135,18 +137,19 @@ impl<'a> Value<'a> {
             ValueType::Bool => match input.first() {
                 Some(0) => Ok((Value::Bool(false), 1)),
                 Some(1) => Ok((Value::Bool(true), 1)),
-                // Любой другой байт — повреждение, а не «истина»: тихое
-                // приведение скрывало бы порчу данных.
+                // Any other byte is corruption, not "true": coercing it
+                // silently would hide damaged data.
                 Some(_) => Err(Error::ReservedValue),
                 None => Err(Error::Truncated),
             },
             ValueType::Blob => {
                 let (len, n) = varint::read_u64(input)?;
                 let len = usize::try_from(len).map_err(|_| Error::Truncated)?;
-                // Длина пришла из файла и может быть любой. `n + len` без
-                // проверки переполняет usize — на 32-битной цели (armv7) это
-                // достижимо длиной около четырёх гигабайт, то есть обычным
-                // мусором в повреждённом блоке, а не экзотикой.
+                // The length came from a file and can be anything. `n + len`
+                // without a check overflows usize — on a 32-bit target (armv7)
+                // that is reachable with a length of about four gigabytes,
+                // which is ordinary garbage in a damaged block rather than an
+                // exotic case.
                 let end = n.checked_add(len).ok_or(Error::Truncated)?;
                 let bytes = input.get(n..end).ok_or(Error::Truncated)?;
                 Ok((Value::Blob(bytes), end))
@@ -162,9 +165,9 @@ mod tests {
     fn roundtrip(v: Value<'_>) {
         let mut buf = Vec::new();
         v.encode(&mut buf);
-        let (got, n) = Value::decode(v.value_type(), &buf).expect("декод");
+        let (got, n) = Value::decode(v.value_type(), &buf).expect("decoding");
         assert_eq!(got, v);
-        assert_eq!(n, buf.len(), "потреблено не всё");
+        assert_eq!(n, buf.len(), "not everything was consumed");
     }
 
     #[test]
@@ -190,11 +193,11 @@ mod tests {
 
         buf.clear();
         Value::U64(100).encode(&mut buf);
-        assert_eq!(buf.len(), 1, "малое u64 — один байт");
+        assert_eq!(buf.len(), 1, "a small u64 is one byte");
 
         buf.clear();
         Value::I64(-5).encode(&mut buf);
-        assert_eq!(buf.len(), 1, "малое i64 через zigzag — один байт");
+        assert_eq!(buf.len(), 1, "a small i64 through zigzag is one byte");
     }
 
     #[test]
@@ -202,10 +205,10 @@ mod tests {
         let mut buf = Vec::new();
         Value::F64(f64::NAN).encode(&mut buf);
         let (got, _) = Value::decode(ValueType::F64, &buf).unwrap();
-        // NaN != NaN, сравниваем биты.
+        // NaN != NaN, so compare the bits.
         match got {
             Value::F64(v) => assert!(v.is_nan()),
-            other => panic!("ожидался f64, получен {other:?}"),
+            other => panic!("expected an f64, got {other:?}"),
         }
     }
 
@@ -220,7 +223,7 @@ mod tests {
             Value::decode(ValueType::Bool, &[2]),
             Err(Error::ReservedValue)
         );
-        // Blob с длиной больше доступного.
+        // A blob whose length exceeds what is available.
         let mut buf = Vec::new();
         varint::write_u64(&mut buf, 10);
         buf.extend_from_slice(&[1, 2, 3]);
@@ -229,10 +232,10 @@ mod tests {
 
     #[test]
     fn absurd_blob_length_does_not_overflow() {
-        // Длина blob'а приходит из файла. Сложение «смещение + длина» без
-        // проверки переполняет usize: на armv7 (32 бита) хватает четырёх
-        // гигабайт, на 64-битной сборке — значений около u64::MAX. Результат
-        // переполнения в debug — паника прямо в разборе чужого дампа.
+        // A blob's length comes from a file. Adding offset and length without a
+        // check overflows usize: on armv7 (32 bits) four gigabytes suffice, on
+        // a 64-bit build values near u64::MAX do. In debug the overflow panics
+        // right inside the parsing of someone else's dump.
         for len in [u64::MAX, u64::from(u32::MAX), 1 << 40] {
             let mut buf = Vec::new();
             varint::write_u64(&mut buf, len);
@@ -240,7 +243,7 @@ mod tests {
             assert_eq!(
                 Value::decode(ValueType::Blob, &buf),
                 Err(Error::Truncated),
-                "длина {len} обязана быть отвергнута, а не переполнить сложение"
+                "length {len} must be rejected, not overflow the addition"
             );
         }
     }
@@ -260,7 +263,7 @@ mod tests {
         assert_eq!(
             ValueType::from_u8(6),
             Err(Error::UnknownValueType(6)),
-            "неизвестный vtype отвергается"
+            "an unknown vtype is rejected"
         );
     }
 }

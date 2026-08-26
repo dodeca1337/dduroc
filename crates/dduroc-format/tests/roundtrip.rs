@@ -1,11 +1,12 @@
-//! Property-тесты формата.
+//! Property tests for the format.
 //!
-//! Проверяются два класса свойств:
-//! 1. **Roundtrip** — что записано, то и прочитано, байт в байт по смыслу.
-//! 2. **Устойчивость к мусору** — произвольные байты декодер либо разбирает,
-//!    либо честно отвергает ошибкой, но никогда не паникует и не зацикливается.
-//!    Это критично: сегмент после обрыва питания содержит именно произвольный
-//!    хвост, и читатель обязан его пережить.
+//! Two classes of property are checked:
+//! 1. **Roundtrip** — what was written is what is read, byte for byte in
+//!    meaning.
+//! 2. **Resilience to garbage** — the decoder either parses arbitrary bytes or
+//!    refuses them honestly with an error, but never panics and never spins.
+//!    That is critical: a segment after a power loss holds exactly such an
+//!    arbitrary tail, and the reader has to survive it.
 
 use dduroc_format::block::{Block, BlockBuilder, BlockHeader, Compression};
 use dduroc_format::footer::{Footer, FooterBuilder, Trailer};
@@ -18,7 +19,7 @@ use dduroc_format::{
 use proptest::prelude::*;
 
 // ════════════════════════════════════════════════════════════════════════════
-// Стратегии
+// Strategies
 // ════════════════════════════════════════════════════════════════════════════
 
 fn any_span() -> impl Strategy<Value = Option<SpanId>> {
@@ -35,14 +36,14 @@ fn any_value() -> impl Strategy<Value = Value<'static>> {
         any::<i64>().prop_map(Value::I64),
         any::<u64>().prop_map(Value::U64),
         any::<bool>().prop_map(Value::Bool),
-        // Blob'ы в property-тестах — из статики: Value заимствует байты.
+        // Blobs in property tests come from statics: Value borrows the bytes.
         Just(Value::Blob(&[])),
         Just(Value::Blob(&[0u8, 1, 2, 3, 255])),
     ]
 }
 
-/// Владеющее описание записи: `Record` заимствует, поэтому стратегии
-/// генерируют владеющую форму, а тест одалживает из неё.
+/// An owning description of a record: `Record` borrows, so the strategies
+/// generate the owning form and the test borrows out of it.
 #[derive(Debug, Clone)]
 enum OwnedRecord {
     Message {
@@ -142,7 +143,7 @@ fn any_record() -> impl Strategy<Value = OwnedRecord> {
     ]
 }
 
-/// Значения f32/f64 сравниваем по битам: NaN != NaN ломал бы roundtrip.
+/// f32/f64 values are compared bitwise: NaN != NaN would break the roundtrip.
 fn records_eq(a: &Record<'_>, b: &Record<'_>) -> bool {
     match (a, b) {
         (Record::Sample(x), Record::Sample(y)) => {
@@ -158,7 +159,7 @@ fn records_eq(a: &Record<'_>, b: &Record<'_>) -> bool {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Свойства
+// Properties
 // ════════════════════════════════════════════════════════════════════════════
 
 proptest! {
@@ -174,8 +175,8 @@ proptest! {
 
     #[test]
     fn varint_never_panics_on_garbage(bytes in prop::collection::vec(any::<u8>(), 0..24)) {
-        // Результат не важен — важно, что нет паники и потреблённая длина
-        // не выходит за границы входа.
+        // The result does not matter — what matters is that there is no panic
+        // and the consumed length stays within the input.
         if let Ok((_, n)) = varint::read_u64(&bytes) {
             prop_assert!(n <= bytes.len());
         }
@@ -190,7 +191,7 @@ proptest! {
         prop_assert_eq!(written, buf.len());
 
         let (framed, read) = record::decode(&buf)?;
-        prop_assert_eq!(read, buf.len(), "декодер обязан потребить ровно запись");
+        prop_assert_eq!(read, buf.len(), "the decoder must consume exactly the record");
         prop_assert_eq!(framed.dt, dt);
         prop_assert!(records_eq(&framed.record, &rec), "{:?} != {:?}", framed.record, rec);
     }
@@ -204,8 +205,8 @@ proptest! {
 
     #[test]
     fn record_iter_terminates_on_garbage(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
-        // Итератор обязан завершиться на любом входе: зацикливание на битом
-        // хвосте подвесило бы чтение сегмента после обрыва питания.
+        // The iterator has to terminate on any input: spinning on a corrupt
+        // tail would hang the reading of a segment after a power loss.
         let count = record::iter(&bytes).take(1024).count();
         prop_assert!(count <= 1024);
     }
@@ -218,7 +219,7 @@ proptest! {
     ) {
         let n = records.len().min(times.len());
         let mut times: Vec<u64> = times[..n].to_vec();
-        times.sort_unstable(); // writer подаёт записи в порядке времени
+        times.sort_unstable(); // the writer feeds records in time order
 
         let mut builder = BlockBuilder::new();
         for (i, owned) in records[..n].iter().enumerate() {
@@ -231,11 +232,11 @@ proptest! {
         prop_assert_eq!(header.count as usize, n);
         prop_assert_eq!(out.len() as u64, header.total_len());
 
-        let block = Block::parse(&out)?.expect("блок должен быть прочитан");
+        let block = Block::parse(&out)?.expect("the block must be read");
         let decoded: Vec<_> = block.records().collect::<Result<Vec<_>, _>>()?;
         prop_assert_eq!(decoded.len(), n);
         for (i, (at, rec)) in decoded.iter().enumerate() {
-            prop_assert_eq!(at.0, times[i], "время записи {} восстановлено неверно", i);
+            prop_assert_eq!(at.0, times[i], "the time of record {} was restored wrongly", i);
             prop_assert!(records_eq(rec, &records[i].as_record()));
         }
     }
@@ -252,8 +253,8 @@ proptest! {
         idx in any::<prop::sample::Index>(),
         xor in 1u8..=255,
     ) {
-        // Любая одиночная порча блока обязана быть замечена — иначе CRC
-        // не выполняет свою работу.
+        // Any single corruption of a block has to be noticed — otherwise the
+        // CRC is not doing its job.
         let mut builder = BlockBuilder::new();
         builder.push(Micros(1000), &Record::Message(Message {
             event: EventId(7),
@@ -267,18 +268,18 @@ proptest! {
         out[i] ^= xor;
 
         match Block::parse(&out) {
-            Err(_) => {}                    // порча замечена
-            Ok(None) => {}                  // затёрт body_len → «конец данных»
+            Err(_) => {}                    // the corruption was noticed
+            Ok(None) => {}                  // body_len was wiped, so "end of data"
             Ok(Some(block)) => {
-                // Уцелевший CRC при изменённом байте невозможен; единственный
-                // законный случай — порча не входящих в CRC резервов, которых
-                // в блоке нет. Значит, содержимое обязано отличаться.
+                // A surviving CRC with a changed byte is impossible; the only
+                // legitimate case is corruption of reserved bytes outside the
+                // CRC, and the block has none. So the content has to differ.
                 let recs: Vec<_> = block.records().collect();
                 let same = recs.len() == 1 && matches!(
                     recs.first(),
                     Some(Ok((_, Record::Message(m)))) if m.payload == payload.as_slice()
                 );
-                prop_assert!(!same, "порча байта {} осталась незамеченной", i);
+                prop_assert!(!same, "corruption of byte {} went unnoticed", i);
             }
         }
     }
@@ -298,7 +299,7 @@ proptest! {
         let bytes = h.to_bytes();
         prop_assert_eq!(SegmentHeader::parse(&bytes)?, h);
 
-        // Имя файла всегда разбирается обратно.
+        // A file name always parses back.
         let name = h.file_name();
         prop_assert_eq!(SegmentName::parse(&name.to_string()), Some(name));
     }
@@ -310,8 +311,8 @@ proptest! {
     ) {
         let na = SegmentName::new(BootCounter(a.0), Micros(a.1));
         let nb = SegmentName::new(BootCounter(b.0), Micros(b.1));
-        // Лексикографический порядок имён обязан совпадать с (boot, время):
-        // на этом стоит выбор сегментов по диапазону без чтения файлов.
+        // Lexicographic order of names has to match (boot, time): selecting
+        // segments by range without reading files rests on it.
         prop_assert_eq!(
             na.to_string().cmp(&nb.to_string()),
             (a.0, a.1).cmp(&(b.0, b.1))
@@ -333,10 +334,10 @@ proptest! {
         let mut offset = SegmentHeader::SIZE as u64;
         let mut base = 0u64;
         let mut expected_blocks = Vec::new();
-        // Типы отмечаются до блока: они приходят с его записями и
-        // закрепляются за сегментом вместе с ним. Множества, объявленные
-        // после последнего блока, принадлежат блоку, который ещё собирается,
-        // и в этот footer не попадают — на то они и отдельная ступень.
+        // Types are noted before the block: they arrive with its records and
+        // are pinned to a segment together with it. Sets declared after the
+        // last block belong to a block that is still being assembled and do not
+        // reach this footer — that is what the separate stage is for.
         for e in &events {
             builder.add_event(EventId(*e));
         }
@@ -360,10 +361,10 @@ proptest! {
         }
 
         let bytes = builder.build();
-        let trailer = Trailer::parse(&bytes)?.expect("сигнатура на месте");
+        let trailer = Trailer::parse(&bytes)?.expect("the signature is there");
         prop_assert_eq!(trailer.total_len(), bytes.len() as u64);
 
-        let footer = Footer::parse(&bytes)?.expect("footer читается");
+        let footer = Footer::parse(&bytes)?.expect("the footer reads");
         prop_assert_eq!(footer.blocks.len(), expected_blocks.len());
         for (got, (offset, base, count)) in footer.blocks.iter().zip(&expected_blocks) {
             prop_assert_eq!(got.offset, *offset);
@@ -371,12 +372,12 @@ proptest! {
             prop_assert_eq!(got.count, *count);
         }
 
-        // Множества — отсортированные и без дублей: по ним идёт бинарный
-        // поиск и в миграции, и при вопросе «какая телеметрия здесь есть».
+        // The sets are sorted and free of duplicates: both the migration and
+        // the question "what telemetry is in here" binary-search them.
         //
-        // Сегмент без единого блока не содержит и записей, поэтому типов в
-        // нём нет: отмеченные принадлежат блоку, который ещё собирается, и
-        // уедут в тот сегмент, куда он ляжет.
+        // A segment without a single block holds no records either, so it holds
+        // no types: the ones noted belong to a block that is still being
+        // assembled and will travel to whichever segment it lands in.
         let sealed = !blocks.is_empty();
         for (declared, got) in [
             (&events, footer.events.iter().map(|e| e.0).collect::<Vec<u16>>()),
@@ -421,11 +422,11 @@ proptest! {
         let footer = Footer::parse(&bytes)?.unwrap();
 
         match footer.block_for_time(Micros(probe)) {
-            None => prop_assert!(probe < bases[0], "None только раньше первого блока"),
+            None => prop_assert!(probe < bases[0], "None only before the first block"),
             Some(i) => {
-                prop_assert!(bases[i] <= probe, "найденный блок начинается позже probe");
+                prop_assert!(bases[i] <= probe, "the block found starts later than probe");
                 if let Some(next) = bases.get(i + 1) {
-                    prop_assert!(*next > probe, "существует более подходящий блок");
+                    prop_assert!(*next > probe, "a better-fitting block exists");
                 }
             }
         }

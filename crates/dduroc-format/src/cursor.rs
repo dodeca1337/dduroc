@@ -1,5 +1,5 @@
-//! Курсор последовательного чтения. Внутренний помощник кодеков: убирает
-//! ручную арифметику смещений, каждое чтение проверяет границы.
+//! A sequential read cursor. An internal helper for the codecs: it removes
+//! hand-written offset arithmetic and bounds-checks every read.
 
 use crate::error::{Error, Result};
 use crate::varint;
@@ -16,7 +16,7 @@ impl<'a> Cursor<'a> {
         Self { data, pos: 0 }
     }
 
-    /// Сколько байт потреблено.
+    /// How many bytes have been consumed.
     #[inline]
     pub(crate) fn pos(&self) -> usize {
         self.pos
@@ -36,8 +36,8 @@ impl<'a> Cursor<'a> {
         Ok(v)
     }
 
-    /// varint, приведённый к u32. Ошибка при переполнении — иначе битые
-    /// данные молча превращались бы в валидный маленький id.
+    /// A varint narrowed to u32. Overflow is an error — otherwise corrupt data
+    /// would silently turn into a valid small id.
     #[inline]
     pub(crate) fn varint_u32(&mut self, what: &'static str) -> Result<u32> {
         let v = self.varint()?;
@@ -58,7 +58,7 @@ impl<'a> Cursor<'a> {
         })
     }
 
-    /// varint-длина, приведённая к usize (на armv7 usize = 32 бита).
+    /// A varint length narrowed to usize (on armv7 usize is 32 bits).
     #[inline]
     pub(crate) fn varint_len(&mut self, what: &'static str) -> Result<usize> {
         let v = self.varint()?;
@@ -77,7 +77,7 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
-    /// Строка с varint-префиксом длины.
+    /// A string with a varint length prefix.
     #[inline]
     pub(crate) fn str(&mut self, what: &'static str) -> Result<&'a str> {
         let len = self.varint_len(what)?;
@@ -85,13 +85,13 @@ impl<'a> Cursor<'a> {
         core::str::from_utf8(bytes).map_err(|_| Error::BadUtf8)
     }
 
-    /// Непрочитанный хвост (без сдвига курсора).
+    /// The unread tail, without moving the cursor.
     #[inline]
     pub(crate) fn rest(&self) -> &'a [u8] {
         &self.data[self.pos.min(self.data.len())..]
     }
 
-    /// Декодировать значение телеметрии заданного типа.
+    /// Decode a telemetry value of the given type.
     #[inline]
     pub(crate) fn value(&mut self, ty: crate::ValueType) -> Result<crate::Value<'a>> {
         let (v, n) = crate::Value::decode(ty, self.rest())?;
@@ -100,7 +100,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Записать строку с varint-префиксом длины.
+/// Write a string with a varint length prefix.
 pub(crate) fn write_str(out: &mut Vec<u8>, s: &str) {
     varint::write_u64(out, s.len() as u64);
     out.extend_from_slice(s.as_bytes());
@@ -114,13 +114,13 @@ mod tests {
     fn reads_sequentially() {
         let mut buf = vec![0xAB];
         varint::write_u64(&mut buf, 300);
-        write_str(&mut buf, "привет");
+        write_str(&mut buf, "hello");
         buf.extend_from_slice(&[1, 2, 3]);
 
         let mut c = Cursor::new(&buf);
         assert_eq!(c.u8().unwrap(), 0xAB);
         assert_eq!(c.varint().unwrap(), 300);
-        assert_eq!(c.str("s").unwrap(), "привет");
+        assert_eq!(c.str("s").unwrap(), "hello");
         assert_eq!(c.take(3).unwrap(), &[1, 2, 3]);
         assert_eq!(c.pos(), buf.len());
         assert!(c.rest().is_empty());
@@ -151,7 +151,7 @@ mod tests {
         let buf = [1u8, 2, 3];
         let mut c = Cursor::new(&buf);
         assert_eq!(c.take(4), Err(Error::Truncated));
-        // Курсор не сдвинулся — состояние не испорчено.
+        // The cursor did not move — the state is intact.
         assert_eq!(c.pos(), 0);
         assert_eq!(c.take(3).unwrap(), &[1, 2, 3]);
     }

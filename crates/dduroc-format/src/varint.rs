@@ -1,15 +1,15 @@
-//! LEB128 varint: 7 бит полезной нагрузки на байт, старший бит — признак
-//! продолжения. Знаковые значения кодируются zigzag'ом.
+//! LEB128 varint: seven payload bits per byte, the top bit marking
+//! continuation. Signed values are zigzag-encoded.
 //!
-//! Значения < 128 занимают один байт — на это опирается вся экономия формата
-//! (типичные `event_id`, `series_local`, `Δt` малы).
+//! Values below 128 occupy one byte, and the whole economy of the format
+//! rests on that (a typical `event_id`, `series_local` or `Δt` is small).
 
 use crate::error::{Error, Result};
 
-/// Максимум байт в varint для u64: ceil(64 / 7) = 10.
+/// The most bytes a u64 varint can take: ceil(64 / 7) = 10.
 pub const MAX_LEN_U64: usize = 10;
 
-/// Дописать `value` в конец `out`. Возвращает число записанных байт.
+/// Append `value` to `out`. Returns the number of bytes written.
 pub fn write_u64(out: &mut Vec<u8>, mut value: u64) -> usize {
     let mut n = 0;
     loop {
@@ -24,16 +24,16 @@ pub fn write_u64(out: &mut Vec<u8>, mut value: u64) -> usize {
     }
 }
 
-/// Дописать знаковое значение (zigzag + varint).
+/// Append a signed value (zigzag, then varint).
 pub fn write_i64(out: &mut Vec<u8>, value: i64) -> usize {
     write_u64(out, zigzag_encode(value))
 }
 
-/// Прочитать varint из начала `input`. Возвращает `(значение, число байт)`.
+/// Read a varint from the start of `input`. Returns `(value, byte count)`.
 ///
-/// Ошибки: [`Error::Truncated`] — данные кончились до терминирующего байта;
-/// [`Error::VarintOverflow`] — кодировка не влезает в u64 или содержит
-/// избыточные (non-canonical) старшие биты.
+/// Errors: [`Error::Truncated`] — the data ran out before the terminating
+/// byte; [`Error::VarintOverflow`] — the encoding does not fit in a u64 or
+/// carries redundant (non-canonical) high bits.
 pub fn read_u64(input: &[u8]) -> Result<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift = 0u32;
@@ -41,15 +41,16 @@ pub fn read_u64(input: &[u8]) -> Result<(u64, usize)> {
     for (i, &byte) in input.iter().take(MAX_LEN_U64).enumerate() {
         let payload = u64::from(byte & 0x7F);
 
-        // На 10-м байте (shift == 63) в u64 остаётся место только под 1 бит.
+        // On the tenth byte (shift == 63) only one bit of room is left in the
+        // u64.
         if shift == 63 && payload > 1 {
             return Err(Error::VarintOverflow);
         }
         value |= payload << shift;
 
         if byte & 0x80 == 0 {
-            // Канонический: терминирующий байт не может быть нулевым padding'ом
-            // (кроме единственного байта, кодирующего 0).
+            // Canonical: the terminating byte cannot be zero padding (except
+            // for the single byte that encodes 0).
             if byte == 0 && i > 0 {
                 return Err(Error::VarintOverflow);
             }
@@ -59,22 +60,22 @@ pub fn read_u64(input: &[u8]) -> Result<(u64, usize)> {
     }
 
     if input.len() >= MAX_LEN_U64 {
-        // 10 байт с выставленным continuation-битом — заведомо не u64.
+        // Ten bytes all carrying the continuation bit are knowably not a u64.
         Err(Error::VarintOverflow)
     } else {
         Err(Error::Truncated)
     }
 }
 
-/// Прочитать знаковое значение (varint + zigzag).
+/// Read a signed value (varint, then zigzag).
 pub fn read_i64(input: &[u8]) -> Result<(i64, usize)> {
     let (raw, n) = read_u64(input)?;
     Ok((zigzag_decode(raw), n))
 }
 
-/// Число байт, которое займёт `value`. Для расчёта размеров без записи.
+/// How many bytes `value` will take. For sizing without writing.
 pub fn len_u64(value: u64) -> usize {
-    // 1 + число полных 7-битных групп сверх младшей.
+    // 1 plus the number of full 7-bit groups above the lowest one.
     let bits = 64 - value.leading_zeros();
     match bits {
         0 => 1,
@@ -99,13 +100,13 @@ mod tests {
     fn roundtrip(v: u64) {
         let mut buf = Vec::new();
         let written = write_u64(&mut buf, v);
-        assert_eq!(written, buf.len(), "возвращённая длина расходится с buf");
+        assert_eq!(written, buf.len(), "the returned length disagrees with buf");
         assert_eq!(
             written,
             len_u64(v),
-            "len_u64 расходится с write_u64 для {v}"
+            "len_u64 disagrees with write_u64 for {v}"
         );
-        let (got, read) = read_u64(&buf).expect("чтение");
+        let (got, read) = read_u64(&buf).expect("a read");
         assert_eq!(got, v);
         assert_eq!(read, written);
     }
@@ -116,7 +117,7 @@ mod tests {
             roundtrip(v);
             let mut buf = Vec::new();
             write_u64(&mut buf, v);
-            assert_eq!(buf.len(), 1, "значения < 128 обязаны занимать 1 байт");
+            assert_eq!(buf.len(), 1, "values below 128 must take 1 byte");
         }
     }
 
@@ -137,7 +138,7 @@ mod tests {
         ] {
             roundtrip(v);
         }
-        // Границы длин: 2^(7k) — первое значение, требующее k+1 байт.
+        // Length boundaries: 2^(7k) is the first value that needs k+1 bytes.
         for k in 1..10u32 {
             let v = 1u64 << (7 * k);
             roundtrip(v);
@@ -163,18 +164,18 @@ mod tests {
             assert_eq!(got, v);
             assert_eq!(n, buf.len());
         }
-        // Малые по модулю значения — один байт (главное свойство zigzag).
+        // Values small in absolute terms take one byte — the point of zigzag.
         for v in -63i64..=63 {
             let mut buf = Vec::new();
             write_i64(&mut buf, v);
-            assert_eq!(buf.len(), 1, "малое {v} должно занимать 1 байт");
+            assert_eq!(buf.len(), 1, "a small {v} must take 1 byte");
         }
     }
 
     #[test]
     fn truncated_input() {
         assert!(matches!(read_u64(&[]), Err(Error::Truncated)));
-        // Все байты с continuation-битом, но поток кончился.
+        // Every byte carries the continuation bit, but the stream ended.
         assert!(matches!(read_u64(&[0x80]), Err(Error::Truncated)));
         assert!(matches!(
             read_u64(&[0x80, 0x80, 0x80]),
@@ -184,16 +185,16 @@ mod tests {
 
     #[test]
     fn overflow_rejected() {
-        // 10 байт с continuation → нет терминатора и уже вне u64.
+        // Ten continuation bytes: no terminator, and already outside u64.
         let all_cont = [0x80u8; MAX_LEN_U64];
         assert!(matches!(read_u64(&all_cont), Err(Error::VarintOverflow)));
 
-        // 10-й байт с payload > 1 не влезает в u64.
+        // A tenth byte with a payload above 1 does not fit in a u64.
         let mut buf = vec![0x80u8; 9];
         buf.push(0x02);
         assert!(matches!(read_u64(&buf), Err(Error::VarintOverflow)));
 
-        // Non-canonical: избыточный нулевой терминатор.
+        // Non-canonical: a redundant zero terminator.
         assert!(matches!(
             read_u64(&[0x81, 0x00]),
             Err(Error::VarintOverflow)
@@ -202,7 +203,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_ignored() {
-        // Читатель обязан вернуть длину, а не съесть хвост.
+        // The reader must return the length, not swallow the tail.
         let mut buf = Vec::new();
         write_u64(&mut buf, 300);
         buf.extend_from_slice(&[0xAA, 0xBB]);

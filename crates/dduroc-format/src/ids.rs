@@ -1,48 +1,50 @@
-//! Идентификаторы и метки времени формата.
+//! Format identifiers and timestamps.
 //!
-//! Идентификаторы — прозрачные newtype'ы над целыми: типизация ловит
-//! перепутанные аргументы, стоимость нулевая. Метка времени — [`BootTime`],
-//! пара «запуск + микросекунды от его старта»: порознь эти числа моментом не
-//! являются, и держать их в одном типе дешевле, чем ловить сравнение
-//! микросекунд разных запусков в отладке.
+//! Identifiers are transparent newtypes over integers: the type checker
+//! catches swapped arguments and the cost is nothing. A timestamp is
+//! [`BootTime`], the pair "boot plus microseconds since it started": on their
+//! own those two numbers are not a moment at all, and holding them in one type
+//! is cheaper than chasing a comparison of microseconds from different boots
+//! through a debugger.
 //!
-//! # Пространства
+//! # Spaces
 //!
-//! `EventId` / `MetricId` / `SpanKindId` — u16, назначаются **явно** в
-//! декларации схемы (авто-нумерация запрещена: позиционные id молча
-//! перемапливают исторические записи на чужие декодеры — грабли прототипа).
-//! Ремапы делаются миграциями.
+//! `EventId` / `MetricId` / `SpanKindId` are u16, assigned **explicitly** in
+//! the schema declaration. Auto-numbering is forbidden: positional ids
+//! silently remap historical records onto the wrong decoders, which is the
+//! trap the prototype fell into. Remapping is what migrations are for.
 //!
-//! # Плотность нумерации метрик — не безразлична
+//! # Metric numbering density is not a matter of taste
 //!
-//! `metric_id` попадает **в каждый отсчёт** телеметрии varint'ом: значения
-//! меньше 128 стоят один байт, от 128 — два. Телеметрия — самая частая
-//! запись, поэтому цена дырок в нумерации измерима:
+//! `metric_id` goes into **every** telemetry sample as a varint: values below
+//! 128 cost one byte, values from 128 up cost two. Telemetry is the most
+//! frequent record there is, so the price of holes in the numbering is
+//! measurable:
 //!
-//! | раскладка id | объём телеметрии |
+//! | id layout | telemetry volume |
 //! |---|---|
-//! | плотно от 1 | базовый (+0.1%) |
-//! | по группам (`0x0101`, `0x0201`…) | **+10% сырых, +15% после LZ4** |
-//! | крупные (`0x4000`+) | **+23% сырых, +29…33% после LZ4** |
+//! | dense from 1 | baseline (+0.1%) |
+//! | grouped (`0x0101`, `0x0201`…) | **+10% raw, +15% after LZ4** |
+//! | large (`0x4000`+) | **+23% raw, +29…33% after LZ4** |
 //!
-//! (Замерено на реальном кодеке: 150 метрик, секундный скан, минута данных.
-//! Сжатие не спасает — наоборот, на шумных значениях расхождение растёт.)
+//! (Measured on the real codec: 150 metrics, one-second scan, one minute of
+//! data. Compression does not rescue it — on noisy values the gap widens.)
 //!
-//! Проверкой это не сделано намеренно: после нескольких миграций с удалением
-//! метрик дырки возникают законно, и запретить их значило бы запретить
-//! эволюцию схемы. Но **нумеруйте метрики плотно от 1** — иначе байт уходит
-//! на каждый отсчёт навсегда.
+//! This is deliberately not enforced: after a few migrations that remove
+//! metrics, holes arise legitimately, and forbidding them would forbid schema
+//! evolution. But **number metrics densely from 1** — otherwise a byte is lost
+//! on every sample, permanently.
 //!
-//! У `event_id` и `span_kind_id` такой чувствительности нет: сообщение и так
-//! несёт payload, а спаны редки.
+//! `event_id` and `span_kind_id` have no such sensitivity: a message carries a
+//! payload anyway, and spans are rare.
 //!
-//! Расчётные пределы (256 типов сообщений, 160 метрик и т.п.) —
-//! предмет валидации в схеме и sizing'а в движке, не в формате.
+//! The design limits (256 message types, 160 metrics and so on) belong to
+//! schema validation and engine sizing, not to the format.
 
 use core::fmt;
 
-/// Счётчик запусков ПО. `u32` **везде** — рассинхрон u16/u32 из прототипа
-/// приводил к тихой поломке конверсии в UTC после 65536 запусков.
+/// Software boot counter. `u32` **everywhere** — the u16/u32 mismatch in the
+/// prototype silently broke UTC conversion after 65536 boots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct BootCounter(pub u32);
@@ -54,36 +56,40 @@ impl From<u32> for BootCounter {
     }
 }
 
-/// Микросекунды от старта текущего run'а (`CLOCK_BOOTTIME` минус базa).
+/// Microseconds since the current run started (`CLOCK_BOOTTIME` minus base).
 ///
-/// Полный u64: в отличие от прототипа, `boot_counter` больше не упакован
-/// в те же 64 бита (он живёт в заголовке сегмента), поэтому 48-битного
-/// ограничения и связанного с ним переполнения через ~8.9 лет нет.
+/// A full u64: unlike the prototype, `boot_counter` is no longer packed into
+/// the same 64 bits (it lives in the segment header), so neither the 48-bit
+/// limit nor the overflow after ~8.9 years it brought with it exists here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct Micros(pub u64);
 
-/// Момент относительного времени: запуск ПО плюс микросекунды от его старта.
+/// A moment in relative time: a software boot plus microseconds since it
+/// started.
 ///
-/// Метка времени прибора без RTC состоит **ровно из этих двух чисел**, и по
-/// отдельности ни одно из них моментом не является: `Micros(500)` из разных
-/// запусков — разные моменты, а сравнение их между собой бессмысленно.
-/// Поэтому они и лежат в одном типе, а не двумя полями рядом.
+/// On a device without an RTC a timestamp consists of **exactly these two
+/// numbers**, and neither is a moment on its own: `Micros(500)` from two
+/// different boots are two different moments, and comparing them is
+/// meaningless. That is why they live in one type rather than as two fields
+/// side by side.
 ///
-/// # Порядок
+/// # Ordering
 ///
-/// Порядок лексикографический — сначала `boot`, потом `at`, — и он совпадает
-/// с хронологическим: `boot_counter` растёт с каждым запуском ПО. Отсюда же
-/// порядок полей в объявлении: производный `Ord` берёт их сверху вниз, и
-/// перестановка полей молча превратила бы сравнение в мусор.
+/// The ordering is lexicographic — `boot` first, then `at` — and it coincides
+/// with the chronological one: `boot_counter` grows with every software boot.
+/// Hence the order of the fields in the declaration: the derived `Ord` reads
+/// them top to bottom, and swapping them would silently turn the comparison
+/// into garbage.
 ///
-/// Тот же порядок даёт и имя файла сегмента (`<boot:08x>-<micros:016x>`),
-/// поэтому лексикографический обход каталога — это обход по времени.
+/// The same ordering gives the segment file its name (`<boot:08x>-
+/// <micros:016x>`), which is why walking the directory lexicographically is
+/// walking it in time order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct BootTime {
-    /// Запуск ПО, в шкале которого отсчитано `at`.
+    /// The software boot in whose scale `at` is counted.
     pub boot: BootCounter,
-    /// Микросекунды от старта этого запуска.
+    /// Microseconds since that boot started.
     pub at: Micros,
 }
 
@@ -93,7 +99,8 @@ impl BootTime {
         Self { boot, at }
     }
 
-    /// То же из голых чисел — для тестов и мест, где ширины уже проверены.
+    /// The same from bare numbers — for tests and for places where the
+    /// widths have already been checked.
     #[inline]
     pub const fn from_raw(boot: u32, micros: u64) -> Self {
         Self {
@@ -104,48 +111,48 @@ impl BootTime {
 }
 
 impl fmt::Display for BootTime {
-    /// `#3 01:23:45.678_901` — запуск и время от его старта.
+    /// `#3 01:23:45.678_901` — the boot and the time since it started.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "#{} {}", self.boot.0, self.at)
     }
 }
 
-/// Версия протокола схемы неймспейса. Монотонно растёт, миграции —
-/// цепочка шагов `vN → vN+1`.
+/// Version of a namespace schema protocol. Grows monotonically; a migration is
+/// a chain of `vN → vN+1` steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
 pub struct ProtocolVersion(pub u16);
 
-/// Тип сообщения в пределах схемы неймспейса.
+/// A message type within a namespace schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct EventId(pub u16);
 
-/// Тип метрики телеметрии в пределах схемы неймспейса.
+/// A telemetry metric type within a namespace schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct MetricId(pub u16);
 
-/// Вид спана в пределах схемы неймспейса.
+/// A span kind within a namespace schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct SpanKindId(pub u16);
 
-/// Идентификатор спана, локальный для run'а (boot имплицитен из сегмента —
-/// спан не переживает перезапуск процесса).
+/// A span identifier, local to one run (the boot is implicit from the segment —
+/// a span does not outlive a process restart).
 ///
-/// Значение `0` зарезервировано как «спана нет» и допустимым `SpanId` не
-/// является: движок нумерует с 1. Отсутствие спана в записи кодируется
-/// флагом (у сообщений) либо нулём (у `parent` в `SpanStart`).
+/// The value `0` is reserved to mean "no span" and is not a valid `SpanId`:
+/// the engine numbers from 1. The absence of a span is encoded by a flag (on
+/// messages) or by zero (for `parent` in `SpanStart`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct SpanId(pub u32);
 
 impl SpanId {
-    /// Сентинел «спана нет» в wire-представлении `parent`.
+    /// The "no span" sentinel in the wire representation of `parent`.
     pub const NONE_RAW: u32 = 0;
 
-    /// `None` для зарезервированного нуля.
+    /// `None` for the reserved zero.
     #[inline]
     pub const fn from_raw(raw: u32) -> Option<Self> {
         if raw == Self::NONE_RAW {
@@ -155,7 +162,7 @@ impl SpanId {
         }
     }
 
-    /// Обратное к [`Self::from_raw`]: `None` → 0.
+    /// The inverse of [`Self::from_raw`]: `None` becomes 0.
     #[inline]
     pub const fn raw_or_none(this: Option<Self>) -> u32 {
         match this {
@@ -184,9 +191,9 @@ impl_display!(
 );
 
 impl Micros {
-    /// Насыщающая разность — база для varint-дельт: отрицательный шаг
-    /// невозможен (записи в блоке монотонны), а паника на битых данных
-    /// недопустима.
+    /// Saturating difference — the basis for varint deltas: a negative step is
+    /// impossible (records within a block are monotonic), and panicking on
+    /// corrupt data is not acceptable.
     #[inline]
     pub const fn saturating_delta(self, earlier: Self) -> u64 {
         self.0.saturating_sub(earlier.0)
@@ -202,7 +209,7 @@ impl Micros {
 }
 
 impl fmt::Display for Micros {
-    /// `01:23:45.678_901` — от старта run'а.
+    /// `01:23:45.678_901` — since the run started.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let us = self.0 % 1_000;
         let ms = (self.0 / 1_000) % 1_000;
@@ -227,17 +234,17 @@ mod tests {
     #[test]
     fn micros_delta_saturates() {
         assert_eq!(Micros(10).saturating_delta(Micros(4)), 6);
-        // Немонотонный вход (битые данные) не паникует.
+        // A non-monotonic input (corrupt data) does not panic.
         assert_eq!(Micros(4).saturating_delta(Micros(10)), 0);
         assert_eq!(Micros(u64::MAX).checked_add_delta(1), None);
     }
 
     #[test]
     fn boot_time_orders_chronologically() {
-        // Лексикографический порядок пары = хронологический: boot_counter
-        // растёт с каждым запуском. Проверка держит порядок полей: поменяй их
-        // местами — и сравнение начнёт сравнивать микросекунды разных
-        // запусков между собой.
+        // Lexicographic order of the pair equals chronological order:
+        // boot_counter grows with every boot. This check pins the field order
+        // down: swap the fields and the comparison starts comparing
+        // microseconds from different boots against each other.
         let mut v = [
             BootTime::from_raw(1, 500),
             BootTime::from_raw(0, 900),
@@ -254,7 +261,7 @@ mod tests {
                 BootTime::from_raw(1, 500),
             ]
         );
-        // Более позднее время раннего запуска остаётся раньше.
+        // A later time in an earlier boot still comes first.
         assert!(BootTime::from_raw(0, u64::MAX) < BootTime::from_raw(1, 0));
     }
 
@@ -272,7 +279,7 @@ mod tests {
         assert_eq!(
             Micros(3_723_456_789).to_string(),
             "01:02:03.456_789",
-            "1ч 2м 3.456789с"
+            "1h 2m 3.456789s"
         );
     }
 }

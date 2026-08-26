@@ -1,40 +1,40 @@
-//! Сегмент — файл-контейнер блоков.
+//! A segment — the file that contains blocks.
 //!
 //! ```text
 //! <boot:08x>-<micros:016x>.seg
 //! [SegmentHeader 32B] [Block]* [Footer]?
 //! ```
 //!
-//! Имя фиксированной ширины в hex: лексикографический порядок имён совпадает
-//! с временным, поэтому выбор сегментов по диапазону — это сортировка строк,
-//! без чтения содержимого.
+//! The name is fixed-width hex, so lexicographic order of names coincides with
+//! chronological order: picking segments by time range is string sorting, with
+//! no need to read any content.
 //!
-//! Сегмент никогда не пересекает границу run'а: `boot_counter` живёт в
-//! заголовке, а не в каждой записи. Смена run'а — всегда новый сегмент.
+//! A segment never crosses a run boundary: `boot_counter` lives in the header
+//! rather than in every record, and a change of run always means a new segment.
 
 use crate::error::{Error, Result};
 use crate::ids::{BootCounter, Micros, ProtocolVersion};
 use core::fmt;
 
-/// Заголовок сегмента.
+/// The segment header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
-    /// Версия протокола схемы неймспейса на момент записи сегмента.
-    /// Миграция сравнивает её с текущей версией схемы.
+    /// Version of the namespace schema protocol at the time the segment was
+    /// written. A migration compares it against the current schema version.
     pub protocol_version: ProtocolVersion,
     pub boot: BootCounter,
-    /// Время первой записи сегмента (совпадает с именем файла).
+    /// Time of the segment's first record (matches the file name).
     pub base: Micros,
-    /// Идентичность хранилища, в котором создан сегмент.
+    /// Identity of the store the segment was created in.
     ///
-    /// Без неё файлы, скопированные с другого устройства, бесшовно
-    /// смешались бы с локальными: `boot_counter` у них своя нумерация, и
-    /// чужие события получили бы локальный UTC-якорь, то есть заведомо
-    /// неверное абсолютное время.
+    /// Without it, files copied from another device would blend seamlessly
+    /// into the local ones: their `boot_counter` follows its own numbering,
+    /// and foreign events would inherit the local UTC anchor — that is, a
+    /// knowably wrong absolute time.
     pub store_id: u64,
 }
 
-/// Сигнатура файла сегмента.
+/// The segment file signature.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"DSEG";
 
 impl SegmentHeader {
@@ -44,7 +44,7 @@ impl SegmentHeader {
         let mut b = [0u8; Self::SIZE];
         b[0..4].copy_from_slice(&SEGMENT_MAGIC);
         b[4] = crate::CONTAINER_VERSION;
-        b[5] = 0; // флаги, резерв
+        b[5] = 0; // flags, reserved
         b[6..8].copy_from_slice(&self.protocol_version.0.to_le_bytes());
         b[8..12].copy_from_slice(&self.boot.0.to_le_bytes());
         b[12..20].copy_from_slice(&self.base.0.to_le_bytes());
@@ -60,7 +60,7 @@ impl SegmentHeader {
             .and_then(|s| s.try_into().ok())
             .ok_or(Error::Truncated)?;
 
-        let magic: [u8; 4] = raw[0..4].try_into().expect("срез 4 байта");
+        let magic: [u8; 4] = raw[0..4].try_into().expect("a 4-byte slice");
         if magic != SEGMENT_MAGIC {
             return Err(Error::BadMagic {
                 expected: SEGMENT_MAGIC,
@@ -68,7 +68,7 @@ impl SegmentHeader {
             });
         }
 
-        let expected_crc = u32::from_le_bytes(raw[28..32].try_into().expect("срез 4 байта"));
+        let expected_crc = u32::from_le_bytes(raw[28..32].try_into().expect("a 4-byte slice"));
         let actual_crc = crc32c::crc32c(&raw[..28]);
         if expected_crc != actual_crc {
             return Err(Error::CrcMismatch {
@@ -77,8 +77,8 @@ impl SegmentHeader {
             });
         }
 
-        // CRC проверен до версии: иначе мусорный байт версии выдавался бы за
-        // «формат из будущего», маскируя порчу.
+        // The CRC is checked before the version: otherwise a garbage version
+        // byte would pass for "a format from the future", masking corruption.
         if raw[4] != crate::CONTAINER_VERSION {
             return Err(Error::UnsupportedContainerVersion(
                 raw[4],
@@ -92,16 +92,16 @@ impl SegmentHeader {
         Ok(Self {
             protocol_version: ProtocolVersion(u16::from_le_bytes([raw[6], raw[7]])),
             boot: BootCounter(u32::from_le_bytes(
-                raw[8..12].try_into().expect("срез 4 байта"),
+                raw[8..12].try_into().expect("a 4-byte slice"),
             )),
             base: Micros(u64::from_le_bytes(
-                raw[12..20].try_into().expect("срез 8 байт"),
+                raw[12..20].try_into().expect("an 8-byte slice"),
             )),
-            store_id: u64::from_le_bytes(raw[20..28].try_into().expect("срез 8 байт")),
+            store_id: u64::from_le_bytes(raw[20..28].try_into().expect("an 8-byte slice")),
         })
     }
 
-    /// Имя файла этого сегмента.
+    /// The file name of this segment.
     pub fn file_name(&self) -> SegmentName {
         SegmentName {
             boot: self.boot,
@@ -110,14 +110,14 @@ impl SegmentHeader {
     }
 }
 
-/// Имя файла сегмента: `<boot:08x>-<micros:016x>.seg`.
+/// A segment file name: `<boot:08x>-<micros:016x>.seg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SegmentName {
     pub boot: BootCounter,
     pub base: Micros,
 }
 
-/// Расширение файлов сегментов.
+/// The extension of segment files.
 pub const SEGMENT_EXT: &str = "seg";
 
 impl SegmentName {
@@ -125,22 +125,23 @@ impl SegmentName {
         Self { boot, base }
     }
 
-    /// Момент первой записи сегмента одним значением.
+    /// The moment of the segment's first record as a single value.
     ///
-    /// Имя сегмента — это [`crate::BootTime`] в шестнадцатеричной записи
-    /// фиксированной ширины, поэтому сравнение имён и сравнение моментов —
-    /// одно и то же.
+    /// A segment name is a [`crate::BootTime`] written in fixed-width
+    /// hexadecimal, so comparing names and comparing moments are the same
+    /// operation.
     pub const fn start(&self) -> crate::BootTime {
         crate::BootTime::new(self.boot, self.base)
     }
 
-    /// Разобрать имя файла. `None` — файл не наш (чужой мусор в каталоге).
+    /// Parse a file name. `None` means the file is not ours (foreign litter in
+    /// the directory).
     ///
-    /// Принимается ровно то, что порождает `Display`, и ничего сверх: строгая
-    /// ширина, только строчные шестнадцатеричные цифры. `from_str_radix` сам
-    /// по себе глотает знак (`+000002a`), а прописные буквы дают ещё одно
-    /// написание того же числа — и один сегмент оказался бы в учёте дважды,
-    /// под разными именами, тогда как на диске файл один.
+    /// Exactly what `Display` produces is accepted and nothing beyond it: a
+    /// strict width, lowercase hex digits only. `from_str_radix` on its own
+    /// swallows a sign (`+000002a`), and uppercase letters give a second
+    /// spelling of the same number — one segment would then be accounted for
+    /// twice under different names while a single file sits on disk.
     pub fn parse(name: &str) -> Option<Self> {
         fn is_lower_hex(s: &str, width: usize) -> bool {
             s.len() == width
@@ -197,7 +198,7 @@ mod tests {
             Err(Error::BadMagic { .. })
         ));
 
-        // Порча полезного поля ловится CRC.
+        // Corruption of a payload field is caught by the CRC.
         let mut bytes = header().to_bytes();
         bytes[9] ^= 0xFF;
         assert!(matches!(
@@ -210,14 +211,16 @@ mod tests {
 
     #[test]
     fn rejects_other_container_version() {
-        // Версия 1 — предыдущая раскладка, где сэмпл ссылался на локальный
-        // номер серии, а связывала его с метрикой отдельная запись. Прочитать
-        // такой сегмент этим билдом нельзя, и «попробовать разобрать» тоже
-        // нельзя: байты сошлись бы по CRC и дали бы чужие метрики.
+        // Version 1 is the previous layout, where a sample referred to a local
+        // series number and a separate record tied that number to a metric.
+        // This build cannot read such a segment, and "try to parse it anyway"
+        // is not an option either: the bytes would pass the CRC and yield the
+        // wrong metrics.
         for other in [1u8, 3, 255] {
             let mut bytes = header().to_bytes();
             bytes[4] = other;
-            // CRC пересчитан — имитируем честно записанный сегмент той версии.
+            // The CRC is recomputed — an honestly written segment of that
+            // version.
             let crc = crc32c::crc32c(&bytes[..28]);
             bytes[28..32].copy_from_slice(&crc.to_le_bytes());
             assert_eq!(
@@ -226,7 +229,7 @@ mod tests {
                     other,
                     crate::CONTAINER_VERSION
                 )),
-                "версия контейнера {other}"
+                "container version {other}"
             );
         }
     }
@@ -241,7 +244,7 @@ mod tests {
             "0000002a-00000000000f4240.seg"
         );
 
-        // Лексикографический порядок имён = временной порядок.
+        // Lexicographic order of names equals chronological order.
         let mut names: Vec<String> = vec![
             SegmentName::new(BootCounter(2), Micros(5)).to_string(),
             SegmentName::new(BootCounter(1), Micros(500)).to_string(),
@@ -255,17 +258,14 @@ mod tests {
             .collect();
         let mut expected = parsed.clone();
         expected.sort();
-        assert_eq!(
-            parsed, expected,
-            "порядок строк совпадает с порядком (boot, время)"
-        );
+        assert_eq!(parsed, expected, "string order matches (boot, time) order");
     }
 
     #[test]
     fn name_parse_rejects_junk() {
         assert_eq!(SegmentName::parse("readme.txt"), None);
         assert_eq!(SegmentName::parse("0000002a.seg"), None);
-        // Нестрогая ширина ломала бы сортировку — отвергаем.
+        // A loose width would break the sorting, so it is rejected.
         assert_eq!(SegmentName::parse("2a-3b9aca00.seg"), None);
         assert_eq!(SegmentName::parse("0000002a-000000003b9aca0.seg"), None);
         assert_eq!(SegmentName::parse("zzzzzzzz-000000003b9aca00.seg"), None);
@@ -273,25 +273,25 @@ mod tests {
 
     #[test]
     fn parse_accepts_only_what_display_produces() {
-        // Каждое из этих имён `from_str_radix` разобрал бы, и сегмент получил
-        // бы второе написание: в инвентаре он оказался бы двумя записями, а
-        // на диске остался бы одним файлом.
+        // `from_str_radix` would parse every one of these names, giving the
+        // segment a second spelling: the inventory would hold two entries while
+        // the disk holds one file.
         for junk in [
-            "+000002a-000000003b9aca00.seg", // знак вместо цифры
-            "0000002A-000000003b9aca00.seg", // прописные
-            "0000002a-000000003B9ACA00.seg", // прописные во второй половине
-            "0000002a-+00000003b9aca00.seg", // знак во второй половине
-            "0000002a-000000003b9aca00.SEG", // расширение не то
-            " 000002a-000000003b9aca00.seg", // пробел
+            "+000002a-000000003b9aca00.seg", // a sign instead of a digit
+            "0000002A-000000003b9aca00.seg", // uppercase
+            "0000002a-000000003B9ACA00.seg", // uppercase in the second half
+            "0000002a-+00000003b9aca00.seg", // a sign in the second half
+            "0000002a-000000003b9aca00.SEG", // the wrong extension
+            " 000002a-000000003b9aca00.seg", // a space
         ] {
             assert_eq!(
                 SegmentName::parse(junk),
                 None,
-                "{junk:?} не порождается Display и не должно разбираться"
+                "{junk:?} is not produced by Display and must not parse"
             );
         }
 
-        // А то, что Display породил, — обязано разбираться обратно.
+        // And what Display produced must parse back.
         for (boot, base) in [(0u32, 0u64), (u32::MAX, u64::MAX), (0xabcdef, 0x123456789)] {
             let n = SegmentName::new(BootCounter(boot), Micros(base));
             assert_eq!(SegmentName::parse(&n.to_string()), Some(n));

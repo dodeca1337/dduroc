@@ -1,32 +1,33 @@
-//! Байтовый формат хранения dduroc: сегменты, блоки, записи.
+//! The dduroc on-disk byte format: segments, blocks, records.
 //!
-//! Крейт содержит **только кодеки и валидацию** — никакого I/O, никакого
-//! состояния, ничего асинхронного. Всё, что здесь есть, — чистые функции над
-//! срезами байт, поэтому слой полностью покрывается unit- и property-тестами,
-//! а движок ([`dduroc-engine`]) отвечает отдельно за файлы, потоки и политики.
+//! This crate contains **codecs and validation only** — no I/O, no state,
+//! nothing asynchronous. Everything here is a pure function over byte slices,
+//! so the layer is fully covered by unit and property tests, while the engine
+//! ([`dduroc-engine`]) answers separately for files, threads and policies.
 //!
-//! # Структура
+//! # Structure
 //!
 //! ```text
 //! <root>/<namespace>/<channel>/<boot:08x>-<micros:016x>.seg
 //!   [SegmentHeader 32B] [Block]* [Footer]?
-//!        Block = [BlockHeader 32B] [тело: записи, опц. сжатое]
+//!        Block = [BlockHeader 32B] [body: records, optionally compressed]
 //! ```
 //!
-//! Неймспейс и канал в байтах не кодируются — они имплицитны из пути файла.
+//! The namespace and the channel are not encoded in the bytes at all — they
+//! are implicit in the file path.
 //!
-//! # Принципы
+//! # Principles
 //!
-//! - **На диск только динамика.** Уровни, шаблоны текста, тэги сообщений,
-//!   имена типов живут в схеме бинарника и резолвятся при чтении.
-//! - **Дельты времени.** Записи внутри блока хранят varint-дельту от
-//!   предыдущей записи: 1–3 байта против 10-байтового ключа в LSM-прототипе.
-//! - **Целостность на блок.** CRC32C и сжатие амортизируются на блок, а не
-//!   на запись.
-//! - **Обрыв питания — норма.** Незавершённый хвост активного сегмента
-//!   отличим от порчи: см. [`Error::is_torn_tail`].
-//! - **armv7.** Размеры и смещения файлов — всегда `u64`, никогда `usize`;
-//!   mmap не используется.
+//! - **Only what varies goes to disk.** Levels, text templates, message tags
+//!   and type names live in the binary's schema and are resolved at read time.
+//! - **Time deltas.** Records within a block store a varint delta from the
+//!   previous record: 1–3 bytes against the 10-byte key of the LSM prototype.
+//! - **Integrity per block.** CRC32C and compression are amortized over a
+//!   block, not over a record.
+//! - **Power loss is normal.** An unfinished tail of an active segment is
+//!   distinguishable from corruption: see [`Error::is_torn_tail`].
+//! - **armv7.** File sizes and offsets are always `u64`, never `usize`; mmap
+//!   is not used.
 //!
 //! [`dduroc-engine`]: https://docs.rs/dduroc-engine
 
@@ -55,16 +56,16 @@ pub use record::{Framed, Message, Record, RecordKind, Sample, SpanStart, Text};
 pub use segment::{SegmentHeader, SegmentName};
 pub use value::{Value, ValueType};
 
-/// Версия контейнера — байтового формата как такового. Не путать с версией
-/// протокола схемы ([`ProtocolVersion`]), которая принадлежит приложению и
-/// меняется его миграциями.
+/// The container version — the byte format as such. Not to be confused with
+/// the schema protocol version ([`ProtocolVersion`]), which belongs to the
+/// application and changes with its migrations.
 ///
-/// | версия | что изменилось |
+/// | version | what changed |
 /// |---|---|
-/// | 1 | первая раскладка: сэмпл ссылался на сегментно-локальный номер серии, отдельная запись `SeriesDef` связывала его с метрикой и рантайм-тэгами, таблица серий дублировалась в footer'е |
-/// | 2 | рантайм-тэгов нет: идентичность ряда равна метрике, сэмпл несёт `metric_id`, запись `SeriesDef` и таблица серий удалены |
+/// | 1 | the first layout: a sample referred to a segment-local series number, a separate `SeriesDef` record tied that number to a metric and to runtime tags, and the series table was duplicated in the footer |
+/// | 2 | no runtime tags: a series is identified by its metric, a sample carries `metric_id`, and both the `SeriesDef` record and the series table are gone |
 ///
-/// Читатель принимает **только** текущую версию: несовпадение — внятная
-/// ошибка [`Error::UnsupportedContainerVersion`], а не попытка угадать
-/// раскладку. Файл прежней версии остаётся читаемым прежним билдом.
+/// A reader accepts **only** the current version: a mismatch is a clear
+/// [`Error::UnsupportedContainerVersion`], not an attempt to guess the layout.
+/// A file of an earlier version stays readable by the earlier build.
 pub const CONTAINER_VERSION: u8 = 2;
