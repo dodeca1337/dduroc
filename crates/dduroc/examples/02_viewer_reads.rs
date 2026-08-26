@@ -1,11 +1,12 @@
-//! Журнал читают: запросы, окна времени, восстановление текста и состояний.
+//! The journal is read: queries, time windows, restoring text and states.
 //!
-//! Запуск: `cargo run -p dduroc --example 02_viewer_reads`
+//! Run: `cargo run -p dduroc --example 02_viewer_reads`
 //!
-//! Читатель один и тот же на приборе и в офлайн-вьюере: ему нужны каталог
-//! хранилища и схемы приложения — без схемы записи остаются идентификаторами
-//! с бинарными полями. Пример сначала пишет историю двух запусков (запуск =
-//! открытие Store), затем разбирает её запросами.
+//! The reader is one and the same on a device and in an offline viewer: it
+//! needs the store's directory and the application's schemas — without a schema
+//! the records stay identifiers with binary fields. The example first writes
+//! the history of two runs (a run = opening a Store), then takes it apart with
+//! queries.
 
 use dduroc::prelude::*;
 use dduroc::read::{EntryKind, KindFilter, Order, Query, Reader, Tail};
@@ -48,8 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = StoreConfig::new(&root).with_budget_per_class(16 << 20);
 
     // -----------------------------------------------------------------------
-    // История. Запуск 1: связь поднялась — единственное изменение состояния
-    // за всю историю (пригодится ниже, в подтяжке состояний).
+    // The history. Run 1: the link came up — the only change of state in the
+    // whole history (useful below, in carrying states through).
     // -----------------------------------------------------------------------
     let boot_first;
     {
@@ -65,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.shutdown();
     }
 
-    // Запуск 2: пришла синхронизация времени, случился перегрев.
+    // Run 2: a time synchronization arrived and an overheat happened.
     let boot_second;
     let sync_at;
     {
@@ -74,8 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
         ns.log(radio::events::Started);
 
-        // Якорь ретроактивен на всю загрузку железа: настенное время получат
-        // и записи ПЕРВОГО запуска — процесс перезапускался, прибор нет.
+        // The anchor is retroactive across the whole hardware boot: the records
+        // of the FIRST run get a wall-clock time too — the process restarted,
+        // the device did not.
         sync_at = Utc::now();
         store.record_sync(sync_at, SyncSource::Ntp)?;
 
@@ -84,100 +86,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         temp.sample(52.0);
         temp.sample(88.5);
         ns.log(radio::events::Overheat { t: 88.5 });
-        ns.log_text(Level::Warn, "app", "мощность сброшена до безопасной", None);
+        ns.log_text(Level::Warn, "app", "power dropped to a safe level", None);
         ns.log(radio::events::PowerSet { dbm: 5.0 });
         ns.sync()?;
 
         // -------------------------------------------------------------------
-        // Живое чтение: хранилище ПИШЕТСЯ прямо сейчас, и читается им же —
-        // `store.reader()` параллелен записи по построению. Создаётся один
-        // раз, правду (корни, схемы, якоря времени) спрашивает у хранилища
-        // на каждый запрос; ротация и дописываемый хвост сегмента для него
-        // штатные события, а не порча. Видно то, что уже на носителе, — тому
-        // и служил `sync()` строкой выше.
+        // Live reading: the store is being WRITTEN right now and is read by the
+        // same process — `store.reader()` is parallel to writing by construction.
+        // It is created once and asks the store for the truth (the roots, the
+        // schemas, the time anchors) on every query; rotation and a segment's
+        // growing tail are ordinary events for it rather than damage. What is
+        // visible is what is on the medium — which is what the `sync()` a line
+        // above was for.
         // -------------------------------------------------------------------
         let live = store.reader();
         let now = live.query(&Query::new().kinds(KindFilter::LOGS).limit(3))?;
-        println!("— живое чтение, писатель не останавливался —");
+        println!("— live reading, the writer never stopped —");
         for e in &now.entries {
-            println!("  {}", live.render(e, "ru").unwrap_or_default());
+            println!("  {}", live.render(e, "en").unwrap_or_default());
         }
         assert!(now.damaged.is_empty());
 
         // -------------------------------------------------------------------
-        // Подписка: то же окно, но поток не заканчивается на конце данных, а
-        // ждёт продолжения. Читатель спит, пока писать нечего, и просыпается
-        // на первом же блоке, легшем в файл, — опрос по таймеру не нужен.
-        // `Idle` — тишина, а не конец; конец объявляется только `Ended`.
+        // A subscription: the same window, but the stream does not end at the end
+        // of the data — it waits for more. The reader sleeps while there is nothing
+        // to write and wakes on the very first block that lands in a file, so no
+        // polling on a timer is needed. `Idle` is silence, not the end; the end is
+        // announced only by `Ended`.
         // -------------------------------------------------------------------
         let mut tail = live.follow(&Query::new().since(ns.now()).order(Order::Oldest))?;
         ns.log(radio::events::PowerSet { dbm: 12.0 });
         ns.log(radio::events::Started);
         ns.sync()?;
 
-        println!("— подписка на поток —");
+        println!("— a subscription to the stream —");
         let mut seen = 0;
         while seen < 2 {
             match tail.next(std::time::Duration::from_millis(200)) {
                 Tail::Entry(e) => {
                     seen += 1;
-                    println!("  {}", live.render(&e, "ru").unwrap_or_default());
+                    println!("  {}", live.render(&e, "en").unwrap_or_default());
                 }
-                // В примере ждать нечего: всё написанное уже на носителе.
+                // In this example there is nothing to wait for: everything
+                // written is already on the medium.
                 Tail::Idle => break,
                 Tail::Ended => break,
             }
         }
-        assert_eq!(seen, 2, "подписка отдала обе записи");
+        assert_eq!(seen, 2, "the subscription handed out both records");
         assert!(tail.take_damage().is_empty());
 
         store.shutdown();
     }
 
     // -----------------------------------------------------------------------
-    // Дальше — офлайн-вьюер: хранилище закрыто, разбирается его дамп.
-    // `Store` для дампа не открывают (он берёт блокировку корня и подметает
-    // временные файлы) — ВСЕ корни дампа и схемы называются разом; для дампа
-    // с другого прибора есть `allow_foreign_segments`. Полнота проверяется
-    // при открытии: дамп, в котором не хватает дерева какого-то класса, — это
-    // ошибка, а не молча укороченная история. Reader дампа не изменяет ничего
-    // и замораживает снимок в момент открытия.
+    // From here on it is the offline viewer: the store is closed and its dump is
+    // taken apart. A `Store` is not opened for a dump (it takes a lock on the root
+    // and sweeps temporary files) — ALL of the dump's roots and schemas are named
+    // at once; for a dump from another device there is `allow_foreign_segments`.
+    // Completeness is checked at open time: a dump missing some class's tree is an
+    // error rather than a silently shortened history. A dump's Reader changes
+    // nothing and freezes a snapshot at the moment it opens.
     // -----------------------------------------------------------------------
     let reader = Reader::open_dump([&root], &[radio::SCHEMA])?;
 
-    println!("— что есть в хранилище —");
+    println!("— what is in the store —");
     let listing = reader.namespaces()?;
     for ns in &listing.namespaces {
         println!(
-            "  {}: схема {} v{}, каналы {:?}, занято {} Б",
+            "  {}: schema {} v{}, channels {:?}, {} B taken",
             ns.name, ns.schema_name, ns.protocol_version, ns.channels, ns.total_bytes
         );
     }
-    // Нечитаемый неймспейс попал бы в `listing.damaged`, а не выпал молча.
+    // An unreadable namespace would reach `listing.damaged` rather than drop
+    // out silently.
     assert!(listing.is_complete());
 
     // -----------------------------------------------------------------------
-    // «Последние события» — запрос по умолчанию: от нового к старому.
-    // Текст записи на диске не лежал — он собран из шаблона схемы на
-    // выбранном языке. У каждой записи есть относительное время (запуск +
-    // микросекунды), настенное — только благодаря якорю.
+    // "The latest events" is the default query: newest to oldest. A record's text
+    // was not on disk — it is assembled from the schema's template in the chosen
+    // language. Every record has a relative time (a run plus microseconds), and a
+    // wall-clock one only thanks to an anchor.
     // -----------------------------------------------------------------------
-    println!("\n— последние 5 записей журнала (ru) —");
+    println!("\n— the last 5 journal records —");
     let last = reader.query(&Query::new().kinds(KindFilter::LOGS).limit(5))?;
     for e in &last.entries {
         println!("  {}", line(&reader, e));
     }
     println!(
-        "  (ответ обрезан по limit: {}, повреждений: {})",
+        "  (the answer was cut short by limit: {}, damaged: {})",
         last.truncated,
         last.damaged.len()
     );
 
     // -----------------------------------------------------------------------
-    // Фильтры считаются по схеме ДО сканирования: уровень и тэги — свойства
-    // типов, диск для такого отбора читается только там, где эти типы есть.
+    // Filters are computed from the schema BEFORE any scanning: levels and tags
+    // are properties of types, and for such a selection the disk is read only
+    // where those types are.
     // -----------------------------------------------------------------------
-    println!("\n— только Warn и выше —");
+    println!("\n— Warn and above only —");
     for e in &reader
         .query(
             &Query::new()
@@ -190,10 +197,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {}", line(&reader, e));
     }
 
-    println!("\n— всё с тэгом thermal —");
-    // Тэг несут сообщения и отсчёты (у метрик — свои тэги); свободный текст
-    // и спаны не несут и пройти такой фильтр не могут — они исключаются, а
-    // не просачиваются.
+    println!("\n— everything with the thermal tag —");
+    // Messages and samples carry tags (metrics have tags of their own); free
+    // text and spans do not and cannot pass such a filter — they are excluded
+    // rather than slipping through.
     for e in &reader
         .query(&Query::new().any_tag("thermal").order(Order::Oldest))?
         .entries
@@ -202,13 +209,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
-    // Типизированный разбор: `render` отдаёт текст, `reader.decode::<E>` —
-    // ПОЛЯ, тем же типом, которым событие писалось. Тип сверяется по схеме
-    // неймспейса записи: совпадение id с чужой схемой — не совпадение типа.
-    // `None` — запись не событие E; `Some(Err)` — объявляет себя E, но поля
-    // не разобрались (порча, о которой нельзя молчать).
+    // Typed parsing: `render` gives the text, `reader.decode::<E>` the FIELDS,
+    // with the same type the event was written with. The type is checked against
+    // the schema of the record's namespace: a matching id from a foreign schema is
+    // not a matching type. `None` means the record is not an event E; `Some(Err)`
+    // that it declares itself an E but the fields did not parse (corruption that
+    // must not be passed over).
     // -----------------------------------------------------------------------
-    println!("\n— поля событий, не текст —");
+    println!("\n— the fields of events, not the text —");
     for e in &reader
         .query(
             &Query::new()
@@ -218,15 +226,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .entries
     {
         if let Some(Ok(radio::events::Overheat { t })) = reader.decode(e) {
-            println!("  перегрев как данные: t = {t} — можно считать, а не читать");
+            println!("  the overheat as data: t = {t} — it can be computed with, not just read");
         }
     }
 
     // -----------------------------------------------------------------------
-    // Телеметрия. Имя метрики, единица, подпись состояния и важность
-    // восстановлены по схеме — на диске лежали идентификатор и значение.
+    // Telemetry. The metric's name, its unit, the state's label and the severity
+    // are restored from the schema — an identifier and a value lay on disk.
     // -----------------------------------------------------------------------
-    println!("\n— телеметрия, от старого к новому —");
+    println!("\n— telemetry, oldest to newest —");
     for e in &reader
         .query(
             &Query::new()
@@ -254,17 +262,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or_default(),
                 severity.unwrap_or_default(),
                 state_name
-                    .map(|s| format!(" состояние: {s}"))
+                    .map(|s| format!(" state: {s}"))
                     .unwrap_or_default(),
             );
         }
     }
 
     // -----------------------------------------------------------------------
-    // Окна времени. Граница — либо BootTime (есть всегда), либо UTC
-    // (сравнима с записями только через якорь).
+    // Time windows. A bound is either a BootTime (always present) or a UTC
+    // (comparable with records only through an anchor).
     // -----------------------------------------------------------------------
-    println!("\n— журнал первого запуска (boot {boot_first}) —");
+    println!("\n— the first run's journal (boot {boot_first}) —");
     for e in &reader
         .query(
             &Query::new()
@@ -277,7 +285,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {}", line(&reader, e));
     }
 
-    println!("\n— окно по настенным часам: минута вокруг синхронизации —");
+    println!("\n— a wall-clock window: the minute around the synchronization —");
     let minute = reader.query(
         &Query::new()
             .time_window(
@@ -287,27 +295,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .order(Order::Oldest),
     )?;
     println!(
-        "  записей: {} (в окне оба запуска: якорь одной загрузки общий), \
-         выпавших запусков: {}",
+        "  records: {} (both runs are in the window: one boot shares its anchor), \
+         runs dropped: {}",
         minute.entries.len(),
         minute.unanchored.len()
     );
 
     // -----------------------------------------------------------------------
-    // Подтяжка состояний. Состояния пишутся ПО ИЗМЕНЕНИЮ; окно «второй
-    // запуск» не содержит ни одного отсчёта LinkState — но полоса состояний
-    // на графике не должна быть пустой: связь всё это время была в Lock.
-    // `with_state_seed` кладёт последний отсчёт каждого ряда-состояний до
-    // окна в `seeds` — отдельно, не нарушая «всё в entries лежит в окне».
+    // Carrying states through. States are written ON CHANGE; the window "the
+    // second run" holds not one LinkState sample — but the state band on a chart
+    // must not be empty: the link was in Lock the whole time. `with_state_seed`
+    // puts the last sample of every state series before the window into `seeds` —
+    // separately, without breaking "everything in entries lies inside the window".
     // -----------------------------------------------------------------------
-    println!("\n— второй запуск + состояния на левый край окна —");
+    println!("\n— the second run plus states carried to the window's left edge —");
     let seeded = reader.query(
         &Query::new()
             .since(BootTime::new(BootCounter(boot_second), Micros(0)))
             .kinds(KindFilter::TELEMETRY)
             .with_state_seed(),
     )?;
-    println!("  отсчётов в окне: {}", seeded.entries.len());
+    println!("  samples in the window: {}", seeded.entries.len());
     for seed in &seeded.seeds {
         if let EntryKind::Sample {
             metric_name,
@@ -316,7 +324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } = &seed.kind
         {
             println!(
-                "  затравка: {} = {} (отсчёт из прошлого, {})",
+                "  seed: {} = {} (a sample from the past, {})",
                 metric_name.unwrap_or("?"),
                 state_name.unwrap_or("?"),
                 seed.at
@@ -325,25 +333,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // -----------------------------------------------------------------------
-    // Поток вместо собранного ответа. `query` собирает всё в память;
-    // на большом хранилище единственный способ читать много — `stream`:
-    // слияние каналов по времени, записи выдаются по одной, обход можно
-    // бросить в любой момент.
+    // A stream instead of an assembled answer. `query` gathers everything in
+    // memory; on a large store the only way to read a lot is `stream`: the
+    // channels are merged by time, the records are handed out one at a time, and
+    // the walk can be abandoned at any moment.
     // -----------------------------------------------------------------------
-    println!("\n— поток: первые 3 записи, дальше не читаем —");
+    println!("\n— the stream: the first 3 records, then we stop reading —");
     let mut stream = reader.stream(&Query::new().kinds(KindFilter::LOGS).order(Order::Oldest))?;
     for e in stream.by_ref().take(3) {
         println!("  {}", line(&reader, &e));
     }
-    println!("  выдано: {}", stream.yielded());
+    println!("  handed out: {}", stream.yielded());
 
     // -----------------------------------------------------------------------
-    // Честность ответа. Повреждённый фрагмент попадает в `damaged` с именем
-    // и причиной — ответ не притворяется полным. Другой сорт неполноты —
-    // `unanchored`: окно задано настенным временем, а у загрузки нет якоря,
-    // и сравнить её записи с часами нечем. Хранилище без единой
-    // синхронизации отвечает на настенное окно пустотой — но называет
-    // запуски, которые выпали, вместо «прибор ничего не писал».
+    // An honest answer. A damaged fragment reaches `damaged` with its name and
+    // the reason — the answer does not pretend to be complete. The other kind of
+    // incompleteness is `unanchored`: the window is in wall-clock time while the
+    // boot has no anchor, and there is nothing to compare its records with a clock
+    // with. A store with not one synchronization answers a wall-clock window with
+    // emptiness — but names the runs that dropped out instead of "the device wrote
+    // nothing".
     // -----------------------------------------------------------------------
     let lone = std::env::temp_dir()
         .join("dduroc-examples")
@@ -354,13 +363,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
         ns.log(radio::events::Started);
         ns.sync()?;
-        store.shutdown(); // record_sync не звали: якоря нет
+        store.shutdown(); // record_sync was never called: there is no anchor
     }
     let no_clock = Reader::open_dump([&lone], &[radio::SCHEMA])?;
     let asked = no_clock
         .query(&Query::new().time_window(sync_at - chrono::TimeDelta::hours(1), sync_at))?;
     println!(
-        "\n— настенное окно без якоря: записей {}, выпали запуски {:?} —",
+        "\n— a wall-clock window with no anchor: records {}, runs dropped {:?} —",
         asked.entries.len(),
         asked.unanchored
     );
@@ -368,7 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Строка журнала: время, уровень, текст на русском.
+/// A journal line: the time, the level, the text.
 fn line(reader: &Reader, e: &dduroc::read::Entry) -> String {
     let clock = e
         .utc
@@ -379,7 +388,7 @@ fn line(reader: &Reader, e: &dduroc::read::Entry) -> String {
             metric_name, value, ..
         } => format!("{} = {value:?}", metric_name.unwrap_or("?")),
         _ => reader
-            .render(e, "ru")
+            .render(e, "en")
             .unwrap_or_else(|| format!("{:?}", e.kind)),
     };
     format!(

@@ -1,12 +1,12 @@
-//! Сквозные проверки под нагрузкой: общий бюджет класса, личные квоты,
-//! обратное давление критической очереди, многопоточная запись и чтение
-//! живого хранилища.
+//! End-to-end checks under load: the shared class budget, personal quotas,
+//! back pressure on the critical queue, multi-threaded writing and reading a
+//! live store.
 //!
-//! Всё это до сих пор держалось на юнит-тестах и ревью. Ротация проверялась
-//! на инвентаре из файлов, набитых нулями, — ни один тест не заставлял writer
-//! действительно выйти за бюджет; обратное давление не исполнялось ни разу;
-//! потоков в тестах не было вовсе, хотя писать из многих потоков — основной
-//! режим работы библиотеки.
+//! All of this used to rest on unit tests and review. Rotation was checked on
+//! an inventory of files stuffed with zeros — no test made the writer actually
+//! exceed its budget; back pressure was never exercised; there were no threads
+//! in the tests at all, although writing from many threads is the library's
+//! main mode of operation.
 
 use dduroc::prelude::*;
 use dduroc::{
@@ -33,8 +33,8 @@ dduroc::schema! {
     }
 }
 
-/// Несжимаемые байты: LZ4 не должен свести объём к нулю, иначе сегменты не
-/// кончатся и проверять будет нечего.
+/// Incompressible bytes: LZ4 must not reduce the volume to nothing, or the
+/// segments will not run out and there will be nothing to check.
 fn noise(n: usize) -> Vec<u8> {
     let mut s: u64 = 0x2545_F491_4F6C_DD1D;
     (0..n)
@@ -47,7 +47,7 @@ fn noise(n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Суммарный размер сегментов в дереве каталогов.
+/// The total size of the segments in a directory tree.
 fn bytes_under(root: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
@@ -67,11 +67,11 @@ fn bytes_under(root: &Path) -> u64 {
         .sum()
 }
 
-/// Номера, дошедшие до диска, в порядке чтения.
+/// The numbers that reached the disk, in read order.
 fn sequence(root: &Path) -> Vec<u64> {
     let reader = Reader::open_dump([root], &[pressure::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
-    assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
+    assert!(result.is_complete(), "damage: {:?}", result.damaged);
     result
         .entries
         .iter()
@@ -88,9 +88,9 @@ fn sequence(root: &Path) -> Vec<u64> {
 
 #[test]
 fn rotation_drops_the_oldest_and_keeps_the_class_inside_its_budget() {
-    // Бюджет объявлен на класс; здесь класс представлен одним неймспейсом —
-    // и именно тут сходятся преаллокация, учёт размера после запечатывания
-    // и защита активного сегмента.
+    // The budget is declared on a class; here the class is represented by one
+    // namespace — and this is exactly where the reserve, the size accounting
+    // after sealing and the protection of the active segment meet.
     const BUDGET: u64 = 32 << 20;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(BUDGET)).unwrap();
@@ -98,7 +98,7 @@ fn rotation_drops_the_oldest_and_keeps_the_class_inside_its_budget() {
     let seq = ns.series(pressure::metrics::Seq).unwrap();
     let bulk = ns.series(pressure::metrics::Bulk).unwrap();
 
-    // Пишем вдвое больше бюджета: каждая порция помечена своим номером.
+    // We write twice the budget: every batch is marked with its own number.
     let chunk = noise(64 << 10);
     let rounds = (BUDGET / chunk.len() as u64) * 2;
     for i in 0..rounds {
@@ -112,50 +112,51 @@ fn rotation_drops_the_oldest_and_keeps_the_class_inside_its_budget() {
     store.shutdown();
 
     let stats = store.stats();
-    assert_eq!(stats.dropped, 0, "очередь успевала: {stats:?}");
+    assert_eq!(stats.dropped, 0, "the queue kept up: {stats:?}");
     assert!(
         stats.segments_rotated > 0,
-        "иначе тест не про ротацию: {stats:?}"
+        "otherwise the test is not about rotation: {stats:?}"
     );
 
     let occupied = bytes_under(dir.path());
     assert!(
         occupied <= BUDGET,
-        "канал занимает {occupied} при бюджете {BUDGET}"
+        "the channel takes {occupied} on a budget of {BUDGET}"
     );
 
-    // И главное — ротация съела НАЧАЛО истории, а не её конец. Обратное
-    // означало бы, что прибор выбрасывает свежие данные, оставляя древние.
+    // And most of all — rotation ate the BEGINNING of the history, not its end.
+    // The reverse would mean the device throws away fresh data and keeps
+    // ancient.
     let seen = sequence(dir.path());
-    assert!(!seen.is_empty(), "что-то обязано было уцелеть");
+    assert!(!seen.is_empty(), "something had to survive");
     assert_eq!(
         *seen.last().unwrap(),
         rounds - 1,
-        "последняя запись обязана уцелеть"
+        "the last record has to survive"
     );
     assert!(
         seen[0] > 0,
-        "иначе ничего не вытеснено и бюджет соблюдён случайно"
+        "otherwise nothing was evicted and the budget was met by accident"
     );
     assert!(
         seen.windows(2).all(|w| w[0] < w[1]),
-        "хвост истории обязан остаться непрерывным и упорядоченным"
+        "the tail of the history has to stay unbroken and ordered"
     );
 }
 
 #[test]
 fn the_class_budget_is_shared_across_namespaces() {
-    // Бюджет — свойство класса, а не неймспейса: «все логи — столько-то».
-    // Два неймспейса пишут в один класс и вместе обязаны уложиться в его
-    // бюджет; вытесняется старейшее по классу, в чьём бы каталоге оно ни
-    // лежало.
+    // The budget is a property of a class rather than of a namespace: "all logs
+    // get this much". Two namespaces write into one class and together have to
+    // fit its budget; the class's oldest is evicted whoever's directory it lies
+    // in.
     const CEILING: u64 = 12 << 20;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).channel(
         StorageClass::Default,
         ChannelConfig {
-            // Сегмент поменьше: двум активным сегментам положено влезать
-            // в бюджет с запасом на историю.
+            // A smaller segment: two active segments are supposed to fit the
+            // budget with room for history.
             segment_bytes: 4 << 20,
             ..ChannelConfig::new(CEILING)
         },
@@ -179,30 +180,30 @@ fn the_class_budget_is_shared_across_namespaces() {
     let occupied = bytes_under(dir.path());
     assert!(
         occupied > 0 && occupied <= CEILING,
-        "класс занимает {occupied} при бюджете {CEILING}"
+        "the class takes {occupied} on a budget of {CEILING}"
     );
     assert_eq!(
         store.stats().budget_overruns,
         0,
-        "бюджет класса выполним: активных сегментов всего два"
+        "the class budget is meetable: there are only two active segments"
     );
-    // Оба неймспейса участвовали — вытеснение шло по возрасту, а не по
-    // принципу «кто последний писал».
+    // Both namespaces took part — eviction went by age rather than by "who
+    // wrote last".
     for name in ["orc-0", "orc-1"] {
         assert!(
             bytes_under(&dir.path().join(name)) > 0,
-            "{name} вытеснен целиком: вытеснение обязано идти по возрасту"
+            "{name} was evicted entirely: eviction has to go by age"
         );
     }
 }
 
 #[test]
 fn a_group_hands_its_namespaces_their_own_segments_and_quota() {
-    // Настройки каналов задаются на всё хранилище, и это верно ровно до тех
-    // пор, пока неймспейсы однородны. Группа — способ сказать «у
-    // оркестраторов телеметрия своя» один раз, а не при каждом открытии
-    // неймспейса. Проверяется, что сказанное доезжает до носителя: и предел
-    // занятости, и размер сегмента.
+    // Channel settings are given for the whole store, and that holds exactly as
+    // long as the namespaces are uniform. A group is the way to say "the
+    // orchestrators' telemetry is its own" once rather than at every namespace
+    // open. What is checked is that what was said reaches the medium: both the
+    // occupancy limit and the segment size.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreConfig::new(dir.path())
@@ -235,20 +236,20 @@ fn a_group_hands_its_namespaces_their_own_segments_and_quota() {
     let occupied = bytes_under(&channel("orc-radio-0"));
     let outside = bytes_under(&channel("diag-0"));
 
-    // Квота группы держит своих: предел плюс активный сегмент, который
-    // вытеснить нельзя, — его преаллокация и есть гарантия ENOSPC.
+    // A group's quota holds its own: the limit plus the active segment, which
+    // cannot be evicted.
     assert!(
         occupied <= (256 << 10) + (64 << 10),
-        "квота группы не удержала: {occupied} Б"
+        "the group quota did not hold: {occupied} B"
     );
-    // Чужой квоты не унаследовал и черпает из общего бюджета класса.
+    // An outsider inherited no quota and draws on the class's shared budget.
     assert!(
         outside > occupied,
-        "неймспейс вне группы не должен подчиняться её квоте: {outside} Б против {occupied} Б"
+        "a namespace outside the group must not obey its quota: {outside} B against {occupied} B"
     );
 
-    // Размер сегмента тоже групповой: у чужого он общий, восьмимегабайтный,
-    // и весь его объём улёгся в один файл.
+    // The segment size is the group's too: an outsider gets the shared
+    // eight-megabyte one, and all of its volume fitted one file.
     let files = |name: &str| {
         std::fs::read_dir(channel(name))
             .unwrap()
@@ -258,22 +259,26 @@ fn a_group_hands_its_namespaces_their_own_segments_and_quota() {
             })
             .count()
     };
-    assert!(files("orc-radio-0") > 1, "мелкие сегменты группы");
-    assert_eq!(files("diag-0"), 1, "общий сегмент вмещает всё разом");
+    assert!(files("orc-radio-0") > 1, "the group's small segments");
+    assert_eq!(
+        files("diag-0"),
+        1,
+        "the shared segment holds everything at once"
+    );
 }
 
 #[test]
 fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
-    // Обещание критической очереди — «не потеряно»: при переполнении
-    // вызывающий ждёт места, а не получает дыру. Путь ожидания не исполнялся
-    // ни одним тестом, то есть обещание держалось на чтении кода.
+    // The critical queue's promise is "not lost": on overflow the caller waits
+    // for room rather than getting a hole. The waiting path was exercised by no
+    // test, which is to say the promise rested on reading the code.
     const N: u64 = 400;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreConfig::new(dir.path())
             .with_budget_per_class(16 << 20)
-            // Очередь на одну запись: ожидание становится не редкостью, а
-            // правилом — и проверяется именно оно.
+            // A queue of one record: waiting stops being a rarity and becomes
+            // the rule — and that is what is checked.
             .with_queues(QueueSizes {
                 normal: 1,
                 critical: 1,
@@ -284,7 +289,7 @@ fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
 
     for _ in 0..N {
         ns.try_log(pressure::events::Alarm)
-            .expect("критическая запись не имеет права быть отвергнутой");
+            .expect("a critical write has no right to be refused");
     }
     ns.sync().unwrap();
     store.shutdown();
@@ -292,36 +297,36 @@ fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
     let stats = store.stats();
     assert!(
         stats.backpressure_waits > 0,
-        "иначе ожидание не исполнялось и тест пуст: {stats:?}"
+        "otherwise the wait was never exercised and the test is empty: {stats:?}"
     );
-    assert_eq!(
-        stats.dropped, 0,
-        "критическая запись не теряется: {stats:?}"
-    );
+    assert_eq!(stats.dropped, 0, "a critical write is not lost: {stats:?}");
 
     let reader = Reader::open_dump([dir.path()], &[pressure::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
-    assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
+    assert!(result.is_complete(), "damage: {:?}", result.damaged);
     let alarms = result
         .entries
         .iter()
         .filter(|e| matches!(&e.kind, EntryKind::Message { event, .. } if event.0 == 2))
         .count();
-    assert_eq!(alarms as u64, N, "ждали места — значит все дошли");
+    assert_eq!(
+        alarms as u64, N,
+        "we waited for room, so all of them arrived"
+    );
     assert!(
         result
             .entries
             .iter()
             .all(|e| e.channel == StorageClass::Critical),
-        "критические события обязаны лежать в своём канале"
+        "critical events have to lie in their own channel"
     );
 }
 
 #[test]
 fn many_threads_write_one_namespace_without_losing_or_duplicating() {
-    // Писать из многих потоков — основной режим работы библиотеки, и ни один
-    // тест этого не делал: очередь, монотонность времени внутри канала и
-    // устойчивая сортировка батча проверялись поодиночке и умозрительно.
+    // Writing from many threads is the library's main mode of operation, and no
+    // test did it: the queue, the monotonicity of time within a channel and the
+    // stable sorting of a batch were checked one at a time and in the abstract.
     const THREADS: u64 = 8;
     const PER_THREAD: u64 = 500;
     let dir = tempfile::tempdir().unwrap();
@@ -333,8 +338,9 @@ fn many_threads_write_one_namespace_without_losing_or_duplicating() {
             let seq = ns.series(pressure::metrics::Seq).unwrap();
             s.spawn(move || {
                 for i in 0..PER_THREAD {
-                    // Очередь переполняется — ждём места, а не теряем:
-                    // тест про сохранность, а не про поведение при отказе.
+                    // The queue overflows — we wait for room rather than lose:
+                    // this test is about preservation, not about behaviour on
+                    // failure.
                     while seq.try_sample(t * PER_THREAD + i).is_err() {
                         std::thread::yield_now();
                     }
@@ -345,30 +351,31 @@ fn many_threads_write_one_namespace_without_losing_or_duplicating() {
 
     ns.sync().unwrap();
     store.shutdown();
-    assert_eq!(store.stats().dropped, 0, "ничего не отброшено");
+    assert_eq!(store.stats().dropped, 0, "nothing was discarded");
 
     let mut seen = sequence(dir.path());
     assert_eq!(
         seen.len() as u64,
         THREADS * PER_THREAD,
-        "ни потерь, ни дублей"
+        "neither losses nor duplicates"
     );
     seen.sort_unstable();
     seen.dedup();
     assert_eq!(
         seen.len() as u64,
         THREADS * PER_THREAD,
-        "каждый номер обязан встретиться ровно раз"
+        "every number has to appear exactly once"
     );
 }
 
 #[test]
 fn reading_a_live_store_never_takes_back_what_it_already_showed() {
-    // Читатель работает и на самом приборе, параллельно записи. Такого теста
-    // не было ни одного, а свойство важнее полноты: незапечатанный сегмент
-    // дочитывается сканом, и оборванный на полуслове блок — обычное дело.
-    // Требовать от живого чтения полноты нельзя, а вот отдать назад уже
-    // показанное — нельзя ему.
+    // The reader works on the device itself, in parallel with writing. There
+    // was not one test of that, and the property matters more than
+    // completeness: an unsealed segment is read to the end by scanning, and a
+    // block cut off mid-word is ordinary. Completeness cannot be demanded of
+    // live reading — but taking back what it has already shown is what it may
+    // not do.
     const N: u64 = 3_000;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(64 << 20)).unwrap();
@@ -403,8 +410,8 @@ fn reading_a_live_store_never_takes_back_what_it_already_showed() {
                 .count();
             assert!(
                 count >= floor,
-                "чтение отдало {count} записей после {floor}: уже показанное \
-                 не имеет права исчезать"
+                "the read handed out {count} records after {floor}: what has been shown \
+                 has no right to disappear"
             );
             floor = count;
             queries += 1;
@@ -412,36 +419,40 @@ fn reading_a_live_store_never_takes_back_what_it_already_showed() {
         queries
     });
 
-    assert!(queries > 0, "иначе чтение не пересеклось с записью");
+    assert!(queries > 0, "otherwise the read never overlapped the write");
     ns.sync().unwrap();
     store.shutdown();
 
-    // А после остановки — уже полнота: всё принятое обязано быть на месте.
+    // And after the stop, completeness: everything accepted has to be there.
     let seen = sequence(dir.path());
-    assert_eq!(seen.len() as u64, N, "после остановки ответ полон");
-    assert!(seen.windows(2).all(|w| w[0] < w[1]), "и упорядочен");
+    assert_eq!(
+        seen.len() as u64,
+        N,
+        "after the stop the answer is complete"
+    );
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "and ordered");
 }
 
 #[test]
 fn a_class_budget_below_two_segments_is_refused_at_open() {
-    // Бюджет класса ниже пары сегментов невыполним по построению: активный
-    // сегмент вытеснить нельзя. Узнать об этом при открытии — единственный
-    // момент, когда это ещё поправимо.
+    // A class budget below a pair of segments is unmeetable by construction:
+    // the active segment cannot be evicted. Learning that at open time is the
+    // only moment when it is still fixable.
     let dir = tempfile::tempdir().unwrap();
     let segment = ChannelConfig::new(0).segment_bytes;
     let err = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(segment))
-        .expect_err("невыполнимый бюджет обязан быть отвергнут");
+        .expect_err("an unmeetable budget must be refused");
     assert!(matches!(err, dduroc::Error::BadChannel { .. }), "{err}");
 
     Store::open(StoreConfig::new(dir.path()).with_budget_per_class(segment * 2))
-        .expect("двух сегментов уже достаточно");
+        .expect("two segments are already enough");
 }
 
 #[test]
 fn a_namespace_quota_rotates_inside_the_shared_class_budget() {
-    // Личная квота — необязательный предел ВНУТРИ общего бюджета класса:
-    // прожорливый сервис ротируется в её рамках, не дожидаясь, пока класс
-    // упрётся в свой бюджет, — и не выедает соседей.
+    // A personal quota is an optional limit INSIDE the class's shared budget: a
+    // greedy service rotates within it without waiting for the class to hit its
+    // budget — and does not eat its neighbours.
     const QUOTA: u64 = 16 << 20;
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(256 << 20)).unwrap();
@@ -465,8 +476,8 @@ fn a_namespace_quota_rotates_inside_the_shared_class_budget() {
     hog.sync().unwrap();
     store.shutdown();
     let stats = store.stats();
-    // Блокировка корня снимается вместе с последней ручкой: ряд и неймспейс
-    // держат хранилище живым.
+    // The lock on the root is released with the last handle: a series and a
+    // namespace keep the store alive.
     drop(bulk);
     drop(hog);
     drop(store);
@@ -474,14 +485,15 @@ fn a_namespace_quota_rotates_inside_the_shared_class_budget() {
     let occupied = bytes_under(&dir.path().join("orc-hog"));
     assert!(
         occupied > 0 && occupied <= QUOTA,
-        "неймспейс занимает {occupied} при квоте {QUOTA}"
+        "the namespace takes {occupied} on a quota of {QUOTA}"
     );
     assert!(
         stats.segments_rotated > 0,
-        "квота обязана была сработать: {stats:?}"
+        "the quota had to fire: {stats:?}"
     );
 
-    // Квота меньше двух сегментов бессмысленна и отвергается при открытии.
+    // A quota smaller than two segments is meaningless and is refused at open
+    // time.
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(256 << 20)).unwrap();
     let err = store
         .namespace_with_quota(
@@ -489,16 +501,16 @@ fn a_namespace_quota_rotates_inside_the_shared_class_budget() {
             pressure::SCHEMA,
             NsQuota::new().limit_bytes(StorageClass::Default, 1 << 20),
         )
-        .expect_err("квота в один сегмент бессмысленна");
+        .expect_err("a quota of one segment is meaningless");
     assert!(matches!(err, dduroc::Error::BadChannel { .. }), "{err}");
     store.shutdown();
 }
 
 #[test]
 fn a_class_can_live_on_its_own_root() {
-    // Критические данные должны уметь жить на своём носителе (защищённый
-    // раздел вроде jffs2): классу задаётся собственный корень, раскладка
-    // внутри него та же — `<корень>/<неймспейс>/<класс>/`.
+    // Critical data has to be able to live on a medium of its own (a protected
+    // partition such as jffs2): a class is given its own root, and the layout
+    // inside it is the same — `<root>/<namespace>/<class>/`.
     let main = tempfile::tempdir().unwrap();
     let vault = tempfile::tempdir().unwrap();
     {
@@ -522,21 +534,21 @@ fn a_class_can_live_on_its_own_root() {
         store.shutdown();
     }
 
-    // Сегменты легли по своим носителям.
+    // The segments landed on their own media.
     assert!(
         bytes_under(&vault.path().join("orc-0").join("critical")) > 0,
-        "критический канал живёт на своём разделе"
+        "the critical channel lives on its own partition"
     );
     assert!(
         !main.path().join("orc-0").join("critical").exists(),
-        "в основном корне критического каталога нет"
+        "there is no critical directory in the main root"
     );
     assert!(
         bytes_under(&main.path().join("orc-0").join("default")) > 0,
-        "обычный канал остался в основном корне"
+        "the ordinary channel stayed in the main root"
     );
 
-    // Читатель собирает оба дерева: дамп открывается всеми корнями разом.
+    // The reader gathers both trees: a dump is opened with every root at once.
     let reader = Reader::open_dump([main.path(), vault.path()], &[pressure::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "{:?}", result.damaged);
@@ -548,16 +560,21 @@ fn a_class_can_live_on_its_own_root() {
             _ => None,
         })
         .collect();
-    assert_eq!(kinds, [1, 2], "видны и обычное, и критическое");
+    assert_eq!(
+        kinds,
+        [1, 2],
+        "both the ordinary and the critical are visible"
+    );
     let listing = reader.namespaces().unwrap();
     assert_eq!(
         listing.namespaces[0].channels,
         [StorageClass::Default, StorageClass::Critical],
-        "перечисление сливает каналы обоих корней"
+        "the listing merges the channels of both roots"
     );
 
-    // Дамп без второго дерева — не «короткий ответ», а отказ: полнота
-    // проверяется по схеме при открытии, и потерять критику молча нельзя.
+    // A dump without the second tree is not a "short answer" but a refusal:
+    // completeness is checked against the schema at open time, and the critical
+    // part must not be lost silently.
     let e = Reader::open_dump([main.path()], &[pressure::SCHEMA]).unwrap_err();
     assert!(
         matches!(
@@ -569,10 +586,10 @@ fn a_class_can_live_on_its_own_root() {
     );
 }
 
-/// Сколько дескрипторов процесса указывает внутрь дерева.
+/// How many of the process's descriptors point inside a tree.
 fn open_fds_under(dir: &Path) -> usize {
     std::fs::read_dir("/proc/self/fd")
-        .expect("procfs смонтирована")
+        .expect("procfs is mounted")
         .filter_map(|e| e.ok())
         .filter_map(|e| std::fs::read_link(e.path()).ok())
         .filter(|target| target.starts_with(dir))
@@ -581,14 +598,14 @@ fn open_fds_under(dir: &Path) -> usize {
 
 #[test]
 fn a_query_does_not_hold_a_descriptor_per_channel() {
-    // Слияние по времени требует головы от КАЖДОГО курсора, а курсор заводится
-    // на каждую пару (неймспейс, канал). Пока курсор держал открытый сегмент,
-    // один запрос стоил дескриптора на канал: на заявленных двадцати четырёх
-    // тысячах неймспейсов это десятки тысяч открытых файлов сверх тех, что
-    // держит writer, — то есть отказ по `ulimit` на ровном месте.
+    // Merging by time needs a head from EVERY cursor, and a cursor is created
+    // per (namespace, channel) pair. While a cursor held an open segment, one
+    // query cost a descriptor per channel: at the twenty-four thousand
+    // namespaces claimed that is tens of thousands of open files on top of what
+    // the writer holds — that is, a `ulimit` failure out of nowhere.
     //
-    // Ста неймспейсов хватает, чтобы отличить «на канал» от «на чтение»:
-    // разница между сотней и единицами не тонет ни в каком шуме.
+    // A hundred namespaces is enough to tell "per channel" from "per read": the
+    // difference between a hundred and a handful drowns in no noise.
     const NAMESPACES: usize = 100;
 
     let dir = tempfile::tempdir().unwrap();
@@ -608,20 +625,21 @@ fn a_query_does_not_hold_a_descriptor_per_channel() {
     let before = open_fds_under(dir.path());
     let reader = store.reader();
     let mut stream = reader.stream(&Query::new().order(Order::Oldest)).unwrap();
-    // Первая запись означает, что курсоры заряжены: голову спросили у всех.
-    let first = stream.next().expect("записи есть");
+    // The first record means the cursors are loaded: every one was asked for a
+    // head.
+    let first = stream.next().expect("there are records");
     let held = open_fds_under(dir.path()).saturating_sub(before);
     assert_eq!(first.namespace.as_ref(), "svc-0000");
     assert!(
         held <= 2,
-        "поток держит {held} дескрипторов на {NAMESPACES} неймспейсов — \
-         значит, по одному на канал"
+        "the stream holds {held} descriptors for {NAMESPACES} namespaces — that is, \
+         one per channel"
     );
 
-    // И читает при этом всё: экономия дескрипторов не имеет права стоить
-    // записей.
+    // And it reads everything meanwhile: saving descriptors has no right to
+    // cost records.
     let seen = 1 + stream.by_ref().count();
-    assert_eq!(seen, NAMESPACES, "прочитаны все неймспейсы");
+    assert_eq!(seen, NAMESPACES, "every namespace was read");
     assert!(stream.damaged().is_empty(), "{:?}", stream.damaged());
 
     drop(stream);

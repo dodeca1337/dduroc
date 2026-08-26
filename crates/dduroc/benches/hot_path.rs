@@ -1,13 +1,13 @@
-//! Бенчмарки горячих путей.
+//! Benchmarks of the hot paths.
 //!
-//! Меряется то, что выполняется на каждое событие в прикладном потоке, и то,
-//! что выполняется на каждый блок в writer'е. Числа с этой машины (x86-64)
-//! не переносятся на armv7 напрямую, но соотношения между вариантами —
-//! переносятся, и именно они показывают, где узкое место.
+//! What is measured is what runs for every event on an application thread and
+//! what runs for every block in the writer. The numbers from this machine
+//! (x86-64) do not carry over to armv7 directly, but the ratios between the
+//! variants do, and it is those that show where the bottleneck is.
 //!
-//! Хранилище пишется в `/dev/shm`, если он доступен: цель — измерить
-//! стоимость кода, а не скорость носителя разработчика. Тесты долговечности
-//! живут отдельно и меряют как раз носитель.
+//! The store is written to `/dev/shm` where it is available: the goal is to
+//! measure the cost of the code, not the speed of a developer's medium. The
+//! durability tests live apart and measure exactly the medium.
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use dduroc::prelude::*;
@@ -52,7 +52,7 @@ dduroc::schema! {
     }
 }
 
-/// Каталог для бенчмарков: по возможности в памяти.
+/// The directory for benchmarks: in memory where possible.
 fn bench_root() -> PathBuf {
     let base = if PathBuf::from("/dev/shm").is_dir() {
         PathBuf::from("/dev/shm")
@@ -61,15 +61,16 @@ fn bench_root() -> PathBuf {
     };
     let dir = base.join(format!("dduroc-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("каталог для бенчмарков");
+    std::fs::create_dir_all(&dir).expect("the benchmark directory");
     dir
 }
 
 fn store_config(root: &std::path::Path) -> StoreConfig {
     StoreConfig::new(root)
         .with_budget_per_class(256 * 1024 * 1024)
-        // Долговечность обычного канала отключена намеренно: иначе бенчмарк
-        // мерил бы fdatasync носителя, а не стоимость собственного кода.
+        // The ordinary channel's durability is turned off deliberately:
+        // otherwise the benchmark would measure the medium's fdatasync rather
+        // than the cost of our own code.
         .channel(
             StorageClass::Default,
             ChannelConfig {
@@ -77,10 +78,10 @@ fn store_config(root: &std::path::Path) -> StoreConfig {
                 ..ChannelConfig::new(256 * 1024 * 1024)
             },
         )
-        // А критический — как есть: немедленность не настройка, а его
-        // определение, и хранилище такую подмену отвергает при открытии.
-        // Прикладной поток от неё всё равно не выигрывает: `fdatasync` делает
-        // writer, а измеряется здесь постановка в очередь.
+        // The critical one is left as it is: immediacy is not a setting but its
+        // definition, and the store refuses such a substitution at open time.
+        // An application thread gains nothing from it anyway: the `fdatasync`
+        // is the writer's, and what is measured here is the enqueueing.
         .channel(
             StorageClass::Critical,
             ChannelConfig::critical(64 * 1024 * 1024),
@@ -88,7 +89,7 @@ fn store_config(root: &std::path::Path) -> StoreConfig {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Кодеки формата: то, что выполняется на каждую запись
+// The format's codecs: what runs for every record
 // ════════════════════════════════════════════════════════════════════════════
 
 fn bench_format(c: &mut Criterion) {
@@ -136,8 +137,8 @@ fn bench_format(c: &mut Criterion) {
         b.iter(|| dduroc_format::record::decode(black_box(&buf)).unwrap());
     });
 
-    // Сериализация полей события: единственная часть горячего пути, которую
-    // выполняет прикладной поток до постановки в очередь.
+    // Serializing an event's fields: the only part of the hot path an
+    // application thread runs before enqueueing.
     g.bench_function("payload/encode_two_fields", |b| {
         b.iter(|| {
             let payload: dduroc::Payload = dduroc::postcard::to_extend(
@@ -179,7 +180,7 @@ fn bench_format(c: &mut Criterion) {
     g.finish();
 }
 
-/// Сборка блока целиком: сюда входят CRC и сжатие.
+/// Assembling a whole block: the CRC and the compression are included.
 fn bench_block(c: &mut Criterion) {
     let mut g = c.benchmark_group("block");
     const RECORDS: usize = 1000;
@@ -216,10 +217,11 @@ fn bench_block(c: &mut Criterion) {
         });
     }
 
-    // Стационарный путь writer'а: накопитель живёт между flush'ами, буферы
-    // (тело и выход LZ4) переиспользуются. Именно так работает канал в
-    // процессе; вариант с холодным накопителем выше — это первый flush после
-    // пробуждения из бездействия, он платит аллокацию и инициализацию.
+    // The writer's steady-state path: the accumulator lives between flushes and
+    // the buffers (the body and the LZ4 output) are reused. That is how a
+    // channel works in a process; the cold-accumulator variant above is the
+    // first flush after waking from idleness, which pays an allocation and an
+    // initialization.
     g.bench_function("build/lz4_steady", |b| {
         let mut builder = BlockBuilder::new();
         let mut out = Vec::new();
@@ -235,7 +237,7 @@ fn bench_block(c: &mut Criterion) {
         });
     });
 
-    // Чтение блока: распаковка + разбор всех записей.
+    // Reading a block: decompression plus parsing every record.
     let mut builder = BlockBuilder::with_capacity(64 * 1024);
     for i in 0..RECORDS {
         builder.push(Micros(i as u64 * 100), &rec).unwrap();
@@ -261,27 +263,27 @@ fn bench_block(c: &mut Criterion) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Горячий путь записи: то, что видит прикладной поток
+// The hot write path: what an application thread sees
 // ════════════════════════════════════════════════════════════════════════════
 
 fn bench_write(c: &mut Criterion) {
     let root = bench_root();
     let config = store_config(&root);
-    let store = Store::open(config.clone()).expect("хранилище");
+    let store = Store::open(config.clone()).expect("the store");
     let ns = store
         .namespace("bench-0", bench::SCHEMA)
-        .expect("неймспейс");
-    let series = ns.series(bench::metrics::Temp).expect("серия");
+        .expect("the namespace");
+    let series = ns.series(bench::metrics::Temp).expect("the series");
 
     let mut g = c.benchmark_group("write");
     g.throughput(Throughput::Elements(1));
 
-    // ВАЖНО про эти числа: криterion гонит вызовы плотнее, чем writer
-    // успевает разбирать очередь, поэтому измеряется НАСЫЩЕННЫЙ режим —
-    // смесь удачных постановок в очередь и быстрых отказов при её
-    // переполнении. Числа полезны для сравнения вариантов между собой, но
-    // не как «стоимость записи в проде»: там очередь обычно пуста.
-    // Осмысленная величина пропускной способности — группа `throughput`.
+    // IMPORTANT about these numbers: criterion drives the calls faster than the
+    // writer can drain the queue, so what is measured is the SATURATED mode — a
+    // mixture of successful enqueues and fast refusals when the queue is full.
+    // The numbers are useful for comparing the variants with one another but
+    // not as "the cost of a write in production": there the queue is usually
+    // empty. The meaningful throughput figure is the `throughput` group.
     g.bench_function("log/simple", |b| {
         let mut n = 0u32;
         b.iter(|| {
@@ -311,18 +313,21 @@ fn bench_write(c: &mut Criterion) {
         });
     });
 
-    // Ненасыщённый режим — то, что видит приложение в реальной работе:
-    // очередь пуста, writer успевает. Пачка заведомо меньше очереди, а
-    // подготовка (не измеряемая) её опустошает.
+    // The unsaturated mode — what an application sees in real work: the queue
+    // is empty and the writer keeps up. The batch is knowably smaller than the
+    // queue, and the (unmeasured) preparation empties it.
     const BURST: usize = 1000;
     g.throughput(Throughput::Elements(BURST as u64));
     g.bench_function("burst/unsaturated_1k", |b| {
         b.iter_batched(
-            || ns.sync().expect("очередь опустошена перед замером"),
+            || {
+                ns.sync()
+                    .expect("the queue is emptied before the measurement")
+            },
             |()| {
                 for i in 0..BURST {
                     ns.try_log(bench::events::Tick { n: i as u32 })
-                        .expect("очередь не должна переполняться");
+                        .expect("the queue must not overflow");
                 }
             },
             BatchSize::PerIteration,
@@ -332,12 +337,15 @@ fn bench_write(c: &mut Criterion) {
     g.throughput(Throughput::Elements(BURST as u64));
     g.bench_function("burst/samples_1k", |b| {
         b.iter_batched(
-            || ns.sync().expect("очередь опустошена перед замером"),
+            || {
+                ns.sync()
+                    .expect("the queue is emptied before the measurement")
+            },
             |()| {
                 for i in 0..BURST {
                     series
                         .try_sample(20.0 + i as f32)
-                        .expect("очередь свободна");
+                        .expect("the queue is free");
                 }
             },
             BatchSize::PerIteration,
@@ -347,10 +355,10 @@ fn bench_write(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
     g.bench_function("span/open_close", |b| {
         b.iter(|| {
-            // Режим здесь насыщенный, как и у остальных замеров группы:
-            // отказ переполненной очереди штатен и входит в измеряемую смесь.
-            // Он и не виден на месте вызова — страж выдаётся всегда, а потеря
-            // учтена счётчиком.
+            // The mode here is saturated, as in the rest of the group: a full
+            // queue's refusal is normal and is part of the mixture being
+            // measured. It is not visible at the call site either — the guard
+            // is always handed out, and the loss is counted.
             let span = ns.span(bench::spans::Work);
             black_box(span.id());
         });
@@ -361,8 +369,8 @@ fn bench_write(c: &mut Criterion) {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Сквозная пропускная способность: сколько событий в секунду доходит до
-/// файлов, включая работу writer'а.
+/// End-to-end throughput: how many events a second reach the files, the
+/// writer's work included.
 fn bench_throughput(c: &mut Criterion) {
     let mut g = c.benchmark_group("throughput");
     const BATCH: usize = 10_000;
@@ -390,11 +398,11 @@ fn bench_throughput(c: &mut Criterion) {
         );
     });
 
-    // Телеметрия отдельно: это самая частая запись, и мерить её надо там же,
-    // где меряется всё остальное — в сквозном режиме. Числа группы `write`
-    // для неё обманчивы: они зависят от состязания прикладного потока с
-    // writer'ом за буфер очереди, и ускорение writer'а выглядит там
-    // замедлением.
+    // Telemetry separately: it is the most frequent record there is, and it has
+    // to be measured where everything else is — end to end. The `write` group's
+    // numbers are deceptive for it: they depend on the application thread
+    // contending with the writer for the queue buffer, and speeding the writer
+    // up looks like a slowdown there.
     g.bench_function("end_to_end/10k_samples", |b| {
         b.iter_batched(
             || {
@@ -420,10 +428,10 @@ fn bench_throughput(c: &mut Criterion) {
     g.finish();
 }
 
-/// Масштаб: стоимость подъёма многих неймспейсов.
+/// Scale: the cost of bringing up many namespaces.
 ///
-/// Заявленный предел — до 24 тысяч; здесь берётся сотня, чтобы увидеть
-/// стоимость одного и линейность.
+/// The limit claimed is up to 24 thousand; a hundred is taken here to see the
+/// cost of one and the linearity.
 fn bench_scale(c: &mut Criterion) {
     let mut g = c.benchmark_group("scale");
     g.sample_size(10);
@@ -444,8 +452,8 @@ fn bench_scale(c: &mut Criterion) {
                                 .unwrap(),
                         );
                     }
-                    // Пустые неймспейсы не должны ничего писать: сегмент
-                    // создаётся только при первой записи.
+                    // Empty namespaces must write nothing: a segment is created
+                    // only by the first record.
                     black_box(&namespaces);
                     store.shutdown();
                     let _ = std::fs::remove_dir_all(&root);
@@ -458,7 +466,7 @@ fn bench_scale(c: &mut Criterion) {
     g.finish();
 }
 
-/// Чтение: сколько стоит поднять и слить записи.
+/// Reading: what it costs to bring up and merge records.
 fn bench_read(c: &mut Criterion) {
     use dduroc_read::{KindFilter, Order, Query, Reader};
 
@@ -472,9 +480,9 @@ fn bench_read(c: &mut Criterion) {
                 .namespace(&format!("orc-radio-{inst}"), bench::SCHEMA)
                 .unwrap();
             for i in 0..25_000u32 {
-                // Наполнение идёт с ретраями: обычный канал вправе терять
-                // записи под давлением, но набор для чтения должен быть
-                // предсказуемым.
+                // The filling goes with retries: an ordinary channel may lose
+                // records under pressure, but the set to be read has to be
+                // predictable.
                 while ns.try_log(bench::events::Tick { n: i }).is_err() {
                     std::thread::yield_now();
                 }
@@ -494,11 +502,11 @@ fn bench_read(c: &mut Criterion) {
         b.iter(|| {
             let reader = Reader::open_dump([&root], &[bench::SCHEMA]).unwrap();
             let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
-            // Прочитанного может быть больше: неудачные try_send оставляют
-            // в потоке отметку о потере. Меньше — значит записи исчезли.
+            // There may be more read: failed try_sends leave a loss notice in
+            // the stream. Fewer means records disappeared.
             assert!(
                 result.entries.len() as u64 >= written,
-                "прочитано {}, записано {written}",
+                "{} read, {written} written",
                 result.entries.len()
             );
             black_box(result.entries.len())

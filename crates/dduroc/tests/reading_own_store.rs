@@ -1,10 +1,10 @@
-//! Читатель, построенный по своему же хранилищу.
+//! A reader built over one's own store.
 //!
-//! До этого связь между `Store` и `Reader` держалась на памяти вызывающего, и
-//! у неё был молчаливый исход: класс, вынесенный на свой носитель, — это
-//! второе дерево, и читатель, которому назвали только основной корень,
-//! показывал историю без него. Без ошибки, без отметки о повреждении, без
-//! единого признака пропажи — просто короче.
+//! Until now the link between a `Store` and a `Reader` rested on the caller's
+//! memory, and it had a silent outcome: a class moved to a medium of its own is
+//! a second tree, and a reader told only the main root showed the history
+//! without it. With no error, no damage notice, not a single sign that anything
+//! was missing — just shorter.
 
 use dduroc::prelude::*;
 use dduroc::{ChannelConfig, StorageClass, StoreConfig, StoreExt};
@@ -13,18 +13,18 @@ use dduroc_read::{KindFilter, Order, Query, Reader};
 dduroc::schema! {
     name: split,
     version: 1,
-    languages: [ru],
+    languages: [en],
 
     events {
-        Ping = 0x01 { level: Info, ru: "пинг {seq}", seq: u32 },
-        Fault = 0x02 { level: Error, store: critical, ru: "отказ {code}", code: u8 },
+        Ping = 0x01 { level: Info, en: "ping {seq}", seq: u32 },
+        Fault = 0x02 { level: Error, store: critical, en: "fault {code}", code: u8 },
     }
 }
 
-/// Тексты записей журнала в порядке от старых к новым.
+/// The texts of the journal records, oldest to newest.
 fn lines(reader: &Reader) -> Vec<String> {
     let q = Query::new().kinds(KindFilter::LOGS).order(Order::Oldest);
-    let result = reader.query(&q).expect("запрос");
+    let result = reader.query(&q).expect("the query");
     assert!(result.damaged.is_empty(), "{:?}", result.damaged);
     result
         .entries
@@ -56,15 +56,16 @@ fn a_reader_of_the_store_sees_the_class_that_lives_on_another_medium() {
     ns.log(split::events::Fault { code: 3 });
     ns.sync().unwrap();
 
-    // Хранилище знает оба своих корня и схему поднятого неймспейса — называть
-    // их по второму разу неоткуда и незачем.
+    // The store knows both of its roots and the schema of the namespace that
+    // came up — there is nowhere and no reason to name them a second time.
     assert_eq!(store.roots().len(), 2, "{:?}", store.roots());
     let reader = store.reader();
-    assert_eq!(lines(&reader), ["пинг 1", "отказ 3"]);
+    assert_eq!(lines(&reader), ["ping 1", "fault 3"]);
 
-    // Дамп, которому назвали не все корни, — не «короткий ответ», а отказ:
-    // полнота проверяется по схеме при открытии. Раньше такой читатель
-    // показывал историю без критики, ничем не выдав пропажу.
+    // A dump that was not told every root is not a "short answer" but a
+    // refusal: completeness is checked against the schema at open time. Such a
+    // reader used to show the history without the critical part, giving nothing
+    // away.
     let e = Reader::open_dump([&root], &[split::SCHEMA]).unwrap_err();
     assert!(
         matches!(
@@ -74,41 +75,42 @@ fn a_reader_of_the_store_sees_the_class_that_lives_on_another_medium() {
         ),
         "{e}"
     );
-    // Со всеми корнями дамп читается целиком.
+    // With every root the dump reads whole.
     assert_eq!(
         lines(&Reader::open_dump([&root, &vault], &[split::SCHEMA]).unwrap()),
-        ["пинг 1", "отказ 3"]
+        ["ping 1", "fault 3"]
     );
 
     store.shutdown();
 }
 
 mod other {
-    // Чужая схема с ТЕМ ЖЕ id 0x01, но другим типом под ним: коллизия
-    // идентификаторов между схемами — штатная ситуация, id уникален только
-    // в пределах своей схемы.
+    // A foreign schema with THE SAME id 0x01 but a different type under it: a
+    // collision of identifiers between schemas is normal — an id is unique only
+    // within its own schema.
     dduroc::schema! {
         name: other,
         version: 1,
-        languages: [ru],
+        languages: [en],
         events {
-            Boom = 0x01 { level: Info, ru: "бум {code}", code: u8 },
+            Boom = 0x01 { level: Info, en: "boom {code}", code: u8 },
         }
     }
 }
 
 #[test]
 fn an_entry_decodes_back_into_the_type_it_was_written_as() {
-    // `render` отдаёт текст; здесь — обратный путь к ПОЛЯМ. Тип сверяется
-    // по схеме неймспейса записи: совпадение id — ещё не совпадение типа.
+    // `render` gives the text; here is the way back to the FIELDS. The type is
+    // checked against the schema of the record's namespace: a matching id is
+    // not yet a matching type.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
     let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
     ns.log(split::events::Ping { seq: 7 });
-    // Одноимённый id из ЧУЖОЙ схемы — в соседнем неймспейсе.
+    // The same id from a FOREIGN schema — in the neighbouring namespace.
     let foreign = store.namespace("other-0", other::other::SCHEMA).unwrap();
     foreign.log(other::other::events::Boom { code: 3 });
-    // Запись, объявляющая себя Ping, но с неразборным payload'ом.
+    // A record that declares itself a Ping but whose payload does not parse.
     ns.try_log_raw(dduroc::EventId(0x01), &[0xFF], None)
         .unwrap();
     ns.sync().unwrap();
@@ -127,15 +129,15 @@ fn an_entry_decodes_back_into_the_type_it_was_written_as() {
     assert_eq!(
         pings.len(),
         2,
-        "Ping из своего неймспейса — да; Boom с тем же id — нет"
+        "a Ping from its own namespace yes; a Boom with the same id no"
     );
     assert_eq!(pings[0], Ok(split::events::Ping { seq: 7 }));
     assert_eq!(
         pings[1],
         Err(dduroc::DecodeError),
-        "неразборный payload — не молчание, а ошибка"
+        "an unparsable payload is an error, not silence"
     );
-    // Чужой Boom разбирается своим типом — в своём неймспейсе.
+    // A foreign Boom parses with its own type — in its own namespace.
     assert_eq!(
         got.entries
             .iter()
@@ -148,10 +150,10 @@ fn an_entry_decodes_back_into_the_type_it_was_written_as() {
 
 #[test]
 fn an_unknown_directory_under_a_namespace_is_reported_not_hidden() {
-    // Канал — это класс хранения, и перечисление каналов типизировано.
-    // Каталог, не являющийся каналом ни одного класса этой сборки (чужая
-    // директория, дамп из будущей версии с новым классом), не разбирается —
-    // но и не выпадает молча: он объявляется повреждением.
+    // A channel is a storage class, and the listing of channels is typed. A
+    // directory that is the channel of no class this build knows (a foreign
+    // directory, a dump from a future version with a new class) is not parsed —
+    // but neither does it drop out silently: it is declared damage.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
     let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
@@ -163,12 +165,12 @@ fn an_unknown_directory_under_a_namespace_is_reported_not_hidden() {
     assert_eq!(
         listing.namespaces[0].channels,
         [StorageClass::Default, StorageClass::Critical],
-        "известные каналы на месте и типизированы"
+        "the known channels are there and typed"
     );
     assert_eq!(
         listing.damaged.len(),
         1,
-        "неизвестный каталог обязан быть объявлен: {:?}",
+        "an unknown directory must be announced: {:?}",
         listing.damaged
     );
     assert!(listing.damaged[0].path.ends_with("scratch"));
@@ -177,9 +179,9 @@ fn an_unknown_directory_under_a_namespace_is_reported_not_hidden() {
 
 #[test]
 fn schemas_outlive_the_namespace_handle() {
-    // Ручку неймспейса отпускают, как только сервис отработал; расшифровывать
-    // его записи процесс от этого не разучивается. Иначе читатель, взятый у
-    // хранилища позже, показывал бы голые идентификаторы.
+    // A namespace handle is released as soon as the service has done its work;
+    // the process does not thereby forget how to decode its records. Otherwise
+    // a reader taken from the store later would show bare identifiers.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
     {
@@ -189,54 +191,55 @@ fn schemas_outlive_the_namespace_handle() {
     }
 
     assert_eq!(store.schemas().len(), 1);
-    assert_eq!(lines(&store.reader()), ["пинг 7"]);
+    assert_eq!(lines(&store.reader()), ["ping 7"]);
     store.shutdown();
 }
 
 #[test]
 fn a_live_reader_stays_current_without_being_rebuilt() {
-    // Живой читатель создаётся один раз при старте и живёт параллельно с
-    // записью. Всё, что появляется в хранилище после его создания, он обязан
-    // видеть без пересоздания: правда спрашивается у хранилища на каждый
-    // запрос, а не замораживается в момент создания.
+    // A live reader is created once at start and lives in parallel with
+    // writing. Everything that appears in the store after it was created it has
+    // to see without being recreated: the truth is asked of the store on every
+    // query rather than frozen at creation.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
-    let reader = store.reader(); // до неймспейса, записей и якоря времени
+    let reader = store.reader(); // before the namespace, the records and the time anchor
 
-    assert!(lines(&reader).is_empty(), "хранилище ещё пусто");
+    assert!(lines(&reader).is_empty(), "the store is still empty");
 
-    // Неймспейс поднят ПОСЛЕ создания читателя: схема обязана найтись.
+    // The namespace came up AFTER the reader was created: the schema has to be
+    // found.
     let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
     ns.log(split::events::Ping { seq: 1 });
     ns.sync().unwrap();
     let first = reader.query(&Query::new().kinds(KindFilter::LOGS)).unwrap();
     assert_eq!(
         reader.render(&first.entries[0], "ru").as_deref(),
-        Some("пинг 1"),
-        "схема сервиса, стартовавшего после создания читателя, видна"
+        Some("ping 1"),
+        "the schema of a service that started after the reader was created is visible"
     );
     assert!(
         first.entries[0].utc.is_none(),
-        "якоря ещё нет — настенного времени взять неоткуда"
+        "there is no anchor yet — there is nowhere to take wall-clock time from"
     );
 
-    // Синхронизация времени ПОСЛЕ создания читателя ретроактивна, и тот же
-    // читатель обязан увидеть её следующим же запросом.
+    // A time synchronization AFTER the reader was created is retroactive, and
+    // that same reader has to see it on its very next query.
     store.record_sync(Utc::now(), SyncSource::Ntp).unwrap();
     let second = reader.query(&Query::new().kinds(KindFilter::LOGS)).unwrap();
     assert!(
         second.entries[0].utc.is_some(),
-        "якорь ретроактивен: запись, сделанная до синхронизации, получила UTC"
+        "the anchor is retroactive: a record made before the synchronization got a UTC"
     );
     store.shutdown();
 }
 
 #[test]
 fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
-    // Writer кладёт блок одним write, но читатель видит страницы без
-    // гарантии целиком: у активного сегмента может найтись хвост, который
-    // ещё не долетел. Для живого читателя это «данные ещё не готовы», для
-    // дампа — честная порча: дамп никто не дописывает.
+    // The writer lays a block down with one write, but a reader sees the pages
+    // with no guarantee of being whole: an active segment may have a tail that
+    // has not arrived yet. For a live reader that is "the data is not ready
+    // yet", for a dump honest corruption: nobody appends to a dump.
     use dduroc_engine::segment::SegmentReader;
     use std::os::unix::fs::FileExt;
 
@@ -246,9 +249,9 @@ fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
     ns.log(split::events::Ping { seq: 1 });
     ns.sync().unwrap();
 
-    // Единственный сегмент канала — активный. Дописываем в него мусор там,
-    // где writer продолжил бы писать: так выглядит блок, чей write ещё не
-    // стал виден целиком.
+    // The channel's only segment is the active one. We append garbage to it
+    // where the writer would have gone on writing: that is what a block whose
+    // write has not become visible whole looks like.
     let ch_dir = dir
         .path()
         .join("orc-probe-0")
@@ -258,15 +261,18 @@ fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.extension().is_some_and(|x| x == "seg"))
-        .expect("активный сегмент");
+        .expect("the active segment");
     let mut seg = SegmentReader::open(&seg_path).unwrap();
     let (offsets, stopped) = seg.scan_block_offsets();
-    assert!(stopped.is_none(), "до вмешательства сегмент цел");
+    assert!(
+        stopped.is_none(),
+        "before the interference the segment is intact"
+    );
     let mut buf = Vec::new();
     let end = seg
         .read_block_at(*offsets.last().unwrap(), &mut buf)
         .unwrap()
-        .expect("последний блок цел");
+        .expect("the last block is intact");
     drop(seg);
     std::fs::OpenOptions::new()
         .write(true)
@@ -279,10 +285,10 @@ fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
         .reader()
         .query(&Query::new().kinds(KindFilter::LOGS))
         .unwrap();
-    assert_eq!(live.entries.len(), 1, "целые блоки читаются");
+    assert_eq!(live.entries.len(), 1, "the intact blocks are read");
     assert!(
         live.damaged.is_empty(),
-        "недописанный хвост — не порча: {:?}",
+        "an unfinished tail is not corruption: {:?}",
         live.damaged
     );
 
@@ -293,17 +299,17 @@ fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
     assert_eq!(
         dump.damaged.len(),
         1,
-        "у дампа тот же хвост — повреждение, молчать о нём нельзя"
+        "in a dump the same tail is damage, and silence about it is not allowed"
     );
     store.shutdown();
 }
 
 #[test]
 fn rotation_and_writes_under_a_live_reader_never_look_like_damage() {
-    // Дымовая проверка настоящей параллельности: писатель молотит записи
-    // сквозь тесную квоту (постоянная ротация), читатель непрерывно
-    // спрашивает. Ни один ответ не имеет права объявить порчу: вытеснение и
-    // дописывание — штатная жизнь хранилища, а не повреждения.
+    // A smoke check of real concurrency: the writer hammers records through a
+    // tight quota (constant rotation) while the reader keeps asking. No answer
+    // has a right to declare damage: eviction and appending are the store's
+    // ordinary life, not corruption.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(
         StoreConfig::new(dir.path())
@@ -335,8 +341,8 @@ fn rotation_and_writes_under_a_live_reader_never_look_like_damage() {
         let _ = ns.sync();
     });
 
-    // Не меньше трёх запросов в любом случае: на быстрой машине писатель
-    // может успеть раньше, чем главный поток дойдёт до первого запроса.
+    // At least three queries in any case: on a fast machine the writer may
+    // finish before the main thread reaches the first query.
     let mut total_queries = 0;
     while !writer.is_finished() || total_queries < 3 {
         let got = reader
@@ -344,7 +350,7 @@ fn rotation_and_writes_under_a_live_reader_never_look_like_damage() {
             .unwrap();
         assert!(
             got.damaged.is_empty(),
-            "живое чтение объявило порчу: {:?}",
+            "live reading declared corruption: {:?}",
             got.damaged
         );
         total_queries += 1;
@@ -354,15 +360,15 @@ fn rotation_and_writes_under_a_live_reader_never_look_like_damage() {
     assert!(last.damaged.is_empty(), "{:?}", last.damaged);
     assert!(
         !last.entries.is_empty() && total_queries > 0,
-        "проверка обязана была застать и записи, и запросы"
+        "the check had to catch both the writes and the queries"
     );
     store.shutdown();
 }
 
 #[test]
 fn a_foreign_namespace_needs_its_schema_named() {
-    // В хранилище лежит неймспейс чужого сервиса: его схемы у этого билда нет,
-    // и записи остаются идентификаторами — пока схему не назовут.
+    // The store holds another service's namespace: this build has no schema for
+    // it, and its records stay identifiers — until the schema is named.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
     let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
@@ -372,16 +378,16 @@ fn a_foreign_namespace_needs_its_schema_named() {
     drop(ns);
     drop(store);
 
-    // Второй процесс о схеме не знает.
+    // The second process knows nothing of the schema.
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
     assert!(store.schemas().is_empty());
     assert!(
         lines(&store.reader()).is_empty(),
-        "без схемы рендерить нечем — и выдумывать текст читатель не станет"
+        "without a schema there is nothing to render with — and a reader will not invent a text"
     );
     assert_eq!(
         lines(&store.reader().with_schema(split::SCHEMA)),
-        ["пинг 2"]
+        ["ping 2"]
     );
     store.shutdown();
 }

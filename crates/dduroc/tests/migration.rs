@@ -1,16 +1,18 @@
-//! Сквозной цикл миграции через макрос: прошивка v1 пишет, прошивка v2
-//! читает старую историю через шаги, потом приводит её физически.
+//! The end-to-end migration cycle through the macro: firmware v1 writes,
+//! firmware v2 reads the old history through the steps and then brings it up
+//! physically.
 //!
-//! Ровно тот сценарий, ради которого миграции существуют: поле сменило тип
-//! (i8 → f32 — postcard прочитал бы старые байты молча и неверно), тип
-//! удалён из схемы, метрика сменила идентификатор. Два `schema!` с одним
-//! именем в разных модулях — это «вчерашний» и «сегодняшний» билды.
+//! Exactly the scenario migrations exist for: a field changed type (i8 → f32 —
+//! postcard would have read the old bytes silently and wrongly), a type was
+//! removed from the schema, a metric changed its identifier. Two `schema!`
+//! declarations of one name in different modules are "yesterday's" and
+//! "today's" builds.
 
 use dduroc::prelude::*;
 use dduroc::{EventId, MetricId, StorageClass, StoreConfig};
 use dduroc_read::{EntryKind, Order, OwnedSampleValue, Query, Reader};
 
-/// Схема вчерашней прошивки.
+/// Yesterday's firmware schema.
 mod was {
     dduroc::schema! {
         name: probe,
@@ -29,8 +31,8 @@ mod was {
     }
 }
 
-/// Схема сегодняшней: `dbm` стал f32, `Legacy` удалён, `Temp` переехал на
-/// новый идентификатор.
+/// Today's: `dbm` became an f32, `Legacy` was removed, `Temp` moved to a new
+/// identifier.
 mod now {
     dduroc::schema! {
         name: probe,
@@ -60,7 +62,7 @@ mod now {
     }
 }
 
-/// Ответ читателя, сведённый к проверяемому виду.
+/// A reader's answer reduced to a checkable form.
 #[derive(Debug, PartialEq)]
 enum Seen {
     Power(f32),
@@ -72,15 +74,15 @@ enum Seen {
 fn read_all(root: &std::path::Path) -> Vec<Seen> {
     let reader = Reader::open_dump([root], &[now::probe::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
-    assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
+    assert!(result.is_complete(), "damage: {:?}", result.damaged);
     result
         .entries
         .iter()
         .filter_map(|e| match &e.kind {
             EntryKind::Message { event, payload, .. } => match event.0 {
                 0x01 => {
-                    let p: now::probe::events::PowerSet =
-                        dduroc::postcard::from_bytes(payload).expect("раскладка текущая");
+                    let p: now::probe::events::PowerSet = dduroc::postcard::from_bytes(payload)
+                        .expect("the layout is the current one");
                     Some(Seen::Power(p.dbm))
                 }
                 0x03 => {
@@ -105,7 +107,7 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 << 20);
 
-    // Вчера: прошивка v1 пишет свою историю.
+    // Yesterday: firmware v1 writes its history.
     {
         let store = Store::open(cfg.clone()).unwrap();
         let ns = store.namespace("orc-0", was::probe::SCHEMA).unwrap();
@@ -117,10 +119,10 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
         store.shutdown();
     }
 
-    // Сегодня: прошивка v2. Ничего ещё не мигрировано физически.
+    // Today: firmware v2. Nothing has been migrated physically yet.
     let store = Store::open(cfg).unwrap();
     let ns = store.namespace("orc-0", now::probe::SCHEMA).unwrap();
-    assert_eq!(ns.pending_migration(), Some((1, 2)), "долг назван");
+    assert_eq!(ns.pending_migration(), Some((1, 2)), "the debt is named");
 
     let expected = vec![
         Seen::Power(-3.0),
@@ -128,13 +130,14 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
         Seen::Sample(MetricId(0x08), 36.5),
     ];
 
-    // Чтение корректно ДО прогона: шаги применяются на лету. Байт -3i8 в
-    // раскладке f32 иначе разобрался бы молча и неверно, Legacy показался бы
-    // «неизвестным типом», а Temp остался бы под старым номером.
+    // Reading is correct BEFORE the run: the steps are applied on the fly. The
+    // byte -3i8 in the f32 layout would otherwise parse silently and wrongly,
+    // Legacy would show as an "unknown type", and Temp would stay under its old
+    // number.
     let before = read_all(dir.path());
-    assert_eq!(before, expected, "чтение через шаги");
+    assert_eq!(before, expected, "reading through the steps");
 
-    // И рендер работает по текущему шаблону поверх мигрированного payload'а.
+    // And rendering works from the current template over the migrated payload.
     {
         let reader = Reader::open_dump([dir.path()], &[now::probe::SCHEMA]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
@@ -142,29 +145,29 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
             .entries
             .iter()
             .find(|e| matches!(&e.kind, EntryKind::Message { event, .. } if event.0 == 1))
-            .expect("PowerSet в ответе");
+            .expect("PowerSet in the answer");
         assert_eq!(
             reader.render(power, "en").as_deref(),
             Some("power -3 dBm"),
-            "шаблон v2 применим, потому что payload уже приведён"
+            "the v2 template applies because the payload has already been brought up"
         );
     }
 
-    // Физический прогон.
-    let report = ns.migrate().expect("прогон проходит");
+    // The physical run.
+    let report = ns.migrate().expect("the run goes through");
     assert_eq!(report.rewritten, 1, "{report:?}");
     assert_eq!(
         report.records_rewritten, 3,
-        "PowerSet, Note и отсчёт пережили шаг: {report:?}"
+        "PowerSet, Note and the sample survived the step: {report:?}"
     );
-    assert_eq!(report.records_dropped, 1, "Legacy удалён: {report:?}");
-    assert_eq!(ns.pending_migration(), None, "долг погашен");
+    assert_eq!(report.records_dropped, 1, "Legacy was deleted: {report:?}");
+    assert_eq!(ns.pending_migration(), None, "the debt is paid");
 
-    // Чтение ПОСЛЕ прогона отвечает то же самое — в этом весь смысл: прогон
-    // меняет носитель, а не ответ.
-    assert_eq!(read_all(dir.path()), expected, "ответ не изменился");
+    // Reading AFTER the run answers exactly the same — which is the whole
+    // point: a run changes the medium, not the answer.
+    assert_eq!(read_all(dir.path()), expected, "the answer did not change");
 
-    // Заголовки сегментов — только текущей версии.
+    // The segment headers are at the current version only.
     let channel = dir
         .path()
         .join("orc-0")
@@ -177,32 +180,32 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
         }
     }
 
-    // Повторный прогон — честный no-op.
+    // A second run is an honest no-op.
     assert_eq!(ns.migrate().unwrap(), dduroc::MigrationReport::default());
     store.shutdown();
 }
 
 #[test]
 fn old_fixtures_are_written_with_the_generated_history_types() {
-    // history-типы получают Serialize именно ради этого: фикстура старой
-    // версии собирается тем же типом, который декодирует шаг, — раскладка
-    // объявлена один раз, и тест не дублирует её байтами.
+    // The history types get Serialize for exactly this: a fixture of the old
+    // version is assembled with the same type the step decodes with — the
+    // layout is declared once, and the test does not duplicate it in bytes.
     let bytes = dduroc::postcard::to_allocvec(&now::probe::v1::PowerSet { dbm: -3 }).unwrap();
     let old: now::probe::v1::PowerSet = dduroc::postcard::from_bytes(&bytes).unwrap();
     assert_eq!(old, now::probe::v1::PowerSet { dbm: -3 });
     assert_eq!(
         <now::probe::v1::PowerSet as dduroc::EventShape>::SHAPE_ID,
         EventId(0x01),
-        "id раскладки — старый, из history"
+        "the layout's id is the old one, from history"
     );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Спаны и значения отсчётов
+// Spans and sample values
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Вчерашняя прошивка: уровень писался десятыми долями в целых, а вид спана
-/// назывался иначе.
+/// Yesterday's firmware: the level was written in tenths as an integer, and
+/// the span kind was called something else.
 mod tenths {
     dduroc::schema! {
         name: gauge,
@@ -215,8 +218,8 @@ mod tenths {
     }
 }
 
-/// Сегодняшняя: уровень стал вещественным в своих единицах, вид спана
-/// переименован. Прежнего имени в схеме больше нет — ключ по голому id.
+/// Today's: the level became a float in its own units and the span kind was
+/// renamed. The earlier name is no longer in the schema — the key is a bare id.
 mod units {
     dduroc::schema! {
         name: gauge,
@@ -236,11 +239,11 @@ mod units {
     }
 }
 
-/// Отсчёты и виды спанов в порядке чтения.
+/// The samples and span kinds in read order.
 fn levels_and_spans(root: &std::path::Path) -> (Vec<f32>, Vec<Option<&'static str>>) {
     let reader = Reader::open_dump([root], &[units::gauge::SCHEMA]).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
-    assert!(result.is_complete(), "повреждения: {:?}", result.damaged);
+    assert!(result.is_complete(), "damage: {:?}", result.damaged);
     let mut levels = Vec::new();
     let mut kinds = Vec::new();
     for e in &result.entries {
@@ -258,10 +261,10 @@ fn levels_and_spans(root: &std::path::Path) -> (Vec<f32>, Vec<Option<&'static st
 
 #[test]
 fn a_span_kind_and_a_sample_value_migrate_like_everything_else() {
-    // Событиям миграции были доступны давно, отсчётам — только смена
-    // идентификатора, спанам — ничего. Между тем «величина стала писаться в
-    // своих единицах» и «вид спана переименован» — обычные правки схемы, и
-    // без них история оставалась бы в прежней раскладке навсегда.
+    // Events have had migrations for a long time, samples only a change of
+    // identifier, spans nothing at all. Yet "the quantity is now written in its
+    // own units" and "the span kind was renamed" are ordinary schema edits, and
+    // without them the history would stay in the earlier layout forever.
     let dir = tempfile::tempdir().unwrap();
     let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 << 20);
 
@@ -281,19 +284,31 @@ fn a_span_kind_and_a_sample_value_migrate_like_everything_else() {
     let ns = store.namespace("orc-0", units::gauge::SCHEMA).unwrap();
     assert_eq!(ns.pending_migration(), Some((1, 2)));
 
-    // Чтение через шаги — до всякого прогона.
+    // Reading through the steps — before any run.
     let expected = (vec![36.5f32, 70.0], vec![Some("Calibration")]);
-    assert_eq!(levels_and_spans(dir.path()), expected, "чтение через шаги");
+    assert_eq!(
+        levels_and_spans(dir.path()),
+        expected,
+        "reading through the steps"
+    );
 
-    // Физический прогон. Сегмент со спанами переписывается всегда: множества
-    // видов спанов в footer'е нет, и «в этом сегменте таких спанов нет»
-    // сказать нечем.
-    let report = ns.migrate().expect("прогон проходит");
+    // The physical run. A segment with spans is always rewritten: there is no
+    // set of span kinds in the footer, and there is nothing to say "this
+    // segment holds no such spans" with.
+    let report = ns.migrate().expect("the run goes through");
     assert_eq!(report.rewritten, 1, "{report:?}");
-    assert_eq!(report.records_dropped, 0, "спаны не удаляются: {report:?}");
+    assert_eq!(
+        report.records_dropped, 0,
+        "spans are not deleted: {report:?}"
+    );
     assert_eq!(ns.pending_migration(), None);
 
-    // И тот же ответ после прогона: прогон меняет носитель, а не ответ.
-    assert_eq!(levels_and_spans(dir.path()), expected, "ответ не изменился");
+    // And the same answer after the run: a run changes the medium, not the
+    // answer.
+    assert_eq!(
+        levels_and_spans(dir.path()),
+        expected,
+        "the answer did not change"
+    );
     store.shutdown();
 }

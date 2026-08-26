@@ -1,12 +1,13 @@
-//! Эксплуатация: политика классов, общий бюджет класса, свой носитель у
-//! критики, учёт потерь.
+//! Operating it: class policy, the shared class budget, a medium of its own for
+//! critical data, accounting for losses.
 //!
-//! Запуск: `cargo run -p dduroc --example 04_operations`
+//! Run: `cargo run -p dduroc --example 04_operations`
 //!
-//! Журнал на приборе живёт годами без присмотра, поэтому у движка нет
-//! состояния «место кончилось, дальше никак»: история ротируется в рамках
-//! бюджетов, потери учитываются и объявляются, нарушение контракта схемы
-//! отличается от отставания диска. Пример показывает эти механизмы по одному.
+//! A device's journal lives for years unattended, so the engine has no state of
+//! "out of space, nothing more to be done": the history rotates within its
+//! budgets, losses are counted and announced, and a violation of the schema
+//! contract is told apart from the disk lagging. This example shows those
+//! mechanisms one at a time.
 
 use dduroc::prelude::*;
 use dduroc::read::{EntryKind, KindFilter, Order, OwnedSampleValue, Query, Reader};
@@ -17,23 +18,25 @@ use dduroc::{
 dduroc::schema! {
     name: probe,
     version: 1,
-    languages: [ru],
+    languages: [en],
 
     events {
-        Ping = 0x01 { level: Debug, ru: "пинг {seq}", seq: u32 },
-        // Критическое — в свой канал: fdatasync сразу после записи (group
-        // commit), без сжатия, и очередь, в которой при переполнении
-        // вызывающий ЖДЁТ места, а не теряет запись.
-        Fault = 0x02 { level: Error, store: critical, ru: "авария {code}", code: u8 },
+        Ping = 0x01 { level: Debug, en: "ping {seq}", seq: u32 },
+        // Critical data goes into its own channel: an fdatasync right after the
+        // write (group commit), no compression, and a queue in which on
+        // overflow the caller WAITS for room rather than losing the record.
+        Fault = 0x02 { level: Error, store: critical, en: "fault {code}", code: u8 },
     }
 
     metrics {
-        // Бинарные слепки — самый тяжёлый поток, ему канал телеметрии.
+        // Binary snapshots are the heaviest stream; they get the telemetry
+        // channel.
         Chunk = 0x01 { type: blob, store: telemetry },
     }
 }
 
-/// Слепок с номером в первых байтах — по нему видно, что именно выжило.
+/// A snapshot with its number in the first bytes — it shows exactly what
+/// survived.
 fn chunk(index: u64) -> Vec<u8> {
     let mut bytes = vec![0u8; 4096];
     bytes[..8].copy_from_slice(&index.to_le_bytes());
@@ -52,20 +55,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Ротация в бюджете класса. Бюджет — ответ на вопрос «сколько истории
-// хранить у ВСЕЙ телеметрии»: класс пишет по кругу, старейший сегмент уходит
-// целиком, свежие данные не отвергаются никогда.
+// 1. Rotation within a class budget. The budget answers "how much history to
+// keep for ALL telemetry": the class writes in a circle, the oldest segment
+// goes whole, and fresh data is never refused.
 // ---------------------------------------------------------------------------
 fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("— ротация в бюджете класса —");
+    println!("— rotation within a class budget —");
     let store = Store::open(StoreConfig::new(root).channel(
         StorageClass::Telemetry,
         ChannelConfig {
-            // Слепки уже плотные — сжатие только жгло бы CPU.
+            // The snapshots are dense already — compression would only burn
+            // CPU.
             compression: Compression::None,
-            // Телеметрия терпит минуту незаписанного — реже fdatasync.
+            // Telemetry tolerates a minute unwritten — fewer fdatasyncs.
             sync_interval: std::time::Duration::from_secs(60),
-            // 12 МиБ бюджета при сегменте 4 МиБ: живут три сегмента.
+            // 12 MiB of budget with a 4 MiB segment: three segments live.
             segment_bytes: 4 << 20,
             ..ChannelConfig::new(12 << 20)
         },
@@ -73,9 +77,9 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
     let chunks = ns.series(probe::metrics::Chunk)?;
 
-    // 16 МиБ слепков в 12 МиБ бюджета: голова истории обязана уйти.
-    // Периодический sync даёт диску догнать — телеметрия реального прибора
-    // приходит с частотой датчика, а не циклом while.
+    // 16 MiB of snapshots into 12 MiB of budget: the head of the history has to
+    // go. A periodic sync lets the disk catch up — a real device's telemetry
+    // arrives at the sensor's rate rather than in a while loop.
     for i in 0..4096u64 {
         chunks.sample(chunk(i));
         if i % 512 == 511 {
@@ -86,13 +90,13 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let stats = store.stats();
     println!(
-        "  сегментов создано {}, запечатано {}, ротировано {}; потеряно записей {}",
+        "  segments created {}, sealed {}, rotated {}; records lost {}",
         stats.segments_created, stats.segments_sealed, stats.segments_rotated, stats.dropped
     );
     assert!(stats.segments_rotated > 0, "{stats:?}");
     store.shutdown();
 
-    // Что выжило: самый старый доступный слепок — уже не нулевой.
+    // What survived: the oldest available snapshot is no longer number zero.
     let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
     let oldest = reader.query(
         &Query::new()
@@ -106,21 +110,22 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }) = oldest.entries.first().map(|e| &e.kind)
     {
         let index = u64::from_le_bytes(bytes[..8].try_into()?);
-        println!("  старейший выживший слепок: №{index} из 4096 — голова вытеснена\n");
+        println!("  the oldest surviving snapshot: no. {index} of 4096 — the head was evicted\n");
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 2. Бюджет класса — общий на все неймспейсы. Число сервисов растёт, а
-// бюджет «всей телеметрии» — нет: каналы черпают из него вместе, и при
-// превышении вытесняется старейший сегмент КЛАССА, в чьём бы неймспейсе он
-// ни лежал — молчащий сервис не держит место, которого не хватает шумному.
-// (Личный предел прожорливому сервису — `store.namespace_with_quota` + NsQuota,
-// а сразу всей группе — `StoreConfig::group`, как ниже.)
+// 2. A class budget is shared by every namespace. The number of services grows
+// while the budget of "all telemetry" does not: the channels draw on it
+// together, and when it is exceeded the CLASS's oldest segment is evicted
+// whoever's namespace it lies in — a quiet service does not hold space a noisy
+// one lacks. (A personal limit for a greedy service is
+// `store.namespace_with_quota` plus NsQuota, and one for a whole group at once
+// is `StoreConfig::group`, as below.)
 // ---------------------------------------------------------------------------
 fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("— общий бюджет класса на все неймспейсы —");
+    println!("— one class budget shared by every namespace —");
     let store = Store::open(
         StoreConfig::new(root)
             .channel(
@@ -131,11 +136,12 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                     ..ChannelConfig::new(12 << 20)
                 },
             )
-            // Настройки класса общие на хранилище — ровно до тех пор, пока
-            // неймспейсы однородны. Группа (префикс имени, тот же, которым
-            // отбирает `Query::group`) говорит про всех оркестраторов разом,
-            // вместо повторения при каждом открытии. Бюджет и носитель ей
-            // недоступны: они принадлежат КЛАССУ и общие на всё хранилище.
+            // Class settings are shared by the store — exactly as long as the
+            // namespaces are uniform. A group (a name prefix, the same one
+            // `Query::group` selects by) speaks about every orchestrator at
+            // once instead of repeating at each open. The budget and the medium
+            // are not available to it: they belong to the CLASS and are shared
+            // by the store.
             .group(
                 "orc-",
                 GroupPolicy::new().channel(
@@ -143,14 +149,14 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                     ChannelOverride::new().segment_bytes(2 << 20),
                 ),
             )
-            // Потолок оперативной памяти под буферы блоков — не бюджет:
-            // бюджет про место на носителе. Необязателен и по умолчанию
-            // отсутствует; нужен там, где «пишущих единицы» перестаёт быть
-            // правдой.
+            // A ceiling on the RAM held for block buffers — not a budget: a
+            // budget is about space on the medium. Optional and absent by
+            // default; it is needed where "only a handful write" stops being
+            // true.
             .with_buffer_ceiling(4 << 20),
     )?;
 
-    // Тихий сервис записал 6 МиБ и замолчал.
+    // The quiet service wrote 6 MiB and fell silent.
     let quiet = store.namespace("orc-quiet", probe::SCHEMA)?;
     let series = quiet.series(probe::metrics::Chunk)?;
     for i in 0..1536u64 {
@@ -161,7 +167,7 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     quiet.sync()?;
 
-    // Шумный пишет 10 МиБ: вдвоём в потолок они не помещаются.
+    // The noisy one writes 10 MiB: together they do not fit the ceiling.
     let noisy = store.namespace("orc-noisy", probe::SCHEMA)?;
     let series = noisy.series(probe::metrics::Chunk)?;
     for i in 0..2560u64 {
@@ -172,10 +178,11 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     noisy.sync()?;
 
-    // Заодно: уборка реестра эпох. Записи о запусках, от которых не осталось
-    // ни одного сегмента, вычищаются (при подъёме хранилища — автоматически).
+    // Along the way: cleaning the epoch registry. Entries for runs of which not
+    // one segment is left are cleared out (automatically when the store comes
+    // up).
     let removed = store.compact_epochs()?;
-    println!("  эпох вычищено: {removed}");
+    println!("  epochs cleaned out: {removed}");
 
     let stats = store.stats();
     store.shutdown();
@@ -183,25 +190,26 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
     let listing = reader.namespaces()?;
     for ns in &listing.namespaces {
-        println!("  {}: занято {} КиБ", ns.name, ns.total_bytes >> 10);
+        println!("  {}: {} KiB taken", ns.name, ns.total_bytes >> 10);
     }
     println!(
-        "  тихий писал 6 МиБ — его голову вытеснил чужой поток того же класса; \
-         поверх потолков не вылезли ни разу (место: {}, память: {})\n",
+        "  the quiet one wrote 6 MiB — its head was evicted by another stream of the \
+         same class; neither ceiling was ever exceeded (space: {}, memory: {})\n",
         stats.budget_overruns, stats.buffer_overruns
     );
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 3. Потери и контракт. Запись не возвращает Result не потому, что исход
-// не важен, а потому, что с ним нечего делать на месте вызова. Исход не
-// исчезает: потери считаются и ОБЪЯВЛЯЮТСЯ в самом потоке записей, чужие
-// схеме записи считаются отдельно — это дефект сборки, а не отставание диска.
+// 3. Losses and the contract. Writing does not return a Result not because the
+// outcome does not matter but because there is nothing to do with it at the
+// call site. The outcome does not disappear: losses are counted and ANNOUNCED
+// in the record stream itself, and records foreign to the schema are counted
+// separately — that is a build defect, not the disk lagging.
 // ---------------------------------------------------------------------------
 fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("— потери учтены и объявлены —");
-    // Крошечные очереди делают переполнение воспроизводимым в примере.
+    println!("— losses are counted and announced —");
+    // Tiny queues make the overflow reproducible in an example.
     let store = Store::open(
         StoreConfig::new(root)
             .with_budget_per_class(16 << 20)
@@ -212,7 +220,8 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let ns = store.namespace("orc-probe-0", probe::SCHEMA)?;
 
-    // Обычный канал: очередь полна — запись теряется, отказ считается.
+    // The ordinary channel: the queue is full, the record is lost, the refusal
+    // counted.
     let mut refused = 0u64;
     for seq in 0..20_000u32 {
         if let Err(e) = ns.try_log(probe::events::Ping { seq }) {
@@ -221,37 +230,38 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Критический канал: очередь полна — вызывающий ждёт места. Медленнее,
-    // зато авария не потеряется.
+    // The critical channel: the queue is full and the caller waits for room.
+    // Slower, but the alarm will not be lost.
     for code in 0..2_000u32 {
         ns.try_log(probe::events::Fault { code: code as u8 })
-            .expect("критическая запись не теряется");
+            .expect("a critical write is not lost");
     }
 
-    // Запись типа, которого нет в схеме, — нарушение контракта, дефект
-    // сборки. `try_*` отдаёт вердикт вызывающему и на этом умывает руки:
+    // Writing a type that is not in the schema is a contract violation, a build
+    // defect. `try_*` gives the verdict to the caller and washes its hands:
     let contract = ns
         .try_log_raw(EventId(0xEE), &[], None)
-        .expect_err("id не из схемы");
+        .expect_err("an id not from the schema");
     assert!(contract.breaks_contract() && !contract.loses_record());
-    // …а «тихий» путь учитывает отказ сам: счётчик `rejected` плюс
-    // однократное объявление в журнале — дефект найдут, а не будут искать
-    // причину тишины.
+    // …while the "quiet" path accounts for the failure itself: the `rejected`
+    // counter plus a one-off announcement in the journal — the defect gets
+    // found rather than searched for as the cause of silence.
     ns.log_raw(EventId(0xEE), &[], None);
 
     store.shutdown();
     let stats = store.stats();
     println!(
-        "  отказов на обычной очереди: {refused}; учтено потерь: {}; \
-         ожиданий на критической: {}; нарушений контракта: {}",
+        "  refusals on the ordinary queue: {refused}; losses counted: {}; \
+         waits on the critical one: {}; contract violations: {}",
         stats.dropped, stats.backpressure_waits, stats.rejected
     );
     assert_eq!(stats.dropped, refused);
 
-    // Дыра, о которой нигде не сказано, неотличима от тишины: потери
-    // объявлены отметками в самом потоке, и их сумма равна счётчику.
-    // Отметку разбирает `Entry::dropped_records` — формат её текста
-    // принадлежит движку, парсить прозу прикладному коду не нужно.
+    // A hole nobody mentions is indistinguishable from silence: the losses are
+    // announced by notices in the stream itself, and their sum equals the
+    // counter. A notice is parsed by `Entry::dropped_records` — the format of
+    // its text belongs to the engine, and application code need not parse the
+    // prose.
     let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
     let mut announced = 0u64;
     let mut marks = 0usize;
@@ -263,25 +273,25 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             marks += 1;
             announced += count;
         } else if let EntryKind::Text { text, .. } = &e.kind {
-            println!("  объявление в журнале: «{text}»");
+            println!("  the announcement in the journal: \"{text}\"");
         }
     }
-    println!("  объявлено в потоке: {announced} (отметок: {marks}) — сходится с учётом");
+    println!("  announced in the stream: {announced} (notices: {marks}) — it matches the count");
     assert_eq!(announced, stats.dropped);
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 4. Свой носитель у класса. Критические данные пишутся на защищённый раздел
-// (jffs2 и подобное): классу задаётся собственный корень, раскладка внутри
-// та же — `<корень>/<неймспейс>/<класс>/`. Дамп такого хранилища — два
-// дерева, и вьюеру называют оба.
+// 4. A class with a medium of its own. Critical data is written to a protected
+// partition (jffs2 and the like): the class is given its own root, and the
+// layout inside it is the same — `<root>/<namespace>/<class>/`. A dump of such
+// a store is two trees, and the viewer is told both.
 // ---------------------------------------------------------------------------
 fn vault(
     root: &std::path::Path,
     vault: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("— критика на своём разделе —");
+    println!("— critical data on its own partition —");
     let store = Store::open(
         StoreConfig::new(root)
             .with_budget_per_class(16 << 20)
@@ -298,7 +308,7 @@ fn vault(
     ns.log(probe::events::Fault { code: 3 });
     ns.sync()?;
     println!(
-        "  основной корень: {:?}\n  раздел критики:  {:?}",
+        "  the main root:          {:?}\n  the critical partition: {:?}",
         std::fs::read_dir(root.join("orc-probe-0"))?
             .filter_map(|e| e
                 .ok()
@@ -311,26 +321,27 @@ fn vault(
             .collect::<Vec<_>>(),
     );
 
-    // Своё хранилище читается им самим: корни (оба!) и схемы поднятых
-    // неймспейсов у него уже есть. Назвать раздел критики второй раз можно
-    // только забыв — и тогда история молча оказалась бы короче.
+    // One's own store is read by itself: it already has the roots (both!) and
+    // the schemas of the namespaces that came up. Naming the critical partition
+    // a second time is only possible by forgetting — and then the history would
+    // silently come out shorter.
     let reader = store.reader();
     let read = reader.query(&Query::new().kinds(KindFilter::LOGS).order(Order::Oldest))?;
     for e in &read.entries {
         println!(
             "  [{}] {}",
             e.channel.as_str(),
-            reader.render(e, "ru").unwrap_or_default()
+            reader.render(e, "en").unwrap_or_default()
         );
     }
 
-    // Чужой дамп — другое дело: `Store` там открывать нельзя (он берёт
-    // блокировку корня и подметает временные файлы), поэтому корни и схемы
-    // называются руками.
+    // A foreign dump is another matter: a `Store` must not be opened there (it
+    // takes a lock on the root and sweeps temporary files), so the roots and
+    // schemas are named by hand.
     store.shutdown();
     let offline = Reader::open_dump([root, vault], &[probe::SCHEMA])?;
     println!(
-        "  тот же дамп вьюером: {} записей",
+        "  the same dump through a viewer: {} records",
         offline
             .query(&Query::new().kinds(KindFilter::LOGS))?
             .entries
