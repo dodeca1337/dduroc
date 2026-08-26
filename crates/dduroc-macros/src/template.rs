@@ -1,21 +1,21 @@
-//! Разбор шаблонов сообщений.
+//! Parsing message templates.
 //!
-//! Шаблон пишется с именованными плейсхолдерами (`"мощность {dbm} дБм"`),
-//! а разворачивается в позиционный `format!`: имена полей проверяются при
-//! компиляции, а рантайм не занимается поиском по именам.
+//! A template is written with named placeholders (`"мощность {dbm} дБм"`) and
+//! expands into a positional `format!`: the field names are checked at compile
+//! time and the runtime does no lookup by name.
 //!
-//! Спецификаторы формата сохраняются: `{dbm:.1}` → `{:.1}`.
+//! Format specifiers are preserved: `{dbm:.1}` becomes `{:.1}`.
 
-/// Имена плейсхолдеров шаблона в порядке появления.
+/// A template's placeholder names in order of appearance.
 pub fn placeholders(template: &str) -> Vec<String> {
     let mut out = Vec::new();
     scan(template, |name, _| out.push(name.to_owned()));
     out
 }
 
-/// Переписать шаблон в позиционный вид.
+/// Rewrite a template into positional form.
 ///
-/// Возвращает строку формата и порядок полей, которые нужно подставить.
+/// Returns the format string and the order of the fields to substitute.
 pub fn rewrite(template: &str) -> (String, Vec<String>) {
     let mut fmt = String::with_capacity(template.len());
     let mut order = Vec::new();
@@ -38,8 +38,9 @@ pub fn rewrite(template: &str) -> (String, Vec<String>) {
                 while j < bytes.len() && bytes[j] != b'}' && bytes[j] != b':' {
                     j += 1;
                 }
-                // Границы сегментов — ASCII-разделители, поэтому срез всегда
-                // попадает на границу символа: русские шаблоны не ломаются.
+                // The segment boundaries are ASCII separators, so a slice
+                // always lands on a character boundary: non-ASCII templates do
+                // not break.
                 order.push(template[start..j].to_owned());
                 fmt.push('{');
                 if j < bytes.len() && bytes[j] == b':' {
@@ -52,8 +53,9 @@ pub fn rewrite(template: &str) -> (String, Vec<String>) {
                 i = if j < bytes.len() { j + 1 } else { j };
             }
             _ => {
-                // Копируем байт как есть: многобайтовые символы проходят
-                // насквозь, потому что мы не интерпретируем не-ASCII.
+                // The byte is copied as it is: multi-byte characters pass
+                // straight through, because non-ASCII is never interpreted
+                // here.
                 let ch_len = utf8_len(bytes[i]);
                 fmt.push_str(&template[i..i + ch_len]);
                 i += ch_len;
@@ -90,7 +92,7 @@ fn scan(template: &str, mut on_placeholder: impl FnMut(&str, Option<&str>)) {
     }
 }
 
-/// Длина UTF-8 символа по его первому байту.
+/// The length of a UTF-8 character from its first byte.
 const fn utf8_len(first: u8) -> usize {
     match first {
         0x00..=0x7F => 1,
@@ -138,8 +140,8 @@ mod tests {
 
     #[test]
     fn cyrillic_text_survives() {
-        // Побайтовое приведение к char превратило бы каждый не-ASCII байт
-        // в отдельный символ latin-1 — ровно та ошибка, что была в прототипе.
+        // Casting byte by byte to char would turn every non-ASCII byte into its
+        // own latin-1 character — exactly the bug the prototype had.
         let (fmt, order) = rewrite("температура {t} °C, канал {ch}");
         assert_eq!(fmt, "температура {} °C, канал {}");
         assert_eq!(order, vec!["t", "ch"]);

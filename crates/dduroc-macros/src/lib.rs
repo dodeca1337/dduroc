@@ -1,8 +1,8 @@
-//! Макрос `schema!` — декларация схемы неймспейса.
+//! The `schema!` macro — the declaration of a namespace schema.
 //!
-//! Разворачивается в структуры событий, дескрипторы и константу схемы.
-//! Всё статическое: схема целиком лежит в `.rodata` и в рантайме ничего
-//! не стоит.
+//! It expands into event structs, descriptors and a schema constant.
+//! Everything is static: the schema lies wholly in `.rodata` and costs nothing
+//! at runtime.
 //!
 //! ```ignore
 //! dduroc::schema! {
@@ -19,21 +19,19 @@
 //!             ru: "мощность {dbm} дБм",
 //!             dbm: f32,
 //!         },
-//!         // Без полей — unit-структура: `ns.log(events::Started)`.
+//!         // With no fields it is a unit struct: `ns.log(events::Started)`.
 //!         Started = 0x02 { level: Info, en: "started", ru: "запущено" },
 //!     }
 //!
 //!     metrics {
-//!         // Диапазоны НОРМЫ — данные: рисуемы, обновляемы в рантайме.
+//!         // Ranges of what is NORMAL are data: drawable, updatable at runtime.
 //!         Temp = 0x01 { type: f32, unit: "°C", tags: [sensor],
 //!                       warn: -40.0..=70.0, alarm: -40.0..=85.0 },
-//!         // Форма, которую диапазоном не выразить, — предикат
-//!         // СРАБАТЫВАНИЯ (`v` — значение): полярность обратная, поэтому
-//!         // и ключ другой.
+//!         // A shape a range cannot express is a TRIGGER predicate (`v` is the
+//!         // value): the polarity is the opposite, hence a different key.
 //!         Vswr = 0x02 { type: f32, warn_if: v > 1.5,
 //!                       alarm_if: v > 3.0 || v < 1.0 },
-//!         // Перечисление: важность — префиксом, без неё состояние
-//!         // нормальное.
+//!         // An enum: severity goes in front; without it a state is normal.
 //!         Link = 0x03 { states: [alarm Los = 0, warn Sync = 1, Lock = 2] },
 //!     }
 //!
@@ -41,37 +39,38 @@
 //!         Calibration = 0x01,
 //!     }
 //!
-//!     // Раскладки прежних версий — их потребляют шаги миграции.
+//!     // The layouts of earlier versions — what the migration steps consume.
 //!     history {
 //!         1 { events { PowerSet = 0x01 { dbm: i8 } } }
 //!     }
 //!
-//!     // Шаг N приводит записи версии N к версии N+1.
+//!     // Step N brings records of version N up to version N+1.
 //!     migrations {
 //!         1 => {
-//!             // Типизированное правило: декод старой раскладки, энкод новой
-//!             // и диспетчер генерируются, затронутые типы выводятся из
-//!             // ключей — разойтись с фактическим поведением им не из чего.
+//!             // A typed rule: decoding the old layout, encoding the new one and
+//!             // the dispatcher are all generated, and the affected types are
+//!             // inferred from the keys — there is nothing for them to drift
+//!             // apart from the actual behaviour on.
 //!             v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) },
-//!             event(0x05): drop,               // тип удалён — имени больше нет
-//!             metric(0x07): metrics::Temp,     // ремап id, значение как было
-//!             // Значение самоописуемо: тип называет само замыкание, и
-//!             // history метрике не нужна.
+//!             event(0x05): drop,               // the type is gone — so is its name
+//!             metric(0x07): metrics::Temp,     // an id remap, the value as it was
+//!             // A value is self-describing: the closure names the type itself,
+//!             // and a metric needs no history.
 //!             metrics::Vswr: |v: u64| v as f32 / 10.0,
-//!             // У спана меняется только вид: номер и родитель — личность
-//!             // записи, и удалить её начало правило не даст.
+//!             // Only a span's kind changes: the number and the parent are the
+//!             // record's identity, and a rule will not let its start be deleted.
 //!             span(0x07): spans::Calibration,
 //!         },
-//!         // Люк: сырой fn. Затронутые типы объявляются руками; не объявлены
-//!         // — шаг считается затрагивающим всё.
+//!         // The hatch: a raw fn. The affected types are declared by hand; if
+//!         // they are not, the step counts as touching everything.
 //!         2 => migrate_v2,
 //!     }
 //! }
 //! ```
 //!
-//! Идентификаторы **обязательно явные**. Позиционная авто-нумерация
-//! прототипа при вставке события в середину списка молча перемапливала
-//! исторические записи на чужие декодеры.
+//! Identifiers are **mandatory and explicit**. When an event was inserted into
+//! the middle of a list, the prototype's positional auto-numbering silently
+//! remapped historical records onto the wrong decoders.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -103,7 +102,7 @@ struct EventDef {
     level: Ident,
     store: Option<Ident>,
     tags: Vec<Ident>,
-    /// Шаблоны по языкам в порядке объявления.
+    /// The templates per language, in declaration order.
     templates: Vec<(Ident, LitStr)>,
     fields: Vec<(Ident, Type)>,
 }
@@ -111,27 +110,28 @@ struct EventDef {
 struct MetricDef {
     name: Ident,
     id: u16,
-    /// `None` — тип выводится: у перечисления это `u64`.
+    /// `None` means the type is inferred: for an enum that is `u64`.
     value_type: Option<Ident>,
     unit: LitStr,
     tags: Vec<Ident>,
     store: Option<Ident>,
     kind: Option<Ident>,
     states: Vec<StateDef>,
-    /// Диапазоны нормы: вне них — соответствующая важность.
+    /// The ranges of what is normal: outside them lies the matching severity.
     warn: Option<syn::ExprRange>,
     alarm: Option<syn::ExprRange>,
-    /// Предикаты срабатывания (`v` — значение): истина — уровень достигнут.
+    /// The trigger predicates (`v` is the value): true means the level is
+    /// reached.
     warn_if: Option<syn::Expr>,
     alarm_if: Option<syn::Expr>,
 }
 
-/// Одно состояние метрики-перечисления: `alarm Los = 0`.
+/// One state of an enum metric: `alarm Los = 0`.
 #[derive(Clone)]
 struct StateDef {
     name: Ident,
     code: u64,
-    /// `None` — состояние нормальное.
+    /// `None` means the state is normal.
     severity: Option<Ident>,
 }
 
@@ -146,23 +146,23 @@ struct MigrationDef {
     step: StepDef,
 }
 
-/// Тело шага миграции.
+/// The body of a migration step.
 enum StepDef {
-    /// Сырой fn — люк для того, что правилами не выразить.
+    /// A raw fn — the hatch for what the rules cannot express.
     Raw {
         func: syn::Path,
-        /// Типы, затронутые шагом. `None` — не объявлены, значит шаг
-        /// считается затрагивающим **всё**: пропустить сегмент молча хуже,
-        /// чем переписать лишний.
+        /// The types the step affects. `None` means they were not declared, so
+        /// the step counts as touching **everything**: skipping a segment
+        /// silently is worse than rewriting a superfluous one.
         touches: Option<Touches>,
     },
-    /// Типизированные правила: диспетчер, декод и энкод генерирует макрос, а
-    /// затронутые типы **выводятся** из ключей — разойтись с фактическим
-    /// поведением им не из чего.
+    /// Typed rules: the macro generates the dispatcher, the decoding and the
+    /// encoding, and the affected types are **inferred** from the keys — there
+    /// is nothing for them to drift apart from the actual behaviour on.
     Rules(Vec<RuleDef>),
 }
 
-/// Затронутые шагом миграции типы.
+/// The types a migration step affects.
 #[derive(Clone, Default)]
 struct Touches {
     events: Vec<Ident>,
@@ -170,27 +170,30 @@ struct Touches {
     spans: Vec<Ident>,
 }
 
-/// Одно правило типизированного шага: `ключ: действие`.
+/// One rule of a typed step: `key: action`.
 struct RuleDef {
     key: RuleKey,
     action: RuleAction,
 }
 
-/// Что правило отбирает — по идентификатору В ТОЙ версии, которую шаг читает.
+/// What a rule selects — by identifier IN THE version the step reads.
 enum RuleKey {
-    /// `v1::PowerSet` — раскладка из history: и старый id, и тип для декода.
+    /// `v1::PowerSet` — a layout from history: both the old id and the type to
+    /// decode with.
     HistoryEvent { version: u16, name: Ident },
-    /// `events::PowerSet` — текущая раскладка (чистка значений, drop).
+    /// `events::PowerSet` — the current layout (scrubbing values, drop).
     CurrentEvent { name: Ident },
-    /// `event(0x05)` — голый id: тип удалён из схемы, имени больше нет.
+    /// `event(0x05)` — a bare id: the type is gone from the schema and so is
+    /// its name.
     RawEvent { id: u16, span: proc_macro2::Span },
-    /// `metrics::Temp` — текущая метрика.
+    /// `metrics::Temp` — a current metric.
     CurrentMetric { name: Ident },
-    /// `metric(0x07)` — голый id метрики.
+    /// `metric(0x07)` — a metric's bare id.
     RawMetric { id: u16, span: proc_macro2::Span },
-    /// `spans::Calibration` — текущий вид спана.
+    /// `spans::Calibration` — a current span kind.
     CurrentSpan { name: Ident },
-    /// `span(0x03)` — голый id вида: вид удалён из схемы, имени больше нет.
+    /// `span(0x03)` — a kind's bare id: the kind is gone from the schema and so
+    /// is its name.
     RawSpan { id: u16, span: proc_macro2::Span },
 }
 
@@ -208,30 +211,30 @@ impl RuleKey {
     }
 }
 
-/// Что правило делает с записью.
+/// What a rule does with a record.
 enum RuleAction {
-    /// `drop` — запись удаляется.
+    /// `drop` — the record is deleted.
     Drop,
-    /// Замыкание или функция: декод старой раскладки → новый payload.
+    /// A closure or a function: decode the old layout, produce a new payload.
     Map(syn::Expr),
-    /// `events::New` — сменить id, payload байт в байт.
+    /// `events::New` — change the id, the payload byte for byte.
     RemapEvent(Ident),
-    /// `metrics::New` — сменить метрику отсчёта.
+    /// `metrics::New` — change a sample's metric.
     RemapMetric(Ident),
-    /// `spans::New` — переименовать вид спана.
+    /// `spans::New` — rename a span kind.
     RemapSpan(Ident),
 }
 
-/// Раскладки изменившихся типов, как они были в версии `version`, — то, что
-/// потребляют шаги миграции. Порождает `pub mod v<N>` с Deserialize-типами.
+/// The layouts of changed types as they were in version `version` — what the
+/// migration steps consume. Produces a `pub mod v<N>` of Deserialize types.
 struct HistoryDef {
     version: u16,
     span: proc_macro2::Span,
     events: Vec<HistoryEvent>,
 }
 
-/// Старое событие: только id и поля — уровень, шаблоны и тэги на диске не
-/// живут, и старой раскладке они не нужны.
+/// An old event: the id and the fields only — the level, the templates and the
+/// tags do not live on disk, and an old layout has no need of them.
 struct HistoryEvent {
     name: Ident,
     id: u16,
@@ -239,14 +242,18 @@ struct HistoryEvent {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Разбор
+// Parsing
 // ════════════════════════════════════════════════════════════════════════════
 
 fn parse_id(input: ParseStream) -> syn::Result<u16> {
     input.parse::<Token![=]>()?;
     let lit: LitInt = input.parse()?;
-    lit.base10_parse::<u16>()
-        .map_err(|e| syn::Error::new(lit.span(), format!("идентификатор не влезает в u16: {e}")))
+    lit.base10_parse::<u16>().map_err(|e| {
+        syn::Error::new(
+            lit.span(),
+            format!("the identifier does not fit in a u16: {e}"),
+        )
+    })
 }
 
 fn parse_ident_list(input: ParseStream) -> syn::Result<Vec<Ident>> {
@@ -320,8 +327,8 @@ impl Parse for SchemaInput {
                     while !content.is_empty() {
                         let lit: LitInt = content.parse()?;
                         content.parse::<Token![=>]>()?;
-                        // Скобки сразу после `=>` — типизированные правила;
-                        // иначе путь к сырому fn с необязательными touches.
+                        // Braces right after `=>` mean typed rules; otherwise
+                        // it is the path to a raw fn with optional touches.
                         let step = if content.peek(syn::token::Brace) {
                             StepDef::Rules(parse_rules(&content)?)
                         } else {
@@ -352,7 +359,7 @@ impl Parse for SchemaInput {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
-                            "неизвестная секция `{other}`: ожидались name, version, \
+                            "unknown section `{other}`: expected name, version, \
                              languages, events, metrics, spans, history, migrations"
                         ),
                     ));
@@ -360,13 +367,13 @@ impl Parse for SchemaInput {
             }
         }
 
-        let name = name.ok_or_else(|| syn::Error::new(input.span(), "не задано `name:`"))?;
+        let name = name.ok_or_else(|| syn::Error::new(input.span(), "`name:` is not set"))?;
         let version =
-            version.ok_or_else(|| syn::Error::new(name.span(), "не задано `version:`"))?;
+            version.ok_or_else(|| syn::Error::new(name.span(), "`version:` is not set"))?;
         if languages.is_empty() {
             return Err(syn::Error::new(
                 name.span(),
-                "не задан `languages:` — рендерить сообщения будет нечем",
+                "`languages:` is not set — there would be nothing to render messages with",
             ));
         }
         Self::check_templates(&events, &languages)?;
@@ -385,35 +392,35 @@ impl Parse for SchemaInput {
 }
 
 impl SchemaInput {
-    /// Сверить шаблоны событий с объявленными языками.
+    /// Check the event templates against the languages declared.
     ///
-    /// Делается после разбора всего объявления, а не по ходу: секции не
-    /// обязаны идти в каком-либо порядке, и до конца разбора список языков
-    /// неизвестен.
+    /// Done after the whole declaration is parsed rather than along the way:
+    /// the sections need not come in any particular order, and until parsing
+    /// ends the list of languages is unknown.
     fn check_templates(events: &[EventDef], languages: &[Ident]) -> syn::Result<()> {
         for ev in events {
-            // Шаблон обязан быть на каждом объявленном языке: недостающий
-            // всплыл бы при чтении логов на языке, которого нет, — то есть в
-            // самый неудачный момент.
+            // A template is required in every language declared: a missing one
+            // would surface when reading logs in a language that is not there —
+            // that is, at the worst possible moment.
             for lang in languages {
                 if !ev.templates.iter().any(|(l, _)| l == lang) {
                     return Err(syn::Error::new(
                         ev.name.span(),
-                        format!("у события `{}` нет шаблона для языка `{lang}`", ev.name),
+                        format!("event `{}` has no template for language `{lang}`", ev.name),
                     ));
                 }
             }
-            // И наоборот: шаблон на языке, которого нет в `languages:`,
-            // никогда не будет показан. Промолчать значило бы оставить
-            // перевод, который пользователь считает работающим.
+            // And the other way round: a template in a language absent from
+            // `languages:` will never be shown. Staying silent would mean
+            // leaving a translation the user believes is working.
             for (lang, _) in &ev.templates {
                 if !languages.contains(lang) {
                     let declared: Vec<String> = languages.iter().map(|l| l.to_string()).collect();
                     return Err(syn::Error::new(
                         lang.span(),
                         format!(
-                            "у события `{}` шаблон на языке `{lang}`, но в `languages:` \
-                             объявлены только {}",
+                            "event `{}` has a template in language `{lang}`, but `languages:` \
+                             declares only {}",
                             ev.name,
                             declared.join(", ")
                         ),
@@ -425,19 +432,20 @@ impl SchemaInput {
     }
 }
 
-/// Разобрать объявление события.
+/// Parse an event declaration.
 ///
-/// Список языков сюда **не передаётся**: секции объявления не обязаны идти в
-/// каком-то порядке, и `events` выше `languages` — законная запись. Раньше
-/// шаблон отличался от поля принадлежностью ключа к списку языков, поэтому при
-/// таком порядке `en: "мощность {dbm}"` разбиралось как поле типа
-/// `"мощность {dbm}"`, и пользователь получал ошибку о неразобранном типе
-/// вместо внятного сообщения о своей схеме.
+/// The list of languages is **not** passed in here: the sections of a
+/// declaration need not come in any particular order, and `events` above
+/// `languages` is a legitimate way to write it. A template used to be told from
+/// a field by whether its key was in the list of languages, so under that order
+/// `en: "мощность {dbm}"` parsed as a field of type `"мощность {dbm}"`, and the
+/// user got an error about an unparsed type instead of a clear message about
+/// their schema.
 ///
-/// Признак теперь синтаксический: значение шаблона — строковый литерал,
-/// значение поля — тип, а тип строковым литералом быть не может. Полнота
-/// шаблонов по языкам проверяется потом, когда объявление разобрано целиком
-/// (см. [`SchemaInput::check_templates`]).
+/// The sign is now syntactic: a template's value is a string literal, a field's
+/// value is a type, and a type cannot be a string literal. Whether the
+/// templates cover every language is checked afterwards, once the declaration
+/// is parsed whole (see [`SchemaInput::check_templates`]).
 fn parse_event(input: ParseStream) -> syn::Result<EventDef> {
     let name: Ident = input.parse()?;
     let id = parse_id(input)?;
@@ -465,23 +473,22 @@ fn parse_event(input: ParseStream) -> syn::Result<EventDef> {
             if templates.iter().any(|(l, _)| *l == key) {
                 return Err(syn::Error::new(
                     key.span(),
-                    format!("шаблон `{key_str}` задан дважды"),
+                    format!("template `{key_str}` is given twice"),
                 ));
             }
             templates.push((key.clone(), content.parse::<LitStr>()?));
         } else {
-            // Всё остальное — поле payload'а.
+            // Everything else is a payload field.
             fields.push((key, content.parse::<Type>()?));
         }
         let _ = content.parse::<Token![,]>();
     }
 
-    let level = level.ok_or_else(|| {
-        syn::Error::new(name.span(), format!("у события `{name}` не задан `level:`"))
-    })?;
+    let level = level
+        .ok_or_else(|| syn::Error::new(name.span(), format!("event `{name}` has no `level:`")))?;
 
-    // Плейсхолдеры обязаны ссылаться на существующие поля. Это проверяется
-    // здесь: список языков для такой проверки не нужен.
+    // Placeholders have to refer to fields that exist. That is checked here:
+    // the list of languages is not needed for such a check.
     let field_names: Vec<String> = fields.iter().map(|(n, _)| n.to_string()).collect();
     for (lang, tmpl) in &templates {
         for placeholder in template::placeholders(&tmpl.value()) {
@@ -489,8 +496,8 @@ fn parse_event(input: ParseStream) -> syn::Result<EventDef> {
                 return Err(syn::Error::new(
                     tmpl.span(),
                     format!(
-                        "шаблон `{lang}` события `{name}` ссылается на `{{{placeholder}}}`, \
-                         но такого поля нет"
+                        "the `{lang}` template of event `{name}` refers to `{{{placeholder}}}`, \
+                         but there is no such field"
                     ),
                 ));
             }
@@ -508,18 +515,18 @@ fn parse_event(input: ParseStream) -> syn::Result<EventDef> {
     })
 }
 
-/// Разобрать список состояний: `[alarm Los = 0, warn Sync = 1, Lock = 2]`.
+/// Parse a list of states: `[alarm Los = 0, warn Sync = 1, Lock = 2]`.
 ///
-/// Важность стоит префиксом и читается как строка журнала: «авария — Los».
-/// Коды **обязательно** явные: позиционная нумерация сдвинулась бы при вставке
-/// состояния в середину списка, и уже записанные сегменты стали бы читаться
-/// неверно, без единого признака ошибки.
+/// The severity goes in front and reads like a journal line: "alarm — Los".
+/// The codes are **mandatory and explicit**: positional numbering would shift
+/// when a state was inserted into the middle of the list, and segments already
+/// written would start reading wrongly, without a single sign of an error.
 fn parse_states(input: ParseStream) -> syn::Result<Vec<StateDef>> {
     let content;
     bracketed!(content in input);
     let mut out = Vec::new();
     while !content.is_empty() {
-        // Два идентификатора подряд — первый из них важность.
+        // Two identifiers in a row: the first of them is the severity.
         let first: Ident = content.parse()?;
         let (severity, name) = if content.peek(Ident) {
             (Some(first), content.parse::<Ident>()?)
@@ -530,9 +537,9 @@ fn parse_states(input: ParseStream) -> syn::Result<Vec<StateDef>> {
             syn::Error::new(
                 name.span(),
                 format!(
-                    "у состояния `{name}` не задан код: пишите `{name} = 0`. \
-                     Код обязан быть явным — позиционная нумерация сдвинулась бы \
-                     при вставке состояния в середину списка"
+                    "state `{name}` has no code: write `{name} = 0`. The code has to \
+                     be explicit — positional numbering would shift when a state was \
+                     inserted into the middle of the list"
                 ),
             )
         })?;
@@ -543,7 +550,7 @@ fn parse_states(input: ParseStream) -> syn::Result<Vec<StateDef>> {
             let sev: Ident = content.parse()?;
             return Err(syn::Error::new(
                 sev.span(),
-                format!("важность пишется префиксом: `{sev} {name} = {code}`"),
+                format!("the severity goes in front: `{sev} {name} = {code}`"),
             ));
         }
         out.push(StateDef {
@@ -574,7 +581,7 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     let mut alarm_if = None;
 
     while !content.is_empty() {
-        // `type` — ключевое слово Rust, обычным `Ident` его не разобрать.
+        // `type` is a Rust keyword — an ordinary `Ident` will not parse it.
         let key: Ident = if content.peek(Token![type]) {
             let t = content.parse::<Token![type]>()?;
             Ident::new("type", t.span)
@@ -591,31 +598,31 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
             "states" => states = parse_states(&content)?,
             "warn" => warn = Some(parse_norm_range(&content, &key)?),
             "alarm" => alarm = Some(parse_norm_range(&content, &key)?),
-            // Предикат срабатывания: у него полярность обратная диапазону,
-            // поэтому и ключ другой — перепутать их молча невозможно.
+            // A trigger predicate: its polarity is the opposite of a range's,
+            // hence a different key — the two cannot be confused silently.
             "warn_if" => warn_if = Some(content.parse::<syn::Expr>()?),
             "alarm_if" => alarm_if = Some(content.parse::<syn::Expr>()?),
             "value_type" => {
                 return Err(syn::Error::new(
                     key.span(),
-                    "ключ называется `type`: приставка `v` не несла смысла",
+                    "the key is called `type`: the `v` prefix carried no meaning",
                 ));
             }
-            // Подсказка вместо «неизвестный ключ»: пара warn/critical —
-            // естественная догадка, а слово занято классом хранения.
+            // A hint instead of "unknown key": the pair warn/critical is a
+            // natural guess, and the word is taken by the storage class.
             "critical" => {
                 return Err(syn::Error::new(
                     key.span(),
-                    "аварийный диапазон называется `alarm`, а не `critical`: \
-                     слово `critical` занято классом хранения (`store: critical`), \
-                     и в одном объявлении метрики они означали бы разное",
+                    "the alarm range is called `alarm`, not `critical`: the word \
+                     `critical` is taken by the storage class (`store: critical`), and in \
+                     one metric declaration the two would mean different things",
                 ));
             }
             other => {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
-                        "у метрики неизвестный ключ `{other}`: ожидались type, unit, \
+                        "unknown key `{other}` on a metric: expected type, unit, \
                          tags, store, kind, states, warn, alarm, warn_if, alarm_if"
                     ),
                 ));
@@ -624,16 +631,16 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         let _ = content.parse::<Token![,]>();
     }
 
-    // Диапазон и предикат одного уровня вместе неоднозначны: у них
-    // противоположная полярность (норма против срабатывания), и объединять
-    // их молча значило бы гадать за пользователя.
+    // A range and a predicate of the same level together are ambiguous: their
+    // polarity is opposite (normal versus triggering), and combining them
+    // silently would mean guessing on the user's behalf.
     for (range, predicate, key) in [(&warn, &warn_if, "warn"), (&alarm, &alarm_if, "alarm")] {
         if range.is_some() && predicate.is_some() {
             return Err(syn::Error::new(
                 name.span(),
                 format!(
-                    "у метрики `{name}` заданы и `{key}:`, и `{key}_if:`: диапазон \
-                     описывает норму, предикат — срабатывание; выберите одну форму"
+                    "metric `{name}` sets both `{key}:` and `{key}_if:`: a range \
+                     describes what is normal, a predicate what triggers; choose one form"
                 ),
             ));
         }
@@ -642,13 +649,13 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         return Err(syn::Error::new(
             name.span(),
             format!(
-                "у перечисления `{name}` предикаты не имеют смысла: важность \
-                 задаётся самим состояниям — `alarm Los = 0`"
+                "predicates make no sense on enum `{name}`: the severity is set on the \
+                 states themselves — `alarm Los = 0`"
             ),
         ));
     }
 
-    // Тип перечисления выводится: код состояния — целое.
+    // An enum's type is inferred: a state code is an integer.
     if value_type.is_none() && !states.is_empty() {
         value_type = Some(Ident::new("u64", name.span()));
     }
@@ -656,8 +663,8 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         return Err(syn::Error::new(
             name.span(),
             format!(
-                "у метрики `{name}` не задан `type:` (у перечисления он выводится \
-                 из `states:`)"
+                "metric `{name}` has no `type:` (for an enum it is inferred from \
+                 `states:`)"
             ),
         ));
     }
@@ -666,7 +673,7 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
         return Err(syn::Error::new(
             name.span(),
             format!(
-                "у метрики `{name}` тип blob: он не приводится к числу, и предикату нечего проверять"
+                "metric `{name}` is of type blob: it cannot be reduced to a number, and a predicate has nothing to check"
             ),
         ));
     }
@@ -688,31 +695,32 @@ fn parse_metric(input: ParseStream) -> syn::Result<MetricDef> {
     })
 }
 
-/// Диапазон нормы `warn:`/`alarm:` — с подсказкой, если написано условие.
+/// The range of what is normal for `warn:`/`alarm:` — with a hint if a
+/// condition was written instead.
 ///
-/// Перепутать формы легко, а ошибка парсера про «ожидался диапазон» не
-/// объясняет главного: у форм противоположная полярность.
+/// The forms are easy to confuse, and a parser error about "a range was
+/// expected" does not explain the main thing: the forms have opposite polarity.
 fn parse_norm_range(input: ParseStream, key: &Ident) -> syn::Result<syn::ExprRange> {
     match input.parse::<syn::Expr>()? {
         syn::Expr::Range(r) => Ok(r),
         other => Err(syn::Error::new_spanned(
             &other,
             format!(
-                "`{key}:` принимает диапазон НОРМЫ (`{key}: -40.0..=70.0`); условие \
-                 срабатывания пишется предикатом: `{key}_if: v > 70.0`"
+                "`{key}:` takes the range of what is NORMAL (`{key}: -40.0..=70.0`); a \
+                 trigger condition is written as a predicate: `{key}_if: v > 70.0`"
             ),
         )),
     }
 }
 
-/// Разобрать затронутые шагом типы: `{ events: [A, B], metrics: [Temp] }`.
+/// Parse the types a step affects: `{ events: [A, B], metrics: [Temp] }`.
 ///
-/// Объявление необязательно, и это осознанный выбор: миграция переписывает
-/// только сегменты, содержащие затронутые типы (множества их идентификаторов
-/// лежат в footer'е), а не переписанный сегмент — сэкономленный ресурс флеша.
-/// Но экономия обязана быть **включена явно**: забытый список не должен
-/// означать «ничего не трогаем», иначе шаг молча обошёл бы всю историю
-/// стороной, оставив её в прежней раскладке.
+/// The declaration is optional, and that is a deliberate choice: a migration
+/// rewrites only the segments holding affected types (the sets of their
+/// identifiers lie in the footer), and a segment not rewritten is flash wear
+/// saved. But the saving has to be **turned on explicitly**: a forgotten list
+/// must not mean "we touch nothing", or the step would silently walk past the
+/// whole history, leaving it in the earlier layout.
 fn parse_touches(input: ParseStream) -> syn::Result<Touches> {
     let content;
     braced!(content in input);
@@ -728,7 +736,7 @@ fn parse_touches(input: ParseStream) -> syn::Result<Touches> {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
-                        "у шага миграции неизвестный ключ `{other}`: ожидались \
+                        "unknown key `{other}` on a migration step: expected \
                          events, metrics, spans"
                     ),
                 ));
@@ -739,7 +747,7 @@ fn parse_touches(input: ParseStream) -> syn::Result<Touches> {
     Ok(out)
 }
 
-/// Разобрать типизированные правила шага: `{ ключ: действие, ... }`.
+/// Parse a step's typed rules: `{ key: action, ... }`.
 fn parse_rules(input: ParseStream) -> syn::Result<Vec<RuleDef>> {
     let content;
     braced!(content in input);
@@ -754,8 +762,8 @@ fn parse_rules(input: ParseStream) -> syn::Result<Vec<RuleDef>> {
     Ok(out)
 }
 
-/// Ключ правила: `v1::PowerSet`, `events::X`, `metrics::X`,
-/// `event(0x05)`, `metric(0x07)`.
+/// A rule's key: `v1::PowerSet`, `events::X`, `metrics::X`, `event(0x05)`,
+/// `metric(0x07)`.
 fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
     if input.peek(Ident) && input.peek2(syn::token::Paren) {
         let kind: Ident = input.parse()?;
@@ -778,7 +786,7 @@ fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
             }),
             other => Err(syn::Error::new(
                 kind.span(),
-                format!("неизвестный вид ключа `{other}(..)`: ожидались event, metric, span"),
+                format!("unknown key kind `{other}(..)`: expected event, metric, span"),
             )),
         };
     }
@@ -787,8 +795,8 @@ fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
     let bad = |msg: &str| Err(syn::Error::new_spanned(&path, msg.to_owned()));
     if path.segments.len() != 2 {
         return bad(
-            "ключ правила — путь из двух сегментов: `v1::Тип`, `events::Тип`, \
-             `metrics::Метрика`, `spans::Вид`, либо голый id: `event(0x05)`, \
+            "a rule's key is a two-segment path: `v1::Type`, `events::Type`, \
+             `metrics::Metric`, `spans::Kind`, or a bare id: `event(0x05)`, \
              `metric(0x07)`, `span(0x03)`",
         );
     }
@@ -808,10 +816,10 @@ fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
     {
         return Ok(RuleKey::HistoryEvent { version, name });
     }
-    bad("первый сегмент ключа — `v<N>` (раскладка из history), `events`, `metrics` или `spans`")
+    bad("a key's first segment is `v<N>` (a layout from history), `events`, `metrics` or `spans`")
 }
 
-/// Действие правила: `drop`, путь-ремап или замыкание/функция.
+/// A rule's action: `drop`, a remap path, or a closure/function.
 fn parse_rule_action(input: ParseStream) -> syn::Result<RuleAction> {
     let expr: syn::Expr = input.parse()?;
     if let syn::Expr::Path(p) = &expr {
@@ -836,7 +844,7 @@ fn parse_rule_action(input: ParseStream) -> syn::Result<RuleAction> {
     Ok(RuleAction::Map(expr))
 }
 
-/// Разобрать одну запись history: `N { events { Имя = 0xID { поле: тип } } }`.
+/// Parse one history entry: `N { events { Name = 0xID { field: type } } }`.
 fn parse_history(input: ParseStream) -> syn::Result<HistoryDef> {
     let lit: LitInt = input.parse()?;
     let version = lit.base10_parse::<u16>()?;
@@ -855,14 +863,15 @@ fn parse_history(input: ParseStream) -> syn::Result<HistoryDef> {
                     let _ = inner.parse::<Token![,]>();
                 }
             }
-            // У отсчётов и спанов payload-раскладки нет: их идентификаторы
-            // ремапятся правилами напрямую, объявлять в history нечего.
+            // Samples and spans have no payload layout: their identifiers are
+            // remapped by rules directly, and there is nothing to declare in
+            // history.
             other => {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
-                        "в history объявляются только `events`, получено `{other}`: \
-                         у отсчётов и спанов нет payload-раскладки"
+                        "history declares only `events`, got `{other}`: samples and \
+                         spans have no payload layout"
                     ),
                 ));
             }
@@ -872,7 +881,9 @@ fn parse_history(input: ParseStream) -> syn::Result<HistoryDef> {
     if events.is_empty() {
         return Err(syn::Error::new(
             lit.span(),
-            format!("history {version} пуста: раз раскладки не изменились, запись не нужна"),
+            format!(
+                "history {version} is empty: if the layouts did not change, the entry is not needed"
+            ),
         ));
     }
     Ok(HistoryDef {
@@ -882,8 +893,9 @@ fn parse_history(input: ParseStream) -> syn::Result<HistoryDef> {
     })
 }
 
-/// Старое событие: `Имя = 0xID { поле: тип, ... }`. Только поля — уровень,
-/// шаблоны и тэги на диск не пишутся, и старой раскладке они не нужны.
+/// An old event: `Name = 0xID { field: type, ... }`. Fields only — the level,
+/// the templates and the tags are not written to disk, and an old layout has
+/// no need of them.
 fn parse_history_event(input: ParseStream) -> syn::Result<HistoryEvent> {
     let name: Ident = input.parse()?;
     let id = parse_id(input)?;
@@ -914,7 +926,7 @@ fn parse_span(input: ParseStream) -> syn::Result<SpanDef> {
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
-                        format!("у спана неизвестный ключ `{other}`"),
+                        format!("unknown key `{other}` on a span"),
                     ));
                 }
             }
@@ -925,7 +937,7 @@ fn parse_span(input: ParseStream) -> syn::Result<SpanDef> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Генерация
+// Generation
 // ════════════════════════════════════════════════════════════════════════════
 
 fn level_path(level: &Ident) -> syn::Result<TokenStream2> {
@@ -940,7 +952,7 @@ fn level_path(level: &Ident) -> syn::Result<TokenStream2> {
             return Err(syn::Error::new(
                 level.span(),
                 format!(
-                    "неизвестный уровень `{other}`: ожидались \
+                    "unknown level `{other}`: expected \
                      DevTrace/Trace/Debug/Info/Warn/Error"
                 ),
             ));
@@ -956,18 +968,18 @@ fn class_path(store: Option<&Ident>) -> syn::Result<TokenStream2> {
         "default" => quote!(::dduroc::StorageClass::Default),
         "critical" => quote!(::dduroc::StorageClass::Critical),
         "telemetry" => quote!(::dduroc::StorageClass::Telemetry),
-        // Неизвестное имя — ошибка, а не новый класс. Раньше любой
-        // идентификатор молча превращался в `StorageClass("…")`: описка в
-        // `critical` давала канал с другим именем, другой политикой
-        // долговечности и другим бюджетом — то есть ровно то, от чего класс
-        // хранения защищает, и без единого признака. Уровень (`level:`) на
-        // опечатку отказывает с самого начала; здесь была единственная
-        // молчаливая ветка во всём макросе.
+        // An unknown name is an error, not a new class. Any identifier used to
+        // turn silently into a `StorageClass("…")`: a typo in `critical` gave a
+        // channel with a different name, a different durability policy and a
+        // different budget — that is, exactly what a storage class protects
+        // against, and with no sign at all. The level (`level:`) has refused a
+        // typo from the start; this was the one silent branch in the whole
+        // macro.
         other => {
             return Err(syn::Error::new(
                 store.span(),
                 format!(
-                    "неизвестный класс хранения `{other}`: ожидались \
+                    "unknown storage class `{other}`: expected \
                      default/critical/telemetry"
                 ),
             ));
@@ -986,17 +998,17 @@ fn value_type_path(value_type: &Ident) -> syn::Result<TokenStream2> {
         other => {
             return Err(syn::Error::new(
                 value_type.span(),
-                format!("неизвестный тип значения `{other}`: ожидались f32/f64/i64/u64/bool/blob"),
+                format!("unknown value type `{other}`: expected f32/f64/i64/u64/bool/blob"),
             ));
         }
     })
 }
 
-/// Rust-тип, которым метрика параметризует свою константу.
+/// The Rust type a metric parameterizes its constant with.
 ///
-/// Он и определяет, что примет `sample`: у `Metric<f32>` — только `f32`.
-/// У перечисления это сам сгенерированный enum, поэтому состояние чужой
-/// метрики не проходит проверку типов.
+/// It is what determines what `sample` will accept: a `Metric<f32>` takes an
+/// `f32` alone. For an enum it is the generated enum itself, so a state of
+/// another metric fails the type check.
 fn marker_path(value_type: &Ident, states_enum: Option<&Ident>) -> syn::Result<TokenStream2> {
     if let Some(name) = states_enum {
         return Ok(quote!(#name));
@@ -1011,17 +1023,18 @@ fn marker_path(value_type: &Ident, states_enum: Option<&Ident>) -> syn::Result<T
         other => {
             return Err(syn::Error::new(
                 value_type.span(),
-                format!("неизвестный тип значения `{other}`: ожидались f32/f64/i64/u64/bool/blob"),
+                format!("unknown value type `{other}`: expected f32/f64/i64/u64/bool/blob"),
             ));
         }
     })
 }
 
-/// Rust-тип значения метрики **на диске**.
+/// The Rust type of a metric's value **on disk**.
 ///
-/// Отличается от [`marker_path`]: там у перечисления — сам сгенерированный
-/// enum (им параметризована константа метрики), а на диск идёт код состояния,
-/// то есть `u64`. Правилу миграции важно именно то, что ляжет на диск.
+/// It differs from [`marker_path`]: there an enum gives the generated enum
+/// itself (the metric constant is parameterized by it), while what reaches disk
+/// is the state code, that is, a `u64`. What matters to a migration rule is
+/// precisely what will lie on disk.
 fn wire_type(m: &MetricDef) -> syn::Result<TokenStream2> {
     if !m.states.is_empty() {
         return Ok(quote!(u64));
@@ -1039,7 +1052,7 @@ fn wire_type(m: &MetricDef) -> syn::Result<TokenStream2> {
         other => {
             return Err(syn::Error::new(
                 value_type.span(),
-                format!("неизвестный тип значения `{other}`: ожидались f32/f64/i64/u64/bool/blob"),
+                format!("unknown value type `{other}`: expected f32/f64/i64/u64/bool/blob"),
             ));
         }
     })
@@ -1053,20 +1066,21 @@ fn severity_path(severity: Option<&Ident>) -> syn::Result<TokenStream2> {
         "normal" => quote!(::dduroc::Severity::Normal),
         "warn" => quote!(::dduroc::Severity::Warn),
         "alarm" => quote!(::dduroc::Severity::Alarm),
-        // `critical` занято классом хранения: `store: critical` и
-        // `Los = 0: critical` в одном объявлении означали бы совсем разное.
+        // `critical` is taken by the storage class: `store: critical` and `Los
+        // = 0: critical` in one declaration would mean entirely different
+        // things.
         "critical" => {
             return Err(syn::Error::new(
                 s.span(),
-                "важность `critical` переименована в `alarm`: слово `critical` \
-                 занято классом хранения (`store: critical`), и в одном \
-                 объявлении метрики они означали бы разное",
+                "the severity `critical` was renamed to `alarm`: the word `critical` \
+                 is taken by the storage class (`store: critical`), and in one metric \
+                 declaration the two would mean different things",
             ));
         }
         other => {
             return Err(syn::Error::new(
                 s.span(),
-                format!("неизвестная важность `{other}`: ожидались normal/warn/alarm"),
+                format!("unknown severity `{other}`: expected normal/warn/alarm"),
             ));
         }
     })
@@ -1074,8 +1088,8 @@ fn severity_path(severity: Option<&Ident>) -> syn::Result<TokenStream2> {
 
 fn metric_kind_path(kind: Option<&Ident>, has_states: bool) -> syn::Result<TokenStream2> {
     let Some(k) = kind else {
-        // Перечисление держится ступенькой по определению; всё остальное по
-        // умолчанию непрерывно.
+        // An enum is held as a step by definition; everything else is
+        // continuous by default.
         return Ok(if has_states {
             quote!(::dduroc::MetricKind::State)
         } else {
@@ -1087,9 +1101,9 @@ fn metric_kind_path(kind: Option<&Ident>, has_states: bool) -> syn::Result<Token
         return Err(syn::Error::new(
             k.span(),
             format!(
-                "метрика объявляет `states:`, значит её вид — state, а не `{name}`: \
-                 непрерывной величиной график соединил бы состояния прямой, \
-                 показав значения, которых не было"
+                "the metric declares `states:`, so its kind is state rather than \
+                 `{name}`: as a continuous quantity a chart would join the states with a \
+                 straight line, showing values that never were"
             ),
         ));
     }
@@ -1100,13 +1114,13 @@ fn metric_kind_path(kind: Option<&Ident>, has_states: bool) -> syn::Result<Token
         other => {
             return Err(syn::Error::new(
                 k.span(),
-                format!("неизвестный вид метрики `{other}`: ожидались gauge/state/counter"),
+                format!("unknown metric kind `{other}`: expected gauge/state/counter"),
             ));
         }
     })
 }
 
-/// Числовое значение границы диапазона: литерал, возможно со знаком минус.
+/// A numeric range bound: a literal, possibly with a minus sign.
 fn bound_value(expr: &syn::Expr) -> syn::Result<f64> {
     use syn::{Expr, Lit, UnOp};
     match expr {
@@ -1115,7 +1129,7 @@ fn bound_value(expr: &syn::Expr) -> syn::Result<f64> {
             Lit::Int(i) => i.base10_parse::<f64>(),
             other => Err(syn::Error::new_spanned(
                 other,
-                "граница диапазона обязана быть числом",
+                "a range bound has to be a number",
             )),
         },
         Expr::Unary(u) if matches!(u.op, UnOp::Neg(_)) => Ok(-bound_value(&u.expr)?),
@@ -1123,15 +1137,15 @@ fn bound_value(expr: &syn::Expr) -> syn::Result<f64> {
         Expr::Paren(p) => bound_value(&p.expr),
         other => Err(syn::Error::new_spanned(
             other,
-            "граница диапазона обязана быть числовым литералом",
+            "a range bound has to be a numeric literal",
         )),
     }
 }
 
-/// Собрать [`dduroc::Range`] из диапазона Rust.
+/// Build a [`dduroc::Range`] from a Rust range.
 ///
-/// Верхняя граница требует `..=`: она **включительная**, и позволить писать
-/// `..70.0` значило бы тихо переопределить смысл общеизвестного синтаксиса.
+/// The upper bound requires `..=`: it is **inclusive**, and allowing `..70.0`
+/// would mean quietly redefining the meaning of a well-known syntax.
 fn range_tokens(range: Option<&syn::ExprRange>) -> syn::Result<TokenStream2> {
     let Some(r) = range else {
         return Ok(quote!(::dduroc::Range {
@@ -1151,8 +1165,8 @@ fn range_tokens(range: Option<&syn::ExprRange>) -> syn::Result<TokenStream2> {
             if matches!(r.limits, syn::RangeLimits::HalfOpen(_)) {
                 return Err(syn::Error::new_spanned(
                     r,
-                    "верхняя граница предела включительная — пишите `..=`: \
-                     значение, равное границе, ещё нормально",
+                    "a limit's upper bound is inclusive — write `..=`: a value equal \
+                     to the bound is still normal",
                 ));
             }
             let v = bound_value(e)?;
@@ -1163,11 +1177,11 @@ fn range_tokens(range: Option<&syn::ExprRange>) -> syn::Result<TokenStream2> {
     Ok(quote!(::dduroc::Range { min: #min, max: #max }))
 }
 
-/// Найти идентификатор объявленного типа по его имени.
+/// Find the identifier of a declared type by its name.
 ///
-/// Опечатка в списке затронутых типов обязана быть ошибкой компиляции: иначе
-/// шаг миграции тихо не нашёл бы свой тип и обошёл бы стороной ровно те
-/// сегменты, ради которых написан.
+/// A typo in the list of affected types has to be a compile error: otherwise a
+/// migration step would quietly fail to find its type and walk past exactly
+/// the segments it was written for.
 fn lookup_id<'a>(
     name: &Ident,
     mut declared: impl Iterator<Item = (&'a Ident, u16)>,
@@ -1179,12 +1193,12 @@ fn lookup_id<'a>(
         .ok_or_else(|| {
             syn::Error::new(
                 name.span(),
-                format!("шаг миграции называет {what} `{name}`, которого нет в схеме"),
+                format!("a migration step names {what} `{name}`, which is not in the schema"),
             )
         })
 }
 
-/// Проверить уникальность идентификаторов.
+/// Check that the identifiers are unique.
 fn check_unique(kind: &str, items: &[(u16, Ident)]) -> syn::Result<()> {
     let mut seen: HashMap<u16, &Ident> = HashMap::new();
     for (id, name) in items {
@@ -1192,7 +1206,7 @@ fn check_unique(kind: &str, items: &[(u16, Ident)]) -> syn::Result<()> {
             return Err(syn::Error::new(
                 name.span(),
                 format!(
-                    "{kind} id {id:#x} уже занят `{prev}` — идентификаторы обязаны быть уникальны"
+                    "{kind} id {id:#x} is already taken by `{prev}` — identifiers have to be unique"
                 ),
             ));
         }
@@ -1201,9 +1215,9 @@ fn check_unique(kind: &str, items: &[(u16, Ident)]) -> syn::Result<()> {
 }
 
 fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
-    // Дескрипторы укладываются по возрастанию идентификаторов: поиск по
-    // схеме идёт бинарно и выполняется на каждую запись. Порядок в
-    // объявлении при этом остаётся свободным — это забота макроса.
+    // The descriptors are laid out in ascending order of identifier: the search
+    // over the schema is binary and happens on every record. The order in the
+    // declaration stays free — that is the macro's business.
     let mut input = SchemaInput {
         name: input.name.clone(),
         version: input.version,
@@ -1220,7 +1234,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
     let input = &input;
 
     check_unique(
-        "событие",
+        "event",
         &input
             .events
             .iter()
@@ -1228,7 +1242,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             .collect::<Vec<_>>(),
     )?;
     check_unique(
-        "метрика",
+        "metric",
         &input
             .metrics
             .iter()
@@ -1236,7 +1250,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             .collect::<Vec<_>>(),
     )?;
     check_unique(
-        "спан",
+        "span",
         &input
             .spans
             .iter()
@@ -1248,7 +1262,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
     let version = input.version;
     let lang_strs: Vec<String> = input.languages.iter().map(|l| l.to_string()).collect();
 
-    // ── события ──────────────────────────────────────────────────────────
+    // ── events ───────────────────────────────────────────────────────────
     let mut event_structs = Vec::new();
     let mut event_descs = Vec::new();
 
@@ -1262,9 +1276,10 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
 
         let field_decls: Vec<TokenStream2> =
             ev.fields.iter().map(|(n, t)| quote!(pub #n: #t)).collect();
-        // Событие без полей — unit-структура, а не пустые фигурные скобки:
-        // `ns.log(events::Started)` вместо `ns.log(events::Started {})`. На
-        // проводе разницы нет — postcard кодирует и то, и другое нулём байт.
+        // An event with no fields is a unit struct rather than empty braces:
+        // `ns.log(events::Started)` instead of `ns.log(events::Started {})`. On
+        // the wire there is no difference — postcard encodes both as zero
+        // bytes.
         let struct_decl = if ev.fields.is_empty() {
             quote!(pub struct #name;)
         } else {
@@ -1280,7 +1295,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             })
             .collect();
 
-        // Шаблоны в порядке объявления языков.
+        // The templates in the order the languages were declared.
         let templates: Vec<&LitStr> = input
             .languages
             .iter()
@@ -1288,12 +1303,13 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 &ev.templates
                     .iter()
                     .find(|(l, _)| l == lang)
-                    .expect("наличие шаблона проверено при разборе")
+                    .expect("the template's presence was checked while parsing")
                     .1
             })
             .collect();
 
-        // Рендер: каждый язык — свой format! с переставленными аргументами.
+        // Rendering: every language gets its own format! with the arguments
+        // reordered.
         let render_arms: Vec<TokenStream2> = templates
             .iter()
             .enumerate()
@@ -1365,7 +1381,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         });
     }
 
-    // ── метрики ──────────────────────────────────────────────────────────
+    // ── metrics ──────────────────────────────────────────────────────────
     let mut metric_consts = Vec::new();
     let mut metric_descs = Vec::new();
     let mut metric_items = Vec::new();
@@ -1376,7 +1392,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         let value_type_ident = m
             .value_type
             .as_ref()
-            .expect("value_type проверен при разборе");
+            .expect("value_type was checked while parsing");
         let value_type = value_type_path(value_type_ident)?;
         let class = class_path(m.store.as_ref())?;
         let unit = &m.unit;
@@ -1385,17 +1401,17 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         let warn = range_tokens(m.warn.as_ref())?;
         let alarm = range_tokens(m.alarm.as_ref())?;
 
-        // Предикаты срабатывания компилируются в обычные fn схемного модуля:
-        // указатель на них лежит в дескрипторе, и читатель пользуется ими так
-        // же, как диапазонами, — дамп со своей схемой раскрашивается одинаково
-        // на приборе и во вьюере.
+        // The trigger predicates compile into ordinary fns of the schema
+        // module: a pointer to them lies in the descriptor, and a reader uses
+        // them exactly as it uses ranges — a dump with its own schema is
+        // coloured the same way on the device and in a viewer.
         let mut predicate = |key: &str, expr: Option<&syn::Expr>| match expr {
             None => quote!(::core::option::Option::None),
             Some(expr) => {
                 let fn_name = quote::format_ident!("__{}_{}", key, name_str.to_lowercase());
-                // Двустороннее условие естественно пишется `v > a || v < b`,
-                // а clippy предлагает переписать его диапазоном — ровно той
-                // формой, вместо которой предикат и выбран.
+                // A two-sided condition is naturally written `v > a || v < b`,
+                // and clippy suggests rewriting it as a range — the very form
+                // the predicate was chosen instead of.
                 metric_items.push(quote! {
                     #[allow(clippy::manual_range_contains)]
                     fn #fn_name(v: f64) -> bool {
@@ -1408,10 +1424,10 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         let warn_if = predicate("warn_if", m.warn_if.as_ref());
         let alarm_if = predicate("alarm_if", m.alarm_if.as_ref());
 
-        // Константа несёт тип значения: `Metric<f32>` не даст записать в эту
-        // метрику целое, а `Metric<LinkState>` — состояние чужой метрики.
-        // Имя занимает пространство значений, поэтому перечисление состояний
-        // может называться так же.
+        // The constant carries the value type: a `Metric<f32>` will not let an
+        // integer be written to this metric, and a `Metric<LinkState>` will not
+        // take a state of another metric. The name occupies the value
+        // namespace, so the enum of states may be called the same.
         let marker = marker_path(
             value_type_ident,
             if m.states.is_empty() {
@@ -1425,8 +1441,8 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 ::dduroc::Metric::new(::dduroc::MetricId(#id));
         });
 
-        // Статика подписей состояний: имена и важность живут в схеме, на диск
-        // уходит только код.
+        // The static state labels: the names and the severities live in the
+        // schema, and only the code reaches disk.
         let states_ref = if m.states.is_empty() {
             quote!(&[])
         } else {
@@ -1447,9 +1463,10 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 static #states_static: &[::dduroc::StateDesc] = &[#(#entries),*];
             });
 
-            // Rust-тип перечисления, чтобы на месте вызова стояло
-            // `metrics::LinkState::Lock`, а не голое число. Константа с тем же
-            // именем не конфликтует: у значений и типов разные пространства имён.
+            // The Rust type of the enum, so that the call site reads
+            // `metrics::LinkState::Lock` rather than a bare number. A constant
+            // of the same name does not clash: values and types have different
+            // namespaces.
             let variants: Vec<TokenStream2> = m
                 .states
                 .iter()
@@ -1469,7 +1486,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 })
                 .collect();
             metric_consts.push(quote! {
-                #[doc = concat!("Состояния метрики `", #name_str, "`.")]
+                #[doc = concat!("The states of metric `", #name_str, "`.")]
                 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
                 #[repr(u64)]
                 pub enum #name {
@@ -1490,11 +1507,11 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                     }
                 }
 
-                // Значение, допустимое для этой метрики, — только её же
-                // состояния. Реализация именно здесь, а не общая по всем
-                // перечислениям: общая пересеклась бы со встроенными типами,
-                // потому что компилятор не умеет опираться на «f32 никогда не
-                // станет состоянием метрики».
+                // A value admissible for this metric is only this metric's own
+                // states. The implementation is here rather than shared across
+                // all enums: a shared one would overlap with the built-in
+                // types, because the compiler cannot lean on "an f32 will never
+                // become a metric state".
                 impl ::dduroc::MetricValue<#name> for #name {
                     fn into_owned(self) -> ::dduroc::OwnedValue {
                         ::dduroc::OwnedValue::U64(self as u64)
@@ -1521,7 +1538,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         });
     }
 
-    // ── спаны ────────────────────────────────────────────────────────────
+    // ── spans ────────────────────────────────────────────────────────────
     let mut span_consts = Vec::new();
     let mut span_descs = Vec::new();
     for s in &input.spans {
@@ -1541,7 +1558,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         });
     }
 
-    // ── history и миграции ───────────────────────────────────────────────
+    // ── history and migrations ───────────────────────────────────────────
     let history_mods = codegen_history(input)?;
     let (migration_descs, migration_fns) = codegen_migrations(input)?;
 
@@ -1550,24 +1567,24 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
     Ok(quote! {
         #[allow(non_snake_case, non_upper_case_globals, clippy::all, unused_imports)]
         pub mod #mod_name {
-            // Имена из области, где объявлена схема, видны и здесь: иначе
-            // `migrations { 2 => migrate_v2 }` требовало бы писать
-            // `super::migrate_v2` — функция шага лежит рядом с объявлением,
-            // а раскрывается внутрь порождённого модуля.
+            // The names from the scope where the schema is declared are visible
+            // here too: otherwise `migrations { 2 => migrate_v2 }` would
+            // require writing `super::migrate_v2` — the step function lies next
+            // to the declaration but expands inside the generated module.
             use super::*;
 
-            /// Типы событий этой схемы.
+            /// This schema's event types.
             pub mod events {
                 use super::*;
                 #(#event_structs)*
             }
 
-            /// Идентификаторы метрик.
+            /// The metric identifiers.
             pub mod metrics {
                 #(#metric_consts)*
             }
 
-            /// Идентификаторы видов спанов.
+            /// The span kind identifiers.
             pub mod spans {
                 #(#span_consts)*
             }
@@ -1584,7 +1601,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 &[#(::dduroc::Language(#lang_strs)),*];
             static MIGRATIONS: &[::dduroc::Migration] = &[#(#migration_descs),*];
 
-            /// Схема неймспейса.
+            /// The namespace schema.
             pub const SCHEMA: ::dduroc::Schema = ::dduroc::Schema {
                 name: #schema_name,
                 version: ::dduroc::ProtocolVersion(#version),
@@ -1598,12 +1615,12 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
     })
 }
 
-/// Породить модули `v<N>` со старыми раскладками.
+/// Produce the `v<N>` modules with the old layouts.
 ///
-/// Каждый тип — обычная serde-структура плюс `EventShape` со **старым** id:
-/// правило `v1::PowerSet` получает и то, и другое из одного объявления.
-/// `Serialize` тоже выводится: тесты миграций пишут фикстуры старых версий, и
-/// собирать их байты руками значило бы дублировать раскладку в тесте.
+/// Every type is an ordinary serde struct plus an `EventShape` with the **old**
+/// id: the rule `v1::PowerSet` gets both from one declaration. `Serialize` is
+/// derived too: migration tests write fixtures of old versions, and assembling
+/// their bytes by hand would duplicate the layout in the test.
 fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
     let mut seen_versions: HashMap<u16, proc_macro2::Span> = HashMap::new();
     let mut out = Vec::new();
@@ -1612,8 +1629,8 @@ fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
             return Err(syn::Error::new(
                 h.span,
                 format!(
-                    "history описывает прошлое: версия {} обязана быть в 1..{} \
-                     (текущая версия схемы — {})",
+                    "history describes the past: version {} has to be in 1..{} \
+                     (the schema's current version is {})",
                     h.version, input.version, input.version
                 ),
             ));
@@ -1621,11 +1638,11 @@ fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
         if seen_versions.insert(h.version, h.span).is_some() {
             return Err(syn::Error::new(
                 h.span,
-                format!("history {} объявлена дважды", h.version),
+                format!("history {} is declared twice", h.version),
             ));
         }
         check_unique(
-            "событие history",
+            "history event",
             &h.events
                 .iter()
                 .map(|e| (e.id, e.name.clone()))
@@ -1636,7 +1653,7 @@ fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
             if let Some(prev) = names.insert(e.name.to_string(), &e.name) {
                 return Err(syn::Error::new(
                     e.name.span(),
-                    format!("тип `{prev}` в history {} объявлен дважды", h.version),
+                    format!("type `{prev}` is declared twice in history {}", h.version),
                 ));
             }
         }
@@ -1650,7 +1667,7 @@ fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
                 let id = e.id;
                 let fields: Vec<TokenStream2> =
                     e.fields.iter().map(|(n, t)| quote!(pub #n: #t)).collect();
-                // Как и у текущих раскладок: без полей — unit-структура.
+                // As with the current layouts: no fields means a unit struct.
                 let decl = if e.fields.is_empty() {
                     quote!(pub struct #name;)
                 } else {
@@ -1671,8 +1688,8 @@ fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
             })
             .collect();
         let doc = format!(
-            "Раскладки версии {}: их потребляют шаги миграции, текущему коду \
-             они не нужны.",
+            "The layouts of version {}: the migration steps consume them, the current \
+             code has no need of them.",
             h.version
         );
         out.push(quote! {
@@ -1686,17 +1703,18 @@ fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
     Ok(out)
 }
 
-/// Разрешённое правило: старый идентификатор и тело match-ветки.
+/// A resolved rule: the old identifier and the body of a match arm.
 struct ResolvedRule {
     old_id: u16,
     arm: TokenStream2,
 }
 
-/// Породить дескрипторы шагов и функции-диспетчеры типизированных правил.
+/// Produce the step descriptors and the dispatcher functions of the typed
+/// rules.
 fn codegen_migrations(input: &SchemaInput) -> syn::Result<(Vec<TokenStream2>, Vec<TokenStream2>)> {
-    // Каждая history-запись обязана быть кем-то использована: мёртвое
-    // объявление — почти наверняка забытое правило, и молчать о нём значит
-    // оставить историю без преобразования.
+    // Every history entry has to be used by somebody: a dead declaration is
+    // almost certainly a forgotten rule, and staying silent about it means
+    // leaving history untransformed.
     let mut used_history: HashMap<(u16, String), bool> = input
         .history
         .iter()
@@ -1728,8 +1746,8 @@ fn codegen_migrations(input: &SchemaInput) -> syn::Result<(Vec<TokenStream2>, Ve
                 return Err(syn::Error::new(
                     e.name.span(),
                     format!(
-                        "раскладка v{}::{} объявлена, но ни одно правило её не \
-                         использует: либо шаг забыт, либо запись лишняя",
+                        "the layout v{}::{} is declared but no rule uses it: either a \
+                         step was forgotten or the entry is superfluous",
                         h.version, e.name
                     ),
                 ));
@@ -1739,12 +1757,12 @@ fn codegen_migrations(input: &SchemaInput) -> syn::Result<(Vec<TokenStream2>, Ve
     Ok((descs, fns))
 }
 
-/// Сырой fn: как и раньше — сам fn плюс необязательные touches.
+/// A raw fn: as before — the fn itself plus optional touches.
 ///
-/// Затронутые типы решают, переписывать ли сегмент, И какие записи шаг
-/// увидит: множества — связывающий фильтр. Не объявлены — `touches_all`:
-/// шаг видит всё, а переписывается каждый сегмент. Молча пропустить историю
-/// хуже, чем переписать лишнюю.
+/// The affected types decide both whether a segment is rewritten AND which
+/// records the step sees: the sets are a binding filter. Not declared means
+/// `touches_all`: the step sees everything and every segment is rewritten.
+/// Skipping history silently is worse than rewriting a superfluous segment.
 fn codegen_raw_step(
     input: &SchemaInput,
     from: u16,
@@ -1758,11 +1776,8 @@ fn codegen_raw_step(
                 .events
                 .iter()
                 .map(|name| {
-                    let id = lookup_id(
-                        name,
-                        input.events.iter().map(|e| (&e.name, e.id)),
-                        "событие",
-                    )?;
+                    let id =
+                        lookup_id(name, input.events.iter().map(|e| (&e.name, e.id)), "event")?;
                     Ok(quote!(::dduroc::EventId(#id)))
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
@@ -1773,7 +1788,7 @@ fn codegen_raw_step(
                     let id = lookup_id(
                         name,
                         input.metrics.iter().map(|m| (&m.name, m.id)),
-                        "метрику",
+                        "metric",
                     )?;
                     Ok(quote!(::dduroc::MetricId(#id)))
                 })
@@ -1782,7 +1797,7 @@ fn codegen_raw_step(
                 .spans
                 .iter()
                 .map(|name| {
-                    let id = lookup_id(name, input.spans.iter().map(|s| (&s.name, s.id)), "спан")?;
+                    let id = lookup_id(name, input.spans.iter().map(|s| (&s.name, s.id)), "span")?;
                     Ok(quote!(::dduroc::SpanKindId(#id)))
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
@@ -1801,9 +1816,10 @@ fn codegen_raw_step(
     })
 }
 
-/// Типизированные правила: диспетчер по старым id, декод старой раскладки,
-/// энкод результата — всё генерируется, а затронутые типы **выводятся** из
-/// ключей. Расхождению объявленного с фактическим взяться неоткуда.
+/// Typed rules: the dispatcher over old ids, the decoding of the old layout
+/// and the encoding of the result are all generated, and the affected types
+/// are **inferred** from the keys. There is nowhere for the declared and the
+/// actual to diverge.
 fn codegen_rules_step(
     input: &SchemaInput,
     from: u16,
@@ -1813,7 +1829,7 @@ fn codegen_rules_step(
     if rules.is_empty() {
         return Err(syn::Error::new(
             input.name.span(),
-            format!("шаг {from} пуст: ни одного правила — такой шаг ничего не делает"),
+            format!("step {from} is empty: not one rule — such a step does nothing"),
         ));
     }
 
@@ -1830,13 +1846,14 @@ fn codegen_rules_step(
             used_history,
         )?;
     }
-    // Два правила на один старый id — неоднозначность, а не приоритет.
-    // Корзины разные: пространства идентификаторов у событий, метрик и видов
-    // спанов свои, и общая корзина отвергала бы законное совпадение номеров.
+    // Two rules for one old id are an ambiguity, not a precedence. The buckets
+    // are separate: events, metrics and span kinds have identifier spaces of
+    // their own, and a shared bucket would reject a legitimate coincidence of
+    // numbers.
     for (what, list) in [
-        ("событие", &event_rules),
-        ("метрику", &metric_rules),
-        ("вид спана", &span_rules),
+        ("event", &event_rules),
+        ("metric", &metric_rules),
+        ("span kind", &span_rules),
     ] {
         let mut seen: HashMap<u16, ()> = HashMap::new();
         for r in list {
@@ -1844,8 +1861,8 @@ fn codegen_rules_step(
                 return Err(syn::Error::new(
                     input.name.span(),
                     format!(
-                        "шаг {from}: два правила на {what} с id {:#x} — какое из них \
-                         применять, неоднозначно",
+                        "step {from}: two rules for {what} with id {:#x} — which of them \
+                         applies is ambiguous",
                         r.old_id
                     ),
                 ));
@@ -1929,8 +1946,8 @@ fn codegen_rules_step(
     Ok((desc, f))
 }
 
-/// Разрешить одно правило: найти старый id, проверить сочетаемость ключа с
-/// действием и породить ветку диспетчера.
+/// Resolve one rule: find the old id, check that the key and the action go
+/// together, and produce a dispatcher arm.
 fn resolve_rule(
     input: &SchemaInput,
     rule: &RuleDef,
@@ -1942,15 +1959,15 @@ fn resolve_rule(
     let span = rule.key.span();
     let err = |msg: String| Err(syn::Error::new(span, msg));
 
-    // Ключ → старый id + тип для декода (если раскладка известна).
+    // Key → old id plus the type to decode with (if the layout is known).
     enum Kind {
         Event {
             decode: Option<TokenStream2>,
         },
         Metric {
-            /// Тип, объявленный метрике схемой, — тот, что ляжет на диск.
-            /// `None` — метрика названа голым id, и объявленного типа у неё
-            /// в этой схеме нет.
+            /// The type the schema declared for the metric — the one that will
+            /// lie on disk. `None` means the metric was named by a bare id and
+            /// has no declared type in this schema.
             declared: Option<TokenStream2>,
         },
         Span,
@@ -1959,12 +1976,12 @@ fn resolve_rule(
         RuleKey::HistoryEvent { version, name } => {
             let Some(h) = input.history.iter().find(|h| h.version == *version) else {
                 return err(format!(
-                    "history версии {version} не объявлена — раскладку `v{version}::{name}` \
-                     взять неоткуда"
+                    "history for version {version} is not declared — there is nowhere to \
+                     take the layout `v{version}::{name}` from"
                 ));
             };
             let Some(e) = h.events.iter().find(|e| e.name == *name) else {
-                return err(format!("в history {version} нет типа `{name}`"));
+                return err(format!("history {version} has no type `{name}`"));
             };
             used_history.insert((*version, name.to_string()), true);
             let mod_ident = format_ident!("v{}", version);
@@ -1976,11 +1993,7 @@ fn resolve_rule(
             )
         }
         RuleKey::CurrentEvent { name } => {
-            let id = lookup_id(
-                name,
-                input.events.iter().map(|e| (&e.name, e.id)),
-                "событие",
-            )?;
+            let id = lookup_id(name, input.events.iter().map(|e| (&e.name, e.id)), "event")?;
             (
                 id,
                 Kind::Event {
@@ -1993,7 +2006,7 @@ fn resolve_rule(
             let id = lookup_id(
                 name,
                 input.metrics.iter().map(|m| (&m.name, m.id)),
-                "метрику",
+                "metric",
             )?;
             let declared = input
                 .metrics
@@ -2005,7 +2018,7 @@ fn resolve_rule(
         }
         RuleKey::RawMetric { id, .. } => (*id, Kind::Metric { declared: None }),
         RuleKey::CurrentSpan { name } => (
-            lookup_id(name, input.spans.iter().map(|s| (&s.name, s.id)), "спан")?,
+            lookup_id(name, input.spans.iter().map(|s| (&s.name, s.id)), "span")?,
             Kind::Span,
         ),
         RuleKey::RawSpan { id, .. } => (*id, Kind::Span),
@@ -2021,9 +2034,10 @@ fn resolve_rule(
         (Kind::Event { decode: Some(ty) }, RuleAction::Map(expr)) => {
             event_rules.push(ResolvedRule {
                 old_id,
-                // Вызов через хелпер, а не `(#expr)(__old)`: тело замыкания
-                // проверяется раньше, чем немедленный вызов подсказал бы тип
-                // параметра, и `|old| old.dbm` не компилировалось бы.
+                // The call goes through a helper rather than `(#expr)(__old)`:
+                // a closure's body is checked before an immediate call would
+                // suggest the parameter's type, and `|old| old.dbm` would not
+                // compile.
                 arm: quote! {
                     #old_id => {
                         let __old: #ty = __r.decode()?;
@@ -2034,15 +2048,15 @@ fn resolve_rule(
         }
         (Kind::Event { decode: None }, RuleAction::Map(_)) => {
             return err(format!(
-                "у `event({old_id:#x})` нет раскладки — декодировать нечем: объявите тип \
-                 в history и напишите `v<N>::Тип`, либо используйте drop или ремап"
+                "`event({old_id:#x})` has no layout — there is nothing to decode with: \
+                 declare the type in history and write `v<N>::Type`, or use drop or a remap"
             ));
         }
         (Kind::Event { .. }, RuleAction::RemapEvent(target)) => {
             let target_id = lookup_id(
                 target,
                 input.events.iter().map(|e| (&e.name, e.id)),
-                "событие",
+                "event",
             )?;
             event_rules.push(ResolvedRule {
                 old_id,
@@ -2057,7 +2071,10 @@ fn resolve_rule(
             });
         }
         (Kind::Event { .. }, RuleAction::RemapMetric(_)) => {
-            return err("событие не превратить в метрику: у них разные виды записей".to_owned());
+            return err(
+                "an event cannot be turned into a metric: they are different record kinds"
+                    .to_owned(),
+            );
         }
         (Kind::Metric { .. }, RuleAction::Drop) => {
             metric_rules.push(ResolvedRule {
@@ -2069,7 +2086,7 @@ fn resolve_rule(
             let target_id = lookup_id(
                 target,
                 input.metrics.iter().map(|m| (&m.name, m.id)),
-                "метрику",
+                "metric",
             )?;
             metric_rules.push(ResolvedRule {
                 old_id,
@@ -2088,11 +2105,12 @@ fn resolve_rule(
         ) => {
             metric_rules.push(ResolvedRule {
                 old_id,
-                // ЧТО правило читает, объявляет само замыкание: значение на
-                // диске самоописуемо, и `history` метрике не нужна. А вот ЧТО
-                // оно возвращает, держит схема: отсчёт, чей тип ей
-                // противоречит, не имеет права лечь на диск — типизированная
-                // запись такого не пропускает, и миграция не должна.
+                // WHAT a rule reads is declared by the closure itself: a value
+                // on disk is self-describing, and a metric needs no `history`.
+                // WHAT it returns, though, is held by the schema: a sample
+                // whose type contradicts it has no right to reach the disk — a
+                // typed write does not let such a thing through, and a
+                // migration must not either.
                 arm: quote! {
                     #old_id => {
                         let __v = __r.value().ok_or(::dduroc::DecodeError)?;
@@ -2107,23 +2125,30 @@ fn resolve_rule(
         }
         (Kind::Metric { declared: None }, RuleAction::Map(_)) => {
             return err(format!(
-                "у `metric({old_id:#x})` нет объявленного типа значения — держать возврат \
-                 правила нечем, и отсчёт лёг бы на диск с типом, которому в схеме ничего \
-                 не соответствует. Назовите метрику по имени (`metrics::Имя`), либо \
-                 используйте drop или ремап"
+                "`metric({old_id:#x})` has no declared value type — there is nothing to \
+                 hold the rule's return, and a sample would reach disk with a type nothing \
+                 in the schema corresponds to. Name the metric (`metrics::Name`), or use \
+                 drop or a remap"
             ));
         }
         (Kind::Metric { .. }, RuleAction::RemapEvent(_)) => {
-            return err("метрику не превратить в событие: у них разные виды записей".to_owned());
+            return err(
+                "a metric cannot be turned into an event: they are different record kinds"
+                    .to_owned(),
+            );
         }
         (Kind::Metric { .. }, RuleAction::RemapSpan(_)) => {
-            return err("метрику не превратить в спан: у них разные виды записей".to_owned());
+            return err(
+                "a metric cannot be turned into a span: they are different record kinds".to_owned(),
+            );
         }
         (Kind::Event { .. }, RuleAction::RemapSpan(_)) => {
-            return err("событие не превратить в спан: у них разные виды записей".to_owned());
+            return err(
+                "an event cannot be turned into a span: they are different record kinds".to_owned(),
+            );
         }
         (Kind::Span, RuleAction::RemapSpan(target)) => {
-            let target_id = lookup_id(target, input.spans.iter().map(|s| (&s.name, s.id)), "спан")?;
+            let target_id = lookup_id(target, input.spans.iter().map(|s| (&s.name, s.id)), "span")?;
             span_rules.push(ResolvedRule {
                 old_id,
                 arm: quote! {
@@ -2135,23 +2160,24 @@ fn resolve_rule(
         }
         (Kind::Span, RuleAction::Drop) => {
             return err(
-                "начало спана не удаляется: на него ссылаются его конец, его \
-                 сообщения и его дочерние спаны, а переписать эти ссылки цепочке \
-                 нечем — остались бы висячие. Виду спана доступен только ремап \
-                 (`spans::Другой`)"
+                "a span's start is not deleted: its end, its messages and its child \
+                 spans refer to it, and a chain has nothing to rewrite those references \
+                 with — they would be left dangling. A span kind allows only a remap \
+                 (`spans::Other`)"
                     .to_owned(),
             );
         }
         (Kind::Span, RuleAction::Map(_)) => {
             return err(
-                "у спана нет полей: он несёт только вид, номер и родителя, и \
-                 декодировать в нём нечего. Доступен ремап вида (`spans::Другой`)"
+                "a span has no fields: it carries only a kind, a number and a parent, \
+                 and there is nothing in it to decode. A kind remap is available \
+                 (`spans::Other`)"
                     .to_owned(),
             );
         }
         (Kind::Span, RuleAction::RemapEvent(_) | RuleAction::RemapMetric(_)) => {
             return err(
-                "спан не превратить в событие или метрику: у них разные виды записей".to_owned(),
+                "a span cannot be turned into an event or a metric: they are different record kinds".to_owned(),
             );
         }
     }
@@ -2264,7 +2290,7 @@ fn clone_history(h: &HistoryDef) -> HistoryDef {
     }
 }
 
-/// Объявить схему неймспейса. См. документацию модуля.
+/// Declare a namespace schema. See the module documentation.
 #[proc_macro]
 pub fn schema(input: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(input as SchemaInput);
@@ -2278,15 +2304,16 @@ pub fn schema(input: TokenStream) -> TokenStream {
 mod tests {
     use super::*;
 
-    /// Разобрать и, если разбор прошёл, сгенерировать код: часть диагностик
-    /// живёт в разборе, часть — в кодогенерации, а пользователю разницы нет.
+    /// Parse and, if parsing succeeded, generate the code: some diagnostics
+    /// live in the parsing, some in the code generation, and to the user it is
+    /// all one.
     fn check(src: &str) -> Result<(), String> {
         let parsed: SchemaInput = syn::parse_str(src).map_err(|e| e.to_string())?;
         codegen(&parsed).map(|_| ()).map_err(|e| e.to_string())
     }
 
     fn err(src: &str) -> String {
-        check(src).expect_err("объявление обязано быть отвергнуто")
+        check(src).expect_err("the declaration must be rejected")
     }
 
     const GOOD: &str = r#"
@@ -2298,16 +2325,16 @@ mod tests {
 
     #[test]
     fn a_correct_declaration_compiles() {
-        check(GOOD).expect("образцовое объявление");
+        check(GOOD).expect("a model declaration");
     }
 
     #[test]
     fn sections_may_come_in_any_order() {
-        // Порядок секций — дело вкуса пишущего, а не требование макроса.
-        // Раньше `events` выше `languages` разбирался с пустым списком
-        // языков, шаблон `en: "…"` принимался за поле типа `"…"`, и
-        // пользователь получал жалобу на неразобранный тип вместо внятного
-        // сообщения о своей схеме.
+        // The order of the sections is the writer's taste, not the macro's
+        // requirement. `events` above `languages` used to parse with an empty
+        // list of languages, the template `en: "…"` was taken for a field of
+        // type `"…"`, and the user got a complaint about an unparsed type
+        // instead of a clear message about their schema.
         check(
             r#"
             events { PowerSet = 0x01 { level: Info, en: "power {dbm}", ru: "мощность {dbm}", dbm: f32 } }
@@ -2316,82 +2343,86 @@ mod tests {
             name: radio,
         "#,
         )
-        .expect("секции в любом порядке");
+        .expect("the sections in any order");
     }
 
     #[test]
     fn an_unknown_storage_class_is_refused() {
-        // Единственная молчаливая ветка макроса: описка в `critical` давала
-        // канал с другим именем, другой политикой долговечности и другим
-        // бюджетом — без единого признака, что что-то не так.
+        // The macro's one silent branch: a typo in `critical` gave a channel
+        // with a different name, a different durability policy and a different
+        // budget — with no sign at all that anything was wrong.
         let e = err(r#"name: radio, version: 1, languages: [en],
                events { Boom = 0x01 { level: Error, store: critcal, en: "x" } }"#);
         assert!(
             e.contains("critcal"),
-            "сказано, что именно не опознано: {e}"
+            "it says exactly what was not recognized: {e}"
         );
-        assert!(e.contains("critical"), "и что ожидалось: {e}");
+        assert!(e.contains("critical"), "and what was expected: {e}");
     }
 
     #[test]
     fn a_template_for_an_undeclared_language_is_refused() {
-        // Перевод, который никогда не будет показан, — это молчание там, где
-        // пишущий уверен в обратном.
+        // A translation that will never be shown is silence in a place where
+        // the writer is sure of the opposite.
         let e = err(r#"name: radio, version: 1, languages: [en],
                events { Boom = 0x01 { level: Error, en: "x", ru: "х" } }"#);
-        assert!(e.contains("ru"), "названо, какой шаблон лишний: {e}");
+        assert!(
+            e.contains("ru"),
+            "it names which template is superfluous: {e}"
+        );
     }
 
     #[test]
     fn a_missing_template_is_refused() {
         let e = err(r#"name: radio, version: 1, languages: [en, ru],
                events { Boom = 0x01 { level: Error, en: "x" } }"#);
-        assert!(e.contains("ru"), "названо, какого языка не хватает: {e}");
+        assert!(e.contains("ru"), "it names which language is missing: {e}");
     }
 
     #[test]
     fn a_placeholder_without_a_field_is_refused() {
         let e = err(r#"name: radio, version: 1, languages: [en],
-               events { Boom = 0x01 { level: Error, en: "перегрев {t}" } }"#);
-        // Проверять одну букву нельзя: если признак «шаблон — строковый
-        // литерал» сломается, `en: "…"` снова уедет в поля, syn пожалуется
-        // «expected type», и латинская `t` найдётся уже там.
+               events { Boom = 0x01 { level: Error, en: "overheat {t}" } }"#);
+        // Checking a single letter is not enough: if the rule "a template is a
+        // string literal" broke, `en: "…"` would slide back into the fields,
+        // syn would complain "expected type", and the Latin `t` would turn up
+        // there.
         assert!(
-            e.contains("{t}") && e.contains("такого поля нет"),
-            "жалоба — на шаблон, а не на неразобранный тип: {e}"
+            e.contains("{t}") && e.contains("no such field"),
+            "the complaint is about the template, not about an unparsed type: {e}"
         );
     }
 
     #[test]
     fn a_field_named_like_a_language_is_still_a_field() {
-        // Обратное направление того же признака: ключ совпал с языком, но
-        // значение — тип, значит это поле. Различать по списку языков нельзя,
-        // и по имени ключа — тоже.
+        // The reverse direction of the same rule: the key matched a language
+        // but the value is a type, so this is a field. Telling them apart by
+        // the list of languages is not possible, and by the key's name neither.
         check(
             r#"name: radio, version: 1, languages: [en],
-               events { Boom = 0x01 { level: Error, en: "код {ru}", ru: u8 } }"#,
+               events { Boom = 0x01 { level: Error, en: "code {ru}", ru: u8 } }"#,
         )
-        .expect("поле с именем языка — это поле");
+        .expect("a field named after a language is a field");
     }
 
     #[test]
     fn an_event_without_fields_is_a_unit_struct() {
-        // `ns.log(events::Started)` — писать `Started {}` ради структуры,
-        // у которой нечего заполнять, значит платить синтаксисом за пустоту.
+        // `ns.log(events::Started)` — writing `Started {}` for a struct with
+        // nothing to fill in means paying syntax for emptiness.
         let src = r#"name: radio, version: 1, languages: [en],
                events {
                    Started = 0x01 { level: Info, en: "started" },
                    PowerSet = 0x02 { level: Info, en: "power {dbm}", dbm: f32 }
                }"#;
-        let parsed: SchemaInput = syn::parse_str(src).expect("образцовое объявление");
-        let out = codegen(&parsed).expect("кодогенерация").to_string();
+        let parsed: SchemaInput = syn::parse_str(src).expect("a model declaration");
+        let out = codegen(&parsed).expect("code generation").to_string();
         assert!(
             out.contains("pub struct Started ;"),
-            "событие без полей обязано быть unit-структурой: {out}"
+            "an event with no fields must be a unit struct: {out}"
         );
         assert!(
             out.contains("pub struct PowerSet { pub dbm : f32 , }"),
-            "событие с полями остаётся структурой с полями: {out}"
+            "an event with fields stays a struct with fields: {out}"
         );
     }
 
@@ -2425,7 +2456,7 @@ mod tests {
     fn a_duplicate_template_is_refused() {
         let e = err(r#"name: radio, version: 1, languages: [en],
                events { Boom = 0x01 { level: Error, en: "x", en: "y" } }"#);
-        assert!(e.contains("дважды"), "{e}");
+        assert!(e.contains("twice"), "{e}");
     }
 
     #[test]
@@ -2437,7 +2468,7 @@ mod tests {
 
     #[test]
     fn the_new_metric_forms_parse() {
-        // Предикаты срабатывания и префиксная важность состояний.
+        // Trigger predicates and prefix severity on states.
         check(
             r#"name: radio, version: 1, languages: [en],
                metrics {
@@ -2446,27 +2477,27 @@ mod tests {
                    Link = 0x02 { states: [alarm Los = 0, warn Sync = 1, Lock = 2] },
                }"#,
         )
-        .expect("новые формы компилируются");
+        .expect("the new forms compile");
     }
 
     #[test]
     fn old_metric_spellings_get_pointed_at_the_new_ones() {
-        // Прежнее имя ключа — подсказка, а не «неизвестный ключ».
+        // The former key name is a hint rather than "unknown key".
         let e = err(r#"name: radio, version: 1, languages: [en],
                metrics { Temp = 0x01 { value_type: f32 } }"#);
         assert!(e.contains("`type`"), "{e}");
 
-        // Условие на месте диапазона: у форм противоположная полярность,
-        // и об этом сказано прямо.
+        // A condition where a range belongs: the forms have opposite polarity,
+        // and that is said outright.
         let e = err(r#"name: radio, version: 1, languages: [en],
                metrics { Temp = 0x01 { type: f32, warn: v > 70.0 } }"#);
         assert!(e.contains("warn_if"), "{e}");
-        assert!(e.contains("НОРМЫ"), "{e}");
+        assert!(e.contains("NORMAL"), "{e}");
 
-        // Суффиксная важность состояния переехала в префикс.
+        // A state's suffix severity moved to the front.
         let e = err(r#"name: radio, version: 1, languages: [en],
                metrics { Link = 0x01 { states: [Los = 0: alarm] } }"#);
-        assert!(e.contains("префиксом"), "{e}");
+        assert!(e.contains("in front"), "{e}");
         assert!(e.contains("alarm Los = 0"), "{e}");
     }
 
@@ -2474,25 +2505,25 @@ mod tests {
     fn a_range_and_a_predicate_of_one_level_are_mutually_exclusive() {
         let e = err(r#"name: radio, version: 1, languages: [en],
                metrics { Temp = 0x01 { type: f32, warn: ..=70.0, warn_if: v > 70.0 } }"#);
-        assert!(e.contains("одну форму"), "{e}");
+        assert!(e.contains("choose one form"), "{e}");
     }
 
     #[test]
     fn predicates_are_refused_where_a_number_never_comes() {
-        // У перечисления важность носят состояния.
+        // On an enum the states carry the severity.
         let e = err(r#"name: radio, version: 1, languages: [en],
                metrics { Link = 0x01 { states: [Lock = 0], warn_if: v > 1.0 } }"#);
-        assert!(e.contains("состояни"), "{e}");
+        assert!(e.contains("states"), "{e}");
 
-        // Blob к числу не приводится.
+        // A blob cannot be reduced to a number.
         let e = err(r#"name: radio, version: 1, languages: [en],
                metrics { Spec = 0x01 { type: blob, alarm_if: v > 1.0 } }"#);
         assert!(e.contains("blob"), "{e}");
     }
 
-    // ── history и типизированные правила ─────────────────────────────────
+    // ── history and typed rules ──────────────────────────────────────────
 
-    /// Заготовка схемы v2 с history и одним типизированным шагом.
+    /// A v2 schema skeleton with history and one typed step.
     const MIGRATING: &str = r#"
         name: radio, version: 2, languages: [en],
         events { PowerSet = 0x01 { level: Info, en: "power {dbm}", dbm: f32 } }
@@ -2509,13 +2540,14 @@ mod tests {
 
     #[test]
     fn history_with_typed_rules_compiles() {
-        check(MIGRATING).expect("образцовая миграция");
+        check(MIGRATING).expect("a model migration");
     }
 
     #[test]
     fn a_history_version_not_in_the_past_is_refused() {
-        // history описывает прошлое: текущая версия и версии из будущего в
-        // ней бессмысленны, а ноль не существует — нумерация с единицы.
+        // History describes the past: the current version and versions from the
+        // future are meaningless in it, and zero does not exist — numbering
+        // starts at one.
         for v in ["2", "3", "0"] {
             let e = err(&format!(
                 r#"name: radio, version: 2, languages: [en],
@@ -2529,13 +2561,13 @@ mod tests {
 
     #[test]
     fn an_unused_history_entry_is_refused() {
-        // Мёртвая раскладка — почти наверняка забытое правило: молчать о ней
-        // значит оставить историю без преобразования.
+        // A dead layout is almost certainly a forgotten rule: staying silent
+        // about it means leaving history untransformed.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                history { 1 { events { E = 0x01 { n: u8 } } } }
                migrations { 1 => { event(0x09): drop } }"#);
-        assert!(e.contains("не") && e.contains("использует"), "{e}");
+        assert!(e.contains("no rule uses it"), "{e}");
     }
 
     #[test]
@@ -2547,7 +2579,7 @@ mod tests {
                    1 => { v1::E: drop },
                    2 => { v2::E: drop },
                }"#);
-        assert!(e.contains("v2") || e.contains("версии 2"), "{e}");
+        assert!(e.contains("v2") || e.contains("version 2"), "{e}");
     }
 
     #[test]
@@ -2561,8 +2593,8 @@ mod tests {
 
     #[test]
     fn a_raw_id_cannot_be_mapped_because_it_has_no_shape() {
-        // У голого id нет раскладки — декодировать нечем. Подсказка обязана
-        // называть выход: объявить тип в history.
+        // A bare id has no layout — there is nothing to decode with. The hint
+        // has to name the way out: declare the type in history.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                migrations { 1 => { event(0x05): |old| old } }"#);
@@ -2571,82 +2603,87 @@ mod tests {
 
     #[test]
     fn metric_values_are_mapped_by_a_closure_that_names_its_type() {
-        // Значение отсчёта самоописуемо — тип лежит в самой записи, — поэтому
-        // правилу не нужна ни history, ни объявление прежнего типа: тип
-        // называет параметр замыкания, он же говорит, что ожидалось на диске.
+        // A sample's value is self-describing — the type lies in the record
+        // itself — so a rule needs neither history nor a declaration of the
+        // earlier type: the closure's parameter names the type, and it also
+        // says what was expected on disk.
         check(
             r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                metrics { Temp = 0x01 { type: f32 } }
                migrations { 1 => { metrics::Temp: |v: f32| v * 10.0 } }"#,
         )
-        .expect("преобразование значения — законное правило");
+        .expect("transforming a value is a legitimate rule");
 
-        // Что правило ЧИТАЕТ, объявляет замыкание; что оно ВОЗВРАЩАЕТ,
-        // держит схема: возврат параметризован объявленным типом метрики
-        // (`IntoSampleOutcome<V>`), и отсчёт, противоречащий схеме, не
-        // соберётся. Проверить это здесь нечем — макрос порождает корректный
-        // код, отвергает его компилятор.
+        // What a rule READS is declared by the closure; what it RETURNS is held
+        // by the schema: the return is parameterized by the metric's declared
+        // type (`IntoSampleOutcome<V>`), and a sample that contradicts the
+        // schema will not compile. There is nothing to check that with here —
+        // the macro produces correct code and the compiler rejects it.
 
-        // А голый id держать нечем: объявленного типа у него в схеме нет, и
-        // отсчёт лёг бы на диск с типом, которому ничего не соответствует.
+        // And a bare id has nothing to hold it: it has no declared type in the
+        // schema, and a sample would reach disk with a type nothing corresponds
+        // to.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                metrics { Temp = 0x01 { type: f32 } }
                migrations { 1 => { metric(0x07): |v: i64| v as f64 } }"#);
-        assert!(e.contains("нет объявленного типа значения"), "{e}");
+        assert!(e.contains("no declared value type"), "{e}");
 
-        // У метрики-перечисления объявленный тип — то, что ложится на диск,
-        // то есть код состояния: перенумеровать коды правило может.
+        // For an enum metric the declared type is what lies on disk, that is,
+        // the state code: a rule may renumber the codes.
         check(
             r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                metrics { Link = 0x02 { states: [alarm Los = 0, Lock = 2] } }
                migrations { 1 => { metrics::Link: |code: u64| code + 1 } }"#,
         )
-        .expect("коды состояний перенумеровываются");
+        .expect("state codes can be renumbered");
     }
 
     #[test]
     fn span_kinds_are_renamed_but_never_deleted() {
-        // Ремап вида — законное правило.
+        // A kind remap is a legitimate rule.
         check(
             r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                spans { Calib = 0x01, Calibration = 0x02 }
                migrations { 1 => { spans::Calib: spans::Calibration } }"#,
         )
-        .expect("переименование вида спана");
+        .expect("renaming a span kind");
 
-        // И по голому id: вид мог исчезнуть из схемы вместе с именем.
+        // And by a bare id too: a kind may have disappeared from the schema
+        // along with its name.
         check(
             r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                spans { Calibration = 0x02 }
                migrations { 1 => { span(0x01): spans::Calibration } }"#,
         )
-        .expect("голый id вида спана");
+        .expect("a span kind by bare id");
 
-        // А вот удаление — нет: на начало спана ссылаются его конец, его
-        // сообщения и его дети, и переписать эти ссылки цепочке нечем.
+        // But deletion is not: a span's start is referred to by its end, its
+        // messages and its children, and a chain cannot rewrite those
+        // references.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                spans { Calib = 0x01 }
                migrations { 1 => { spans::Calib: drop } }"#);
-        assert!(e.contains("висячие"), "{e}");
+        assert!(e.contains("dangling"), "{e}");
 
-        // Замыкание тоже нет: декодировать у спана нечего.
+        // Nor is a closure: a span has nothing to decode.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                spans { Calib = 0x01 }
                migrations { 1 => { spans::Calib: |s| s } }"#);
-        assert!(e.contains("нет полей"), "{e}");
+        assert!(e.contains("no fields"), "{e}");
     }
 
     #[test]
     fn span_kinds_have_their_own_id_space_in_rules() {
-        // Номера видов спанов, событий и метрик живут в разных пространствах:
-        // общая корзина проверок отвергала бы законное совпадение номеров.
+        // The numbers of span kinds, events and metrics live in different
+        // spaces: a shared bucket of checks would reject a legitimate
+        // coincidence of numbers.
         check(
             r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
@@ -2658,30 +2695,31 @@ mod tests {
                    spans::Calib: spans::Calibration,
                } }"#,
         )
-        .expect("три правила с id 0x01 в трёх пространствах");
+        .expect("three rules with id 0x01 in three spaces");
 
-        // А два правила на один вид — по-прежнему неоднозначность.
+        // And two rules for one kind are still an ambiguity.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                spans { Calib = 0x01, A = 0x02, B = 0x03 }
                migrations { 1 => { spans::Calib: spans::A, span(0x01): spans::B } }"#);
-        assert!(e.contains("неоднозначно"), "{e}");
+        assert!(e.contains("ambiguous"), "{e}");
     }
 
     #[test]
     fn kinds_do_not_cross() {
-        // Событие не превратить в метрику и наоборот: разные виды записей.
+        // An event cannot be turned into a metric or the reverse: different
+        // record kinds.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                metrics { Temp = 0x01 { type: f32 } }
                migrations { 1 => { events::E: metrics::Temp } }"#);
-        assert!(e.contains("разные виды"), "{e}");
+        assert!(e.contains("different record kinds"), "{e}");
 
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                metrics { Temp = 0x01 { type: f32 } }
                migrations { 1 => { metrics::Temp: events::E } }"#);
-        assert!(e.contains("разные виды"), "{e}");
+        assert!(e.contains("different record kinds"), "{e}");
     }
 
     #[test]
@@ -2690,7 +2728,7 @@ mod tests {
                events { E = 0x01 { level: Info, en: "x" } }
                history { 1 { events { E = 0x01 { n: u8 } } } }
                migrations { 1 => { v1::E: drop, events::E: drop } }"#);
-        assert!(e.contains("неоднозначно"), "{e}");
+        assert!(e.contains("ambiguous"), "{e}");
     }
 
     #[test]
@@ -2698,7 +2736,7 @@ mod tests {
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                migrations { 1 => { } }"#);
-        assert!(e.contains("пуст"), "{e}");
+        assert!(e.contains("is empty"), "{e}");
     }
 
     #[test]
@@ -2710,13 +2748,14 @@ mod tests {
                    1 { events { E = 0x01 { n: u16 } } }
                }
                migrations { 1 => { v1::E: drop }, 2 => { event(0x09): drop } }"#);
-        assert!(e.contains("дважды"), "{e}");
+        assert!(e.contains("twice"), "{e}");
     }
 
     #[test]
     fn history_declares_events_only() {
-        // У отсчётов payload-раскладки нет — объявлять в history нечего, и
-        // попытка обязана быть названа, а не молча проглочена.
+        // Samples have no payload layout — there is nothing to declare in
+        // history, and the attempt has to be named rather than swallowed
+        // silently.
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                history { 1 { metrics { Temp = 0x01 { } } } }
@@ -2730,13 +2769,13 @@ mod tests {
                events { E = 0x01 { level: Info, en: "x" } }
                history { 1 { events { } } }
                migrations { 1 => { event(0x09): drop } }"#);
-        assert!(e.contains("пуста"), "{e}");
+        assert!(e.contains("is empty"), "{e}");
     }
 
     #[test]
     fn the_raw_fn_escape_hatch_still_parses() {
-        // Люк остаётся люком: сырой fn с touches и без, вперемешку с
-        // типизированными шагами.
+        // The hatch stays a hatch: a raw fn with touches and without,
+        // interleaved with typed steps.
         check(
             r#"name: radio, version: 4, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
@@ -2747,7 +2786,7 @@ mod tests {
                    3 => migrate_v3 { events: [E] },
                }"#,
         )
-        .expect("смешанное объявление законно");
+        .expect("a mixed declaration is legitimate");
     }
 
     #[test]
