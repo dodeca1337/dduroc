@@ -1,14 +1,14 @@
-//! Счётчики движка.
+//! The engine's counters.
 //!
-//! Единственный способ узнать, что происходит внутри: логировать свою работу
-//! writer не может — вызов публичного пути записи из его собственного потока
-//! означал бы ожидание места в очереди, освободить которую может только он
-//! сам. Поэтому диагностика — атомарные счётчики, снимаемые снаружи.
+//! The only way to learn what goes on inside: the writer cannot log its own
+//! work — calling the public write path from its own thread would mean waiting
+//! for room in a queue only it can drain. So the diagnostics are atomic
+//! counters, sampled from outside.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Атомарные счётчики. Все операции — `Relaxed`: счётчики ничего не
-/// упорядочивают, а лишние барьеры на armv7 заметны.
+/// Atomic counters. Every operation is `Relaxed`: the counters order nothing,
+/// and superfluous barriers are noticeable on armv7.
 #[derive(Debug, Default)]
 pub struct Counters {
     pub records_written: AtomicU64,
@@ -18,54 +18,59 @@ pub struct Counters {
     pub segments_created: AtomicU64,
     pub segments_sealed: AtomicU64,
     pub segments_rotated: AtomicU64,
-    /// Записи, отброшенные из-за переполнения очереди обычного канала.
+    /// Records dropped because the normal channel's queue overflowed.
     pub dropped: AtomicU64,
-    /// Записи, отвергнутые как нарушающие контракт схемы: id из чужой схемы,
-    /// значение не того типа. Дефект сборки, а не следствие нагрузки, поэтому
-    /// счётчик отдельный — смешать его с потерями значило бы спрятать баг за
-    /// «диск не успевает».
+    /// Records refused as breaking the schema contract: an id from a foreign
+    /// schema, a value of the wrong type. A build defect rather than a
+    /// consequence of load, hence a separate counter — mixing it with losses
+    /// would hide a bug behind "the disk cannot keep up".
     pub rejected: AtomicU64,
-    /// Сколько раз запись в критический канал ждала места в очереди.
+    /// How many times a write to the critical channel waited for room in the
+    /// queue.
     pub backpressure_waits: AtomicU64,
-    /// Ошибки ввода-вывода в writer'е.
+    /// I/O errors in the writer.
     pub io_errors: AtomicU64,
-    /// Повреждённые хвосты, отброшенные при восстановлении.
+    /// Damaged tails discarded during recovery.
     pub truncated_tails: AtomicU64,
-    /// Сколько раз канал брал сегмент в работу: создавал новый **или**
-    /// возвращал отпущенный по бездействию.
+    /// How many times a channel took a segment into work: created a new one
+    /// **or** brought back one released for idleness.
     pub segments_opened: AtomicU64,
-    /// Сколько раз занятость носителя выросла.
+    /// How many times occupancy of the medium grew.
     ///
-    /// Наружу не отдаётся — это сторож пересчёта суммарного бюджета. Растёт
-    /// в трёх случаях: создан сегмент, возвращён отпущенный, расширено окно
-    /// резерва (см. `SegmentWriter::reserve`); всё остальное занятость только
-    /// уменьшает. Пока счётчик не сдвинулся, обходить весь флот ради суммы
-    /// незачем.
+    /// Not handed out: this is the watchdog for recomputing the total budget.
+    /// It grows in three cases — a segment was created, a released one was
+    /// brought back, the reserve window was extended (see
+    /// `SegmentWriter::reserve`); everything else only reduces occupancy. While
+    /// the counter has not moved, there is no reason to walk the whole fleet
+    /// for the sum.
     ///
-    /// Отдельно от `segments_opened` он затем, что по тому счётчику читателям
-    /// объявляется смена формы хранилища: расширение окна формы не меняет —
-    /// ни одного сегмента не появилось и не исчезло, — и будить им подписки
-    /// значило бы звать их на каждый мегабайт записи.
+    /// It is separate from `segments_opened` because that counter is what
+    /// announces a change of the store's shape to readers: extending a window
+    /// changes no shape — not one segment appeared or vanished — and waking
+    /// subscriptions with it would mean calling them for every megabyte
+    /// written.
     pub occupancy_raised: AtomicU64,
-    /// Сколько раз хранилище не удалось вернуть в объявленный суммарный
-    /// потолок.
+    /// How many times the store could not be brought back under its declared
+    /// total ceiling.
     ///
-    /// Вытеснять можно только запечатанные сегменты: в активный пишут, и его
-    /// резерв — не расточительство, а гарантия того, что ENOSPC придёт при
-    /// расширении окна, а не посреди аварийного события. Поэтому потолок
-    /// обязан быть больше, чем занятое живыми сегментами, — а занимают они
-    /// не по `segment_bytes`, а по фактическому окну резерва, которое растёт
-    /// вместе с записанным. Невыполнимый потолок лучше узнать по счётчику,
-    /// чем по кончившемуся месту.
+    /// Only sealed segments can be evicted: the active one is being written to,
+    /// and its reserve is not extravagance but the guarantee that ENOSPC
+    /// arrives when the window is extended rather than in the middle of a
+    /// critical event. So the ceiling has to exceed what the live segments have
+    /// taken — and they take not `segment_bytes` but their actual reserve
+    /// window, which grows along with what has been written. An unmeetable
+    /// ceiling is better learned from a counter than from the medium running
+    /// out.
     pub budget_overruns: AtomicU64,
-    /// Сколько раз буферы блоков не удалось вернуть в объявленный потолок
-    /// памяти.
+    /// How many times the block buffers could not be brought back under the
+    /// declared memory ceiling.
     ///
-    /// Потолок нельзя сделать жёстким, не теряя данных: одна запись бывает
-    /// крупнее любого разумного потолка (несжимаемый blob), а буфер блока
-    /// обязан вместить хотя бы её. Поэтому потолок соблюдается освобождением
-    /// того, что освободить можно, а невыполнимость объявляется счётчиком —
-    /// это честнее, чем отбросить запись ради бухгалтерии по памяти.
+    /// The ceiling cannot be made hard without losing data: one record can be
+    /// larger than any reasonable ceiling (an incompressible blob), and a block
+    /// buffer has to hold at least that one. So the ceiling is honoured by
+    /// freeing what can be freed, and its unmeetability is announced by a
+    /// counter — which is more honest than discarding a record for the sake of
+    /// memory accounting.
     pub buffer_overruns: AtomicU64,
 }
 
@@ -80,19 +85,20 @@ impl Counters {
         counter.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// То же, но с публикацией всего, что записано до вызова.
+    /// The same, but publishing everything written before the call.
     ///
-    /// Нужно ровно одному счётчику и ровно на одном переходе: writer решает,
-    /// обходить ли каналы за отметками о потерях, по изменению общего
-    /// счётчика — обход всего флота на каждом обороте цикла стоит слишком
-    /// дорого. Поканальный счётчик при этом растёт на прикладном потоке, и с
-    /// `Relaxed` writer мог бы увидеть новый общий счётчик раньше
-    /// поканального: обход нашёл бы ноль, отметку счёл бы выданной, и дыра
-    /// осталась бы необъявленной до следующей потери.
+    /// Exactly one counter needs this, and on exactly one transition: the
+    /// writer decides whether to walk the channels for loss notices by the
+    /// change in the total counter, because walking the whole fleet on every
+    /// turn of the loop costs too much. The per-channel counter meanwhile grows
+    /// on an application thread, and with `Relaxed` the writer could see the
+    /// new total before the per-channel one: the walk would find zero, consider
+    /// the notice issued, and the hole would stay unannounced until the next
+    /// loss.
     ///
-    /// Поэтому порядок обязателен: сначала поканальный счётчик, потом этот
-    /// вызов. Барьер платится только на пути потери — то есть тогда, когда
-    /// запись всё равно уже не состоялась.
+    /// So the order is mandatory: the per-channel counter first, then this
+    /// call. The barrier is paid only on the loss path — that is, at a point
+    /// where the record has already failed to happen.
     #[inline]
     pub fn publish(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Release);
@@ -119,11 +125,11 @@ impl Counters {
     }
 }
 
-/// Снимок счётчиков.
+/// A snapshot of the counters.
 ///
-/// Структура **открытая**: счётчик добавляется всякий раз, когда движок
-/// научается замечать что-то новое, и это не должно ломать сборку тем, кто их
-/// только читает.
+/// The struct is **open**: a counter is added whenever the engine learns to
+/// notice something new, and that must not break the build of anyone who only
+/// reads them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Stats {
@@ -135,22 +141,22 @@ pub struct Stats {
     pub segments_sealed: u64,
     pub segments_rotated: u64,
     pub dropped: u64,
-    /// Отвергнутые как нарушающие контракт схемы — см. одноимённое поле
-    /// [`Counters`].
+    /// Refused as breaking the schema contract — see the field of the same name
+    /// on [`Counters`].
     pub rejected: u64,
     pub backpressure_waits: u64,
     pub io_errors: u64,
     pub truncated_tails: u64,
-    /// Хранилище не влезло в объявленный суммарный потолок — см. одноимённое
-    /// поле [`Counters`].
+    /// The store did not fit its declared total ceiling — see the field of the
+    /// same name on [`Counters`].
     pub budget_overruns: u64,
-    /// Буферы блоков не влезли в объявленный потолок памяти — см. одноимённое
-    /// поле [`Counters`].
+    /// The block buffers did not fit the declared memory ceiling — see the
+    /// field of the same name on [`Counters`].
     pub buffer_overruns: u64,
 }
 
 impl Stats {
-    /// Всё ли благополучно: ничего не потеряно, не отвергнуто и не сломалось.
+    /// Whether all is well: nothing lost, nothing refused, nothing broken.
     pub fn is_clean(&self) -> bool {
         self.dropped == 0 && self.rejected == 0 && self.io_errors == 0
     }
@@ -170,16 +176,16 @@ mod tests {
         let s = c.snapshot();
         assert_eq!(s.records_written, 10);
         assert_eq!(s.dropped, 1);
-        assert!(!s.is_clean(), "потери обязаны быть видны");
+        assert!(!s.is_clean(), "losses must be visible");
         assert!(Stats::default().is_clean());
 
-        // Нарушение контракта учитывается отдельно от потерь: причины разные,
-        // и реакция на них разная.
+        // A contract violation is accounted for separately from losses: the
+        // causes differ, and so does the response.
         let c = Counters::default();
         Counters::bump(&c.rejected);
         let s = c.snapshot();
         assert_eq!(s.dropped, 0);
         assert_eq!(s.rejected, 1);
-        assert!(!s.is_clean(), "отвергнутая запись обязана быть видна");
+        assert!(!s.is_clean(), "a refused record must be visible");
     }
 }

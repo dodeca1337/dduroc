@@ -1,12 +1,13 @@
-//! Инвентарь сегментов канала и ротация по бюджету.
+//! A channel's segment inventory and rotation by budget.
 //!
-//! Ротация — это `unlink` самого старого сегмента, когда суммарный размер
-//! превышает бюджет. Никакой перезаписи: удаление целого файла на eMMC/SD
-//! отдаёт FTL сразу целые erase-блоки, а не размазывает работу по всей
-//! трансляции адресов.
+//! Rotation is an `unlink` of the oldest segment once the total size exceeds
+//! the budget. Nothing is rewritten: deleting a whole file on eMMC/SD hands
+//! the FTL whole erase blocks at once rather than smearing the work across the
+//! entire address translation.
 //!
-//! Считается **выделенный** размер файлов, а не объём полезных данных:
-//! флеш занят преаллокацией, и бюджет должен отражать реальную занятость.
+//! What counts is the **allocated** size of the files, not the volume of
+//! useful data: the flash is taken by the reserve window, and the budget has
+//! to reflect real occupancy.
 
 use crate::error::{IoContext, Result};
 use crate::fsutil;
@@ -14,11 +15,11 @@ use dduroc_format::segment::SegmentName;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
-/// Сегмент в инвентаре.
+/// A segment in the inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentEntry {
     pub name: SegmentName,
-    /// Размер файла на диске (с учётом преаллокации).
+    /// The file's size on disk (its reserve window included).
     pub size_bytes: u64,
 }
 
@@ -28,19 +29,19 @@ impl SegmentEntry {
     }
 }
 
-/// Упорядоченный по времени список сегментов канала.
+/// A channel's segment list, ordered by time.
 #[derive(Debug, Default)]
 pub struct Inventory {
-    /// Отсортирован по возрастанию `(boot, base)` — порядок ротации.
+    /// Sorted by ascending `(boot, base)` — the rotation order.
     segments: VecDeque<SegmentEntry>,
     total: u64,
 }
 
 impl Inventory {
-    /// Прочитать каталог канала.
+    /// Read a channel directory.
     ///
-    /// Посторонние файлы игнорируются: каталог может содержать что угодно,
-    /// и падать из-за чужого `README` движок не должен.
+    /// Foreign files are ignored: a directory may contain anything, and the
+    /// engine must not fall over someone else's `README`.
     pub fn scan(dir: &Path) -> Result<Self> {
         let mut segments = Vec::new();
         let entries = match std::fs::read_dir(dir) {
@@ -48,17 +49,18 @@ impl Inventory {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
             }
-            Err(e) => return Err(e).ctx_path("чтение каталога канала", dir),
+            Err(e) => return Err(e).ctx_path("reading a channel directory", dir),
         };
 
         for entry in entries {
-            let entry = entry.ctx_path("обход каталога", dir)?;
+            let entry = entry.ctx_path("walking a directory", dir)?;
             let file_name = entry.file_name();
             let Some(name) = file_name.to_str().and_then(SegmentName::parse) else {
                 continue;
             };
-            // Симлинк на чужой файл не должен попасть под ротацию: удаление
-            // пошло бы по ссылке, а учёт размера был бы неверным.
+            // A symlink to a foreign file must not fall under rotation: the
+            // deletion would follow the link, and the size accounting would be
+            // wrong.
             let meta = entry.metadata().ctx_path("stat", &entry.path())?;
             if !meta.is_file() {
                 continue;
@@ -77,18 +79,18 @@ impl Inventory {
         })
     }
 
-    /// Только имена сегментов, в порядке времени.
+    /// The segment names alone, in time order.
     ///
-    /// Отдельно от [`Inventory::scan`], потому что размеры стоят `stat` на
-    /// каждый файл, а читателю они не нужны вовсе: отбор сегментов по окну
-    /// идёт по именам. При сотнях сегментов в канале и тысячах каналов это
-    /// разница между одним `readdir` и сотнями тысяч системных вызовов на
-    /// запрос.
+    /// Separate from [`Inventory::scan`] because the sizes cost a `stat` per
+    /// file and a reader does not need them at all: selecting segments by
+    /// window goes by name. With hundreds of segments per channel and thousands
+    /// of channels, that is the difference between one `readdir` and hundreds
+    /// of thousands of system calls per query.
     pub fn scan_names(dir: &Path) -> Result<Vec<SegmentName>> {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e).ctx_path("чтение каталога канала", dir),
+            Err(e) => return Err(e).ctx_path("reading a channel directory", dir),
         };
         let mut names: Vec<SegmentName> = entries
             .flatten()
@@ -106,7 +108,7 @@ impl Inventory {
         self.segments.len()
     }
 
-    /// Суммарный размер сегментов.
+    /// The total size of the segments.
     pub fn total_bytes(&self) -> u64 {
         self.total
     }
@@ -123,13 +125,13 @@ impl Inventory {
         self.segments.back()
     }
 
-    /// Добавить только что созданный сегмент (он самый новый).
+    /// Add a just-created segment (it is the newest).
     pub fn push_newest(&mut self, entry: SegmentEntry) {
         self.total += entry.size_bytes;
         self.segments.push_back(entry);
     }
 
-    /// Уточнить размер сегмента (после запечатывания файл обрезается).
+    /// Correct a segment's size (sealing truncates the file).
     pub fn update_size_bytes(&mut self, name: SegmentName, size_bytes: u64) {
         if let Some(e) = self.segments.iter_mut().find(|e| e.name == name) {
             self.total = self.total - e.size_bytes + size_bytes;
@@ -137,11 +139,11 @@ impl Inventory {
         }
     }
 
-    /// Удалять самые старые сегменты, пока сумма превышает бюджет.
+    /// Delete the oldest segments while the total exceeds the budget.
     ///
-    /// `live` — сегмент, в который канал пишет или продолжит писать
-    /// (см. `WriterLoop::live_segment`): удалять его нельзя.
-    /// Возвращает число удалённых.
+    /// `live` is the segment the channel writes to or will go on writing to
+    /// (see `WriterLoop::live_segment`): it must not be deleted. Returns the
+    /// number deleted.
     pub fn enforce_budget(
         &mut self,
         dir: &Path,
@@ -153,19 +155,23 @@ impl Inventory {
             let Some(front) = self.segments.front() else {
                 break;
             };
-            // Единственный оставшийся сегмент — активный: удалять нечего,
-            // иначе запись потеряла бы файл под собой.
+            // The only segment left is the active one: there is nothing to
+            // delete, or the write would lose the file out from under itself.
             if Some(front.name) == live {
                 break;
             }
             let path = front.path(dir);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
-                // Файл уже исчез (ручная уборка, гонка) — просто забываем его.
+                // The file is already gone (manual cleanup, a race) — simply
+                // forget it.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).ctx_path("удаление сегмента", &path),
+                Err(e) => return Err(e).ctx_path("deleting a segment", &path),
             }
-            let entry = self.segments.pop_front().expect("front проверен выше");
+            let entry = self
+                .segments
+                .pop_front()
+                .expect("the front was checked above");
             self.total = self.total.saturating_sub(entry.size_bytes);
             removed += 1;
         }
@@ -175,16 +181,16 @@ impl Inventory {
         Ok(removed)
     }
 
-    /// Забыть сегмент (после удаления миграцией или вручную).
+    /// Forget a segment (after a migration or a hand deleted it).
     pub fn remove(&mut self, name: SegmentName) {
         if let Some(pos) = self.segments.iter().position(|e| e.name == name) {
-            let entry = self.segments.remove(pos).expect("позиция найдена");
+            let entry = self.segments.remove(pos).expect("the position was found");
             self.total = self.total.saturating_sub(entry.size_bytes);
         }
     }
 
-    /// Минимальный `boot_counter` среди сегментов — граница для уборки
-    /// записей об эпохах.
+    /// The smallest `boot_counter` among the segments — the boundary for
+    /// cleaning up epoch entries.
     pub fn min_boot(&self) -> Option<u32> {
         self.segments.front().map(|s| s.name.boot.0)
     }
@@ -206,19 +212,19 @@ mod tests {
         make(dir.path(), 2, 100, 10);
         make(dir.path(), 1, 500, 20);
         make(dir.path(), 1, 100, 30);
-        std::fs::write(dir.path().join("README"), "не сегмент".as_bytes()).unwrap();
-        std::fs::write(dir.path().join("junk.seg"), "неверное имя".as_bytes()).unwrap();
+        std::fs::write(dir.path().join("README"), "not a segment".as_bytes()).unwrap();
+        std::fs::write(dir.path().join("junk.seg"), "a wrong name".as_bytes()).unwrap();
         std::fs::create_dir(dir.path().join("00000009-000000000000000f.seg")).unwrap();
 
         let inv = Inventory::scan(dir.path()).unwrap();
-        assert_eq!(inv.len(), 3, "посторонние файлы и каталоги пропущены");
+        assert_eq!(inv.len(), 3, "foreign files and directories are skipped");
         assert_eq!(inv.total_bytes(), 60);
 
         let order: Vec<_> = inv.iter().map(|e| (e.name.boot.0, e.name.base.0)).collect();
         assert_eq!(
             order,
             vec![(1, 100), (1, 500), (2, 100)],
-            "порядок по (boot, время)"
+            "ordered by (boot, time)"
         );
         assert_eq!(inv.oldest().unwrap().name.base, Micros(100));
         assert_eq!(inv.newest().unwrap().name.boot, BootCounter(2));
@@ -243,14 +249,14 @@ mod tests {
         assert_eq!(inv.total_bytes(), 500);
 
         let removed = inv.enforce_budget(dir.path(), 250, None).unwrap();
-        assert_eq!(removed, 3, "удалено ровно столько, чтобы влезть в бюджет");
+        assert_eq!(removed, 3, "exactly enough was deleted to fit the budget");
         assert_eq!(inv.total_bytes(), 200);
         assert_eq!(inv.oldest().unwrap().name.base, Micros(300));
         assert!(
             !dir.path()
                 .join(SegmentName::new(BootCounter(1), Micros(0)).to_string())
                 .exists(),
-            "старейший файл действительно удалён"
+            "the oldest file really is deleted"
         );
     }
 
@@ -261,12 +267,14 @@ mod tests {
         let mut inv = Inventory::scan(dir.path()).unwrap();
         let active = inv.newest().unwrap().name;
 
-        // Бюджет заведомо превышен, но удалять нечего кроме активного.
+        // The budget is knowably exceeded, but there is nothing to delete
+        // except the active one.
         let removed = inv.enforce_budget(dir.path(), 10, Some(active)).unwrap();
         assert_eq!(removed, 0);
-        assert_eq!(inv.len(), 1, "активный сегмент уцелел");
+        assert_eq!(inv.len(), 1, "the active segment survived");
 
-        // Со вторым сегментом старый удаляется, активный остаётся.
+        // With a second segment the old one is deleted and the active one
+        // stays.
         make(dir.path(), 1, 500, 1000);
         let mut inv = Inventory::scan(dir.path()).unwrap();
         let active = inv.newest().unwrap().name;
@@ -291,10 +299,10 @@ mod tests {
         let mut inv = Inventory::scan(dir.path()).unwrap();
         assert_eq!(inv.total_bytes(), 1000);
 
-        // Запечатывание обрезает хвост преаллокации.
+        // Sealing trims the tail of the reserve window.
         let name = inv.newest().unwrap().name;
         inv.update_size_bytes(name, 200);
-        assert_eq!(inv.total_bytes(), 200, "бюджет учитывает реальный размер");
+        assert_eq!(inv.total_bytes(), 200, "the budget counts the real size");
 
         inv.remove(name);
         assert_eq!(inv.total_bytes(), 0);
@@ -308,7 +316,7 @@ mod tests {
         make(dir.path(), 1, 100, 100);
         let mut inv = Inventory::scan(dir.path()).unwrap();
 
-        // Кто-то удалил файл мимо движка.
+        // Someone deleted the file behind the engine's back.
         std::fs::remove_file(
             dir.path()
                 .join(SegmentName::new(BootCounter(1), Micros(0)).to_string()),
@@ -316,7 +324,7 @@ mod tests {
         .unwrap();
 
         let removed = inv.enforce_budget(dir.path(), 50, None).unwrap();
-        assert_eq!(removed, 2, "исчезнувший файл просто забыт");
+        assert_eq!(removed, 2, "a vanished file is simply forgotten");
         assert!(inv.is_empty());
     }
 }

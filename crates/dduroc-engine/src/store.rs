@@ -940,9 +940,9 @@ fn live_boots(roots: &[PathBuf]) -> Result<std::collections::BTreeSet<u32>> {
         match std::fs::read_dir(path) {
             Ok(it) => it
                 .collect::<std::io::Result<Vec<_>>>()
-                .ctx_path("обход каталога", path),
+                .ctx_path("walking a directory", path),
             Err(e) if matches!(e.kind(), NotADirectory | NotFound) => Ok(Vec::new()),
-            Err(e) => Err(e).ctx_path("обход каталога", path),
+            Err(e) => Err(e).ctx_path("walking a directory", path),
         }
     }
 
@@ -988,7 +988,7 @@ fn acquire_lock(root: &Path) -> Result<File> {
         .truncate(false)
         .mode(fsutil::FILE_MODE)
         .open(&path)
-        .ctx_path("открытие файла блокировки", &path)?;
+        .ctx_path("opening the lock file", &path)?;
 
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
         |e| {

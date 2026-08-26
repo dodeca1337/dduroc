@@ -2139,7 +2139,7 @@ impl WriterLoop {
         let path = ch.dir.join(name.to_string());
         match commit {
             MigrationCommit::Replace { tmp, size } => {
-                std::fs::rename(&tmp, &path).ctx_path("подмена сегмента", &path)?;
+                std::fs::rename(&tmp, &path).ctx_path("swapping a segment in", &path)?;
                 crate::fsutil::sync_dir(&ch.dir)?;
                 ch.inventory.update_size_bytes(name, size);
             }

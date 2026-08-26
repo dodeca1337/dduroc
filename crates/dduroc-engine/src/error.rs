@@ -1,14 +1,14 @@
-//! Ошибки движка.
+//! Engine errors.
 
 use std::path::PathBuf;
 
-/// Отказ движка.
+/// An engine failure.
 ///
-/// Перечисление **открытое** (`#[non_exhaustive]`): новая причина отказа
-/// появляется от новой проверки, а не от нового решения вызывающего — на путях
-/// записи вопрос звучит «потеряна ли запись» ([`Error::loses_record`]) и
-/// «дефект ли это сборки» ([`Error::breaks_contract`]), и ответ на него у новых
-/// вариантов уже есть.
+/// The enum is **open** (`#[non_exhaustive]`): a new cause of failure comes
+/// from a new check, not from a new decision by the caller — on the write
+/// paths the questions are "was the record lost" ([`Error::loses_record`]) and
+/// "is this a build defect" ([`Error::breaks_contract`]), and new variants
+/// already answer them.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -19,69 +19,70 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("формат: {0}")]
+    #[error("format: {0}")]
     Format(#[from] dduroc_format::Error),
 
-    #[error("сериализация метаданных: {0}")]
+    #[error("serializing metadata: {0}")]
     Postcard(#[from] postcard::Error),
 
-    #[error("недопустимое имя неймспейса {name:?}: {reason}")]
+    #[error("invalid namespace name {name:?}: {reason}")]
     BadNamespace { name: String, reason: &'static str },
 
-    #[error("схема {name:?} не проходит проверку: {reason}")]
+    #[error("schema {name:?} fails validation: {reason}")]
     BadSchema { name: String, reason: String },
 
     #[error(
-        "событие {event} не объявлено в схеме {schema:?}: id из чужой схемы означал бы \
-         чужой декодер при чтении"
+        "event {event} is not declared in schema {schema:?}: an id from a foreign schema \
+         would mean a foreign decoder at read time"
     )]
     UnknownEvent { schema: &'static str, event: u16 },
 
-    #[error("вид спана {kind} не объявлен в схеме {schema:?}")]
+    #[error("span kind {kind} is not declared in schema {schema:?}")]
     UnknownSpanKind { schema: &'static str, kind: u16 },
 
-    #[error("поля события {event:?} не сериализуются")]
+    #[error("the fields of event {event:?} do not serialize")]
     EncodeFailed { event: &'static str },
 
     #[error(
-        "класс хранения {class:?} не объявлен ни одним типом схемы {schema:?}: \
-         канала под него нет"
+        "storage class {class:?} is declared by no type of schema {schema:?}: \
+         there is no channel for it"
     )]
     ClassNotDeclared {
         schema: &'static str,
         class: crate::schema::StorageClass,
     },
 
-    #[error("недопустимая настройка хранилища {setting}: {reason}")]
+    #[error("invalid store setting {setting}: {reason}")]
     BadStore {
         setting: &'static str,
         reason: &'static str,
     },
 
-    #[error("недопустимая политика группы {prefix:?}: {reason}")]
+    #[error("invalid policy for group {prefix:?}: {reason}")]
     BadGroup {
         prefix: String,
         reason: &'static str,
     },
 
     #[error(
-        "недопустимый канал {class}{}: {reason}",
-        namespace.as_deref().map(|n| format!(" неймспейса {n:?}")).unwrap_or_default()
+        "invalid channel {class}{}: {reason}",
+        namespace.as_deref().map(|n| format!(" of namespace {n:?}")).unwrap_or_default()
     )]
     BadChannel {
-        /// Класс хранения: канал и есть класс, второго имени у него нет.
+        /// The storage class: a channel is a class, and it has no second name.
         class: crate::schema::StorageClass,
-        /// Чей канал; `None` — конфигурация класса до всякого неймспейса.
+        /// Whose channel; `None` means the class configuration before any
+        /// namespace.
         namespace: Option<String>,
         reason: &'static str,
     },
 
-    #[error("неймспейс {0:?} уже открыт в этом процессе")]
+    #[error("namespace {0:?} is already open in this process")]
     NamespaceBusy(String),
 
     #[error(
-        "неймспейс {namespace:?} записан схемой {stored:?}, открывается схемой {opening:?} — \
-         разные схемы в одном неймспейсе смешали бы несовместимые id событий"
+        "namespace {namespace:?} was written by schema {stored:?} and is being opened by \
+         schema {opening:?}: different schemas in one namespace would mix incompatible event ids"
     )]
     SchemaMismatch {
         namespace: String,
@@ -90,8 +91,8 @@ pub enum Error {
     },
 
     #[error(
-        "неймспейс {namespace:?} имеет версию протокола {stored}, схема билда — {current}: \
-         данные из будущего, эта прошивка их не поймёт"
+        "namespace {namespace:?} is at protocol version {stored}, this build's schema is \
+         {current}: data from the future, which this firmware cannot understand"
     )]
     ProtocolFromFuture {
         namespace: String,
@@ -99,23 +100,24 @@ pub enum Error {
         current: u16,
     },
 
-    #[error("нет шага миграции {from} → {to} для схемы {schema:?}")]
+    #[error("no migration step {from} → {to} for schema {schema:?}")]
     MissingMigration { schema: String, from: u16, to: u16 },
 
-    /// Второй одновременный `Namespace::migrate` на одном неймспейсе.
+    /// A second concurrent `Namespace::migrate` on one namespace.
     ///
-    /// Отказ, а не ожидание: прогон занимает минуты, и молча повисший второй
-    /// вызов выглядел бы как зависание приложения. Повторить его имеет смысл
-    /// только после завершения первого — когда, скорее всего, уже нечего.
-    #[error("миграция неймспейса {0:?} уже идёт")]
+    /// A refusal rather than a wait: a run takes minutes, and a second call
+    /// hanging silently would look like the application had frozen. Repeating
+    /// it makes sense only once the first has finished — by which time there is
+    /// most likely nothing left to do.
+    #[error("a migration of namespace {0:?} is already running")]
     MigrationBusy(String),
 
-    #[error("метрика {metric_id} не объявлена в схеме")]
+    #[error("metric {metric_id} is not declared in the schema")]
     UnknownMetric { metric_id: u16 },
 
     #[error(
-        "метрика {metric_id} объявлена как {declared:?}, а значение — {got:?}: \
-         тип отсчёта — свойство метрики, а не отдельной записи"
+        "metric {metric_id} is declared as {declared:?} but the value is {got:?}: \
+         a sample's type is a property of the metric, not of an individual record"
     )]
     ValueTypeMismatch {
         metric_id: u16,
@@ -123,51 +125,52 @@ pub enum Error {
         got: dduroc_format::ValueType,
     },
 
-    #[error("недопустимые пределы метрики {metric_name:?}: {reason}")]
+    #[error("invalid limits for metric {metric_name:?}: {reason}")]
     BadLimits {
         metric_name: &'static str,
         reason: &'static str,
     },
 
-    #[error("повреждён {path}: {reason}")]
+    #[error("{path} is damaged: {reason}")]
     Corrupt { path: PathBuf, reason: String },
 
     #[error(
-        "хранилище {0} уже открыто: два писателя на одном каталоге выдавали бы \
-         одинаковые номера запусков и сталкивались бы именами сегментов"
+        "store {0} is already open: two writers on one directory would hand out \
+         the same run numbers and collide on segment names"
     )]
     StoreBusy(PathBuf),
 
-    #[error("хранилище закрывается")]
+    #[error("the store is shutting down")]
     ShuttingDown,
 
-    #[error("очередь записи переполнена: диск не успевает")]
+    #[error("the write queue is full: the disk cannot keep up")]
     QueueFull,
 
-    #[error("writer-поток умер: запись невозможна")]
+    #[error("the writer thread died: writing is impossible")]
     WriterDead,
 
-    /// Синхронизация не догнала очередь.
+    /// The sync did not catch up with the queue.
     ///
-    /// Прикладные потоки ставят записи в очередь быстрее, чем writer успевает
-    /// их разбирать, и `sync` прекратил попытки, отработав отведённое число
-    /// проходов: иначе он не вернулся бы, пока пишущие не замолчат.
+    /// Application threads enqueue records faster than the writer can consume
+    /// them, and `sync` stopped trying after its allotted number of passes:
+    /// otherwise it would not return until the writers fell silent.
     ///
-    /// Записи **не потеряны** — они по-прежнему в очереди и лягут на носитель
-    /// обычным ходом; на носителе нет только их. Поэтому это и не потеря
-    /// ([`Error::loses_record`] — `false`), и не дефект вызова: это отчёт о
-    /// том, что обещание «всё накопленное на носителе» в этот раз выполнено
-    /// не до конца.
-    #[error("синхронизация не догнала очередь: часть записей ещё не на носителе")]
+    /// The records are **not lost** — they are still in the queue and will
+    /// reach the medium in the ordinary course; they are merely not on the
+    /// medium yet. So this is neither a loss ([`Error::loses_record`] is
+    /// `false`) nor a defect in the call: it is a report that the promise
+    /// "everything accumulated is on the medium" was this time not kept in
+    /// full.
+    #[error("the sync did not catch up with the queue: some records are not on the medium yet")]
     SyncIncomplete,
 
-    #[error("нет места на устройстве: {0}")]
+    #[error("no space left on device: {0}")]
     NoSpace(PathBuf),
 
     #[error(
-        "сегмент {path} создан другим хранилищем (ожидалось {expected:#018x}, \
-         в файле {found:#018x}): у него своя нумерация запусков и своя привязка \
-         ко времени"
+        "segment {path} was created by another store (expected {expected:#018x}, \
+         the file says {found:#018x}): it has its own run numbering and its own \
+         anchoring to time"
     )]
     ForeignSegment {
         path: PathBuf,
@@ -178,8 +181,9 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Добавляет к io-ошибке путь и операцию: без этого «No such file or directory»
-/// в логе не позволяет понять, какой из тысяч файлов не открылся.
+/// Adds a path and an operation to an io error: without them a "No such file
+/// or directory" in a log says nothing about which of a thousand files failed
+/// to open.
 pub(crate) trait IoContext<T> {
     fn ctx(self, what: &str) -> Result<T>;
     fn ctx_path(self, what: &str, path: &std::path::Path) -> Result<T>;
@@ -218,13 +222,14 @@ impl<T> IoContext<T> for std::result::Result<T, rustix::io::Errno> {
 }
 
 impl Error {
-    /// Означает ли ошибка, что **запись потеряна**.
+    /// Whether the error means the **record was lost**.
     ///
-    /// Главный вопрос вызывающего на пути записи, и он не должен требовать
-    /// разбора всего перечисления: потеря — это состояние носителя (очередь не
-    /// успевает, writer мёртв, хранилище останавливается), а не ошибка вызова.
-    /// Нарушение контракта (id из чужой схемы) — наоборот, дефект кода, и
-    /// реагировать на него надо иначе: не повтором, а исправлением.
+    /// The caller's main question on the write path, and it must not require
+    /// matching the whole enum: a loss is a state of the medium (the queue is
+    /// falling behind, the writer is dead, the store is stopping), not an error
+    /// in the call. A contract violation (an id from a foreign schema) is the
+    /// opposite — a defect in the code, and it calls for a different response:
+    /// not a retry but a fix.
     pub fn loses_record(&self) -> bool {
         matches!(
             self,
@@ -232,10 +237,12 @@ impl Error {
         )
     }
 
-    /// Ошибка вызова: объявленное в схеме и переданное не совпали.
+    /// An error in the call: what the schema declared and what was passed do
+    /// not match.
     ///
-    /// Такое не лечится повтором и не зависит от нагрузки — это дефект сборки
-    /// (обычно тип из одной схемы передан в неймспейс другой).
+    /// A retry does not cure it and load does not cause it — this is a build
+    /// defect (usually a type from one schema passed to a namespace of
+    /// another).
     pub fn breaks_contract(&self) -> bool {
         matches!(
             self,
@@ -248,8 +255,8 @@ impl Error {
         )
     }
 
-    /// Закончилось место на устройстве — для этого случая политика особая:
-    /// движок обязан продолжать ротацию и не терять критические данные молча.
+    /// The device ran out of space — the policy for this case is special: the
+    /// engine has to keep rotating and must not lose critical data silently.
     pub fn is_no_space(&self) -> bool {
         match self {
             Error::NoSpace(_) => true,
@@ -260,7 +267,7 @@ impl Error {
 }
 
 const fn libc_enospc() -> i32 {
-    // ENOSPC одинаков на всех Linux-ABI (включая armv7).
+    // ENOSPC is the same on every Linux ABI (armv7 included).
     28
 }
 
@@ -270,10 +277,10 @@ mod tests {
 
     #[test]
     fn lost_records_are_distinguishable_from_caller_bugs() {
-        // Ради этого разделения предикаты и существуют: на потерю прикладной
-        // код реагирует счётчиком и деградацией, на нарушение контракта —
-        // исправлением сборки. Перепутать их значит либо молча терпеть баг,
-        // либо поднимать тревогу из-за занятого диска.
+        // This split is what the predicates exist for: application code answers
+        // a loss with a counter and with degradation, and a contract violation
+        // with a fix to the build. Confusing them means either tolerating a bug
+        // silently or raising an alarm over a full disk.
         for lost in [Error::QueueFull, Error::WriterDead, Error::ShuttingDown] {
             assert!(lost.loses_record(), "{lost}");
             assert!(!lost.breaks_contract(), "{lost}");
@@ -305,7 +312,7 @@ mod tests {
             assert!(!bug.loses_record(), "{bug}");
         }
 
-        // Отказ носителя — ни то, ни другое: запись могла и дойти.
+        // A failure of the medium is neither: the record may well have landed.
         let io = Error::NoSpace(PathBuf::from("/data"));
         assert!(!io.loses_record());
         assert!(!io.breaks_contract());

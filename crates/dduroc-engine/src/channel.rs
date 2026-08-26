@@ -1,79 +1,79 @@
-//! Канал — класс хранения внутри неймспейса.
+//! A channel — a storage class within a namespace.
 //!
-//! Физически это поддиректория с сегментами, логически — набор политик:
-//! размер сегмента и блока, сжатие и, главное, долговечность. Формат записей
-//! во всех каналах одинаков — различаются только политики, поэтому
-//! «критическое» и «некритическое» живёт в одном движке.
+//! Physically it is a subdirectory of segments; logically it is a set of
+//! policies: segment and block size, compression and, above all, durability.
+//! The record format is the same in every channel — only the policies differ,
+//! which is why "critical" and "not critical" live in one engine.
 //!
-//! Бюджет объявляется на **класс целиком**: «вся телеметрия — столько-то,
-//! все логи — столько-то». Каналы всех неймспейсов одного класса черпают из
-//! общего бюджета, и вытесняется старейший сегмент класса, в чьём бы
-//! неймспейсе он ни лежал.
+//! A budget is declared for a **whole class**: "all telemetry gets this much,
+//! all logs get that much". The channels of every namespace of one class draw
+//! on a shared budget, and the oldest segment of the class is evicted
+//! regardless of whose namespace it lies in.
 
 use crate::error::{Error, Result};
 use dduroc_format::Compression;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Настройки класса хранения — политика всех его каналов.
+/// The settings of a storage class — the policy of all its channels.
 ///
-/// Имени здесь нет намеренно: канал живёт в каталоге своего класса хранения
-/// ([`crate::schema::StorageClass::as_str`]), и второй источник того же имени
-/// в конфигурации мог бы только разойтись с первым.
+/// There is deliberately no name here: a channel lives in the directory of its
+/// storage class ([`crate::schema::StorageClass::as_str`]), and a second source
+/// of the same name in the configuration could only drift away from the first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelConfig {
-    /// Бюджет **класса на всё хранилище**: суммарный размер сегментов этого
-    /// класса во всех неймспейсах. При превышении вытесняется старейший
-    /// сегмент класса — чей бы он ни был: молчащий сервис не держит место,
-    /// которого не хватает шумному. Квота отдельного неймспейса — отдельная
-    /// необязательная настройка ([`crate::store::NsQuota`]).
+    /// The budget of a **class across the whole store**: the total size of that
+    /// class's segments in every namespace. When it is exceeded, the class's
+    /// oldest segment is evicted whoever it belongs to: a quiet service does
+    /// not hold space a noisy one lacks. A quota for an individual namespace is
+    /// a separate, optional setting ([`crate::store::NsQuota`]).
     pub budget_bytes: u64,
-    /// Предел роста одного сегмента — граница ротации.
+    /// The growth limit of one segment — the rotation boundary.
     ///
-    /// Это **не** размер файла при создании: место резервируется окном,
-    /// начиная с одного блока, и растёт восьмыми долями предела по мере
-    /// записи (см. модуль `segment`). Канал, написавший сто байт, занимает
-    /// на носителе один экстент, а не целый сегмент, и в бюджете класса
-    /// числится тем же. Поэтому предел одновременно пишущих каналов задаёт
-    /// не `budget_bytes / segment_bytes`, а то, сколько они реально
-    /// записали.
+    /// This is **not** the file's size at creation: space is reserved as a
+    /// window starting at one block and grows by eighths of the limit as
+    /// writing goes on (see the `segment` module). A channel that wrote a
+    /// hundred bytes takes one extent on the medium rather than a whole
+    /// segment, and is counted as that in the class budget. So the number of
+    /// channels that can write at once is set not by `budget_bytes /
+    /// segment_bytes` but by how much they actually wrote.
     ///
-    /// Фиксированный, а не производный от бюджета: бюджет общий на класс, и
-    /// сегмент, выросший вместе с ним, дал бы одному шумному каналу право
-    /// занять его целиком до первой ротации.
+    /// Fixed rather than derived from the budget: the budget is shared by the
+    /// class, and a segment that grew along with it would give one noisy
+    /// channel the right to take the whole thing before the first rotation.
     pub segment_bytes: u64,
-    /// Порог закрытия блока.
+    /// The threshold at which a block is closed.
     pub block_max_bytes: usize,
-    /// Максимальная задержка выталкивания неполного блока.
+    /// The longest an incomplete block may wait before being flushed.
     pub flush_interval: Duration,
-    /// Не чаще этого интервала — `fdatasync`. Окно потери при обрыве питания
-    /// равно интервалу; синхронизация при запечатывании сегмента и на
-    /// завершении происходит в любом случае.
+    /// `fdatasync` no more often than this interval. The window of loss on a
+    /// power cut equals the interval; syncing on sealing a segment and on
+    /// shutdown happens in any case.
     ///
-    /// `ZERO` — синхронизировать сразу после каждой групповой фиксации.
-    /// Это group commit, а не sync на запись: writer забирает из очереди всё
-    /// накопившееся, пишет одним блоком и синхронизирует один раз — всплеск
-    /// из сотни событий стоит одного `fdatasync` (~1–10 мс на eMMC). Так
-    /// работает критический канал, и для него это не настройка, а
-    /// определение: ненулевой интервал у критического класса отвергается при
-    /// открытии хранилища.
+    /// `ZERO` means syncing right after every group commit. That is a group
+    /// commit, not a sync per record: the writer takes everything that has
+    /// piled up in the queue, writes it as one block and syncs once — a burst
+    /// of a hundred events costs one `fdatasync` (~1–10 ms on eMMC). This is
+    /// how the critical channel works, and for it this is not a setting but a
+    /// definition: a non-zero interval on the critical class is refused when
+    /// the store is opened.
     pub sync_interval: Duration,
     pub compression: Compression,
-    /// Собственный корень класса. `None` — общий корень хранилища.
+    /// The class's own root. `None` means the store's shared root.
     ///
-    /// Нужен, когда классу положен другой носитель: критические данные — на
-    /// защищённый раздел (jffs2), тяжёлая телеметрия — на большой. Раскладка
-    /// внутри корня та же: `<корень>/<неймспейс>/<класс>/`. Живой читатель
-    /// (`store.reader()`) знает все корни от самого хранилища; дампу их
-    /// называют разом (`Reader::open_dump`). Смена корня не переносит
-    /// историю: новые сегменты пишутся в новое место, старое остаётся
-    /// читаемым как ещё один корень дампа, но в бюджете класса больше не
-    /// учитывается.
+    /// Needed when a class belongs on a different medium: critical data on a
+    /// protected partition (jffs2), heavy telemetry on a large one. The layout
+    /// inside the root is the same: `<root>/<namespace>/<class>/`. A live
+    /// reader (`store.reader()`) learns every root from the store itself; a
+    /// dump is told them all at once (`Reader::open_dump`). Changing the root
+    /// does not move the history: new segments are written to the new place,
+    /// the old one stays readable as one more dump root but no longer counts
+    /// towards the class budget.
     pub custom_root: Option<PathBuf>,
 }
 
 impl ChannelConfig {
-    /// Разумные умолчания под указанный бюджет класса.
+    /// Sensible defaults for the given class budget.
     pub fn new(budget_bytes: u64) -> Self {
         Self {
             budget_bytes,
@@ -86,11 +86,12 @@ impl ChannelConfig {
         }
     }
 
-    /// Класс критических данных: синхронизация сразу, сжатие выключено.
+    /// The class of critical data: sync immediately, compression off.
     ///
-    /// Сжатие на критическом канале вредно: оно заставляет копить данные ради
-    /// эффективности, а копить — ровно то, чего критический канал избегает.
-    /// Сегмент вдвое меньше обычного: критические разделы малы.
+    /// Compression on a critical channel is harmful: it makes the system hoard
+    /// data for the sake of efficiency, and hoarding is exactly what a critical
+    /// channel avoids. The segment is half the usual size: critical partitions
+    /// are small.
     pub fn critical(budget_bytes: u64) -> Self {
         Self {
             sync_interval: Duration::ZERO,
@@ -102,7 +103,8 @@ impl ChannelConfig {
         }
     }
 
-    /// Проверить конфигурацию; `class` — чей это канал в сообщении об ошибке.
+    /// Validate the configuration; `class` says whose channel it is in the
+    /// error.
     pub fn validate(&self, class: crate::schema::StorageClass) -> Result<()> {
         self.check().map_err(|reason| Error::BadChannel {
             class,
@@ -111,53 +113,60 @@ impl ChannelConfig {
         })
     }
 
-    /// Та же проверка, но одной причиной без адреса.
+    /// The same check, but with one cause and no address.
     ///
-    /// Адресов у одной и той же негодной настройки два: класс хранилища и
-    /// класс группы неймспейсов ([`crate::store::GroupPolicy`]). Причина у них
-    /// общая, и второй её копии быть не должно — разъехавшись, копии объявляли
-    /// бы негодным разное.
+    /// One and the same bad setting has two addresses: the store's class and
+    /// the class of a namespace group ([`crate::store::GroupPolicy`]). The
+    /// cause they share, and there must not be a second copy of it — once the
+    /// copies drifted apart they would declare different things invalid.
     pub(crate) fn check(&self) -> std::result::Result<(), &'static str> {
-        // Бюджет меньше двух сегментов означает, что при запечатывании
-        // единственного сегмента ротация немедленно удалила бы его — канал
-        // не хранил бы ничего.
+        // A budget smaller than two segments means that on sealing the only
+        // segment rotation would delete it at once — the channel would hold
+        // nothing.
         //
-        // Умножение насыщающее: `segment_bytes` приходит из конфигурации
-        // приложения, и обычное переполнило бы u64 паникой в debug там, где
-        // ответ очевиден — такой бюджет заведомо мал.
+        // The multiplication saturates: `segment_bytes` comes from the
+        // application's configuration, and an ordinary one would overflow a u64
+        // into a debug panic where the answer is obvious — such a budget is
+        // knowably too small.
         if self.budget_bytes < self.segment_bytes.saturating_mul(2) {
-            return Err("бюджет меньше двух сегментов — ротация съедала бы данные сразу");
+            return Err(
+                "the budget is smaller than two segments: rotation would eat the data at once",
+            );
         }
         if self.block_max_bytes < 512 {
-            return Err("слишком маленький блок: накладные расходы съедят экономию");
+            return Err("the block is too small: the overhead would eat the savings");
         }
         if (self.block_max_bytes as u64) * 2 > self.segment_bytes {
-            return Err("блок сопоставим с сегментом — сегмент не вместит и пары блоков");
+            return Err(
+                "the block is comparable to a segment: a segment would not hold even two blocks",
+            );
         }
         Ok(())
     }
 
-    /// Сколько сегментов помещается в бюджет.
+    /// How many segments fit in the budget.
     pub fn max_segments(&self) -> u64 {
         (self.budget_bytes / self.segment_bytes).max(1)
     }
 }
 
-/// Чем группа неймспейсов может отличаться от общих настроек класса.
+/// How a namespace group may differ from the class's shared settings.
 ///
-/// Здесь нет ни `budget_bytes`, ни `custom_root`, и это не упущение. Бюджет и
-/// носитель — свойства **класса**, общие на всё хранилище: «вся телеметрия —
-/// столько-то, критика — на защищённом разделе». Дать их группе значило бы
-/// либо поднять потолок занятости выше объявленного (лишний бюджет сверх
-/// класса), либо развести один класс по двум носителям, где его общий бюджет
-/// перестал бы что-либо означать. Личный предел у группы всё же есть — это
-/// квота ([`GroupPolicy::limit_bytes`]), предел ВНУТРИ бюджета класса.
+/// There is neither `budget_bytes` nor `custom_root` here, and that is no
+/// oversight. The budget and the medium are properties of the **class**,
+/// shared across the whole store: "all telemetry gets this much, critical data
+/// goes on the protected partition". Giving them to a group would either raise
+/// the occupancy ceiling above what was declared (a budget on top of the
+/// class's) or spread one class across two media, where its shared budget
+/// would stop meaning anything. A group does have a limit of its own — a quota
+/// ([`GroupPolicy::limit_bytes`]), a limit INSIDE the class budget.
 ///
-/// Остальное — свойства каждого пишущего канала по отдельности, и группе они
-/// принадлежат по праву: тяжёлой телеметрии оркестраторов уместен свой размер
-/// сегмента, редкому диагностическому сервису — своя задержка выталкивания.
+/// The rest are properties of each writing channel separately, and belong to a
+/// group by right: heavy orchestrator telemetry deserves its own segment size,
+/// a rarely used diagnostic service its own flush delay.
 ///
-/// Незаданное наследуется от класса; строится цепочкой, как и всё остальное.
+/// What is not set is inherited from the class; it is built as a chain, like
+/// everything else.
 ///
 /// [`GroupPolicy::limit_bytes`]: crate::store::GroupPolicy::limit_bytes
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -175,38 +184,38 @@ impl ChannelOverride {
         Self::default()
     }
 
-    /// Свой размер сегмента (он же — шаг преаллокации).
+    /// Its own segment growth limit.
     pub fn segment_bytes(mut self, bytes: u64) -> Self {
         self.segment_bytes = Some(bytes);
         self
     }
 
-    /// Свой порог закрытия блока.
+    /// Its own threshold for closing a block.
     pub fn block_max_bytes(mut self, bytes: usize) -> Self {
         self.block_max_bytes = Some(bytes);
         self
     }
 
-    /// Своя максимальная задержка выталкивания неполного блока.
+    /// Its own longest delay before flushing an incomplete block.
     pub fn flush_interval(mut self, every: Duration) -> Self {
         self.flush_interval = Some(every);
         self
     }
 
-    /// Свой интервал синхронизации. У критического класса допустим только
-    /// нулевой: немедленность — его определение, а не настройка.
+    /// Its own sync interval. On the critical class only zero is allowed:
+    /// immediacy is its definition, not a setting.
     pub fn sync_interval(mut self, every: Duration) -> Self {
         self.sync_interval = Some(every);
         self
     }
 
-    /// Своё сжатие.
+    /// Its own compression.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = Some(compression);
         self
     }
 
-    /// Наложить на настройки класса.
+    /// Lay these over the class's settings.
     pub(crate) fn apply_to(&self, config: &mut ChannelConfig) {
         if let Some(v) = self.segment_bytes {
             config.segment_bytes = v;
@@ -226,34 +235,35 @@ impl ChannelOverride {
     }
 }
 
-/// Проверка компонента пути (имя неймспейса или канала).
+/// Validation of a path component (a namespace or channel name).
 ///
-/// Имена приходят из конфигурации и кода приложения, но подставляются в путь
-/// файловой системы, поэтому проверяются строго: `..`, разделители пути и
-/// управляющие символы способны увести запись за пределы хранилища.
+/// The names come from the application's configuration and code but are
+/// substituted into a filesystem path, so they are checked strictly: `..`,
+/// path separators and control characters can lead a write outside the store.
 pub(crate) fn validate_component(name: &str) -> std::result::Result<(), &'static str> {
     if name.is_empty() {
-        return Err("пустое имя");
+        return Err("an empty name");
     }
     if name.len() > 64 {
-        return Err("длиннее 64 байт");
+        return Err("longer than 64 bytes");
     }
     if name == "." || name == ".." {
-        return Err("зарезервированное имя");
+        return Err("a reserved name");
     }
     if name.starts_with('.') {
-        return Err("имя не может начинаться с точки");
+        return Err("a name may not begin with a dot");
     }
     if !name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
-        return Err("допустимы только ASCII-буквы, цифры, '-', '_' и '.'");
+        return Err("only ASCII letters, digits, '-', '_' and '.' are allowed");
     }
-    // Расширение .tmp зарезервировано за незавершёнными атомарными записями,
-    // .seg — за сегментами: каталог с таким именем сбил бы уборку и скан.
+    // The .tmp extension is reserved for unfinished atomic writes and .seg for
+    // segments: a directory with such a name would confuse cleanup and
+    // scanning.
     if name.ends_with(".tmp") || name.ends_with(".seg") || name.ends_with(".corrupt") {
-        return Err("зарезервированное расширение");
+        return Err("a reserved extension");
     }
     Ok(())
 }
@@ -264,16 +274,20 @@ mod tests {
 
     #[test]
     fn segment_size_does_not_scale_with_the_class_budget() {
-        // Бюджет общий на класс, а преаллокацию держит каждый пишущий
-        // неймспейс: сегмент, выросший вместе с бюджетом, съел бы бюджет
-        // одними активными сегментами. 20 ГиБ телеметрии по формуле давали
-        // бы 80-МиБ преаллокацию каждому писателю.
+        // The budget is shared by the class, while every writing namespace
+        // holds a segment of its own: a segment that grew along with the budget
+        // would let the active ones eat it. By the formula, 20 GiB of telemetry
+        // would give every writer an 80 MiB segment.
         let c = ChannelConfig::new(20 * 1024 * 1024 * 1024);
         assert_eq!(c.segment_bytes, 8 * 1024 * 1024);
         c.validate(crate::schema::StorageClass::Default).unwrap();
 
         let c = ChannelConfig::new(64 * 1024 * 1024);
-        assert_eq!(c.segment_bytes, 8 * 1024 * 1024, "и от малого не зависит");
+        assert_eq!(
+            c.segment_bytes,
+            8 * 1024 * 1024,
+            "and does not depend on a small one either"
+        );
         assert_eq!(c.max_segments(), 8);
         c.validate(crate::schema::StorageClass::Default).unwrap();
     }
@@ -284,7 +298,7 @@ mod tests {
         assert_eq!(
             c.sync_interval,
             Duration::ZERO,
-            "немедленность — определение критического канала"
+            "immediacy is the definition of the critical channel"
         );
         assert_eq!(c.compression, Compression::None);
         assert!(c.flush_interval < Duration::from_secs(1));
@@ -294,10 +308,10 @@ mod tests {
     #[test]
     fn degenerate_configs_rejected() {
         let mut c = ChannelConfig::new(64 * 1024 * 1024);
-        c.budget_bytes = c.segment_bytes; // ровно один сегмент
+        c.budget_bytes = c.segment_bytes; // exactly one segment
         assert!(
             c.validate(crate::schema::StorageClass::Default).is_err(),
-            "бюджет в один сегмент бессмыслен"
+            "a budget of one segment is meaningless"
         );
 
         let mut c = ChannelConfig::new(64 * 1024 * 1024);
@@ -312,7 +326,7 @@ mod tests {
     #[test]
     fn path_components_are_validated_strictly() {
         for good in ["default", "orc-radio-0", "apt_x", "a.b", "A1"] {
-            assert!(validate_component(good).is_ok(), "{good} должно проходить");
+            assert!(validate_component(good).is_ok(), "{good} must pass");
         }
         for bad in [
             "",
@@ -323,17 +337,14 @@ mod tests {
             "a\\b",
             "../etc",
             "a b",
-            "имя",
+            "naïve", // non-ASCII
             "a\0b",
             "x.tmp",
             "x.seg",
             "x.corrupt",
             "\n",
         ] {
-            assert!(
-                validate_component(bad).is_err(),
-                "{bad:?} обязано отвергаться"
-            );
+            assert!(validate_component(bad).is_err(), "{bad:?} must be rejected");
         }
         assert!(validate_component(&"x".repeat(64)).is_ok());
         assert!(validate_component(&"x".repeat(65)).is_err());

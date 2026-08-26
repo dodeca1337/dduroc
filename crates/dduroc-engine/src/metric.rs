@@ -1,34 +1,35 @@
-//! Метрика вместе с типом своего значения.
+//! A metric together with the type of its value.
 //!
-//! Тип отсчёта — свойство метрики, объявленное в схеме, а не свойство
-//! отдельной записи. Значит проверять его должен компилятор, а не движок в
-//! рантайме: раньше `sample_f32` рядом с метрикой, объявленной как `u64`,
-//! собирался и падал ошибкой на устройстве.
+//! The type of a sample is a property of the metric, declared in the schema,
+//! not a property of an individual record. So it is the compiler's job to
+//! check it, not the engine's at runtime: `sample_f32` next to a metric
+//! declared as `u64` used to compile and then fail with an error on the
+//! device.
 //!
-//! Поэтому константа метрики несёт тип значения — [`Metric<T>`], — а ряд,
-//! открытый по ней, принимает только его:
+//! That is why a metric constant carries the value type — [`Metric<T>`] — and
+//! a series opened from it accepts only that type:
 //!
 //! ```text
 //! metrics::TempPa: Metric<f32>          series(TempPa)?.sample(36.6)   ✓
-//!                                       series(TempPa)?.sample(36u64)  ошибка компиляции
+//!                                       series(TempPa)?.sample(36u64)  does not compile
 //! metrics::LinkState: Metric<LinkState>  series(LinkState)?.sample(LinkState::Lock) ✓
 //! ```
 //!
-//! Параметр — маркер, а не хранимое значение, поэтому [`Metric`] остаётся
-//! `Copy` и укладывается в те же четыре байта, что и `MetricId`.
+//! The parameter is a marker rather than a stored value, so [`Metric`] stays
+//! `Copy` and fits in the same four bytes as `MetricId`.
 
 use crate::staged::OwnedValue;
 use dduroc_format::MetricId;
 use std::marker::PhantomData;
 
-/// Метрика, объявленная со типом значения `T`.
+/// A metric declared with value type `T`.
 ///
-/// Порождается макросом схемы; вручную нужна только тем, кто описывает схему
-/// без макроса.
+/// Produced by the schema macro; needed by hand only by those who describe a
+/// schema without the macro.
 pub struct Metric<T> {
     id: MetricId,
-    /// `fn() -> T`, а не `T`: маркер не влияет ни на `Copy`, ни на `Send`,
-    /// ни на вариантность — метрика не хранит значение.
+    /// `fn() -> T` rather than `T`: the marker affects neither `Copy` nor
+    /// `Send` nor variance — a metric stores no value.
     _value: PhantomData<fn() -> T>,
 }
 
@@ -73,37 +74,39 @@ impl<T> From<Metric<T>> for MetricId {
     }
 }
 
-/// Маркер метрики с двоичным значением (`type: blob`): спектр, дамп регистра.
+/// The marker of a metric with a binary value (`type: blob`): a spectrum, a
+/// register dump.
 ///
-/// Отдельный тип, потому что принимаемых Rust-типов у неё несколько
-/// (`&[u8]`, `Vec<u8>`), а объявленный — один.
+/// A separate type, because it accepts several Rust types (`&[u8]`,
+/// `Vec<u8>`) while declaring one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Blob;
 
-/// Маркер ряда, открытого по идентификатору из рантайма.
+/// The marker of a series opened by a runtime identifier.
 ///
-/// Типа значения на этапе компиляции нет — его знает только схема, — поэтому
-/// такой ряд принимает лишь [`Series::sample_raw`]. Нужен веб-слою и
-/// миграциям: там метрика приходит строкой из запроса.
+/// There is no compile-time value type — only the schema knows it — so such a
+/// series accepts [`Series::sample_raw`] alone. Needed by the web layer and by
+/// migrations, where a metric arrives as a string in a request.
 ///
 /// [`Series::sample_raw`]: crate::namespace::Series::sample_raw
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Untyped;
 
-/// Значение, допустимое для метрики, объявленной как `M`.
+/// A value admissible for a metric declared as `M`.
 ///
-/// Реализации пишет макрос схемы (для перечислений) и этот модуль (для
-/// встроенных типов). Своих реализаций прикладному коду не нужно.
+/// The implementations are written by the schema macro (for enums) and by this
+/// module (for built-in types). Application code needs none of its own.
 #[diagnostic::on_unimplemented(
-    message = "у этой метрики объявлен другой тип значения: `{Self}` не подходит",
-    label = "здесь нужно значение того типа, что стоит в схеме",
-    note = "тип отсчёта — свойство метрики (`type:` в объявлении), а не отдельной записи: \
-            у метрики-перечисления это её собственные состояния, у `type: blob` — байты",
-    note = "если тип действительно должен измениться, это правка схемы и миграция, \
-            а не приведение на месте вызова"
+    message = "this metric is declared with a different value type: `{Self}` does not fit",
+    label = "a value of the type named in the schema is needed here",
+    note = "a sample's type is a property of the metric (`type:` in the declaration), not of \
+            an individual record: for an enum metric it is that metric's own states, for \
+            `type: blob` it is bytes",
+    note = "if the type really has to change, that is a schema edit and a migration, \
+            not a cast at the call site"
 )]
 pub trait MetricValue<M> {
-    /// Перевести в форму, которая уйдёт в очередь записи.
+    /// Convert into the form that goes into the write queue.
     fn into_owned(self) -> OwnedValue;
 }
 
@@ -130,35 +133,36 @@ impl MetricValue<Blob> for &[u8] {
 impl MetricValue<Blob> for Vec<u8> {
     #[inline]
     fn into_owned(self) -> OwnedValue {
-        // Владение переезжает без копии: буфер вектора становится кучным
-        // хранилищем SmallVec. Прежний `as_slice().into()` копировал
-        // мегабайтный снимок спектра целиком — лишняя копия и лишний пик
-        // транзиентной памяти на каждый blob-отсчёт.
+        // Ownership moves without a copy: the vector's buffer becomes the
+        // SmallVec's heap storage. The former `as_slice().into()` copied a
+        // megabyte spectrum snapshot whole — a superfluous copy and a
+        // superfluous spike of transient memory on every blob sample.
         OwnedValue::Blob(crate::staged::Payload::from_vec(self))
     }
 }
 
-/// Числовое значение метрики: границы можно задать только там, где
-/// значения упорядочены.
+/// A numeric metric value: bounds can be set only where values are ordered.
 ///
-/// Реализован для встроенных чисел и **не** реализован для перечислений
-/// состояний, `bool` и [`Blob`]: «выше порога» к ним неприменимо. Раньше это
-/// ловил рантайм — `set_thresholds` на метрику-перечисление собирался и падал
-/// ошибкой на устройстве, хотя тип значения известен из константы метрики
-/// прямо на месте вызова. Имя — в семье соседей: [`MetricValue`] — значение,
-/// [`MetricState`] — состояние.
+/// Implemented for the built-in numbers and **not** implemented for state
+/// enums, `bool` or [`Blob`]: "above the threshold" does not apply to them.
+/// The runtime used to catch this — `set_thresholds` on an enum metric
+/// compiled and then failed with an error on the device, although the value
+/// type is known from the metric constant right at the call site. The name
+/// belongs to a family of neighbours: [`MetricValue`] is a value,
+/// [`MetricState`] is a state.
 ///
-/// Запечатан: набор числовых типов закрыт схемой (`type:` в объявлении), и
-/// сторонняя реализация означала бы обход той самой проверки.
+/// Sealed: the set of numeric types is closed by the schema (`type:` in the
+/// declaration), and an outside implementation would mean bypassing that very
+/// check.
 #[diagnostic::on_unimplemented(
-    message = "границы задаются только числовой метрике: `{Self}` не число",
-    label = "здесь нужна метрика с числовым `type:` из схемы",
-    note = "у метрики-перечисления важность приходит от состояния, а не от диапазона: \
-            задавайте её через MetricLimits::states",
-    note = "двоичному значению (`type: blob`) границы неприменимы вовсе"
+    message = "bounds can be set only on a numeric metric: `{Self}` is not a number",
+    label = "a metric with a numeric `type:` from the schema is needed here",
+    note = "for an enum metric severity comes from the state, not from a range: \
+            set it through MetricLimits::states",
+    note = "bounds do not apply to a binary value (`type: blob`) at all"
 )]
 pub trait NumericValue: Copy + sealed::Sealed {
-    /// Граница в том виде, в котором её хранит движок.
+    /// A bound in the form the engine stores it in.
     fn into_f64(self) -> f64;
 }
 
@@ -180,17 +184,17 @@ macro_rules! impl_numeric {
 
 impl_numeric!(f32, f64, i64, u64);
 
-/// Состояние метрики-перечисления, порождённое макросом схемы.
+/// A state of an enum metric, produced by the schema macro.
 ///
-/// Даёт человекочитаемое имя и код, уходящий на диск. Принадлежность метрике
-/// проверяет уже не он, а тип ряда: `Series<LinkState>` не примет состояние
-/// другой метрики.
+/// It gives a human-readable name and the code that goes to disk. Belonging to
+/// a metric is checked not by it but by the series type: a `Series<LinkState>`
+/// will not accept a state of another metric.
 pub trait MetricState: Copy {
-    /// Метрика, которой принадлежит это перечисление.
+    /// The metric this enum belongs to.
     fn metric() -> MetricId;
-    /// Код, попадающий на диск.
+    /// The code that reaches the disk.
     fn code(self) -> u64;
-    /// Имя состояния из схемы.
+    /// The state's name from the schema.
     fn name(self) -> &'static str;
 }
 
@@ -204,9 +208,10 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<Metric<f32>>(),
             std::mem::size_of::<MetricId>(),
-            "маркер типа не должен занимать места"
+            "the type marker must take no space"
         );
-        // Copy и в generic-контексте: маркер не участвует в автотрейтах.
+        // Copy in a generic context too: the marker takes no part in auto
+        // traits.
         fn takes_copy<T: Copy>(_: T) {}
         takes_copy(Metric::<Vec<u8>>::new(MetricId(1)));
     }

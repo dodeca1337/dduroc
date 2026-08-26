@@ -1,28 +1,29 @@
-//! Служебные отметки движка в потоке записей.
+//! The engine's own notices in the record stream.
 //!
-//! Потеря записи объявляется в самом потоке — текстовой записью с target'ом
-//! [`TARGET`]: дыра, о которой нигде не сказано, неотличима от тишины.
-//! Текст отметки — контракт между writer'ом и читателем, и собирается и
-//! разбирается он ЗДЕСЬ, в одном месте: прикладной код, который парсил бы
-//! прозу по префиксу, ломался бы каждой правкой формулировки.
+//! A lost record is announced in the stream itself, as a text record with the
+//! [`TARGET`] target: a hole nobody mentions is indistinguishable from
+//! silence. The text of a notice is a contract between the writer and the
+//! reader, and it is assembled and parsed HERE, in one place: application code
+//! that parsed the prose by its prefix would break with every rewording.
 
-/// Target служебных записей движка. Свободному тексту приложения он не
-/// принадлежит: по нему читатель отличает отметку движка от совпавшего слова.
+/// The target of the engine's own records. It does not belong to an
+/// application's free text: it is how a reader tells an engine notice from a
+/// word that merely matched.
 pub const TARGET: &str = "dduroc";
 
-/// Текст отметки о `count` записях, потерянных на переполнении очереди.
+/// The text of a notice about `count` records lost to queue overflow.
 pub fn drop_notice(count: u64) -> String {
-    format!("потеряно записей: {count} (очередь переполнена)")
+    format!("records lost: {count} (the queue overflowed)")
 }
 
-/// Разобрать отметку о потерях обратно в число.
+/// Parse a loss notice back into a number.
 ///
-/// `None` — это не отметка о потерях (чужой target либо другой текст).
+/// `None` means this is not a loss notice (a foreign target, or other text).
 pub fn parse_drop_notice(target: &str, text: &str) -> Option<u64> {
     if target != TARGET {
         return None;
     }
-    text.strip_prefix("потеряно записей: ")?
+    text.strip_prefix("records lost: ")?
         .split_whitespace()
         .next()?
         .parse()
@@ -35,14 +36,15 @@ mod tests {
 
     #[test]
     fn a_notice_survives_the_round_trip() {
-        // Формат собирается и разбирается одной парой функций: разъехаться
-        // им не из чего, и это единственное, что здесь стоит проверять.
+        // The format is assembled and parsed by one pair of functions, so there
+        // is nothing for them to drift apart on — and that is all there is to
+        // check here.
         assert_eq!(parse_drop_notice(TARGET, &drop_notice(42)), Some(42));
         assert_eq!(
             parse_drop_notice("app", &drop_notice(42)),
             None,
-            "чужой target — не отметка движка, чьё бы слово ни совпало"
+            "a foreign target is not an engine notice, whatever word happened to match"
         );
-        assert_eq!(parse_drop_notice(TARGET, "потеряно всё"), None);
+        assert_eq!(parse_drop_notice(TARGET, "everything lost"), None);
     }
 }

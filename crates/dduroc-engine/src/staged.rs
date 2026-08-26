@@ -1,9 +1,9 @@
-//! Запись в пути от вызывающего потока к writer'у.
+//! A record on its way from the calling thread to the writer.
 //!
-//! Через очередь нельзя передать [`dduroc_format::Record`] — он заимствует
-//! байты. Поэтому запись «стажируется»: payload копируется в
-//! [`smallvec::SmallVec`] с inline-ёмкостью, которой хватает
-//! типичному событию, и обращения к куче на горячем пути нет.
+//! A [`dduroc_format::Record`] cannot travel through a queue — it borrows its
+//! bytes. So a record is "staged": the payload is copied into a
+//! [`smallvec::SmallVec`] whose inline capacity is enough for a typical event,
+//! and the hot path never touches the heap.
 
 use dduroc_format::{
     EventId, Level, MetricId, Micros, Record, SpanId, SpanKindId, Value, ValueType,
@@ -11,21 +11,21 @@ use dduroc_format::{
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-/// Inline-ёмкость payload'а. Событие с парой чисел укладывается целиком;
-/// более крупные уходят в кучу.
+/// The payload's inline capacity. An event with a couple of numbers fits
+/// entirely; larger ones go to the heap.
 pub const INLINE_PAYLOAD: usize = 32;
 
 pub type Payload = SmallVec<[u8; INLINE_PAYLOAD]>;
 
-/// Идентификатор неймспейса внутри процесса.
+/// A namespace identifier within the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NsId(pub u32);
 
-/// Индекс канала внутри неймспейса.
+/// A channel index within a namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChannelIdx(pub u16);
 
-/// Значение сэмпла во владеющей форме.
+/// A sample value in owning form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OwnedValue {
     F32(f32),
@@ -60,7 +60,7 @@ impl OwnedValue {
     }
 }
 
-/// Тело записи во владеющей форме.
+/// A record body in owning form.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StagedRecord {
     Message {
@@ -83,14 +83,14 @@ pub enum StagedRecord {
     Text {
         level: Level,
         span: Option<SpanId>,
-        /// Источник сообщения. `Arc`, потому что у моста из `tracing` он
-        /// один и тот же на миллионы записей.
+        /// The message's source. An `Arc`, because the bridge from `tracing`
+        /// has one and the same for millions of records.
         target: Arc<str>,
         text: Box<str>,
     },
 }
 
-/// Запись вместе с адресом назначения.
+/// A record together with its destination address.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Staged {
     pub ns: NsId,
@@ -100,11 +100,11 @@ pub struct Staged {
 }
 
 impl Staged {
-    /// Идентификатор типа для учёта в footer'е.
+    /// The type identifier, for accounting in the footer.
     ///
-    /// Множества встреченных типов нужны миграции (сегмент без затронутых
-    /// типов не переписывается) и читателю — узнать, что вообще есть в
-    /// сегменте, не читая блоки.
+    /// The sets of types seen are what migrations need (a segment holding none
+    /// of the affected types is not rewritten) and what a reader needs to learn
+    /// what is in a segment at all without reading its blocks.
     pub fn footer_ids(&self) -> (Option<EventId>, Option<MetricId>) {
         match self.record {
             StagedRecord::Message { event, .. } => (Some(event), None),
@@ -115,10 +115,10 @@ impl Staged {
 }
 
 impl StagedRecord {
-    /// Одолжить как [`Record`] формата.
+    /// Borrow as a format [`Record`].
     ///
-    /// Разрешать нечего: сэмпл несёт метрику, а метрика — это и есть
-    /// идентичность ряда.
+    /// There is nothing to resolve: a sample carries its metric, and the metric
+    /// is what identifies the series.
     pub fn as_record(&self) -> Record<'_> {
         match self {
             StagedRecord::Message {
@@ -157,13 +157,13 @@ impl StagedRecord {
     }
 }
 
-/// Счётчики потерь по каналам неймспейса.
+/// Per-channel loss counters of a namespace.
 ///
-/// Учёт потерь лежит **на горячем пути ровно тогда, когда система под
-/// давлением** — в худший из возможных моментов. Поэтому это массив атомиков,
-/// индексируемый номером канала, а не разделяемая таблица под мьютексом:
-/// последняя добавляла бы к каждой потерянной записи захват блокировки и
-/// работу с хеш-таблицей.
+/// Loss accounting sits **on the hot path at exactly the moment the system is
+/// under pressure** — the worst moment there is. So this is an array of
+/// atomics indexed by channel number rather than a shared table under a mutex:
+/// the latter would add a lock acquisition and hash-table work to every record
+/// lost.
 #[derive(Debug)]
 pub struct DropCounters {
     per_channel: Vec<std::sync::atomic::AtomicU64>,
@@ -178,14 +178,14 @@ impl DropCounters {
         }
     }
 
-    /// Отметить потерю в канале.
+    /// Note a loss in a channel.
     #[inline]
     pub fn record(&self, channel: ChannelIdx) {
         self.record_n(channel, 1);
     }
 
-    /// Отметить сразу несколько потерь: блок теряется целиком, а объявить
-    /// одну запись вместо сотни значило бы соврать о размере дыры.
+    /// Note several losses at once: a block is lost whole, and announcing one
+    /// record instead of a hundred would lie about the size of the hole.
     #[inline]
     pub fn record_n(&self, channel: ChannelIdx, n: u64) {
         if let Some(c) = self.per_channel.get(channel.0 as usize) {
@@ -193,7 +193,7 @@ impl DropCounters {
         }
     }
 
-    /// Забрать накопленное, обнулив счётчик.
+    /// Take what has accumulated, zeroing the counter.
     pub fn take(&self, channel: ChannelIdx) -> u64 {
         self.per_channel
             .get(channel.0 as usize)
@@ -211,13 +211,13 @@ mod tests {
 
     #[test]
     fn typical_payload_stays_inline() {
-        // Событие с пятью f32 — 20 байт postcard: обращения к куче быть не
-        // должно, иначе горячий путь логирования аллоцирует на каждый вызов.
+        // An event with five f32s is 20 postcard bytes: there must be no trip
+        // to the heap, or the hot logging path allocates on every call.
         let payload: Payload = smallvec::smallvec![0u8; 20];
-        assert!(!payload.spilled(), "типичный payload обязан быть inline");
+        assert!(!payload.spilled(), "a typical payload must stay inline");
 
         let big: Payload = smallvec::smallvec![0u8; INLINE_PAYLOAD + 1];
-        assert!(big.spilled(), "крупный payload уходит в кучу");
+        assert!(big.spilled(), "a large payload goes to the heap");
     }
 
     #[test]
@@ -236,9 +236,9 @@ mod tests {
 
     #[test]
     fn sample_needs_nothing_resolved() {
-        // Метрика — это и есть идентичность ряда, поэтому запись собирается
-        // без обращения к какому-либо реестру. Раньше здесь требовался
-        // сегментно-локальный номер серии, известный только writer'у.
+        // The metric is what identifies the series, so a record is assembled
+        // without consulting any registry. This used to require a segment-local
+        // series number known only to the writer.
         let rec = StagedRecord::Sample {
             metric: MetricId(7),
             value: OwnedValue::F32(1.0),
@@ -248,7 +248,7 @@ mod tests {
                 assert_eq!(s.metric, MetricId(7));
                 assert_eq!(s.value, Value::F32(1.0));
             }
-            other => panic!("ожидался сэмпл: {other:?}"),
+            other => panic!("expected a sample: {other:?}"),
         }
         assert_eq!(
             Staged {
@@ -259,7 +259,7 @@ mod tests {
             }
             .footer_ids(),
             (None, Some(MetricId(7))),
-            "метрика обязана попасть в множество footer'а"
+            "the metric must reach the footer set"
         );
     }
 
@@ -272,7 +272,7 @@ mod tests {
         };
         match rec.as_record() {
             Record::Message(m) => assert_eq!(m.payload, &[9, 8, 7]),
-            other => panic!("ожидалось сообщение: {other:?}"),
+            other => panic!("expected a message: {other:?}"),
         }
     }
 }

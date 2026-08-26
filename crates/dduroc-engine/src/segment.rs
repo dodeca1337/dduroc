@@ -117,7 +117,7 @@ impl SegmentWriter {
             .create_new(true)
             .mode(fsutil::FILE_MODE)
             .open(path)
-            .ctx_path("создание сегмента", path)?;
+            .ctx_path("creating a segment", path)?;
 
         // Пол общий для предела и окна: сегмент, в который не влезает даже
         // заголовок с нулевым терминатором, — не сегмент.
@@ -131,7 +131,7 @@ impl SegmentWriter {
         }
 
         file.write_all_at(&header.to_bytes(), 0)
-            .ctx_path("запись заголовка", path)?;
+            .ctx_path("writing the header", path)?;
         fsutil::sync_data(&file, path)?;
         fsutil::sync_dir(path.parent().unwrap_or(Path::new(".")))?;
 
@@ -172,7 +172,7 @@ impl SegmentWriter {
             .read(true)
             .write(true)
             .open(path)
-            .ctx_path("открытие сегмента", path)?;
+            .ctx_path("opening a segment", path)?;
         let on_disk = file.metadata().ctx_path("stat", path)?.len();
         let limit = limit.unwrap_or(on_disk).max(on_disk);
 
@@ -180,7 +180,7 @@ impl SegmentWriter {
         scan.check_store(expect_store, path)?;
 
         file.set_len(scan.data_end)
-            .ctx_path("обрезка повреждённого хвоста", path)?;
+            .ctx_path("truncating a damaged tail", path)?;
         fsutil::sync_data(&file, path)?;
 
         Ok(Self {
@@ -288,7 +288,7 @@ impl SegmentWriter {
         let offset = self.end;
         self.file
             .write_all_at(bytes, offset)
-            .ctx_path("запись блока", &self.path)?;
+            .ctx_path("writing a block", &self.path)?;
         self.end += bytes.len() as u64;
         self.next_seq = self.next_seq.saturating_add(1);
         self.dirty = true;
@@ -313,10 +313,10 @@ impl SegmentWriter {
         self.sync()?;
         self.file
             .set_len(self.end)
-            .ctx_path("обрезка до конца данных", &self.path)?;
+            .ctx_path("truncating to the end of the data", &self.path)?;
         self.file
             .write_all_at(footer, self.end)
-            .ctx_path("запись footer", &self.path)?;
+            .ctx_path("writing the footer", &self.path)?;
         fsutil::sync_data(&self.file, &self.path)?;
         Ok(())
     }
@@ -326,7 +326,7 @@ impl SegmentWriter {
         self.sync()?;
         self.file
             .set_len(self.end)
-            .ctx_path("обрезка до конца данных", &self.path)
+            .ctx_path("truncating to the end of the data", &self.path)
     }
 }
 
@@ -502,7 +502,7 @@ impl Scan {
         let mut footer_complete = true;
         let mut head = [0u8; SegmentHeader::SIZE];
         file.read_exact_at(&mut head, 0)
-            .ctx_path("чтение заголовка сегмента", path)?;
+            .ctx_path("reading a segment header", path)?;
         let header = SegmentHeader::parse(&head).map_err(|e| Error::Corrupt {
             path: path.to_owned(),
             reason: format!("заголовок сегмента: {e}"),
@@ -620,7 +620,7 @@ impl Scan {
 
     /// Прочитать сегмент с диска и восстановить его границы.
     pub fn of_path(path: &Path) -> Result<Self> {
-        let file = File::open(path).ctx_path("открытие сегмента", path)?;
+        let file = File::open(path).ctx_path("opening a segment", path)?;
         let len = file.metadata().ctx_path("stat", path)?.len();
         Self::run(&file, len, path)
     }
@@ -678,7 +678,7 @@ pub fn seal_orphan(path: &Path, expect_store: Option<u64>) -> Result<Option<Reco
         .read(true)
         .write(true)
         .open(path)
-        .ctx_path("открытие сегмента для восстановления", path)?;
+        .ctx_path("opening a segment for recovery", path)?;
     let len = file.metadata().ctx_path("stat", path)?.len();
     if len < SegmentHeader::SIZE as u64 || is_sealed(&file, len)? {
         return Ok(None);
@@ -695,11 +695,11 @@ pub fn seal_orphan(path: &Path, expect_store: Option<u64>) -> Result<Option<Reco
     // перечисляет не все блоки, увёл бы читателя мимо остальных, а без него
     // сегмент честно читается сканом.
     file.set_len(scan.data_end)
-        .ctx_path("обрезка до конца данных", path)?;
+        .ctx_path("truncating to the end of the data", path)?;
     let bytes = if footer_complete {
         let bytes = footer.build();
         file.write_all_at(&bytes, scan.data_end)
-            .ctx_path("запись footer", path)?;
+            .ctx_path("writing the footer", path)?;
         bytes
     } else {
         Vec::new()
@@ -738,12 +738,12 @@ pub struct SegmentReader {
 
 impl SegmentReader {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).ctx_path("открытие сегмента", path)?;
+        let file = File::open(path).ctx_path("opening a segment", path)?;
         let len = file.metadata().ctx_path("stat", path)?.len();
 
         let mut head = [0u8; SegmentHeader::SIZE];
         file.read_exact_at(&mut head, 0)
-            .ctx_path("чтение заголовка", path)?;
+            .ctx_path("reading the header", path)?;
         let header = SegmentHeader::parse(&head).map_err(|e| Error::Corrupt {
             path: path.to_owned(),
             reason: format!("заголовок сегмента: {e}"),
@@ -789,7 +789,7 @@ impl SegmentReader {
         }
         let mut tail = [0u8; Trailer::SIZE];
         file.read_exact_at(&mut tail, len - Trailer::SIZE as u64)
-            .ctx_path("чтение трейлера", path)?;
+            .ctx_path("reading the trailer", path)?;
         let Ok(Some(trailer)) = Trailer::parse(&tail) else {
             return Ok((None, len));
         };
@@ -810,7 +810,7 @@ impl SegmentReader {
         }
         let mut buf = vec![0u8; total as usize];
         file.read_exact_at(&mut buf, len - total)
-            .ctx_path("чтение footer", path)?;
+            .ctx_path("reading the footer", path)?;
         if matches!(dduroc_format::Footer::parse(&buf), Ok(Some(_))) {
             Ok((Some(buf), len - total))
         } else {
@@ -837,8 +837,7 @@ impl SegmentReader {
     /// Убедиться, что файл открыт.
     fn attach(&mut self) -> Result<()> {
         if self.file.is_none() {
-            self.file =
-                Some(File::open(&self.path).ctx_path("повторное открытие сегмента", &self.path)?);
+            self.file = Some(File::open(&self.path).ctx_path("reopening a segment", &self.path)?);
         }
         Ok(())
     }
@@ -890,7 +889,7 @@ impl SegmentReader {
         let file = self.file.as_ref().expect("после attach дескриптор есть");
         let mut hdr = [0u8; BlockHeader::SIZE];
         file.read_exact_at(&mut hdr, offset)
-            .ctx_path("чтение заголовка блока", &self.path)?;
+            .ctx_path("reading a block header", &self.path)?;
         let Some(header) = BlockHeader::parse(&hdr).map_err(|e| Error::Corrupt {
             path: self.path.clone(),
             reason: format!("заголовок блока на {offset}: {e}"),
@@ -910,7 +909,7 @@ impl SegmentReader {
         buf.clear();
         buf.resize(total as usize, 0);
         file.read_exact_at(buf, offset)
-            .ctx_path("чтение блока", &self.path)?;
+            .ctx_path("reading a block", &self.path)?;
         Ok(Some(offset + total))
     }
 

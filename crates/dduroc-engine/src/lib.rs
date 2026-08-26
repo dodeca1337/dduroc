@@ -1,17 +1,17 @@
-//! Движок хранилища dduroc.
+//! The dduroc storage engine.
 //!
-//! Отвечает за всё, чего нет в [`dduroc_format`]: файлы, потоки, политики.
-//! Синхронный и **без tokio** — writer живёт на выделенном OS-потоке, поэтому
-//! библиотека одинаково пригодна в async- и в обычных приложениях, а
-//! офлайн-вьюеру не нужен рантайм.
+//! It answers for everything [`dduroc_format`] does not: files, threads,
+//! policies. Synchronous and **without tokio** — the writer lives on a
+//! dedicated OS thread, so the library fits async and ordinary applications
+//! alike, and an offline viewer needs no runtime.
 //!
 //! ```text
 //! <root>/
-//!   epochs.bin                 связь относительного времени с UTC
+//!   epochs.bin                 relative time tied to UTC
 //!   <namespace>/
-//!     ns-meta                  схема и версия протокола неймспейса
+//!     ns-meta                  the namespace's schema and protocol version
 //!     <channel>/
-//!       <boot>-<micros>.seg    сегменты
+//!       <boot>-<micros>.seg    segments
 //! ```
 
 #![forbid(unsafe_code)]

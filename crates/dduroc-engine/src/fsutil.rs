@@ -1,16 +1,16 @@
-//! Файловые примитивы с явной семантикой долговечности.
+//! File primitives with explicit durability semantics.
 //!
-//! Правила, которым подчиняется весь движок:
+//! The rules the whole engine obeys:
 //!
-//! - **`fdatasync`, а не `fsync`.** Сегменты преаллоцированы (`fallocate`),
-//!   поэтому append не меняет размер файла и синхронизировать метаданные
-//!   инода незачем. Исключение — файлы, которые растут (метаданные): там
-//!   `fdatasync` тоже достаточен, он синхронизирует метаданные, необходимые
-//!   для чтения данных (в том числе размер).
-//! - **Имя файла долговечно только после `fsync` каталога.** Без этого
-//!   после обрыва питания файл может существовать, но не иметь имени.
-//! - **Замена файла — только через `rename`.** Перезапись на месте оставляет
-//!   окно, в котором файл наполовину старый, наполовину новый.
+//! - **`fdatasync`, not `fsync`.** Segments reserve their space up front
+//!   (`fallocate`), so an append does not change the file size and there is no
+//!   reason to sync inode metadata. The exception is files that grow
+//!   (metadata): `fdatasync` is enough there too — it syncs the metadata
+//!   needed to read the data, the size included.
+//! - **A file name is durable only after an `fsync` of the directory.**
+//!   Without it, a file may exist after a power loss but have no name.
+//! - **Replacing a file goes through `rename` only.** Overwriting in place
+//!   leaves a window in which the file is half old and half new.
 
 use crate::error::{IoContext, Result};
 use std::fs::{File, OpenOptions};
@@ -18,41 +18,42 @@ use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-/// Права на создаваемые файлы: владельцу — чтение и запись, группе — чтение,
-/// **посторонним — ничего**.
+/// Permissions on created files: read and write for the owner, read for the
+/// group, **nothing for anyone else**.
 ///
-/// Задаются явно, а не оставляются на umask процесса: журнал прибора — это
-/// диагностика работающей установки (адреса, режимы, параметры настройки), и
-/// при типичной umask 022 он оказался бы доступен на чтение любому
-/// пользователю системы. Ядро может только сузить эти права своей umask,
-/// расширить — нет.
+/// Set explicitly rather than left to the process umask: a device's journal is
+/// diagnostics of a working installation (addresses, modes, tuning
+/// parameters), and with the usual umask of 022 it would be readable by every
+/// user on the system. The kernel can only narrow these permissions with its
+/// umask, never widen them.
 ///
-/// Группа оставлена читающей намеренно: веб-интерфейс прибора и утилита сбора
-/// дампов часто работают отдельным пользователем в общей группе, и снимать им
-/// доступ значило бы обязать их к root.
+/// The group is left readable deliberately: a device's web interface and the
+/// dump-collection utility often run as a separate user in a shared group, and
+/// taking their access away would force them to be root.
 pub const FILE_MODE: u32 = 0o640;
 
-/// Права на каталоги хранилища: то же плюс обход для владельца и группы.
+/// Permissions on store directories: the same plus traversal for owner and
+/// group.
 pub const DIR_MODE: u32 = 0o750;
 
-/// Синхронизировать каталог: делает долговечными операции над **именами**
-/// (создание, переименование, удаление файлов внутри него).
+/// Sync a directory: this makes operations on **names** durable (creating,
+/// renaming and deleting files inside it).
 pub fn sync_dir(dir: &Path) -> Result<()> {
-    let f = File::open(dir).ctx_path("открытие каталога", dir)?;
-    // Часть ФС не поддерживает fsync на каталоге (например, некоторые
-    // сетевые); EINVAL там означает «нечего синхронизировать», а не сбой.
+    let f = File::open(dir).ctx_path("opening a directory", dir)?;
+    // Some filesystems do not support fsync on a directory (certain network
+    // ones, for example); EINVAL there means "nothing to sync", not a failure.
     match rustix::fs::fsync(&f) {
         Ok(()) | Err(rustix::io::Errno::INVAL) => Ok(()),
-        Err(e) => Err(e).ctx_path("fsync каталога", dir),
+        Err(e) => Err(e).ctx_path("fsync of a directory", dir),
     }
 }
 
-/// `fdatasync` файла.
+/// `fdatasync` a file.
 pub fn sync_data(file: &File, path: &Path) -> Result<()> {
     rustix::fs::fdatasync(file).ctx_path("fdatasync", path)
 }
 
-/// Создать каталог со всеми родителями и сделать имена долговечными.
+/// Create a directory with all its parents and make the names durable.
 pub fn create_dir_all_synced(dir: &Path) -> Result<()> {
     if dir.is_dir() {
         return Ok(());
@@ -61,9 +62,9 @@ pub fn create_dir_all_synced(dir: &Path) -> Result<()> {
         .recursive(true)
         .mode(DIR_MODE)
         .create(dir)
-        .ctx_path("создание каталога", dir)?;
-    // Долговечно должно стать имя каждого созданного звена, поэтому
-    // синхронизируем цепочку родителей снизу вверх.
+        .ctx_path("creating a directory", dir)?;
+    // The name of every link created has to become durable, so the chain of
+    // parents is synced from the bottom up.
     let mut cur = Some(dir);
     while let Some(d) = cur {
         if let Some(parent) = d.parent() {
@@ -79,11 +80,11 @@ pub fn create_dir_all_synced(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Атомарно заменить содержимое файла.
+/// Replace a file's contents atomically.
 ///
-/// Порядок: запись во временный файл → `fdatasync` → `rename` →
-/// `fsync` каталога. Обрыв питания в любой точке оставляет на диске либо
-/// целиком старое содержимое, либо целиком новое.
+/// The order: write to a temporary file → `fdatasync` → `rename` → `fsync` of
+/// the directory. A power loss at any point leaves either the whole old
+/// content on disk or the whole new one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = tmp_path(path);
@@ -95,63 +96,65 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .truncate(true)
             .mode(FILE_MODE)
             .open(&tmp)
-            .ctx_path("создание временного файла", &tmp)?;
-        f.write_all(bytes).ctx_path("запись", &tmp)?;
+            .ctx_path("creating a temporary file", &tmp)?;
+        f.write_all(bytes).ctx_path("writing", &tmp)?;
         sync_data(&f, &tmp)?;
     }
 
-    // Ошибку rename нельзя проглатывать: временный файл остался бы мусором,
-    // а вызывающий считал бы данные записанными.
+    // A rename error must not be swallowed: the temporary file would stay
+    // behind as litter while the caller believed the data was written.
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e).ctx_path("переименование в", path);
+        return Err(e).ctx_path("renaming into", path);
     }
     sync_dir(dir)
 }
 
-/// Путь временного файла рядом с целевым: `rename` работает только в
-/// пределах одной ФС, поэтому /tmp не подходит.
+/// The path of a temporary file next to the target: `rename` works only
+/// within one filesystem, so /tmp will not do.
 fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     path.with_file_name(name)
 }
 
-/// Прочитать файл целиком; `Ok(None)`, если его нет.
+/// Read a whole file; `Ok(None)` if it does not exist.
 pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).ctx_path("чтение", path),
+        Err(e) => Err(e).ctx_path("reading", path),
     }
 }
 
-/// Удалить файл, если он есть, и сделать удаление долговечным.
+/// Delete a file if it exists and make the deletion durable.
 pub fn remove_synced(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).ctx_path("удаление", path),
+        Err(e) => return Err(e).ctx_path("deleting", path),
     }
     sync_dir(path.parent().unwrap_or(Path::new(".")))
 }
 
-/// Прибрать оставшиеся от прерванных операций `*.tmp` в каталоге.
+/// Clean up `*.tmp` files left behind by interrupted operations in a
+/// directory.
 ///
-/// Такой файл — след обрыва питания между созданием временного файла и
-/// `rename`: его содержимое заведомо неполное и никем не адресуется.
+/// Such a file is the trace of a power loss between creating the temporary
+/// file and the `rename`: its content is knowably incomplete and nothing
+/// addresses it.
 pub fn sweep_tmp(dir: &Path) -> Result<usize> {
     let mut removed = 0;
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e).ctx_path("чтение каталога", dir),
+        Err(e) => return Err(e).ctx_path("reading a directory", dir),
     };
     for entry in entries {
-        let entry = entry.ctx_path("обход каталога", dir)?;
+        let entry = entry.ctx_path("walking a directory", dir)?;
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "tmp") && path.is_file() {
-            std::fs::remove_file(&path).ctx_path("удаление временного файла", &path)?;
+            std::fs::remove_file(&path).ctx_path("deleting a temporary file", &path)?;
             removed += 1;
         }
     }
@@ -182,13 +185,13 @@ mod tests {
             Some(&b"second-longer"[..])
         );
 
-        // Временный файл не остаётся мусором.
+        // The temporary file does not stay behind as litter.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "остался временный файл");
+        assert!(leftovers.is_empty(), "a temporary file was left behind");
     }
 
     #[test]
@@ -209,9 +212,9 @@ mod tests {
         assert!(!dir.path().join("a.seg.tmp").exists());
         assert!(!dir.path().join("meta.tmp").exists());
 
-        // Идемпотентность: второй проход ничего не находит.
+        // Idempotence: a second pass finds nothing.
         assert_eq!(sweep_tmp(dir.path()).unwrap(), 0);
-        // Отсутствующий каталог — не ошибка.
+        // A missing directory is not an error.
         assert_eq!(sweep_tmp(&dir.path().join("nope")).unwrap(), 0);
     }
 
@@ -226,11 +229,11 @@ mod tests {
 
     #[test]
     fn created_files_and_dirs_are_not_world_readable() {
-        // Журнал прибора — диагностика работающей установки. При типичной
-        // umask 022 он оказался бы доступен на чтение любому пользователю
-        // системы, поэтому права задаются явно. Проверяется именно отсутствие
-        // прав у посторонних: umask способна только сузить наши, и точное
-        // значение зависит от неё.
+        // A device's journal is diagnostics of a working installation. With the
+        // usual umask of 022 it would be readable by every user on the system,
+        // so the permissions are set explicitly. What is checked is precisely
+        // the absence of permissions for others: a umask can only narrow ours,
+        // and the exact value depends on it.
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -243,15 +246,19 @@ mod tests {
         assert_eq!(
             mode & 0o007,
             0,
-            "посторонние не должны читать журнал: {mode:#o}"
+            "others must not read the journal: {mode:#o}"
         );
-        assert_eq!(mode & 0o600, 0o600, "владелец обязан читать и писать");
+        assert_eq!(
+            mode & 0o600,
+            0o600,
+            "the owner must be able to read and write"
+        );
 
         let dir_mode = std::fs::metadata(&nested).unwrap().permissions().mode();
         assert_eq!(
             dir_mode & 0o007,
             0,
-            "каталог не должен быть открыт посторонним: {dir_mode:#o}"
+            "the directory must not be open to others: {dir_mode:#o}"
         );
     }
 
