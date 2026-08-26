@@ -1,4 +1,4 @@
-//! Хранилище: корень, блокировка, эпохи и writer.
+//! The store: the root, the lock, the epochs and the writer.
 
 use crate::channel::{ChannelConfig, ChannelOverride, validate_component};
 use crate::clock::{Clock, boottime_us};
@@ -20,81 +20,85 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Имя файла блокировки в корне хранилища.
+/// The name of the lock file in the store root.
 const LOCK_FILE: &str = ".lock";
-/// Имя файла метаданных хранилища.
+/// The name of the store metadata file.
 const STORE_META: &str = "store-meta";
 
-/// Метаданные хранилища.
+/// The store's metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreMeta {
-    /// Версия контейнерного формата.
+    /// The container format version.
     pub container_version: u8,
-    /// Идентичность хранилища. Штампуется в каждый сегмент, чтобы файлы,
-    /// скопированные с другого прибора, не смешивались с локальными: у них
-    /// своя нумерация запусков и своя привязка ко времени.
+    /// The store's identity. Stamped into every segment so that files copied
+    /// from another device do not blend with the local ones: they have their
+    /// own run numbering and their own anchoring to time.
     pub store_id: u64,
 }
 
-/// Настройки хранилища.
+/// The store's settings.
 ///
-/// Строятся цепочкой: каждый метод возвращает настройки, а не меняет их на
-/// месте. `config.with_budget_per_class(n);` отдельным выражением не сделало бы ничего.
+/// Built as a chain: every method returns the settings rather than mutating
+/// them in place. `config.with_budget_per_class(n);` as a standalone
+/// expression would do nothing.
 #[derive(Debug, Clone)]
-#[must_use = "настройки строятся цепочкой: результат метода и есть настройки"]
+#[must_use = "the settings are built as a chain: a method's result is the settings"]
 pub struct StoreConfig {
     pub root: PathBuf,
-    /// Конфигурации классов хранения. Класс, которого здесь нет, получает
-    /// настройки по умолчанию с бюджетом [`StoreConfig::default_budget_bytes`].
+    /// The configurations of the storage classes. A class not named here gets
+    /// the defaults with a budget of [`StoreConfig::default_budget_bytes`].
     ///
-    /// Ключ — [`StorageClass`], перечисление: класс с опечаткой непредставим,
-    /// а имя каталога канала — производная от класса, второго источника имени
-    /// не существует.
+    /// The key is [`StorageClass`], an enum: a misspelled class is
+    /// unrepresentable, and a channel's directory name is derived from the
+    /// class — there is no second source of that name.
     pub channels: HashMap<StorageClass, ChannelConfig>,
-    /// Бюджет по умолчанию **на класс** — для классов, не названных в
+    /// The default budget **per class** — for classes not named in
     /// [`StoreConfig::channels`].
     ///
-    /// Бюджет класса — общий на всё хранилище: «вся телеметрия — столько-то».
-    /// Каналы всех неймспейсов класса черпают из него, и при превышении
-    /// вытесняется старейший сегмент класса, в чьём бы неймспейсе он ни
-    /// лежал. Сумма бюджетов классов и есть потолок занятости; отдельной
-    /// ручки «потолок хранилища» нет — при классах на разных носителях
-    /// (см. [`ChannelConfig::custom_root`]) общий потолок не имел бы смысла.
+    /// A class budget is shared across the whole store: "all telemetry gets
+    /// this much". The channels of every namespace of the class draw on it, and
+    /// when it is exceeded the class's oldest segment is evicted whoever's
+    /// namespace it lies in. The sum of the class budgets is the occupancy
+    /// ceiling; there is no separate "store ceiling" knob — with classes on
+    /// different media (see [`ChannelConfig::custom_root`]) a shared ceiling
+    /// would mean nothing.
     ///
-    /// Потолок класса не может быть меньше того, что держат активные
-    /// сегменты: их преаллокация — гарантия ENOSPC. Практический предел
-    /// одновременно пишущих каналов класса — `budget_bytes / segment_bytes`;
-    /// попытка выйти за него видна в [`crate::stats::Stats::budget_overruns`].
+    /// A class ceiling cannot be smaller than what the active segments hold.
+    /// They hold their reserve window, which grows along with what was written,
+    /// rather than `segment_bytes` — so how many channels can write at once is
+    /// set by how much they wrote. An attempt to exceed the ceiling is visible
+    /// in [`crate::stats::Stats::budget_overruns`].
     pub default_budget_bytes: u64,
-    /// Ёмкости очередей записи. Выделяются целиком при открытии хранилища.
+    /// The write queue capacities. Allocated whole when the store is opened.
     pub queues: QueueSizes,
-    /// Потолок суммарных байт, которые пишущие каналы держат в памяти под
-    /// блоки. `None` — потолка нет, и это умолчание.
+    /// The ceiling on the total bytes writing channels hold in memory for
+    /// blocks. `None` means there is no ceiling, and that is the default.
     ///
-    /// Память на канал — активный буфер блока и его сериализованная копия;
-    /// растут они до крупнейшего прошедшего блока и возвращаются, когда канал
-    /// замолчал. Пишущих в любой момент единицы, и обычно этого достаточно.
-    /// Потолок нужен там, где «единицы» перестают быть правдой: класс с
-    /// сотнями одновременно пишущих каналов при 64 КиБ блока — это десятки
-    /// мегабайт, а на armv7 их может не быть.
+    /// The memory per channel is the active block buffer and its serialized
+    /// copy; they grow to the largest block that passed through and are given
+    /// back once the channel goes quiet. Only a handful of channels write at
+    /// any moment, and usually that is enough. The ceiling is for where "a
+    /// handful" stops being true: a class with hundreds of channels writing at
+    /// once at 64 KiB per block is tens of megabytes, and armv7 may not have
+    /// them.
     ///
-    /// Не бюджет: бюджет — про место на носителе и принадлежит классу, а этот
-    /// потолок — про оперативную память и принадлежит процессу. Соблюдается
-    /// освобождением буферов у самых крупных держателей; невыполнимый потолок
-    /// объявляется счётчиком [`crate::stats::Stats::buffer_overruns`], а не
-    /// отброшенными записями.
+    /// Not a budget: a budget is about space on the medium and belongs to a
+    /// class, while this ceiling is about RAM and belongs to the process. It is
+    /// honoured by freeing the buffers of the largest holders; an unmeetable
+    /// ceiling is announced by the [`crate::stats::Stats::buffer_overruns`]
+    /// counter rather than by discarded records.
     pub buffer_ceiling_bytes: Option<u64>,
-    /// Политики групп неймспейсов: префикс имени и то, чем группа отличается
-    /// от общих настроек классов.
+    /// The policies of namespace groups: a name prefix and how the group
+    /// differs from the shared class settings.
     ///
-    /// Список, а не отображение: порядок объявления ничего не решает —
-    /// выигрывает самый длинный подходящий префикс, — и от порядка обхода
-    /// хэш-таблицы настройки прибора зависеть не должны.
+    /// A list rather than a map: declaration order decides nothing — the
+    /// longest matching prefix wins — and a device's settings must not depend
+    /// on the order a hash table happens to be walked in.
     pub groups: Vec<(String, GroupPolicy)>,
 }
 
 impl StoreConfig {
-    /// Настройки с общим бюджетом на каждый класс.
+    /// Settings with a shared budget for every class.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -106,78 +110,81 @@ impl StoreConfig {
         }
     }
 
-    /// Ограничить суммарные буферы блоков пишущих каналов.
+    /// Bound the total block buffers of the writing channels.
     ///
-    /// См. [`StoreConfig::buffer_ceiling_bytes`].
+    /// See [`StoreConfig::buffer_ceiling_bytes`].
     pub fn with_buffer_ceiling(mut self, bytes: u64) -> Self {
         self.buffer_ceiling_bytes = Some(bytes);
         self
     }
 
-    /// Бюджет класса по умолчанию — см. [`StoreConfig::default_budget_bytes`].
+    /// The default class budget — see [`StoreConfig::default_budget_bytes`].
     ///
-    /// Столько получает каждый класс, не названный в
-    /// [`StoreConfig::channel`] явно.
+    /// Every class not named explicitly in [`StoreConfig::channel`] gets this
+    /// much.
     pub fn with_budget_per_class(mut self, bytes: u64) -> Self {
         self.default_budget_bytes = bytes;
         self
     }
 
-    /// Задать ёмкости очередей записи.
+    /// Set the write queue capacities.
     ///
-    /// Меньшая очередь экономит память, но раньше начинает терять записи на
-    /// всплесках; большая переживает всплеск, но откладывает момент, когда
-    /// отставание диска станет заметно.
+    /// A smaller queue saves memory but starts losing records sooner on bursts;
+    /// a larger one survives a burst but puts off the moment the disk falling
+    /// behind becomes noticeable.
     pub fn with_queues(mut self, queues: QueueSizes) -> Self {
         self.queues = queues;
         self
     }
 
-    /// Задать настройки канала указанного класса хранения.
+    /// Set the channel settings of the given storage class.
     pub fn channel(mut self, class: StorageClass, config: ChannelConfig) -> Self {
         self.channels.insert(class, config);
         self
     }
 
-    /// Задать политику группе неймспейсов — тех, чьё имя начинается с
+    /// Set the policy of a namespace group — those whose names begin with
     /// `prefix`.
     ///
-    /// Группа здесь и группа в запросе чтения (`Query::group`) — одно и то же
-    /// множество: правило отбора общее ([`in_group`]). Иначе «журналы
-    /// оркестраторов» и «настройки оркестраторов» обозначали бы разное.
+    /// A group here and a group in a read query (`Query::group`) are the same
+    /// set: the selection rule is shared ([`in_group`]). Otherwise "the
+    /// orchestrators' journals" and "the orchestrators' settings" would denote
+    /// different things.
     ///
-    /// Совпало несколько префиксов — выигрывает самый длинный: `orc-radio-`
-    /// уточняет `orc-`, а не спорит с ним. Настройки неймспейса, заданные при
-    /// открытии (квота), бьют групповые: они конкретнее.
+    /// When several prefixes match, the longest wins: `orc-radio-` refines
+    /// `orc-` rather than arguing with it. Namespace settings given at open
+    /// time (the quota) beat the group's: they are more specific.
     pub fn group(mut self, prefix: impl Into<String>, policy: GroupPolicy) -> Self {
         self.groups.push((prefix.into(), policy));
         self
     }
 
-    /// Политики, которым принадлежит неймспейс, от общей к частной.
+    /// The policies a namespace belongs to, from the general to the specific.
     ///
-    /// Совпасть могут несколько: `orc-radio-` **уточняет** `orc-`, а не
-    /// спорит с ним, — и накладываются они друг на друга, как группа
-    /// накладывается на класс. Иначе уточнение одной настройки молча снимало
-    /// бы все остальные, заданные общей группой: квоту, сжатие, интервалы.
+    /// Several may match: `orc-radio-` **refines** `orc-` rather than arguing
+    /// with it — and they lay over one another the way a group lays over a
+    /// class. Otherwise refining one setting would silently remove all the
+    /// others the general group set: the quota, the compression, the intervals.
     fn policies_for<'a>(&'a self, namespace: &'a str) -> impl Iterator<Item = &'a GroupPolicy> {
         let mut matched: Vec<&(String, GroupPolicy)> = self
             .groups
             .iter()
             .filter(|(prefix, _)| in_group(prefix, namespace))
             .collect();
-        // От короткого к длинному: последний слой — самый частный. Длина
-        // однозначна — два разных префикса одной длины не могут оба быть
-        // началом одного имени.
+        // From short to long: the last layer is the most specific. Length is
+        // unambiguous — two different prefixes of the same length cannot both
+        // begin one name.
         matched.sort_by_key(|(prefix, _)| prefix.len());
         matched.into_iter().map(|(_, policy)| policy)
     }
 
-    /// Настройки канала: класс, поверх него — группа неймспейса.
+    /// The channel settings: the class, with the namespace's group laid over
+    /// it.
     ///
-    /// `namespace: None` — настройки самого класса, без чьих-либо уточнений.
-    /// Именно они, а не групповые, отвечают за бюджет и носитель: то и другое
-    /// общее на весь класс, и группа их не задаёт (см. [`ChannelOverride`]).
+    /// `namespace: None` gives the class's own settings, refined by nobody.
+    /// Those, not the group's, answer for the budget and the medium: both are
+    /// shared by the whole class, and a group does not set them (see
+    /// [`ChannelOverride`]).
     fn config_for(&self, namespace: Option<&str>, class: StorageClass) -> ChannelConfig {
         let mut config = match self.channels.get(&class) {
             Some(c) => c.clone(),
@@ -196,37 +203,39 @@ impl StoreConfig {
         config
     }
 
-    /// Квота, положенная неймспейсу его группами: побеждает самая частная из
-    /// назвавших её.
+    /// The quota a namespace gets from its groups: the most specific of those
+    /// naming one wins.
     fn group_quota(&self, namespace: &str, class: StorageClass) -> Option<u64> {
         self.policies_for(namespace)
             .filter_map(|p| p.quota.get(class))
             .last()
     }
 
-    /// Проверить всё, что задало приложение.
+    /// Check everything the application set.
     ///
-    /// Настройки канала приходят снаружи и до сих пор нигде не проверялись:
-    /// бюджет меньше двух сегментов или блок размером с сегмент доезжали до
-    /// writer'а как есть и ломали ротацию уже на работающем приборе.
-    /// Отказать при открытии — единственный момент, когда это ещё поправимо.
+    /// Channel settings arrive from outside and used to be checked nowhere: a
+    /// budget smaller than two segments, or a block the size of a segment,
+    /// reached the writer as they were and broke rotation on a device already
+    /// in service. Refusing at open time is the only moment when that is still
+    /// fixable.
     ///
-    /// Проверяются и **синтезированные** конфигурации — те, что получит класс,
-    /// для которого приложение ничего не задавало: `default_budget_bytes`
-    /// меньше двух сегментов (16 МиБ при умолчаниях) даёт класс, у которого
-    /// вытеснение съедало бы единственный сегмент сразу после запечатывания.
+    /// **Synthesized** configurations are checked too — the ones a class gets when
+    /// the application set nothing for it: a `default_budget_bytes` smaller than
+    /// two segments (16 MiB with the defaults) yields a class whose eviction would
+    /// eat the only segment right after it was sealed.
     fn validate(&self) -> Result<()> {
-        // Немедленная синхронизация — определение критического класса, а не
-        // настройка: канал, ради которого приложение готово ждать очередь,
-        // не имеет права отставать от носителя. Молча перекрыть интервал
-        // нельзя — оператор считал бы, что настройка действует.
+        // Immediate syncing is the definition of the critical class, not a
+        // setting: a channel the application is prepared to wait in a queue for
+        // has no right to fall behind the medium. Overriding the interval
+        // silently is not an option — the operator would believe the setting
+        // was in force.
         if self.config_for(None, StorageClass::Critical).sync_interval != std::time::Duration::ZERO
         {
             return Err(Error::BadChannel {
                 class: StorageClass::Critical,
                 namespace: None,
-                reason: "критический канал синхронизируется сразу — в этом его \
-                         смысл; настраивайте его от ChannelConfig::critical",
+                reason: "the critical channel syncs at once — that is the point of \
+                         it; configure it from ChannelConfig::critical",
             });
         }
 
@@ -235,12 +244,13 @@ impl StoreConfig {
             config.validate(class)?;
         }
 
-        // Потолок ниже четырёх блоков невыполним по построению: один
-        // пишущий канал держит около трёх — тело накопителя, выход сжатия и
-        // сериализованную копию, — и порог закрытия блока проверяется ПОСЛЕ
-        // добавления записи, так что каждый из них перебирает на запись.
-        // Такой потолок не ограничивал бы ничего, зато гонял бы аллокатор на
-        // каждом обороте цикла и считал бы невыполнимость.
+        // A ceiling below four blocks is unmeetable by construction: one
+        // writing channel holds about three — the accumulator's body, the
+        // compression output and the serialized copy — and the block-closing
+        // threshold is checked AFTER a record is added, so each of them
+        // overshoots by one record. Such a ceiling would bound nothing while
+        // driving the allocator on every turn of the loop and counting
+        // unmeetability.
         if let Some(ceiling) = self.buffer_ceiling_bytes {
             let block = StorageClass::ALL
                 .iter()
@@ -255,16 +265,17 @@ impl StoreConfig {
             if ceiling < block.saturating_mul(4) {
                 return Err(Error::BadStore {
                     setting: "buffer_ceiling_bytes",
-                    reason: "потолок памяти меньше четырёх блоков — столько держит один \
-                             пишущий канал, и такой потолок только гонял бы аллокатор",
+                    reason: "the memory ceiling is below four blocks — that is what one \
+                             writing channel holds, and such a ceiling would only drive the allocator",
                 });
             }
         }
 
-        // Группы проверяются ровно так же и по тем же правилам: настройка,
-        // негодная классу, не становится годной оттого, что её задали группе.
-        // Проверять их приходится отдельно — конфигурация группы применяется к
-        // имени, а имён при открытии хранилища ещё нет.
+        // Groups are checked in exactly the same way and by the same rules: a
+        // setting unfit for a class does not become fit by being given to a
+        // group. They have to be checked separately — a group's configuration
+        // applies to a name, and there are no names yet when the store is
+        // opened.
         for (i, (prefix, policy)) in self.groups.iter().enumerate() {
             let bad = |reason| Error::BadGroup {
                 prefix: prefix.clone(),
@@ -272,20 +283,20 @@ impl StoreConfig {
             };
             if prefix.is_empty() {
                 return Err(bad(
-                    "пустой префикс совпадает с любым именем — это настройки хранилища, \
-                     а не группы",
+                    "an empty prefix matches every name — that is the store's settings, \
+                     not a group's",
                 ));
             }
             if crate::channel::validate_component(prefix).is_err() {
                 return Err(bad(
-                    "префикс не может начать собой имя неймспейса: допустимы ASCII-буквы, \
-                     цифры, '-', '_' и '.'",
+                    "the prefix cannot begin a namespace name: ASCII letters, digits, \
+                     '-', '_' and '.' are allowed",
                 ));
             }
             if self.groups[..i].iter().any(|(p, _)| p == prefix) {
                 return Err(bad(
-                    "две политики на один префикс — какая из них действует, \
-                     ответить нечем",
+                    "two policies for one prefix — there is nothing to answer \
+                     which of them applies with",
                 ));
             }
             for (&class, over) in &policy.channels {
@@ -293,16 +304,16 @@ impl StoreConfig {
                 over.apply_to(&mut config);
                 if class == StorageClass::Critical && !config.sync_interval.is_zero() {
                     return Err(bad(
-                        "критический канал синхронизируется сразу — в этом его смысл; \
-                         группа не имеет права это отменить",
+                        "the critical channel syncs at once — that is the point of it; \
+                         a group has no right to cancel that",
                     ));
                 }
                 config.check().map_err(bad)?;
             }
-            // Квота проверяется здесь же, а не при открытии первого
-            // подходящего неймспейса: негодная настройка обязана называться
-            // тогда, когда её ещё можно поправить, — а первое подходящее имя
-            // может подняться через месяцы работы прибора.
+            // The quota is checked right here rather than when the first
+            // matching namespace comes up: a bad setting has to be named while
+            // it can still be fixed — and the first matching name may come up
+            // months into a device's service.
             for class in StorageClass::ALL {
                 let Some(quota) = policy.quota.get(class) else {
                     continue;
@@ -313,8 +324,8 @@ impl StoreConfig {
                 }
                 if quota < config.segment_bytes.saturating_mul(2) {
                     return Err(bad(
-                        "квота меньше двух сегментов — ротация съедала бы данные сразу \
-                         после запечатывания",
+                        "the quota is smaller than two segments — rotation would eat the \
+                         data right after sealing",
                     ));
                 }
             }
@@ -323,26 +334,27 @@ impl StoreConfig {
     }
 }
 
-/// Принадлежит ли неймспейс группе.
+/// Whether a namespace belongs to a group.
 ///
-/// Группа — префикс имени, и правило у записи и у чтения обязано быть одним:
-/// «журналы оркестраторов» (`Query::group`) и «квота оркестраторов»
-/// ([`StoreConfig::group`]) не имеют права обозначать разные множества.
+/// A group is a name prefix, and the rule has to be one and the same for
+/// writing and for reading: "the orchestrators' journals" (`Query::group`) and
+/// "the orchestrators' quota" ([`StoreConfig::group`]) have no right to denote
+/// different sets.
 pub fn in_group(prefix: &str, namespace: &str) -> bool {
     namespace.starts_with(prefix)
 }
 
-/// Чем группа неймспейсов отличается от общих настроек хранилища.
+/// How a namespace group differs from the store's shared settings.
 ///
-/// Настройки каналов задаются на всё хранилище, по классу хранения, — и это
-/// верно ровно до тех пор, пока неймспейсы однородны. Двадцать четыре тысячи
-/// однородными не бывают: у оркестраторов телеметрия тяжёлая и её не жалко,
-/// у диагностического сервиса записи редкие и терять их нельзя. Группа даёт
-/// сказать это один раз про всех, кого объединяет префикс имени, вместо того
-/// чтобы повторять при каждом открытии неймспейса.
+/// Channel settings are given for the whole store, per storage class — and
+/// that holds exactly as long as the namespaces are uniform. Twenty-four
+/// thousand of them never are: an orchestrator's telemetry is heavy and
+/// expendable, a diagnostic service's records are rare and must not be lost. A
+/// group makes it possible to say that once about everyone a name prefix
+/// unites, instead of repeating it at every namespace open.
 ///
-/// Что группа задать НЕ может — бюджет класса и его носитель:
-/// см. [`ChannelOverride`].
+/// What a group can NOT set is the class budget and its medium: see
+/// [`ChannelOverride`].
 #[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct GroupPolicy {
@@ -355,32 +367,32 @@ impl GroupPolicy {
         Self::default()
     }
 
-    /// Чем каналы этого класса у группы отличаются от общих.
+    /// How this class's channels differ for the group.
     pub fn channel(mut self, class: StorageClass, over: ChannelOverride) -> Self {
         self.channels.insert(class, over);
         self
     }
 
-    /// Личная квота **каждому** неймспейсу группы.
+    /// A personal quota for **each** namespace of the group.
     ///
-    /// Именно каждому, а не всей группе вместе: общий котёл на группу — это
-    /// бюджет, а бюджет принадлежит классу и делится по возрасту сегментов на
-    /// всё хранилище. Квота же — предел внутри бюджета, и она про один
-    /// неймспейс: «ни один оркестратор не занимает больше гигабайта
-    /// телеметрии». Квота, заданная при открытии неймспейса, бьёт групповую.
+    /// Each, not the group as a whole: a shared pot for a group is a budget,
+    /// and a budget belongs to a class and is divided by segment age across the
+    /// whole store. A quota is a limit inside a budget, and it is about one
+    /// namespace: "no orchestrator takes more than a gigabyte of telemetry". A
+    /// quota given when a namespace is opened beats the group's.
     pub fn limit_bytes(mut self, class: StorageClass, bytes: u64) -> Self {
         self.quota = self.quota.limit_bytes(class, bytes);
         self
     }
 }
 
-/// Личные квоты неймспейса внутри бюджетов классов.
+/// A namespace's personal quotas inside the class budgets.
 ///
-/// Необязательны — и это умолчание осмысленно: обычный канал черпает из
-/// общего бюджета своего класса и поканальной ротации не имеет вовсе. Квота
-/// нужна, когда конкретный сервис нельзя пускать к общему бюджету без
-/// предела: его каналы ротируются в рамках квоты, не дожидаясь, пока класс
-/// упрётся в свой бюджет.
+/// Optional — and the default makes sense: an ordinary channel draws on the
+/// shared budget of its class and has no per-channel rotation at all. A quota
+/// is for when a particular service must not be let near the shared budget
+/// unbounded: its channels rotate within the quota without waiting for the
+/// class to hit its budget.
 #[derive(Debug, Clone, Default)]
 pub struct NsQuota {
     slots: [Option<u64>; StorageClass::ALL.len()],
@@ -391,7 +403,7 @@ impl NsQuota {
         Self::default()
     }
 
-    /// Ограничить каналы класса `class` этого неймспейса `bytes` байтами.
+    /// Bound this namespace's channels of class `class` to `bytes` bytes.
     pub fn limit_bytes(mut self, class: StorageClass, bytes: u64) -> Self {
         self.slots[class.index()] = Some(bytes);
         self
@@ -402,54 +414,54 @@ impl NsQuota {
     }
 }
 
-/// Хранилище.
+/// The store.
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
-    /// Базовый каталог каждого класса (индекс — [`StorageClass::index`]):
-    /// либо общий корень, либо собственный носитель класса.
+    /// The base directory of every class (indexed by [`StorageClass::index`]):
+    /// either the shared root or the class's own medium.
     class_roots: Vec<PathBuf>,
-    /// Все различные корни — для обходов имён (эпохи, уборка).
+    /// Every distinct root — for walking names (epochs, cleanup).
     scan_roots: Vec<PathBuf>,
     meta: StoreMeta,
-    /// Версия контейнера, с которой поднято хранилище, если она была старее
-    /// текущей. Приложению стоит записать это в журнал: часть накопленной
-    /// истории этим билдом не читается.
+    /// The container version the store came up with, if it was older than the
+    /// current one. The application should log this: part of the accumulated
+    /// history is not readable by this build.
     upgraded_from: Option<u8>,
-    /// Настройки, с которыми хранилище открыто: неймспейсы берут политики
-    /// каналов отсюда, а не из повторно переданного экземпляра.
+    /// The settings the store was opened with: namespaces take their channel
+    /// policies from here rather than from a second instance passed in again.
     config: StoreConfig,
     clock: Clock,
     epochs: Mutex<EpochStore>,
     writer: Arc<Writer>,
     counters: Arc<Counters>,
-    /// Счётчик спанов, общий на процесс: спан живёт внутри одного запуска,
-    /// поэтому персистить его незачем.
+    /// The span counter, shared by the process: a span lives inside one run, so
+    /// there is no reason to persist it.
     next_span: Arc<AtomicU32>,
-    /// Открытые неймспейсы: повторное открытие того же имени в одном
-    /// процессе дало бы два независимых состояния на одном каталоге.
+    /// The open namespaces: opening the same name twice in one process would
+    /// give two independent states over one directory.
     open: Mutex<HashMap<String, Option<NsId>>>,
-    /// Отметки о том, что смотреть снова есть смысл: их поднимает writer,
-    /// а ждёт подписка читателя.
+    /// The marks saying there is a point in looking again: the writer raises
+    /// them and a reader's subscription waits on them.
     pulse: Arc<crate::pulse::Pulse>,
-    /// Схемы, принесённые поднятыми неймспейсами, по имени схемы.
+    /// The schemas brought in by the namespaces that came up, by schema name.
     ///
-    /// Отдельно от `open` и **не** убирается вместе с ручкой: занятость имени
-    /// — про запись, а умение расшифровать записи процесс не теряет от того,
-    /// что ручку отпустили. Отсюда их берёт читатель, построенный по
-    /// хранилищу.
+    /// Kept apart from `open` and **not** removed with the handle: holding a
+    /// name is about writing, and the process does not lose the ability to
+    /// decode records because a handle was released. This is where a reader
+    /// built over the store takes them from.
     schemas: Mutex<HashMap<&'static str, Schema>>,
-    /// Держится открытым, пока живёт хранилище: снимается ядром при
-    /// завершении процесса, в том числе аварийном.
+    /// Held open for as long as the store lives: the kernel releases it when
+    /// the process ends, a crash included.
     _lock: File,
 }
 
 impl Store {
-    /// Открыть (или создать) хранилище.
+    /// Open (or create) a store.
     ///
-    /// Берёт эксклюзивную блокировку корня: два процесса на одном каталоге
-    /// перезаписывали бы `epochs.bin` друг друга и выдавали бы одинаковые
-    /// `boot_counter`, из-за чего имена сегментов столкнулись бы.
+    /// Takes an exclusive lock on the root: two processes over one directory
+    /// would overwrite each other's `epochs.bin` and hand out equal
+    /// `boot_counter` values, which would make segment names collide.
     pub fn open(config: StoreConfig) -> Result<Arc<Self>> {
         config.validate()?;
         fsutil::create_dir_all_synced(&config.root)?;
@@ -458,9 +470,9 @@ impl Store {
 
         let (meta, upgraded_from) = load_or_create_meta(&config.root)?;
 
-        // Корни классов и бюджетные группы. Ключ носителя — по фактическому
-        // совпадению путей: классы на одном разделе делят давление ENOSPC,
-        // классы на разных не мешают друг другу.
+        // The class roots and the budget groups. The medium key comes from
+        // paths actually matching: classes on one partition share ENOSPC
+        // pressure, classes on different ones do not get in each other's way.
         let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let mut keys: Vec<PathBuf> = vec![canon(&config.root)];
         let mut class_roots = Vec::with_capacity(StorageClass::ALL.len());
@@ -486,15 +498,17 @@ impl Store {
             class_roots.push(base);
         }
 
-        // База часов и запись в epochs.bin берут одно и то же значение
-        // BOOTTIME: расхождение между ними уехало бы в конверсию в UTC.
+        // The clock's base and the entry in epochs.bin take one and the same
+        // BOOTTIME value: a discrepancy between them would carry into the UTC
+        // conversion.
         let base_us = boottime_us();
-        // Номер запуска не имеет права оказаться ниже того, что уже написан на
-        // именах сегментов: файл эпох мог не пережить порчу или чистку, а
-        // сегменты пережили, и повторно выданный номер увёл бы новые записи в
-        // прошлое (см. `EpochStore::open_and_register`). Обход имён делается
-        // лениво — только когда файла эпох не осталось; обходятся ВСЕ корни:
-        // история класса может целиком жить на своём носителе.
+        // A run number has no right to come out below what is already written
+        // on segment names: the epochs file may not have survived corruption or
+        // a cleanup while the segments did, and a number handed out twice would
+        // carry new records into the past (see
+        // `EpochStore::open_and_register`). The walk over names is lazy — only
+        // when no epochs file is left; and ALL roots are walked: a class's
+        // history may live entirely on its own medium.
         let epochs = EpochStore::open_and_register(&config.root, base_us, &|| {
             Ok(live_boots(&scan_roots)?.into_iter().next_back())
         })?;
@@ -531,9 +545,9 @@ impl Store {
             _lock: lock,
         });
 
-        // Файл эпох растёт на запись за перезапуск и читается целиком при
-        // каждом старте. Подметаем его, когда он действительно вырос, — иначе
-        // обход имён сегментов стоил бы дороже, чем экономит.
+        // The epochs file grows by an entry per restart and is read whole at
+        // every start. It is swept when it really has grown — otherwise walking
+        // segment names would cost more than it saves.
         let runs = store.locked_epochs().epochs().runs.len();
         if runs > EPOCH_COMPACT_THRESHOLD {
             let _ = store.compact_epochs();
@@ -545,21 +559,22 @@ impl Store {
         &self.root
     }
 
-    /// Все корни, в которых лежат данные хранилища; первый — основной.
+    /// Every root the store's data lies in; the first is the main one.
     ///
-    /// Их больше одного, когда класс вынесен на свой носитель
-    /// ([`ChannelConfig::custom_root`]): критика на защищённом разделе — это
-    /// второе дерево `<корень>/<неймспейс>/<класс>/`. Читатель обязан знать их
-    /// все, иначе покажет хранилище без вынесенного класса и промолчит об
-    /// этом.
+    /// There is more than one when a class has been moved to its own medium
+    /// ([`ChannelConfig::custom_root`]): critical data on a protected partition
+    /// is a second `<root>/<namespace>/<class>/` tree. A reader has to know
+    /// them all, or it will show the store without the class that was moved out
+    /// and say nothing about it.
     pub fn roots(&self) -> &[PathBuf] {
         &self.scan_roots
     }
 
-    /// Схемы, которые это хранилище умеет расшифровывать.
+    /// The schemas this store can decode.
     ///
-    /// Их приносят поднятые неймспейсы; отпущенная ручка схему не уносит.
-    /// Одна схема на несколько неймспейсов считается один раз.
+    /// They are brought in by the namespaces that came up; a released handle
+    /// does not take its schema away. One schema shared by several namespaces
+    /// counts once.
     pub fn schemas(&self) -> Vec<Schema> {
         self.schemas
             .lock()
@@ -573,19 +588,22 @@ impl Store {
         self.meta
     }
 
-    /// Отметки хранилища о новых данных — на них спит подписка читателя.
+    /// The store's marks about new data — what a reader's subscription sleeps
+    /// on.
     ///
-    /// Отметка не заменяет чтение и ничего о записях не рассказывает: она лишь
-    /// говорит, что смотреть снова есть смысл. Правда по-прежнему на носителе.
+    /// A mark does not replace reading and says nothing about the records: it
+    /// only says there is a point in looking again. The truth is still on the
+    /// medium.
     pub fn pulse(&self) -> &Arc<crate::pulse::Pulse> {
         &self.pulse
     }
 
-    /// Прежняя версия контейнера, если хранилище было поднято со старой.
+    /// The earlier container version, if the store came up from an old one.
     ///
-    /// `Some(v)` означает: сегменты версии `v` в каталоге есть, но этим билдом
-    /// они не читаются и уйдут при ротации. Стоит записать это событие —
-    /// молчаливая потеря доступа к истории хуже, чем явная.
+    /// `Some(v)` means there are segments of version `v` in the directory but
+    /// this build does not read them and they will go with rotation. This event
+    /// is worth logging — silently losing access to history is worse than
+    /// saying so.
     pub fn upgraded_from(&self) -> Option<u8> {
         self.upgraded_from
     }
@@ -598,20 +616,22 @@ impl Store {
         self.counters.snapshot()
     }
 
-    /// Поднять неймспейс с указанной схемой.
+    /// Bring up a namespace with the given schema.
     ///
-    /// Настройки каналов берутся из тех, с которыми открыто хранилище: раньше
-    /// их приходилось передавать вторым экземпляром (`Store::open(config.clone())`
-    /// плюс `namespace(.., &config)`), и ничто не мешало передать сюда другие —
-    /// каналы получили бы бюджет, о котором хранилище не знает.
+    /// The channel settings come from those the store was opened with: they
+    /// used to have to be passed as a second instance
+    /// (`Store::open(config.clone())` plus `namespace(.., &config)`), and
+    /// nothing stopped a different one being passed here — the channels would
+    /// have got a budget the store knew nothing about.
     ///
-    /// Каналы черпают из общих бюджетов своих классов; неймспейсу, которому
-    /// положен личный предел, есть [`Store::namespace_with_quota`].
+    /// The channels draw on the shared budgets of their classes; for a
+    /// namespace that deserves a personal limit there is
+    /// [`Store::namespace_with_quota`].
     pub fn namespace(self: &Arc<Self>, name: &str, schema: Schema) -> Result<Namespace> {
         self.namespace_with_quota(name, schema, NsQuota::default())
     }
 
-    /// Поднять неймспейс с личными квотами — см. [`NsQuota`].
+    /// Bring up a namespace with personal quotas — see [`NsQuota`].
     pub fn namespace_with_quota(
         self: &Arc<Self>,
         name: &str,
@@ -622,19 +642,19 @@ impl Store {
             name: name.to_owned(),
             reason,
         })?;
-        // Причина — обычная строка. Раньше здесь стоял `Box::leak`, потому что
-        // `reason` был `&'static str`: каждая неудачная попытка подъёма
-        // неймспейса навсегда оставляла в памяти свой текст, а на устройстве
-        // такую попытку повторяют в цикле переподключения.
+        // The reason is an ordinary string. This used to be a `Box::leak`,
+        // because `reason` was a `&'static str`: every failed attempt to bring
+        // a namespace up left its text in memory forever, and on a device such
+        // an attempt is repeated in a reconnection loop.
         schema.validate().map_err(|e| Error::BadSchema {
             name: schema.name.to_owned(),
             reason: e.to_string(),
         })?;
 
-        // Занятость помечается под той же блокировкой, что и проверка:
-        // между «свободен» и «занял» два потока успевали получить по
-        // независимому writer-состоянию на один каталог, и оба писали бы
-        // сегменты с одинаковыми именами.
+        // The name is marked taken under the same lock that checks it: between
+        // "free" and "taken" two threads managed to get an independent writer
+        // state each over one directory, and both would write segments with
+        // equal names.
         {
             let mut open = self.locked_open();
             if open.contains_key(name) {
@@ -642,8 +662,8 @@ impl Store {
             }
             open.insert(name.to_owned(), None);
         }
-        // Дальше любой ранний выход обязан снять пометку, иначе имя
-        // останется занятым до конца жизни процесса.
+        // From here on, any early return has to clear the mark, or the name
+        // stays taken for the life of the process.
         let guard = ReserveGuard {
             store: self,
             name,
@@ -654,20 +674,21 @@ impl Store {
         fsutil::create_dir_all_synced(&dir)?;
         fsutil::sweep_tmp(&dir)?;
 
-        // Схема неймспейса фиксируется при первом открытии: одинаковые
-        // идентификаторы событий в разных схемах означают разное, и смешать
-        // их в одном каталоге — значит расшифровывать записи чужими
-        // шаблонами.
+        // A namespace's schema is fixed at the first open: equal event
+        // identifiers in different schemas mean different things, and mixing
+        // them in one directory means decoding records with the wrong
+        // templates.
         let meta = NsMeta::open(&dir, name, &schema)?;
 
         let classes = schema.classes();
-        // Канал живёт в каталоге своего класса — возможно, на другом
-        // носителе; группа бюджета и есть класс.
+        // A channel lives in the directory of its class — possibly on another
+        // medium; the budget group is the class.
         let mut specs = Vec::with_capacity(classes.len());
         for class in &classes {
             let config = self.config.config_for(Some(name), *class);
-            // Квота неймспейса бьёт групповую: она конкретнее. Групповая —
-            // «ни один оркестратор не занимает больше», личная — про этого.
+            // A namespace quota beats a group's: it is more specific. The
+            // group's is "no orchestrator takes more than", the personal one is
+            // about this one.
             let personal = quota
                 .get(*class)
                 .or_else(|| self.config.group_quota(name, *class));
@@ -677,8 +698,8 @@ impl Store {
                 return Err(Error::BadChannel {
                     class: *class,
                     namespace: Some(name.to_owned()),
-                    reason: "квота меньше двух сегментов — ротация съедала бы \
-                             данные сразу после запечатывания",
+                    reason: "the quota is smaller than two segments — rotation would \
+                             eat the data right after sealing",
                 });
             }
             specs.push(ChannelSpec {
@@ -732,52 +753,54 @@ impl Store {
         ))
     }
 
-    /// Реестр открытых неймспейсов, с восстановлением после отравления.
+    /// The registry of open namespaces, with recovery from poisoning.
     ///
-    /// Причина та же, что у [`Store::locked_epochs`]: отравление означает
-    /// панику в другом потоке, а не противоречивые данные — под мьютексом
-    /// только вставки и удаления в готовой таблице. Отказ обошёлся бы дороже:
-    /// ручка неймспейса при уничтожении не смогла бы снять пометку «занято»,
-    /// имя осталось бы занятым навсегда, а его строка — неосвобождённой.
+    /// The reason is the same as for [`Store::locked_epochs`]: poisoning means
+    /// a panic on another thread, not contradictory data — only insertions into
+    /// and removals from a ready table happen under the mutex. Failing would
+    /// cost more: a namespace handle being dropped could not clear the "taken"
+    /// mark, the name would stay taken forever and its string would never be
+    /// freed.
     fn locked_open(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<NsId>>> {
         self.open.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Эпохи под мьютексом, с восстановлением после отравления.
+    /// The epochs under a mutex, with recovery from poisoning.
     ///
-    /// Отравление означает панику в другом потоке, но не противоречивые
-    /// данные: под мьютексом выполняются только короткие операции над уже
-    /// разобранной структурой. Отказ обошёлся бы дороже — `boot_counter`
-    /// подменился бы нулём, который неотличим от настоящего первого запуска,
-    /// и сегменты чужого run'а стали бы «своими».
+    /// Poisoning means a panic on another thread but not contradictory data:
+    /// only short operations over an already parsed structure happen under the
+    /// mutex. Failing would cost more — `boot_counter` would be replaced by a
+    /// zero, indistinguishable from a genuine first run, and another run's
+    /// segments would become "ours".
     fn locked_epochs(&self) -> std::sync::MutexGuard<'_, EpochStore> {
         self.epochs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Зафиксировать синхронизацию времени.
+    /// Record a time synchronization.
     ///
-    /// Возвращает `false`, если источник менее достоверен, чем уже
-    /// записанный якорь (ручной ввод не перебивает GPS).
+    /// Returns `false` if the source is less trustworthy than the anchor
+    /// already written (a manual entry does not beat GPS).
     pub fn record_sync(&self, utc: DateTime<Utc>, source: SyncSource) -> Result<bool> {
-        // Заведомо невозможное время не должно портить всю историю: якорь
-        // ретроактивен, и один вызов с мусором исказил бы UTC у всех событий
-        // этой загрузки.
+        // A knowably impossible time must not spoil the whole history: the
+        // anchor is retroactive, and one call with garbage would distort the
+        // UTC of every event of this boot.
         if !is_plausible_utc(utc) {
             return Ok(false);
         }
         self.locked_epochs().record_sync(utc, source)
     }
 
-    /// Убрать из `epochs.bin` записи о запусках, от которых не осталось
-    /// сегментов. Возвращает число удалённых записей.
+    /// Remove entries from `epochs.bin` about runs of which no segments are
+    /// left. Returns the number of entries removed.
     ///
-    /// Обходятся только **имена** файлов: `readdir` по каналам, без единого
-    /// открытия сегмента. Текущий запуск не удаляется никогда — он ещё пишет.
+    /// Only file **names** are walked: a `readdir` over the channels, without
+    /// opening a single segment. The current run is never removed — it is still
+    /// writing.
     ///
-    /// Вызывается автоматически при подъёме хранилища, но лишь когда файл
-    /// действительно вырос (порядка тысячи запусков): обход каталогов при
-    /// тысячах неймспейсов не бесплатен, а лишняя запись об эпохе стоит
-    /// десятки байт. Приложение вправе позвать уборку и само.
+    /// Called automatically when the store comes up, but only once the file
+    /// really has grown (of the order of a thousand runs): walking directories
+    /// with thousands of namespaces is not free, while a stale epoch entry
+    /// costs tens of bytes. An application may call the cleanup itself.
     pub fn compact_epochs(&self) -> Result<usize> {
         let live = live_boots(&self.scan_roots)?;
         let mut epochs = self.locked_epochs();
@@ -786,62 +809,65 @@ impl Store {
         Ok(before - epochs.epochs().runs.len())
     }
 
-    /// Перевести относительное время в настенное. `None` — нет якоря.
+    /// Convert relative time into wall-clock time. `None` means there is no
+    /// anchor.
     pub fn to_utc(&self, at: BootTime) -> Option<DateTime<Utc>> {
         self.locked_epochs().epochs().to_utc(at)
     }
 
-    /// Снимок эпох в этот момент — со всеми якорями, включая только что
-    /// записанные [`Store::record_sync`].
+    /// A snapshot of the epochs at this moment — with every anchor, including
+    /// the ones [`Store::record_sync`] has just written.
     ///
-    /// Отсюда их берёт живой читатель на каждый запрос: разобранный при
-    /// своём открытии `epochs.bin` устаревает с первой же синхронизацией
-    /// времени, и записи, у которых якорь уже есть, оставались бы без UTC.
+    /// This is where a live reader takes them from on every query: the
+    /// `epochs.bin` parsed when it opened goes stale with the first time
+    /// synchronization, and records that do have an anchor would be left
+    /// without a UTC.
     pub fn epochs(&self) -> crate::epochs::Epochs {
         self.locked_epochs().epochs().clone()
     }
 
-    /// Текущий момент в тех же координатах, что и у записей.
+    /// The current moment in the same coordinates as the records.
     pub fn now(&self) -> BootTime {
         self.clock.now_at()
     }
 
-    /// Текущий `boot_counter`.
+    /// The current `boot_counter`.
     pub fn boot_counter(&self) -> u32 {
         self.locked_epochs().current_run().boot_counter
     }
 
-    /// Доходят ли ещё записи до носителя — то есть жив ли writer-поток.
+    /// Whether records still reach the medium — that is, whether the writer
+    /// thread is alive.
     ///
-    /// `false` означает, что записи больше не доходят до диска: либо
-    /// хранилище остановлено, либо поток погиб. Потери при этом учтены в
+    /// `false` means records no longer reach the disk: either the store has
+    /// stopped or the thread has died. The losses are accounted for in
     /// [`Stats::dropped`].
     ///
-    /// Подписке читателя это нужно, чтобы не ждать вечно того, кого уже
-    /// некому писать: поток, снятый паникой, отметку о закрытии
-    /// ([`crate::pulse::Pulse::close`]) выставить не успевает.
+    /// A reader's subscription needs this so as not to wait forever for someone
+    /// there is nobody left to write for: a thread killed by a panic never gets
+    /// to set the close mark ([`crate::pulse::Pulse::close`]).
     pub fn is_writing(&self) -> bool {
         self.writer.is_alive()
     }
 
-    /// Дождаться, пока всё накопленное окажется на носителе.
+    /// Wait until everything accumulated is on the medium.
     pub fn sync(&self) -> Result<()> {
         self.writer.sync(None)
     }
 
-    /// Завершить работу: дописать, запечатать сегменты, остановить writer.
+    /// Finish: write out, seal the segments, stop the writer.
     pub fn shutdown(&self) {
         self.writer.shutdown();
     }
 }
 
-/// Держит хранилище живым, пока жива ручка неймспейса, и освобождает имя
-/// при её уничтожении.
+/// Keeps the store alive for as long as a namespace handle lives, and frees
+/// the name when the handle is dropped.
 ///
-/// Без первого `Store` при уничтожении остановил бы writer, а переживший его
-/// `Namespace` возвращал бы `Ok` в никуда. Без второго имя оставалось бы
-/// занятым до конца жизни процесса, и сервис не смог бы переоткрыть свой
-/// неймспейс после перенастройки.
+/// Without the first, a `Store` being dropped would stop the writer while a
+/// `Namespace` that outlived it went on returning `Ok` into nothing. Without
+/// the second, the name would stay taken for the life of the process, and a
+/// service could not reopen its namespace after being reconfigured.
 #[derive(Debug)]
 struct NamespaceLease {
     store: Arc<Store>,
@@ -851,22 +877,22 @@ struct NamespaceLease {
 
 impl Drop for NamespaceLease {
     fn drop(&mut self) {
-        // Writer'у — ПЕРВЫМ, и только потом снимается пометка «имя занято».
-        // Обратный порядок оставлял окно: между снятием пометки и отправкой
-        // команды другой поток успевает поднять тот же неймспейс, его
-        // `Register` встаёт в очередь команд впереди нашего `Release`, и на
-        // один каталог оказывается два состояния канала — с двумя
-        // инвентарями и двумя ротациями. Ротация одного удалила бы сегмент,
-        // открытый другим: запись продолжалась бы в файл без имени и пропала
-        // при закрытии.
+        // The writer FIRST, and only then the "name taken" mark is cleared. The
+        // reverse order left a window: between clearing the mark and sending
+        // the command another thread manages to bring the same namespace up,
+        // its `Register` queues ahead of our `Release`, and one directory ends
+        // up with two channel states — with two inventories and two rotations.
+        // One's rotation would delete a segment the other had open: writing
+        // would go on into a file with no name and vanish when it closed.
         //
-        // Порядок между самими командами держит их общая очередь.
+        // The order between the commands themselves is kept by their shared
+        // queue.
         self.store.writer.release(self.id);
         self.store.locked_open().remove(&self.name);
     }
 }
 
-/// Снимает пометку «имя занято», если подъём неймспейса не дошёл до конца.
+/// Clears the "name taken" mark if bringing a namespace up did not finish.
 struct ReserveGuard<'a> {
     store: &'a Store,
     name: &'a str,
@@ -889,52 +915,55 @@ impl Drop for ReserveGuard<'_> {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        // Незапечатанный сегмент читается сканом, поэтому данные не теряются
-        // и без этого — но footer экономит чтению целый проход по файлу.
+        // An unsealed segment reads by scanning, so no data is lost without
+        // this — but a footer saves the reader a whole pass over the file.
         self.writer.shutdown();
     }
 }
 
-/// При каком числе записей о запусках подметать `epochs.bin` на старте.
+/// At how many run entries `epochs.bin` is swept at start.
 ///
-/// Уборка стоит обхода имён во всех каналах, а невычищенная запись — десятки
-/// байт, поэтому платить за обход на каждом старте незачем: порог
-/// амортизирует его на тысячу с лишним перезапусков. Файл при этом остаётся
-/// ограниченным, а данные — нет: запуск, от которого остались сегменты,
-/// уборка не трогает, и UTC его записей не теряется.
+/// The cleanup costs a walk over the names in every channel, while an uncleaned
+/// entry costs tens of bytes, so there is no reason to pay for the walk at
+/// every start: the threshold amortizes it over a thousand-odd restarts. The
+/// file stays bounded that way, and the data does not: the cleanup does not
+/// touch a run whose segments are still there, and the UTC of its records is
+/// not lost.
 const EPOCH_COMPACT_THRESHOLD: usize = 1024;
 
-/// Номера запусков, за которыми ещё стоят сегменты.
+/// The run numbers segments still stand behind.
 ///
-/// Только `readdir` и разбор имён — ни одного открытия файла: имя сегмента
-/// несёт `boot_counter` первыми восемью символами.
+/// Only `readdir` and name parsing — not one file is opened: a segment's name
+/// carries `boot_counter` in its first eight characters.
 ///
-/// Ошибка обхода — **отказ**, а не пустое множество. Результат используется
-/// двояко, и в обеих ролях недосмотр необратим: уборка эпох по неполному
-/// списку удалила бы якоря запусков, чьи сегменты просто не удалось
-/// перечислить, а нижняя граница номера запуска по нему же дала бы повторную
-/// нумерацию. «Не смог посмотреть» и «там ничего нет» — разные ответы.
+/// An error while walking is a **failure**, not an empty set. The result is
+/// used in two ways, and in both an oversight is irreversible: cleaning epochs
+/// from an incomplete list would delete the anchors of runs whose segments
+/// merely could not be listed, and the lower bound on the run number derived
+/// from the same list would give repeated numbering. "Could not look" and
+/// "there is nothing there" are different answers.
 ///
-/// Строгость при этом распространяется только на **своё**. Корень хранилища
-/// бывает точкой монтирования, и рядом с неймспейсами лежит чужое: `lost+found`
-/// с правами root, каталоги соседних подсистем, висячие симлинки. Уронить на
-/// них `Store::open` значило бы оставить прибор без журнала ровно тогда, когда
-/// он нужнее всего, — и ровно в том сценарии, ради которого обход заведён
-/// (файл эпох не пережил прошлый запуск, в том числе при первом же старте).
+/// The strictness extends only to what is **ours**. A store root is sometimes
+/// a mount point, and foreign things lie next to the namespaces: a `lost+found`
+/// owned by root, the directories of neighbouring subsystems, dangling
+/// symlinks. Falling over them in `Store::open` would leave the device without
+/// a journal exactly when it is needed most — and in exactly the scenario the
+/// walk exists for (the epochs file did not survive the previous run, the very
+/// first start included).
 ///
-/// Признак «это не наше» — имя: каталог неймспейса создаётся только через
-/// [`Store::namespace`], которая проверяет имя тем же [`validate_component`].
-/// Вход с недопустимым именем не может содержать сегментов **этого**
-/// хранилища, поэтому в него не заходят вовсе — до всякого `read_dir`.
-/// Всё, что прошло проверку имени, обходится строго.
+/// The sign of "not ours" is the name: a namespace directory is created only
+/// through [`Store::namespace`], which checks the name with the same
+/// [`validate_component`]. An entry with an invalid name cannot hold segments
+/// of **this** store, so it is not entered at all — before any `read_dir`.
+/// Everything that passed the name check is walked strictly.
 fn live_boots(roots: &[PathBuf]) -> Result<std::collections::BTreeSet<u32>> {
     use crate::channel::validate_component;
     use dduroc_format::segment::SegmentName;
 
-    /// Перечислить каталог. `NotADirectory` — обычный файл на месте каталога,
-    /// `NotFound` — вход исчез между перечислением и заходом (внешняя чистка,
-    /// висячий симлинк): и то, и другое означает «сегментов здесь нет», а не
-    /// «не смог посмотреть».
+    /// List a directory. `NotADirectory` means an ordinary file where a
+    /// directory should be, `NotFound` that the entry vanished between the
+    /// listing and the descent (an external cleanup, a dangling symlink): both
+    /// mean "there are no segments here" rather than "could not look".
     fn entries(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
         use std::io::ErrorKind::{NotADirectory, NotFound};
         match std::fs::read_dir(path) {
@@ -946,7 +975,7 @@ fn live_boots(roots: &[PathBuf]) -> Result<std::collections::BTreeSet<u32>> {
         }
     }
 
-    /// Могло ли это имя быть создано хранилищем.
+    /// Whether this name could have been created by the store.
     fn ours(entry: &std::fs::DirEntry) -> bool {
         entry
             .file_name()
@@ -969,17 +998,17 @@ fn live_boots(roots: &[PathBuf]) -> Result<std::collections::BTreeSet<u32>> {
     Ok(out)
 }
 
-/// Разумен ли момент времени: между 2001-09-09 и 2100-01-01.
+/// Whether a moment in time is sensible: between 2001-09-09 and 2100-01-01.
 ///
-/// Ниже границы лежат нули и мусор от неинициализированных часов, выше —
-/// переполнения и заведомо испорченные значения.
+/// Below the lower bound lie zeros and garbage from uninitialized clocks, above
+/// the upper one overflows and knowably corrupted values.
 fn is_plausible_utc(utc: DateTime<Utc>) -> bool {
     const MIN_MS: i64 = 1_000_000_000_000;
     const MAX_MS: i64 = 4_102_444_800_000;
     (MIN_MS..MAX_MS).contains(&utc.timestamp_millis())
 }
 
-/// Взять эксклюзивную блокировку корня хранилища.
+/// Take an exclusive lock on the store root.
 fn acquire_lock(root: &Path) -> Result<File> {
     let path = root.join(LOCK_FILE);
     let file = std::fs::OpenOptions::new()
@@ -993,14 +1022,14 @@ fn acquire_lock(root: &Path) -> Result<File> {
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
         |e| {
             if matches!(e, rustix::io::Errno::WOULDBLOCK) {
-                // Блокировка привязана к описанию открытого файла, а не к
-                // процессу: конфликт возникает и при повторном открытии того
-                // же корня внутри одного процесса — а это ровно та ошибка,
-                // которую нужно поймать.
+                // The lock is tied to an open file description rather than to a
+                // process: the conflict arises when the same root is opened
+                // twice within one process too — and that is exactly the
+                // mistake worth catching.
                 Error::StoreBusy(root.to_owned())
             } else {
                 Error::Io {
-                    context: format!("блокировка {}", path.display()),
+                    context: format!("locking {}", path.display()),
                     source: e.into(),
                 }
             }
@@ -1009,21 +1038,21 @@ fn acquire_lock(root: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// Прочитать или создать метаданные хранилища.
+/// Read or create the store's metadata.
 ///
-/// Хранилище, записанное **прежней** версией контейнера, поднимается: файл
-/// метаданных переписывается на текущую версию, `store_id` сохраняется, а
-/// старые сегменты остаются лежать до ротации.
+/// A store written by an **earlier** container version comes up: the metadata
+/// file is rewritten to the current version, `store_id` is preserved, and the
+/// old segments stay where they are until rotation.
 ///
-/// Отказаться было бы хуже всего: обновление прошивки означало бы, что
-/// `Store::open` не удался и прибор перестал логировать вовсе — ровно в тот
-/// момент, когда журнал нужнее всего. Данные прежней версии при этом не
-/// подменяются и не выдаются за свои: заголовок каждого сегмента несёт версию
-/// контейнера, и читатель сообщает о них как о непрочитанном фрагменте, а не
-/// разбирает их наугад.
+/// Refusing would be the worst of all: a firmware update would mean
+/// `Store::open` failed and the device stopped logging entirely — exactly when
+/// the journal is needed most. The earlier version's data is not substituted
+/// for or passed off as ours: every segment header carries its container
+/// version, and the reader reports them as an unread fragment rather than
+/// parsing them on a guess.
 ///
-/// Версия **из будущего** по-прежнему ошибка: раскладку, которой этот билд не
-/// знает, угадывать нечем.
+/// A version **from the future** is still an error: there is nothing to guess a
+/// layout this build does not know with.
 fn load_or_create_meta(root: &Path) -> Result<(StoreMeta, Option<u8>)> {
     let path = root.join(STORE_META);
     let current = dduroc_format::CONTAINER_VERSION;
@@ -1031,14 +1060,14 @@ fn load_or_create_meta(root: &Path) -> Result<(StoreMeta, Option<u8>)> {
     if let Some(bytes) = fsutil::read_optional(&path)? {
         let meta: StoreMeta = postcard::from_bytes(&bytes).map_err(|_| Error::Corrupt {
             path: path.clone(),
-            reason: "метаданные хранилища не разбираются".to_owned(),
+            reason: "the store metadata does not parse".to_owned(),
         })?;
         if meta.container_version > current {
             return Err(Error::Corrupt {
                 path,
                 reason: format!(
-                    "версия контейнера {} новее поддерживаемой ({}): раскладку из \
-                     будущего этот билд разобрать не может",
+                    "container version {} is newer than the supported one ({}): this \
+                     build cannot parse a layout from the future",
                     meta.container_version, current
                 ),
             });
@@ -1063,11 +1092,11 @@ fn load_or_create_meta(root: &Path) -> Result<(StoreMeta, Option<u8>)> {
     Ok((meta, None))
 }
 
-/// Идентификатор хранилища.
+/// The store identifier.
 ///
-/// Криптостойкость не нужна — задача только различать приборы, поэтому
-/// хватает смеси boot_id ядра, времени и адреса в куче: тянуть генератор
-/// случайных чисел ради одного значения незачем.
+/// Cryptographic strength is not needed — the job is only to tell devices
+/// apart — so a mix of the kernel boot_id, the time and a heap address is
+/// enough: pulling in a random number generator for one value is pointless.
 fn fresh_store_id() -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix = |bytes: &[u8]| {
@@ -1089,12 +1118,11 @@ fn fresh_store_id() -> u64 {
     h
 }
 
-/// Выделить идентификатор спана.
+/// Allocate a span identifier.
 ///
-/// Нумерация локальна для запуска и не персистится. При переполнении u32
-/// счётчик заворачивается на 1: чтение сопоставляет начало и конец спана
-/// в пределах временного окна, а между повторами одного номера пройдут
-/// миллиарды событий.
+/// The numbering is local to a run and is not persisted. On a u32 overflow the
+/// counter wraps to 1: reading matches a span's start with its end within a
+/// time window, and billions of events pass between repeats of one number.
 pub(crate) fn next_span_id(counter: &AtomicU32) -> dduroc_format::SpanId {
     let raw = counter.fetch_add(1, Ordering::Relaxed);
     dduroc_format::SpanId(if raw == 0 { 1 } else { raw })
@@ -1104,17 +1132,17 @@ pub(crate) fn next_span_id(counter: &AtomicU32) -> dduroc_format::SpanId {
 mod tests {
     use super::*;
 
-    /// Момент времени из миллисекунд эпохи.
+    /// A moment in time from epoch milliseconds.
     fn utc_ms(ms: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp_millis(ms).expect("миллисекунды в пределах эпохи")
+        DateTime::from_timestamp_millis(ms).expect("the milliseconds are within the epoch")
     }
 
     #[test]
     fn a_longer_prefix_refines_the_shorter_one_and_the_namespace_beats_them_all() {
-        // Префиксы вкладываются друг в друга: `orc-radio-` УТОЧНЯЕТ `orc-`, а
-        // не заменяет его. Иначе уточнение одной настройки молча снимало бы
-        // все прочие, заданные общей группой. Зависеть от порядка объявления
-        // или от обхода хэш-таблицы такой ответ не имеет права.
+        // Prefixes nest inside one another: `orc-radio-` REFINES `orc-` rather
+        // than replacing it. Otherwise refining one setting would silently
+        // remove every other the general group set. Such an answer has no right
+        // to depend on declaration order or on how a hash table is walked.
         let cfg = StoreConfig::new("/tmp/nowhere")
             .group(
                 "orc-",
@@ -1137,20 +1165,25 @@ mod tests {
             cfg.config_for(Some(ns), StorageClass::Default)
                 .segment_bytes
         };
-        assert_eq!(seg("orc-radio-0"), 1 << 20, "выигрывает длинный префикс");
+        assert_eq!(seg("orc-radio-0"), 1 << 20, "the longer prefix wins");
         assert_eq!(seg("orc-power-0"), 2 << 20);
-        assert_eq!(seg("diag-0"), 8 << 20, "чужому — общие настройки класса");
+        assert_eq!(
+            seg("diag-0"),
+            8 << 20,
+            "an outsider gets the class's shared settings"
+        );
         assert_eq!(
             cfg.config_for(None, StorageClass::Default).segment_bytes,
             8 << 20,
-            "без имени группы не спрашиваются вовсе"
+            "with no name the groups are not consulted at all"
         );
 
-        // Квота задана только общей группой — уточняющая её не отменяет.
+        // The quota is set by the general group alone — the refining one does
+        // not cancel it.
         assert_eq!(
             cfg.group_quota("orc-radio-0", StorageClass::Default),
             Some(100 << 20),
-            "уточнение размера сегмента не снимает квоту общей группы"
+            "refining the segment size does not remove the general group's quota"
         );
         assert_eq!(
             cfg.group_quota("orc-power-0", StorageClass::Default),
@@ -1158,8 +1191,8 @@ mod tests {
         );
         assert_eq!(cfg.group_quota("diag-0", StorageClass::Default), None);
 
-        // И наоборот: настройка класса, которую уточняющая группа не
-        // упоминает, приходит от общей.
+        // And the other way round: a class setting the refining group does not
+        // mention comes from the general one.
         let refining = StoreConfig::new("/tmp/nowhere")
             .group(
                 "orc-",
@@ -1178,20 +1211,21 @@ mod tests {
                 ),
             );
         let refined = refining.config_for(Some("orc-radio-0"), StorageClass::Telemetry);
-        assert_eq!(refined.segment_bytes, 1 << 20, "своё — своё");
+        assert_eq!(refined.segment_bytes, 1 << 20, "its own is its own");
         assert_eq!(
             refined.compression,
             dduroc_format::Compression::None,
-            "не упомянутое уточнением приходит от общей группы"
+            "what the refinement does not mention comes from the general group"
         );
     }
 
     #[test]
     fn the_class_keeps_its_budget_and_its_medium_whatever_a_group_says() {
-        // Бюджет и носитель — свойства класса, общие на всё хранилище. Группа
-        // задать их не может по построению: в `ChannelOverride` этих полей
-        // нет. Проверяется здесь то, что резолв их и не трогает — иначе
-        // потолок занятости, объявленный классом, перестал бы быть потолком.
+        // The budget and the medium are properties of a class, shared across
+        // the whole store. A group cannot set them by construction:
+        // `ChannelOverride` has no such fields. What is checked here is that
+        // resolution does not touch them either — otherwise the occupancy
+        // ceiling a class declared would stop being a ceiling.
         let vault = std::path::PathBuf::from("/tmp/vault");
         let cfg = StoreConfig::new("/tmp/nowhere")
             .channel(
@@ -1212,19 +1246,23 @@ mod tests {
             );
 
         let grouped = cfg.config_for(Some("orc-0"), StorageClass::Default);
-        assert_eq!(grouped.segment_bytes, 2 << 20, "своё — своё");
+        assert_eq!(grouped.segment_bytes, 2 << 20, "its own is its own");
         assert_eq!(grouped.compression, dduroc_format::Compression::None);
-        assert_eq!(grouped.budget_bytes, 32 << 20, "бюджет остался классовым");
-        assert_eq!(grouped.custom_root, Some(vault), "носитель тоже");
+        assert_eq!(
+            grouped.budget_bytes,
+            32 << 20,
+            "the budget stayed the class's"
+        );
+        assert_eq!(grouped.custom_root, Some(vault), "and so did the medium");
     }
 
     #[test]
     fn a_group_is_refused_for_what_a_class_would_be_refused_for() {
         let base = || StoreConfig::new("/tmp/nowhere").with_budget_per_class(64 << 20);
 
-        // Настройка, негодная классу, не становится годной оттого, что её
-        // задали группе: сегмент больше половины бюджета — ротация съедала бы
-        // данные сразу после запечатывания.
+        // A setting unfit for a class does not become fit by being given to a
+        // group: a segment larger than half the budget means rotation would eat
+        // the data right after it was sealed.
         let e = base()
             .group(
                 "orc-",
@@ -1237,8 +1275,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(e, Error::BadGroup { .. }), "{e}");
 
-        // Немедленность критического канала — его определение, и отменить её
-        // группе не позволено ровно так же, как хранилищу.
+        // The immediacy of the critical channel is its definition, and a group
+        // is no more allowed to cancel it than the store is.
         let e = base()
             .group(
                 "orc-",
@@ -1251,12 +1289,13 @@ mod tests {
             .unwrap_err();
         assert!(matches!(e, Error::BadGroup { .. }), "{e}");
 
-        // Префикс, которым не может начаться ни одно имя, — мёртвая настройка:
-        // оператор считал бы, что она действует.
+        // A prefix no name can begin with is a dead setting: the operator would
+        // believe it was in force.
         assert!(base().group("orc/", GroupPolicy::new()).validate().is_err());
         assert!(base().group("", GroupPolicy::new()).validate().is_err());
 
-        // Две политики на один префикс: какая действует — ответить нечем.
+        // Two policies for one prefix: there is nothing to answer "which
+        // applies" with.
         let e = base()
             .group("orc-", GroupPolicy::new())
             .group("orc-", GroupPolicy::new())
@@ -1264,7 +1303,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(e, Error::BadGroup { .. }), "{e}");
 
-        // Годная группа проходит.
+        // A sound group passes.
         base()
             .group(
                 "orc-",
@@ -1276,11 +1315,11 @@ mod tests {
                     .limit_bytes(StorageClass::Telemetry, 64 << 20),
             )
             .validate()
-            .expect("годная политика группы");
+            .expect("a sound group policy");
 
-        // Квота группы проверяется при открытии, а не при подъёме первого
-        // подходящего неймспейса: тот может случиться через месяцы работы, и
-        // поправить настройку будет уже негде.
+        // A group's quota is checked at open time rather than when the first
+        // matching namespace comes up: that may happen months into service, and
+        // there would be nowhere left to fix the setting.
         let e = base()
             .group(
                 "orc-",
@@ -1303,7 +1342,7 @@ mod tests {
         drop(a);
 
         let b = Store::open(cfg).unwrap();
-        assert_eq!(b.meta().store_id, id, "идентичность хранилища постоянна");
+        assert_eq!(b.meta().store_id, id, "the store identity is constant");
     }
 
     #[test]
@@ -1315,45 +1354,49 @@ mod tests {
         assert_ne!(
             sa.meta().store_id,
             sb.meta().store_id,
-            "разные хранилища обязаны различаться"
+            "different stores must differ"
         );
     }
 
     #[test]
     fn second_open_of_the_same_root_is_refused() {
-        // Два писателя на одном каталоге перезаписывали бы epochs.bin друг
-        // друга и выдавали бы одинаковые boot_counter — имена сегментов
-        // столкнулись бы. flock привязан к описанию открытого файла, поэтому
-        // конфликт ловится и внутри одного процесса.
+        // Two writers over one directory would overwrite each other's
+        // epochs.bin and hand out equal boot_counter values — segment names
+        // would collide. flock is tied to an open file description, so the
+        // conflict is caught within one process too.
         let dir = tempfile::tempdir().unwrap();
         let first = Store::open(StoreConfig::new(dir.path())).unwrap();
 
         let err = Store::open(StoreConfig::new(dir.path())).unwrap_err();
-        assert!(matches!(err, Error::StoreBusy(_)), "получено {err}");
+        assert!(matches!(err, Error::StoreBusy(_)), "got {err}");
 
-        // Освобождённый корень открывается снова: иначе перезапуск сервиса
-        // упирался бы в собственный файл блокировки.
+        // A released root opens again: otherwise restarting a service would run
+        // into its own lock file.
         first.shutdown();
         drop(first);
-        Store::open(StoreConfig::new(dir.path())).expect("корень освободился");
+        Store::open(StoreConfig::new(dir.path())).expect("the root was freed");
     }
 
     #[test]
     fn older_container_version_is_upgraded_not_fatal() {
-        // Отказ открыть хранилище означал бы, что обновление прошивки лишает
-        // прибор журнала — ровно в тот момент, когда он нужнее всего.
-        // Поднимаемся, сохранив идентичность хранилища, и сообщаем о том, что
-        // часть истории этим билдом не читается.
+        // Refusing to open the store would mean a firmware update deprives the
+        // device of its journal — exactly when it is needed most. We come up,
+        // preserving the store's identity, and report that part of the history
+        // is not readable by this build.
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig::new(dir.path());
 
         let first = Store::open(cfg.clone()).unwrap();
         let store_id = first.meta().store_id;
-        assert_eq!(first.upgraded_from(), None, "новое хранилище не «поднято»");
+        assert_eq!(
+            first.upgraded_from(),
+            None,
+            "a new store did not come up from anything"
+        );
         first.shutdown();
         drop(first);
 
-        // Подделываем прежнюю версию контейнера.
+        // Forge an earlier container version.
         let path = dir.path().join(STORE_META);
         let old = StoreMeta {
             container_version: 1,
@@ -1362,12 +1405,12 @@ mod tests {
         std::fs::write(&path, postcard::to_allocvec(&old).unwrap()).unwrap();
 
         let upgraded = Store::open(cfg.clone()).unwrap();
-        assert_eq!(upgraded.upgraded_from(), Some(1), "подъём объявлен");
+        assert_eq!(upgraded.upgraded_from(), Some(1), "coming up is announced");
         assert_eq!(
             upgraded.meta().store_id,
             store_id,
-            "идентичность хранилища обязана сохраниться: иначе свои же сегменты \
-             стали бы чужими"
+            "the store identity must be preserved: otherwise our own segments \
+             would become foreign"
         );
         assert_eq!(
             upgraded.meta().container_version,
@@ -1376,15 +1419,15 @@ mod tests {
         upgraded.shutdown();
         drop(upgraded);
 
-        // Повторное открытие уже не считается подъёмом.
+        // Opening it again no longer counts as coming up.
         let again = Store::open(cfg).unwrap();
         assert_eq!(again.upgraded_from(), None);
     }
 
     #[test]
     fn future_container_version_is_refused() {
-        // Раскладку из будущего угадывать нечем: тут отказ — единственный
-        // честный ответ.
+        // There is nothing to guess a layout from the future with: a refusal is
+        // the only honest answer here.
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig::new(dir.path());
         let s = Store::open(cfg.clone()).unwrap();
@@ -1403,19 +1446,19 @@ mod tests {
         .unwrap();
 
         let err = Store::open(cfg).unwrap_err();
-        assert!(matches!(err, Error::Corrupt { .. }), "получено {err}");
+        assert!(matches!(err, Error::Corrupt { .. }), "got {err}");
     }
 
     #[test]
     fn writer_liveness_is_reported_honestly() {
-        // До остановки писать можно, после — нет. Прежняя проверка смотрела
-        // на заполненность очередей и отвечала «жив» на любом состоянии,
-        // включая мёртвый поток.
+        // Before the stop writing is possible, after it not. The former check
+        // looked at how full the queues were and answered "alive" in any state,
+        // a dead thread included.
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(StoreConfig::new(dir.path())).unwrap();
-        assert!(store.is_writing(), "сразу после открытия writer работает");
+        assert!(store.is_writing(), "right after opening the writer runs");
         store.shutdown();
-        assert!(!store.is_writing(), "после остановки записи не идут");
+        assert!(!store.is_writing(), "after the stop no writes go through");
     }
 
     #[test]
@@ -1434,11 +1477,12 @@ mod tests {
 
     #[test]
     fn a_lost_epochs_file_never_renumbers_over_existing_segments() {
-        // Сквозная проверка связки «граница ↔ скан имён»: `boot_counter`
-        // попадает в имя каждого сегмента, а порядок имён объявлен временным.
-        // Начать нумерацию заново поверх сегментов, переживших потерю файла
-        // эпох, значит поставить новые записи в историю ПЕРЕД старыми:
-        // ротация примется за свежее, читатель отдаст историю вперемешку.
+        // An end-to-end check of the "floor ↔ name scan" pairing:
+        // `boot_counter` goes into the name of every segment, and the order of
+        // names is declared to be chronological. Restarting the numbering on
+        // top of segments that survived the loss of the epochs file means
+        // placing new records BEFORE the old ones: rotation will start on the
+        // fresh ones and a reader will hand the history back jumbled.
         use crate::schema::{EventDesc, Language, Schema, StorageClass};
         use dduroc_format::segment::SegmentName;
         use dduroc_format::{EventId, Level, ProtocolVersion};
@@ -1467,7 +1511,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
 
-        // Три запуска, каждый оставляет свой сегмент.
+        // Three runs, each leaving a segment of its own.
         for _ in 0..3 {
             let store = Store::open(cfg.clone()).unwrap();
             let ns = store.namespace("orc-0", schema).unwrap();
@@ -1488,17 +1532,17 @@ mod tests {
         };
         let before = names(&channel);
         let highest = before.iter().map(|n| n.boot.0).max().unwrap();
-        assert_eq!(highest, 2, "три запуска — сегменты запусков 0, 1, 2");
+        assert_eq!(highest, 2, "three runs: the segments of runs 0, 1, 2");
 
-        // Файл эпох потерян: чистка носителя, карантин после порчи — исход
-        // один и тот же.
+        // The epochs file is lost: a cleanup of the medium, a quarantine after
+        // corruption — the outcome is the same.
         std::fs::remove_file(dir.path().join(crate::epochs::EPOCHS_FILE)).unwrap();
 
         let store = Store::open(cfg).unwrap();
         assert!(
             store.boot_counter() > highest,
-            "номер запуска обязан продолжить, а не начать заново: \
-             {} против {highest} на диске",
+            "the run number must continue rather than start over: \
+             {} against {highest} on disk",
             store.boot_counter()
         );
         let ns = store.namespace("orc-0", schema).unwrap();
@@ -1506,26 +1550,27 @@ mod tests {
         ns.sync().unwrap();
         store.shutdown();
 
-        // И самое главное — следствие: новый сегмент сортируется ПОСЛЕ всех
-        // прежних, то есть попадает в конец истории, а не в её начало.
+        // And most importantly the consequence: the new segment sorts AFTER all
+        // the earlier ones, that is, it lands at the end of the history rather
+        // than at its start.
         let after = names(&channel);
         let fresh = after
             .iter()
             .find(|n| !before.contains(n))
-            .expect("новый сегмент создан");
+            .expect("a new segment was created");
         assert!(
             before.iter().all(|old| old.to_string() < fresh.to_string()),
-            "новое имя обязано сортироваться после старых: {fresh} против {before:?}"
+            "the new name must sort after the old ones: {fresh} against {before:?}"
         );
     }
 
     #[test]
     fn epoch_cleanup_keeps_runs_that_still_have_segments() {
-        // `epochs.bin` читается целиком при каждом старте и растёт на запись
-        // за перезапуск: двадцать перезапусков в сутки за пять лет — тридцать
-        // шесть тысяч записей. Уборка обязана выбрасывать запуски, от которых
-        // не осталось сегментов, и не трогать те, от которых осталось: их UTC
-        // потерялся бы вместе с записью об эпохе.
+        // `epochs.bin` is read whole at every start and grows by an entry per
+        // restart: twenty restarts a day over five years is thirty-six thousand
+        // entries. The cleanup has to throw out runs of which no segments are
+        // left and leave alone those of which some are: their UTC would be lost
+        // along with the epoch entry.
         use crate::schema::{EventDesc, Language, Schema, StorageClass};
         use dduroc_format::{EventId, Level, ProtocolVersion};
 
@@ -1553,7 +1598,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
 
-        // Запуск 0 оставляет после себя сегмент.
+        // Run 0 leaves a segment behind.
         {
             let store = Store::open(cfg.clone()).unwrap();
             let ns = store.namespace("orc-0", schema).unwrap();
@@ -1561,7 +1606,7 @@ mod tests {
             ns.sync().unwrap();
             store.shutdown();
         }
-        // Запуски 1..4 не пишут ничего — сегментов за ними нет.
+        // Runs 1..4 write nothing — no segments stand behind them.
         for _ in 0..3 {
             let store = Store::open(cfg.clone()).unwrap();
             store.shutdown();
@@ -1572,7 +1617,7 @@ mod tests {
         assert_eq!(store.locked_epochs().epochs().runs().len(), 5);
 
         let removed = store.compact_epochs().unwrap();
-        assert_eq!(removed, 3, "убраны запуски без сегментов");
+        assert_eq!(removed, 3, "runs without segments were removed");
 
         let kept: Vec<u32> = store
             .locked_epochs()
@@ -1584,19 +1629,19 @@ mod tests {
         assert_eq!(
             kept,
             vec![0, 4],
-            "остались запуск с сегментами и текущий — он ещё пишет"
+            "the run with segments and the current one, which is still writing, remain"
         );
 
-        // Записи запуска 0 по-прежнему переводятся в UTC.
+        // Run 0's records still convert to UTC.
         store
             .record_sync(utc_ms(1_700_000_000_000), SyncSource::Gps)
             .unwrap();
         assert!(
             store.to_utc(BootTime::from_raw(0, 0)).is_some(),
-            "уборка не имеет права лишать UTC живые данные"
+            "the cleanup has no right to deprive live data of its UTC"
         );
 
-        // Повторная уборка ничего не находит.
+        // A second cleanup finds nothing.
         assert_eq!(store.compact_epochs().unwrap(), 0);
         store.shutdown();
     }
@@ -1609,23 +1654,23 @@ mod tests {
         assert!(
             !s.record_sync(DateTime::UNIX_EPOCH, SyncSource::Gps)
                 .unwrap(),
-            "нулевое время"
+            "a zero time"
         );
         assert!(
             !s.record_sync(utc_ms(-1), SyncSource::Gps).unwrap(),
-            "отрицательное время"
+            "a negative time"
         );
         assert!(
             !s.record_sync(DateTime::<Utc>::MAX_UTC, SyncSource::Gps)
                 .unwrap(),
-            "время за пределами разумного"
+            "a time beyond the sensible"
         );
         assert!(
             s.record_sync(utc_ms(1_700_000_000_000), SyncSource::Ntp)
                 .unwrap(),
-            "правдоподобное время принимается"
+            "a plausible time is accepted"
         );
-        // Менее достоверный источник не перебивает.
+        // A less trustworthy source does not override.
         assert!(
             !s.record_sync(utc_ms(1_800_000_000_000), SyncSource::User)
                 .unwrap()
@@ -1635,12 +1680,12 @@ mod tests {
                 .unwrap()
         );
 
-        // Конверсия туда и обратно: запись текущего момента получает UTC.
+        // A round trip: a record of the current moment gets a UTC.
         let at = s.now();
-        let utc = s.to_utc(at).expect("якорь есть");
+        let utc = s.to_utc(at).expect("there is an anchor");
         assert!(
             (1_800_000_000_000..1_800_000_001_000).contains(&utc.timestamp_millis()),
-            "UTC рядом с точкой синхронизации: {utc}"
+            "the UTC is close to the synchronization point: {utc}"
         );
     }
 
@@ -1652,7 +1697,10 @@ mod tests {
         let wrapped = next_span_id(&c);
         assert_ne!(a.0, 0);
         assert_ne!(b.0, 0);
-        assert_ne!(wrapped.0, 0, "после переполнения нельзя выдавать сентинел");
+        assert_ne!(
+            wrapped.0, 0,
+            "the sentinel must not be handed out after an overflow"
+        );
     }
 
     #[test]
