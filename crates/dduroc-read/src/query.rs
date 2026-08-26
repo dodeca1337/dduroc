@@ -1,47 +1,48 @@
-//! Запрос: что читать и в каком порядке.
+//! A query: what to read and in what order.
 //!
-//! # Время в границах запроса
+//! # Time in a query's bounds
 //!
-//! Границы задаются одним типом — [`Timestamp`], — и он либо относительный
-//! ([`BootTime`]: запуск плюс микросекунды от его старта), либо настенный
-//! (`DateTime<Utc>`). Раньше здесь лежали `boot: Option<u32>` и
-//! `from/to: Option<Micros>` по отдельности, и смысл пары зависел от того,
-//! задан ли `boot`: без него микросекунды прикладывались к шкале **каждого**
-//! запуска, то есть «первые десять секунд любого запуска» и «десять секунд
-//! конкретного запуска» выражались одинаково.
+//! The bounds are given by one type — [`Timestamp`] — and it is either relative
+//! ([`BootTime`]: a run plus microseconds since it started) or wall-clock
+//! (`DateTime<Utc>`). This used to be `boot: Option<u32>` and `from/to:
+//! Option<Micros>` separately, and the meaning of the pair depended on whether
+//! `boot` was given: without it the microseconds applied to the scale of
+//! **every** run, so "the first ten seconds of any run" and "ten seconds of a
+//! particular run" were expressed the same way.
 //!
-//! Настенные границы сравнимы с записями только через якорь синхронизации
-//! (см. [`dduroc_engine::epochs`]), поэтому перед сканированием они
-//! переводятся в шкалу каждого запуска — [`Query::resolve`]. Запуск без якоря
-//! сопоставить с настенным временем нечем; он выпадает из выборки, и об этом
-//! сообщается явно ([`Resolution::unanchored`]), а не молча.
+//! Wall-clock bounds are comparable with records only through a
+//! synchronization anchor (see [`dduroc_engine::epochs`]), so before scanning
+//! they are converted into the scale of each run — [`Query::resolve`]. A run
+//! with no anchor cannot be matched against wall-clock time at all; it drops
+//! out of the selection, and that is reported explicitly
+//! ([`Resolution::unanchored`]) rather than silently.
 
 use dduroc_engine::epochs::{Epochs, RunOffset};
 use dduroc_engine::schema::StorageClass;
 use dduroc_format::{BootCounter, BootTime, EventId, Level, Micros, SpanId};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-/// Момент времени в границах запроса.
+/// A moment in time in a query's bounds.
 ///
-/// Две шкалы, а не два поля: у прибора без RTC есть относительное время
-/// всегда, настенное — только после синхронизации, и подменять одно другим
-/// нельзя.
+/// Two scales rather than two fields: a device without an RTC always has
+/// relative time and wall-clock time only after a synchronization, and one
+/// must not be substituted for the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Timestamp {
-    /// Относительное время: запуск и микросекунды от его старта.
+    /// Relative time: a run and microseconds since it started.
     Boot(BootTime),
-    /// Настенное время. Записи запуска, чья загрузка не синхронизирована,
-    /// сопоставить с ним нечем — они выпадут из выборки.
+    /// Wall-clock time. The records of a run whose boot was never synchronized
+    /// cannot be matched against it — they will drop out of the selection.
     Utc(chrono::DateTime<chrono::Utc>),
 }
 
 impl Timestamp {
-    /// Относительная ли шкала.
+    /// Whether the scale is the relative one.
     pub const fn is_relative(self) -> bool {
         matches!(self, Timestamp::Boot(_))
     }
 
-    /// Момент на микросекунду раньше — граница «строго до».
+    /// The moment one microsecond earlier — a "strictly before" bound.
     pub fn just_before(self) -> Self {
         match self {
             Timestamp::Boot(bt) => {
@@ -73,8 +74,8 @@ impl std::fmt::Display for Timestamp {
     }
 }
 
-/// Границы окна в относительной шкале одного запуска. Обе включительные,
-/// `None` — ограничения нет.
+/// The bounds of a window in one run's relative scale. Both inclusive; `None`
+/// means there is no bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunBounds {
     pub from: Option<Micros>,
@@ -87,50 +88,52 @@ impl RunBounds {
     }
 }
 
-/// Границы запроса, приведённые к тому, что можно сравнивать с записями.
+/// A query's bounds brought to something comparable with records.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Bounds {
-    /// Ограничений по времени нет.
+    /// There are no time bounds.
     #[default]
     All,
-    /// Относительные границы. Сравниваются лексикографически по (запуск, µs) —
-    /// это и есть хронологический порядок, потому что счётчик запусков растёт.
+    /// Relative bounds. Compared lexicographically by (run, µs) — which is the
+    /// chronological order, because the run counter grows.
     Relative {
         from: Option<BootTime>,
         to: Option<BootTime>,
     },
-    /// Настенные границы, переведённые по якорям в шкалу каждого запуска.
+    /// Wall-clock bounds converted by the anchors into each run's scale.
     Wall {
-        /// Запуски, попавшие в окно, с границами в их собственной шкале.
+        /// The runs that fell in the window, with bounds in their own scale.
         runs: BTreeMap<u32, RunBounds>,
-        /// Запуски, у которых есть якорь. Нужно, чтобы отличить «этого
-        /// запуска нет в окне» от «его нечем с окном сравнить»: второе — про
-        /// данные, которые есть, но остались за кадром, и о них надо сказать.
+        /// The runs that have an anchor. Needed to tell "this run is not in the
+        /// window" from "there is nothing to compare it with": the second is
+        /// about data that exists but stayed out of frame, and that has to be
+        /// said.
         anchored: BTreeSet<u32>,
     },
 }
 
-/// Как окно ложится на записи одного запуска.
+/// How a window falls on one run's records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
-    /// Запуск нужен, вот его границы.
+    /// The run is wanted; here are its bounds.
     In(RunBounds),
-    /// Запуск целиком вне окна.
+    /// The run is entirely outside the window.
     Outside,
-    /// Окно задано настенным временем, а якоря у запуска нет: попадают ли его
-    /// записи в окно — неизвестно, и они выпадают из выборки.
+    /// The window is given in wall-clock time and the run has no anchor:
+    /// whether its records fall in the window is unknown, and they drop out of
+    /// the selection.
     Unanchored,
 }
 
 impl Bounds {
-    /// Как окно ложится на записи запуска.
+    /// How a window falls on a run's records.
     pub fn fit(&self, boot: BootCounter) -> Fit {
         match self {
             Bounds::All => Fit::In(RunBounds::default()),
             Bounds::Relative { from, to } => {
-                // Границы соседних запусков превращаются в «весь этот запуск
-                // внутри окна» либо в «его тут нет вовсе»: сравнивать
-                // микросекунды разных запусков нельзя.
+                // The bounds of neighbouring runs turn into "this whole run is
+                // inside the window" or "it is not here at all": microseconds
+                // of different runs cannot be compared.
                 let from = match from {
                     Some(b) if b.boot > boot => return Fit::Outside,
                     Some(b) if b.boot == boot => Some(b.at),
@@ -146,16 +149,17 @@ impl Bounds {
             Bounds::Wall { runs, anchored } => match runs.get(&boot.0) {
                 Some(b) => Fit::In(*b),
                 None if anchored.contains(&boot.0) => Fit::Outside,
-                // Сюда попадает и запуск, которого нет в `epochs.bin` вовсе:
-                // дамп могли скопировать без него, и тогда настенного времени
-                // у его записей нет — ровно как без синхронизации.
+                // This also covers a run that is not in `epochs.bin` at all: a
+                // dump may have been copied without it, and then its records
+                // have no wall-clock time — exactly as without a
+                // synchronization.
                 None => Fit::Unanchored,
             },
         }
     }
 
-    /// Что разрешено записям этого запуска. `None` — запуск не нужен целиком,
-    /// его сегменты можно не открывать вовсе.
+    /// What is allowed for this run's records. `None` means the run is not
+    /// wanted at all and its segments need not be opened.
     pub fn for_boot(&self, boot: BootCounter) -> Option<RunBounds> {
         match self.fit(boot) {
             Fit::In(b) => Some(b),
@@ -163,46 +167,46 @@ impl Bounds {
         }
     }
 
-    /// Попадает ли момент в окно.
+    /// Whether a moment falls in the window.
     pub fn contains(&self, at: BootTime) -> bool {
         self.for_boot(at.boot).is_some_and(|b| b.contains(at.at))
     }
 }
 
-/// Разрешённые границы вместе с тем, что пришлось из-за них отбросить.
+/// The resolved bounds together with what had to be dropped because of them.
 #[derive(Debug, Clone, Default)]
 pub struct Resolution {
     pub bounds: Bounds,
-    /// Запуски **из реестра эпох**, которые настенное окно сопоставить не
-    /// может: якоря у них нет.
+    /// The runs **from the epoch registry** that a wall-clock window cannot
+    /// match: they have no anchor.
     ///
-    /// Это ответ про реестр, а не про выборку: у запуска может не оказаться
-    /// ни одного сегмента в запрошенных каналах. То, что действительно выпало
-    /// из ответа, читатель собирает по сегментам — см.
+    /// This is an answer about the registry, not about the selection: a run may
+    /// turn out to have no segments in the channels asked for. What really
+    /// dropped out of the answer the reader collects from the segments — see
     /// `QueryResult::unanchored`.
     pub unanchored: Vec<BootCounter>,
 }
 
-/// Порядок выдачи.
+/// The order records come back in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Order {
-    /// От старого к новому.
+    /// Oldest to newest.
     Oldest,
-    /// От нового к старому — то, что нужно интерфейсу по умолчанию.
+    /// Newest to oldest — what an interface wants by default.
     #[default]
     Newest,
 }
 
-/// Выбор неймспейсов.
+/// The choice of namespaces.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NsSelect {
-    /// Все.
+    /// All of them.
     #[default]
     All,
-    /// По точным именам.
+    /// By exact name.
     Names(Vec<String>),
-    /// Группа: неймспейсы с общим префиксом (`orc-` — оркестраторы,
-    /// `apt-` — адаптеры).
+    /// A group: the namespaces sharing a prefix (`orc-` for orchestrators,
+    /// `apt-` for adapters).
     Group(String),
 }
 
@@ -211,43 +215,44 @@ impl NsSelect {
         match self {
             NsSelect::All => true,
             NsSelect::Names(names) => names.iter().any(|n| n == name),
-            // Правило одно на чтение и на запись: «журналы оркестраторов» и
-            // «настройки оркестраторов» обязаны обозначать одно множество.
+            // One rule for reading and for writing: "the orchestrators'
+            // journals" and "the orchestrators' settings" have to denote one
+            // set.
             NsSelect::Group(prefix) => dduroc_engine::store::in_group(prefix, name),
         }
     }
 }
 
-/// Фильтр по содержимому.
+/// A filter on content.
 ///
-/// Уровни и тэги — статические свойства типов, поэтому фильтрация по ним
-/// не требует чтения записей: она сводится к вычислению множества
-/// идентификаторов по схеме **до** сканирования.
+/// Levels and tags are static properties of types, so filtering by them
+/// requires no reading of records: it reduces to computing a set of
+/// identifiers from the schema **before** any scanning.
 ///
-/// Контентный фильтр (тэги, типы, имена) применяется к записям, у которых
-/// такое свойство есть, и **исключает** записи, которые не могут ему
-/// удовлетворить: свободный текст и спаны не несут ни тэгов, ни типа события
-/// и при таком фильтре выпадают. Тэги есть у сообщений и отсчётов (у метрик —
-/// свои), типы — только у сообщений. `min_level` — иное: уровень есть у
-/// сообщений и текста, а телеметрия и спаны вне шкалы уровней и по нему не
-/// отсеиваются.
+/// A content filter (tags, types, names) applies to the records that have such
+/// a property and **excludes** the records that cannot satisfy it: free text
+/// and spans carry neither tags nor an event type and drop out under such a
+/// filter. Messages and samples have tags (metrics have their own); only
+/// messages have types. `min_level` is different: messages and text have a
+/// level, while telemetry and spans are outside the level scale and are not
+/// filtered out by it.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
-    /// Минимальный уровень (включительно).
+    /// The minimum level (inclusive).
     pub min_level: Option<Level>,
-    /// Требуемые тэги: запись должна нести хотя бы один из них.
+    /// The tags required: a record has to carry at least one of them.
     pub any_tags: Vec<String>,
-    /// Конкретные типы событий.
+    /// Particular event types.
     pub events: Option<HashSet<EventId>>,
-    /// Имена событий — резолвятся по схеме.
+    /// Event names — resolved from the schema.
     pub event_names: Vec<String>,
-    /// Только записи, привязанные к этим спанам.
+    /// Only records attached to these spans.
     pub spans: Option<HashSet<SpanId>>,
-    /// Какие разновидности записей нужны.
+    /// Which kinds of record are wanted.
     pub kinds: KindFilter,
 }
 
-/// Какие разновидности записей включать.
+/// Which kinds of record to include.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KindFilter {
     pub messages: bool,
@@ -268,7 +273,7 @@ impl Default for KindFilter {
 }
 
 impl KindFilter {
-    /// Только сообщения и свободный текст — «журнал» в привычном смысле.
+    /// Messages and free text only — a "journal" in the usual sense.
     pub const LOGS: Self = Self {
         messages: true,
         spans: false,
@@ -276,7 +281,7 @@ impl KindFilter {
         text: true,
     };
 
-    /// Только телеметрия.
+    /// Telemetry only.
     pub const TELEMETRY: Self = Self {
         messages: false,
         spans: false,
@@ -284,7 +289,7 @@ impl KindFilter {
         text: false,
     };
 
-    /// Только спаны.
+    /// Spans only.
     pub const SPANS: Self = Self {
         messages: false,
         spans: true,
@@ -293,36 +298,37 @@ impl KindFilter {
     };
 }
 
-/// Запрос.
+/// A query.
 ///
-/// Строится цепочкой: каждый метод возвращает новый запрос, а не меняет
-/// существующий. `q.limit(500);` отдельным выражением потерялось бы целиком.
+/// Built as a chain: every method returns a new query rather than mutating the
+/// existing one. `q.limit(500);` as a standalone expression would be lost
+/// whole.
 #[derive(Debug, Clone, Default)]
-#[must_use = "запрос строится цепочкой: результат метода и есть настроенный запрос"]
+#[must_use = "a query is built as a chain: a method's result is the configured query"]
 pub struct Query {
     pub namespaces: NsSelect,
-    /// Каналы по классам хранения. Пусто — все.
+    /// The channels, by storage class. Empty means all of them.
     pub channels: Vec<StorageClass>,
-    /// Ограничение по запуску ПО: только его сегменты.
+    /// A restriction to one software run: its segments only.
     pub boot: Option<BootCounter>,
-    /// Нижняя граница окна, включительно.
+    /// The window's lower bound, inclusive.
     pub from: Option<Timestamp>,
-    /// Верхняя граница окна, включительно.
+    /// The window's upper bound, inclusive.
     pub to: Option<Timestamp>,
     pub filter: Filter,
     pub order: Order,
-    /// Максимум записей в ответе.
+    /// The maximum number of records in the answer.
     pub limit: Option<usize>,
-    /// Дотянуть состояния на левый край окна.
+    /// Carry states through to the window's left edge.
     ///
-    /// Состояния пишут **по изменению**, а не периодически — иначе в них нет
-    /// смысла. Значит окно `from..to` может не содержать ни одного отсчёта
-    /// ряда, который всё это время держал одно значение, и полоса состояний
-    /// на графике осталась бы пустой, хотя состояние было известно.
+    /// States are written **on change** rather than periodically — otherwise
+    /// there is no point to them. So a `from..to` window may contain not a
+    /// single sample of a series that held one value the whole time, and the
+    /// state band on a chart would stay empty although the state was known.
     ///
-    /// С этим флагом ответ несёт ещё и последний отсчёт каждого
-    /// ряда-состояния, сделанный **до** `from` — отдельно от `entries`, чтобы
-    /// не нарушать обещание «всё в ответе лежит внутри диапазона».
+    /// With this flag the answer also carries the last sample of every state
+    /// series taken **before** `from` — separately from `entries`, so as not to
+    /// break the promise that everything in the answer lies inside the range.
     pub seed_states: bool,
 }
 
@@ -341,37 +347,38 @@ impl Query {
         self
     }
 
-    /// Читать только каналы этого класса хранения.
+    /// Read only the channels of this storage class.
     ///
-    /// Класс — перечисление, а не имя: канал с опечаткой непредставим.
+    /// The class is an enum rather than a name: a misspelled channel is
+    /// unrepresentable.
     pub fn channel(mut self, class: StorageClass) -> Self {
         self.channels.push(class);
         self
     }
 
-    /// Окно времени `from..=to` — пара к [`Query::boot_window`], но границы
-    /// любой шкалы. Шкалы могут и различаться, только смешивать их стоит
-    /// осознанно: настенная граница переводится по якорю, и запуск без
-    /// якоря выпадет из выборки целиком.
+    /// The time window `from..=to` — a companion to [`Query::boot_window`], but
+    /// with bounds in either scale. The scales may differ, only mixing them is
+    /// worth doing knowingly: a wall-clock bound is converted by an anchor, and
+    /// a run without one drops out of the selection entirely.
     pub fn time_window(mut self, from: impl Into<Timestamp>, to: impl Into<Timestamp>) -> Self {
         self.from = Some(from.into());
         self.to = Some(to.into());
         self
     }
 
-    /// Только нижняя граница.
+    /// The lower bound only.
     pub fn since(mut self, from: impl Into<Timestamp>) -> Self {
         self.from = Some(from.into());
         self
     }
 
-    /// Только верхняя граница.
+    /// The upper bound only.
     pub fn until(mut self, to: impl Into<Timestamp>) -> Self {
         self.to = Some(to.into());
         self
     }
 
-    /// Окно внутри одного запуска — обычный случай для относительного времени.
+    /// A window inside one run — the ordinary case for relative time.
     pub fn boot_window(mut self, boot: impl Into<BootCounter>, from: Micros, to: Micros) -> Self {
         let boot = boot.into();
         self.boot = Some(boot);
@@ -390,16 +397,16 @@ impl Query {
         self
     }
 
-    /// Только записи с этим тэгом. Несколько вызовов — «хотя бы один из».
+    /// Only records with this tag. Several calls mean "at least one of".
     ///
-    /// Тэг несут сообщения и отсчёты; текст и спаны при таком фильтре
-    /// выпадают — см. [`Filter`].
+    /// Messages and samples carry tags; text and spans drop out under such a
+    /// filter — see [`Filter`].
     pub fn any_tag(mut self, tag: impl Into<String>) -> Self {
         self.filter.any_tags.push(tag.into());
         self
     }
 
-    /// Только события этого типа. Несколько вызовов — «любой из названных».
+    /// Only events of this type. Several calls mean "any of those named".
     pub fn event(mut self, id: EventId) -> Self {
         self.filter
             .events
@@ -408,13 +415,13 @@ impl Query {
         self
     }
 
-    /// Только события с этим именем (резолвится по схеме).
+    /// Only events with this name (resolved from the schema).
     pub fn event_name(mut self, name: impl Into<String>) -> Self {
         self.filter.event_names.push(name.into());
         self
     }
 
-    /// Только записи, привязанные к этому спану.
+    /// Only records attached to this span.
     pub fn span(mut self, id: SpanId) -> Self {
         self.filter
             .spans
@@ -438,17 +445,19 @@ impl Query {
         self
     }
 
-    /// Дотянуть состояния на левый край окна — см. [`Query::seed_states`].
+    /// Carry states through to the window's left edge — see
+    /// [`Query::seed_states`].
     pub fn with_state_seed(mut self) -> Self {
         self.seed_states = true;
         self
     }
 
-    /// Привести границы к тому, что можно сравнивать с записями.
+    /// Bring the bounds to something comparable with records.
     ///
-    /// Пока обе границы относительные, эпохи не нужны вовсе — сравнение идёт
-    /// по (запуск, µs). Стоит появиться настенной границе, и приходится
-    /// разбирать окно по запускам: у каждого своя шкала и свой якорь.
+    /// While both bounds are relative, the epochs are not needed at all — the
+    /// comparison goes by (run, µs). The moment a wall-clock bound appears, the
+    /// window has to be broken down by run: each has its own scale and its own
+    /// anchor.
     pub fn resolve(&self, epochs: &Epochs) -> Resolution {
         let relative = self.from.is_none_or(Timestamp::is_relative)
             && self.to.is_none_or(Timestamp::is_relative);
@@ -495,17 +504,18 @@ fn boot_time(t: Timestamp) -> Option<BootTime> {
     }
 }
 
-/// Перевести границы окна в шкалу одного запуска.
+/// Convert a window's bounds into one run's scale.
 fn run_bounds(boot: u32, from: Option<Timestamp>, to: Option<Timestamp>, epochs: &Epochs) -> Fit {
     let lower = match from {
         None => None,
-        // Запуск раньше границы — весь позади; позже — весь внутри.
+        // A run earlier than the bound is all behind it; later, all inside.
         Some(Timestamp::Boot(b)) if b.boot.0 > boot => return Fit::Outside,
         Some(Timestamp::Boot(b)) if b.boot.0 == boot => Some(b.at),
         Some(Timestamp::Boot(_)) => None,
         Some(Timestamp::Utc(t)) => match epochs.from_utc(boot, t) {
             RunOffset::Unanchored => return Fit::Unanchored,
-            // Запуск начался позже нижней границы — ограничивать нечего.
+            // The run started later than the lower bound — there is nothing to
+            // restrict.
             RunOffset::BeforeStart => None,
             RunOffset::At(m) => Some(m),
         },
@@ -517,7 +527,7 @@ fn run_bounds(boot: u32, from: Option<Timestamp>, to: Option<Timestamp>, epochs:
         Some(Timestamp::Boot(_)) => None,
         Some(Timestamp::Utc(t)) => match epochs.from_utc(boot, t) {
             RunOffset::Unanchored => return Fit::Unanchored,
-            // Запуск начался позже верхней границы — его тут нет.
+            // The run started later than the upper bound — it is not here.
             RunOffset::BeforeStart => return Fit::Outside,
             RunOffset::At(m) => Some(m),
         },
@@ -543,7 +553,7 @@ mod tests {
         assert!(names.matches("orc-radio-0"));
         assert!(!names.matches("orc-radio-1"));
 
-        assert!(NsSelect::All.matches("что угодно"));
+        assert!(NsSelect::All.matches("anything at all"));
     }
 
     #[test]
@@ -560,7 +570,8 @@ mod tests {
         assert!(r.bounds.contains(b(200)));
         assert!(!r.bounds.contains(b(201)));
 
-        // Без границ проходит всё, включая запуски, о которых эпохи не знают.
+        // With no bounds everything passes, runs the epochs know nothing of
+        // included.
         let all = Query::new().resolve(&epochs);
         assert_eq!(all.bounds, Bounds::All);
         assert!(all.bounds.contains(BootTime::from_raw(9, u64::MAX)));
@@ -568,17 +579,17 @@ mod tests {
 
     #[test]
     fn relative_bounds_span_runs_lexicographically() {
-        // Граница живёт в шкале своего запуска, поэтому «от середины запуска 1»
-        // означает: весь запуск 0 позади, у запуска 1 отсечена середина, запуск
-        // 2 внутри целиком. Раньше это выражалось `boot` + `Micros` по
-        // отдельности, и микросекунды прикладывались к каждому запуску.
+        // A bound lives in the scale of its own run, so "from the middle of run
+        // 1" means: all of run 0 is behind, run 1 is cut in the middle, run 2
+        // is inside entirely. This used to be expressed by `boot` plus `Micros`
+        // separately, and the microseconds applied to every run.
         let q = Query::new().since(BootTime::from_raw(1, 500));
         let bounds = q.resolve(&Epochs::default()).bounds;
 
         assert_eq!(
             bounds.for_boot(BootCounter(0)),
             None,
-            "запуск 0 весь позади"
+            "run 0 is entirely behind"
         );
         assert_eq!(
             bounds.for_boot(BootCounter(1)),
@@ -590,14 +601,14 @@ mod tests {
         assert_eq!(
             bounds.for_boot(BootCounter(2)),
             Some(RunBounds::default()),
-            "запуск 2 внутри окна целиком"
+            "run 2 is inside the window entirely"
         );
 
         assert!(!bounds.contains(BootTime::from_raw(0, u64::MAX)));
         assert!(bounds.contains(BootTime::from_raw(1, 500)));
         assert!(bounds.contains(BootTime::from_raw(2, 0)));
 
-        // Верхняя граница — симметрично.
+        // The upper bound, symmetrically.
         let bounds = Query::new()
             .until(BootTime::from_raw(1, 500))
             .resolve(&Epochs::default())
@@ -611,7 +622,7 @@ mod tests {
     fn wall_bounds_drop_unanchored_runs_and_say_so() {
         use dduroc_engine::epochs::{HwBoot, Run};
 
-        // Два запуска одной загрузки железа плюс запуск загрузки без якоря.
+        // Two runs of one hardware boot plus a run of a boot with no anchor.
         let anchor_ms = 1_700_000_000_000;
         let epochs = Epochs {
             runs: vec![
@@ -645,7 +656,8 @@ mod tests {
         };
 
         let utc = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).unwrap();
-        // Окно: от 3-й до 5-й секунды BOOTTIME первой загрузки.
+        // The window: from the 3rd to the 5th second of the first boot's
+        // BOOTTIME.
         let r = Query::new()
             .time_window(utc(anchor_ms + 3_000), utc(anchor_ms + 5_000))
             .resolve(&epochs);
@@ -653,23 +665,23 @@ mod tests {
         assert_eq!(
             r.bounds.for_boot(BootCounter(0)),
             Some(RunBounds {
-                from: Some(Micros(2_000_000)), // 3 с BOOTTIME − 1 с старта run'а
+                from: Some(Micros(2_000_000)), // 3 s of BOOTTIME minus the run's 1 s start
                 to: Some(Micros(4_000_000)),
             })
         );
         assert_eq!(
             r.bounds.for_boot(BootCounter(1)),
             None,
-            "запуск без якоря не сравнить с настенным временем"
+            "a run with no anchor cannot be matched against wall-clock time"
         );
         assert_eq!(
             r.unanchored,
             vec![BootCounter(1)],
-            "выпавший запуск обязан быть назван"
+            "a run that dropped out must be named"
         );
 
-        // Запуска, о котором эпохи не знают, при настенных границах тоже нет:
-        // якоря у него взяться неоткуда.
+        // A run the epochs know nothing of is absent under wall-clock bounds
+        // too: there is nowhere for it to get an anchor.
         assert_eq!(r.bounds.for_boot(BootCounter(42)), None);
     }
 
@@ -693,17 +705,22 @@ mod tests {
         };
         let utc = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).unwrap();
 
-        // Нижняя граница раньше старта запуска: ограничивать нечего.
+        // A lower bound earlier than the run started: there is nothing to
+        // restrict.
         let r = Query::new().since(utc(anchor_ms + 1_000)).resolve(&epochs);
         assert_eq!(
             r.bounds.for_boot(BootCounter(0)),
             Some(RunBounds::default())
         );
 
-        // Верхняя граница раньше старта: запуска в окне нет вовсе.
+        // An upper bound earlier than the start: the run is not in the window
+        // at all.
         let r = Query::new().until(utc(anchor_ms + 1_000)).resolve(&epochs);
         assert_eq!(r.bounds.for_boot(BootCounter(0)), None);
-        assert!(r.unanchored.is_empty(), "якорь есть, дело не в нём");
+        assert!(
+            r.unanchored.is_empty(),
+            "there is an anchor; it is not the problem"
+        );
     }
 
     #[test]
@@ -712,9 +729,9 @@ mod tests {
         assert_eq!(
             t.just_before(),
             Timestamp::Boot(BootTime::from_raw(2, 99)),
-            "запуск не меняется: шкала та же"
+            "the run does not change: the scale is the same"
         );
-        // На нуле шага нет — вычитать не из чего.
+        // At zero there is no step back — there is nothing to subtract from.
         assert_eq!(
             Timestamp::Boot(BootTime::from_raw(2, 0)).just_before(),
             Timestamp::Boot(BootTime::from_raw(2, 0))
@@ -722,15 +739,15 @@ mod tests {
 
         let utc = chrono::DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap();
         let Timestamp::Utc(back) = Timestamp::Utc(utc).just_before() else {
-            panic!("шкала не должна меняться");
+            panic!("the scale must not change");
         };
         assert_eq!(back.timestamp_micros(), 1_699_999_999_999_999);
     }
 
     #[test]
     fn kind_presets() {
-        // Значения константные, поэтому сравниваем структуры целиком:
-        // так проверка не вырождается в тавтологию для компилятора.
+        // The values are constants, so whole structs are compared: that keeps
+        // the check from degenerating into a tautology for the compiler.
         assert_eq!(
             KindFilter::LOGS,
             KindFilter {

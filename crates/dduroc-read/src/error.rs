@@ -1,23 +1,23 @@
-//! Ошибки чтения.
+//! Read errors.
 
 use std::path::PathBuf;
 
-/// Отказ чтения.
+/// A read failure.
 ///
-/// Перечисление **открытое** по той же причине, что и [`dduroc_engine::Error`]:
-/// новая причина отказа — это новая проверка, а не новое решение вызывающего.
+/// The enum is **open** for the same reason as [`dduroc_engine::Error`]: a new
+/// cause of failure is a new check, not a new decision by the caller.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReadError {
     #[error(transparent)]
     Engine(#[from] dduroc_engine::Error),
 
-    #[error("формат: {0}")]
+    #[error("format: {0}")]
     Format(#[from] dduroc_format::Error),
 
     #[error(
-        "сегмент {path} принадлежит другому хранилищу (ожидалось {expected:#018x}, \
-         в файле {found:#018x})"
+        "segment {path} belongs to another store (expected {expected:#018x}, \
+         the file says {found:#018x})"
     )]
     ForeignStore {
         path: PathBuf,
@@ -26,21 +26,21 @@ pub enum ReadError {
     },
 
     #[error(
-        "дамп неполон: у неймспейса {namespace:?} нет дерева класса {class} — \
-         хранилище писало этот класс в свой корень, назовите ВСЕ корни дампа"
+        "the dump is incomplete: namespace {namespace:?} has no tree for class {class} — \
+         the store wrote that class to a root of its own, name ALL the dump's roots"
     )]
     IncompleteDump {
         namespace: String,
         class: dduroc_engine::schema::StorageClass,
     },
 
-    #[error("недопустимый шаблон выбора неймспейсов {0:?}")]
+    #[error("invalid namespace selection pattern {0:?}")]
     BadPattern(String),
 
-    #[error("на такой запрос нельзя подписаться: {0}")]
+    #[error("such a query cannot be subscribed to: {0}")]
     NotFollowable(&'static str),
 
-    #[error("недопустимый курсор пагинации")]
+    #[error("invalid pagination cursor")]
     BadCursor,
 
     #[error("io: {context}: {source}")]
