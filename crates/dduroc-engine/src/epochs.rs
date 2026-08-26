@@ -1,22 +1,23 @@
-//! Эпохи: связь относительного времени с абсолютным.
+//! Epochs: what ties relative time to absolute time.
 //!
-//! Два уровня идентичности:
+//! There are two levels of identity:
 //!
-//! - **run** (`boot_counter`) — один запуск процесса. Растёт при каждом старте.
-//! - **hardware boot** (`hw_boot_id`) — одна загрузка железа. Определяется по
-//!   `/proc/sys/kernel/random/boot_id`: ядро генерирует этот UUID при загрузке,
-//!   и он не зависит от того, в какой момент стартовало ПО. (Прототип различал
-//!   загрузки по возрастанию `CLOCK_BOOTTIME`, что ошибалось при быстром
-//!   рестарте после перезагрузки.)
+//! - a **run** (`boot_counter`) — one execution of the process. It grows on
+//!   every start.
+//! - a **hardware boot** (`hw_boot_id`) — one boot of the hardware. Determined
+//!   from `/proc/sys/kernel/random/boot_id`: the kernel generates that UUID at
+//!   boot, and it does not depend on when the software started. (The prototype
+//!   told boots apart by `CLOCK_BOOTTIME` increasing, which got it wrong on a
+//!   quick restart after a reboot.)
 //!
-//! **UTC-якорь хранится на hardware boot** — это UTC-время, соответствующее
-//! `CLOCK_BOOTTIME == 0`. Одна синхронизация даёт абсолютное время всем
-//! событиям этой загрузки, включая записанные **до** синхронизации: конверсия
-//! выполняется при чтении.
+//! **The UTC anchor is stored per hardware boot** — it is the UTC time
+//! corresponding to `CLOCK_BOOTTIME == 0`. One synchronization gives absolute
+//! time to every event of that boot, including those recorded **before** the
+//! synchronization: the conversion happens at read time.
 //!
-//! Якорь **обновляемый, с приоритетом источника**: `User < Ntp < Gps`.
-//! Сначала оператор мог ввести время руками, потом пришёл GPS — якорь
-//! уточняется. Обратно (ручное поверх GPS) — нет.
+//! The anchor is **updatable, with source priority**: `User < Ntp < Gps`. An
+//! operator may have entered the time by hand first and GPS arrived later — the
+//! anchor is refined. The other way round (by hand over GPS) it is not.
 
 use crate::clock::boottime_us;
 use crate::error::{Error, IoContext, Result};
@@ -26,15 +27,15 @@ use dduroc_format::{BootTime, Micros};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Имя файла эпох в корне хранилища.
+/// The name of the epochs file in the store root.
 pub const EPOCHS_FILE: &str = "epochs.bin";
 
-/// Источник синхронизации времени. Порядок — приоритет: более достоверный
-/// источник перезаписывает менее достоверный, но не наоборот.
+/// The source of a time synchronization. The order is the priority: a more
+/// trustworthy source overwrites a less trustworthy one, but not the reverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SyncSource {
-    /// Введено оператором.
+    /// Entered by an operator.
     User = 1,
     Ntp = 2,
     Gps = 3,
@@ -50,60 +51,62 @@ impl SyncSource {
     }
 }
 
-/// Один запуск процесса.
+/// One execution of the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
     pub boot_counter: u32,
     pub hw_boot_id: u32,
-    /// `CLOCK_BOOTTIME` в момент регистрации run'а. Та же величина служит
-    /// базой [`crate::clock::Clock`], поэтому
-    /// `boottime_at_init_us + micros_события` — точное BOOTTIME события.
+    /// `CLOCK_BOOTTIME` at the moment the run was registered. The same value
+    /// serves as the base of [`crate::clock::Clock`], so
+    /// `boottime_at_init_us + event_micros` is the event's exact BOOTTIME.
     pub boottime_at_init_us: u64,
 }
 
-/// Одна загрузка железа.
+/// One boot of the hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HwBoot {
     pub hw_boot_id: u32,
-    /// UUID из `/proc/sys/kernel/random/boot_id`.
+    /// The UUID from `/proc/sys/kernel/random/boot_id`.
     pub kernel_boot_id: [u8; 16],
-    /// UTC (мс), соответствующее `CLOCK_BOOTTIME == 0`. `None` — не было
-    /// синхронизации: события этой загрузки имеют только относительное время.
+    /// The UTC (ms) corresponding to `CLOCK_BOOTTIME == 0`. `None` means there
+    /// was no synchronization: the events of this boot have relative time only.
     ///
-    /// На диске — миллисекунды целым, а не разобранная дата: восемь байт
-    /// против двенадцати у сериализованного `DateTime`, и никакой зависимости
-    /// формата файла от представления даты в чужом крейте. Наружу отдаётся
-    /// нормальный тип — [`HwBoot::utc_anchor`].
+    /// On disk this is milliseconds as an integer rather than a parsed date:
+    /// eight bytes against twelve for a serialized `DateTime`, and no
+    /// dependence of the file format on how some other crate represents a date.
+    /// What is handed out is a normal type — [`HwBoot::utc_anchor`].
     pub utc_anchor_ms: Option<i64>,
     pub anchor_source: Option<SyncSource>,
-    /// `CLOCK_BOOTTIME` в момент фиксации якоря.
+    /// `CLOCK_BOOTTIME` at the moment the anchor was recorded.
     pub anchor_captured_us: Option<u64>,
 }
 
 impl HwBoot {
-    /// Якорь как момент времени. `None` — синхронизации не было.
+    /// The anchor as a moment in time. `None` means there was no
+    /// synchronization.
     pub fn utc_anchor(&self) -> Option<DateTime<Utc>> {
         DateTime::from_timestamp_millis(self.utc_anchor_ms?)
     }
 }
 
-/// Куда настенный момент попадает в относительной шкале запуска.
+/// Where a wall-clock moment falls in a run's relative scale.
 ///
-/// Трёхзначность здесь по делу: «раньше старта» и «якоря нет» — разные вещи.
-/// Первое — обычное дело для нижней границы окна (весь запуск лежит внутри),
-/// второе означает, что сравнивать нечем, и запуск выпадает из выборки, о чём
-/// придётся сказать вызывающему.
+/// Three outcomes are warranted here: "earlier than the start" and "there is
+/// no anchor" are different things. The first is ordinary for the lower bound
+/// of a window (the whole run lies inside it); the second means there is
+/// nothing to compare with, the run drops out of the selection, and the caller
+/// has to be told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOffset {
-    /// Момент раньше старта запуска — в его шкале не выражается.
+    /// A moment earlier than the run started — not expressible in its scale.
     BeforeStart,
-    /// Микросекунды от старта запуска.
+    /// Microseconds since the run started.
     At(Micros),
-    /// Запуск неизвестен или его загрузка не синхронизирована.
+    /// The run is unknown, or its boot was never synchronized.
     Unanchored,
 }
 
-/// Содержимое `epochs.bin`.
+/// The contents of `epochs.bin`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Epochs {
     pub runs: Vec<Run>,
@@ -111,14 +114,15 @@ pub struct Epochs {
 }
 
 impl Epochs {
-    /// Запуск по номеру.
+    /// A run by its number.
     ///
-    /// Поиск двоичный: `to_utc` вызывается на **каждую** запись ответа, а
-    /// запусков в файле накапливается тем больше, чем дольше живёт прибор
-    /// (двадцать перезапусков в сутки за пять лет — тридцать шесть тысяч).
-    /// Линейный обход означал бы тридцать шесть тысяч сравнений на строчку
-    /// журнала. Записи добавляются с возрастающим `boot_counter`, а уборка
-    /// порядок сохраняет; на файле, изменённом руками, есть честный откат.
+    /// The search is binary: `to_utc` is called on **every** record of an
+    /// answer, and the longer a device lives the more runs pile up in the file
+    /// (twenty restarts a day over five years is thirty-six thousand). A linear
+    /// walk would mean thirty-six thousand comparisons per journal line.
+    /// Entries are appended with an increasing `boot_counter`, and cleanup
+    /// preserves the order; on a file edited by hand there is an honest
+    /// fallback.
     pub fn run(&self, boot_counter: u32) -> Option<&Run> {
         match self
             .runs
@@ -136,12 +140,12 @@ impl Epochs {
         }
     }
 
-    /// Перевести относительное время в настенное. `None` — для hardware
-    /// boot'а этого run'а нет якоря, и абсолютного времени у записи нет.
+    /// Convert relative time into wall-clock time. `None` means the run's
+    /// hardware boot has no anchor and the record has no absolute time.
     ///
-    /// Якорь хранится с точностью до миллисекунды, но смещение внутри run'а
-    /// прибавляется микросекундами: округлять относительное время до
-    /// миллисекунд незачем — его-то как раз измерили точно.
+    /// The anchor is stored to the millisecond, but the offset within the run
+    /// is added in microseconds: there is no reason to round relative time to
+    /// milliseconds — that is exactly the part that was measured precisely.
     pub fn to_utc(&self, at: BootTime) -> Option<DateTime<Utc>> {
         let run = self.run(at.boot.0)?;
         let hw = self.hw_boot(run.hw_boot_id)?;
@@ -151,10 +155,11 @@ impl Epochs {
         DateTime::from_timestamp_micros(i64::try_from(total_us).ok()?)
     }
 
-    /// Обратный перевод: где настенный момент лежит в шкале данного запуска.
+    /// The reverse conversion: where a wall-clock moment lies in a given run's
+    /// scale.
     ///
-    /// Нужен запросу с границами по настенным часам: сравнивать записи с ним
-    /// напрямую нельзя — у каждого запуска своя шкала и свой якорь.
+    /// Needed by a query with wall-clock bounds: records cannot be compared
+    /// against it directly — every run has its own scale and its own anchor.
     pub fn from_utc(&self, boot_counter: u32, utc: DateTime<Utc>) -> RunOffset {
         let Some(run) = self.run(boot_counter) else {
             return RunOffset::Unanchored;
@@ -167,30 +172,31 @@ impl Epochs {
         if from_start < 0 {
             return RunOffset::BeforeStart;
         }
-        // Насыщение вместо ошибки: 2^64 µs — это 584 тысячи лет, столько
-        // относительное время не набирает, а паниковать на арифметике границы
-        // запроса тем более не за что.
+        // Saturating rather than erroring: 2^64 µs is 584 thousand years, which
+        // relative time never reaches, and there is even less reason to panic
+        // on the arithmetic of a query bound.
         RunOffset::At(Micros(u64::try_from(from_start).unwrap_or(u64::MAX)))
     }
 
-    /// Есть ли у запуска якорь: можно ли его записи сопоставить с настенными
-    /// часами вообще.
+    /// Whether a run has an anchor: whether its records can be matched against
+    /// a wall clock at all.
     pub fn is_anchored(&self, boot_counter: u32) -> bool {
         self.run(boot_counter)
             .and_then(|r| self.hw_boot(r.hw_boot_id))
             .is_some_and(|hw| hw.utc_anchor_ms.is_some())
     }
 
-    /// Запуски в хронологическом порядке регистрации.
+    /// The runs in chronological order of registration.
     pub fn runs(&self) -> &[Run] {
         &self.runs
     }
 
-    /// Обновить якорь загрузки. Возвращает `true`, если якорь принят.
+    /// Update a boot's anchor. Returns `true` if the anchor was accepted.
     ///
-    /// Правило: источник не ниже текущего. Равный приоритет допускается —
-    /// свежий GPS уточняет старый GPS (дрейф часов между синхронизациями
-    /// реален, отбрасывать уточнение нельзя).
+    /// The rule: the source must be no lower than the current one. Equal
+    /// priority is allowed — a fresh GPS fix refines an old one (clock drift
+    /// between synchronizations is real, and the refinement must not be thrown
+    /// away).
     pub fn set_anchor(
         &mut self,
         hw_boot_id: u32,
@@ -210,7 +216,7 @@ impl Epochs {
         {
             return false;
         }
-        // Якорь — это UTC момента, когда BOOTTIME был нулём.
+        // The anchor is the UTC of the moment BOOTTIME was zero.
         hw.utc_anchor_ms = Some(
             utc.timestamp_millis()
                 .saturating_sub((now_boottime_us / 1_000) as i64),
@@ -220,11 +226,11 @@ impl Epochs {
         true
     }
 
-    /// Забыть run'ы, которых нет среди `alive`, и осиротевшие загрузки.
+    /// Forget runs that are not among `alive`, and boots left orphaned.
     ///
-    /// Без этого файл рос бы вечно: 20 перезапусков в сутки за пять лет —
-    /// 36 тысяч записей, которые читаются и переписываются целиком при
-    /// каждом старте.
+    /// Without this the file would grow forever: twenty restarts a day over
+    /// five years is thirty-six thousand entries, read and rewritten whole on
+    /// every start.
     pub fn retain_runs(&mut self, alive: &dyn Fn(u32) -> bool) {
         self.runs.retain(|r| alive(r.boot_counter));
         let used: std::collections::BTreeSet<u32> =
@@ -233,14 +239,14 @@ impl Epochs {
     }
 }
 
-/// Исход чтения файла эпох.
+/// The outcome of reading the epochs file.
 enum Loaded {
     Missing,
     Corrupt,
     Ok(Epochs),
 }
 
-/// Файл эпох: чтение, регистрация run'а, обновление якоря.
+/// The epochs file: reading, registering a run, updating an anchor.
 #[derive(Debug)]
 pub struct EpochStore {
     path: PathBuf,
@@ -249,24 +255,25 @@ pub struct EpochStore {
 }
 
 impl EpochStore {
-    /// Открыть файл и зарегистрировать новый run.
+    /// Open the file and register a new run.
     ///
-    /// `boottime_at_init_us` передаётся снаружи, чтобы совпасть с базой часов
-    /// ровно до микросекунды.
+    /// `boottime_at_init_us` is passed in from outside so that it matches the
+    /// clock's base to the microsecond.
     ///
-    /// `floor_boot` — наибольший номер запуска, написанный на именах уже
-    /// лежащих сегментов. Спрашивается **только** если файл эпох не пережил
-    /// прошлый запуск (потерян или уведён в карантин после порчи): у целого
-    /// файла максимум по `runs` и так покрывает всё, что есть на диске, а
-    /// обход каталогов при тысячах неймспейсов стоит дороже, чем экономит, —
-    /// ровно поэтому уборка эпох и делается по порогу, а не на каждом старте.
+    /// `floor_boot` is the largest run number written on the names of segments
+    /// already on disk. It is asked for **only** if the epochs file did not
+    /// survive the previous run (lost, or quarantined after corruption): with
+    /// an intact file the maximum over `runs` already covers everything on
+    /// disk, and walking directories with thousands of namespaces costs more
+    /// than it saves — which is exactly why epoch cleanup runs on a threshold
+    /// rather than at every start.
     ///
-    /// Без этой границы потеря `epochs.bin` начинала бы нумерацию заново,
-    /// поверх запусков, чьи сегменты никуда не делись. Имя сегмента — это
-    /// `(boot, µs)`, и его лексикографический порядок объявлен временным:
-    /// повторно выданный номер поставил бы новые сегменты в историю **перед**
-    /// старыми. Ротация, удаляющая старейшее, принялась бы за свежие записи, а
-    /// читатель отдал бы историю вперемешку.
+    /// Without that floor, losing `epochs.bin` would restart the numbering on
+    /// top of runs whose segments are still there. A segment's name is `(boot,
+    /// µs)` and its lexicographic order is declared to be chronological: a
+    /// number handed out twice would place new segments **before** the old ones
+    /// in the history. Rotation, deleting the oldest, would start on the fresh
+    /// records, and a reader would hand back the history jumbled.
     pub fn open_and_register(
         root: &Path,
         boottime_at_init_us: u64,
@@ -277,7 +284,7 @@ impl EpochStore {
         let floor_boot = if lost { floor_boot()? } else { None };
         let kernel_boot_id = read_kernel_boot_id()?;
 
-        // Та же загрузка железа, что и у предыдущего run'а? Сверяем UUID ядра.
+        // The same hardware boot as the previous run? Compare the kernel UUID.
         let hw_boot_id = match epochs
             .hw_boots
             .iter()
@@ -326,22 +333,22 @@ impl EpochStore {
         Ok(store)
     }
 
-    /// Открыть только для чтения (вьюер, офлайн-анализ) — run не регистрируется.
+    /// Open read-only (a viewer, offline analysis) — no run is registered.
     ///
-    /// **Ничего не пишет.** Дамп, принесённый на анализ, может лежать на
-    /// носителе только для чтения, принадлежать другому прибору или быть
-    /// вещественным доказательством разбираемой аварии: карантин повреждённого
-    /// файла — операция записи, и в этом режиме она недопустима.
+    /// **It writes nothing.** A dump brought in for analysis may sit on read-only
+    /// media, belong to another device, or be material evidence in the incident
+    /// being investigated: quarantining a damaged file is a write, and in this
+    /// mode a write is not allowed.
     pub fn open_read_only(root: &Path) -> Result<Epochs> {
         Ok(match Self::read(&root.join(EPOCHS_FILE))? {
             Loaded::Ok(e) => e,
-            // Относительное время самодостаточно; без эпох теряется только
-            // конверсия в UTC.
+            // Relative time is self-sufficient; without epochs only the
+            // conversion to UTC is lost.
             Loaded::Missing | Loaded::Corrupt => Epochs::default(),
         })
     }
 
-    /// Прочитать файл, не трогая его.
+    /// Read the file without touching it.
     fn read(path: &Path) -> Result<Loaded> {
         let Some(bytes) = fsutil::read_optional(path)? else {
             return Ok(Loaded::Missing);
@@ -352,14 +359,14 @@ impl EpochStore {
         })
     }
 
-    /// То же для пишущей стороны: повреждённый файл уводится в карантин.
+    /// The same for the writing side: a damaged file is moved to quarantine.
     ///
-    /// Молча затирать его нельзя — по нему разбирают, что случилось с
-    /// привязкой ко времени.
+    /// Overwriting it silently is not an option — it is what one examines to
+    /// work out what happened to the anchoring of time.
     ///
-    /// Второй элемент — «прежнего состояния не осталось»: файла не было или
-    /// он оказался нечитаем. Это единственный случай, когда нумерацию
-    /// запусков приходится восстанавливать по диску.
+    /// The second element means "no previous state survived": either the file
+    /// was not there or it turned out unreadable. That is the only case in
+    /// which run numbering has to be reconstructed from the disk.
     fn load_for_write(path: &Path) -> Result<(Epochs, bool)> {
         match Self::read(path)? {
             Loaded::Ok(e) => Ok((e, false)),
@@ -380,8 +387,8 @@ impl EpochStore {
         &self.epochs
     }
 
-    /// Зафиксировать синхронизацию времени для текущей загрузки железа.
-    /// Возвращает `false`, если источник менее достоверен, чем текущий якорь.
+    /// Record a time synchronization for the current hardware boot. Returns
+    /// `false` if the source is less trustworthy than the current anchor.
     pub fn record_sync(&mut self, utc: DateTime<Utc>, source: SyncSource) -> Result<bool> {
         let accepted = self
             .epochs
@@ -392,11 +399,11 @@ impl EpochStore {
         Ok(accepted)
     }
 
-    /// Убрать записи о run'ах, от которых не осталось сегментов.
+    /// Remove entries for runs of which no segments are left.
     pub fn retain_runs(&mut self, alive: &dyn Fn(u32) -> bool) -> Result<()> {
         let current = self.current.boot_counter;
         let before = self.epochs.runs.len();
-        // Текущий run удалять нельзя ни при каких условиях: он ещё пишет.
+        // The current run must never be removed: it is still writing.
         self.epochs
             .retain_runs(&|boot| boot == current || alive(boot));
         if self.epochs.runs.len() != before {
@@ -411,18 +418,19 @@ impl EpochStore {
     }
 }
 
-/// Прочитать UUID загрузки ядра.
+/// Read the kernel's boot UUID.
 fn read_kernel_boot_id() -> Result<[u8; 16]> {
     const PATH: &str = "/proc/sys/kernel/random/boot_id";
-    let raw = std::fs::read_to_string(PATH).ctx("чтение /proc/sys/kernel/random/boot_id")?;
+    let raw = std::fs::read_to_string(PATH).ctx("reading /proc/sys/kernel/random/boot_id")?;
     parse_uuid(raw.trim()).ok_or_else(|| Error::Corrupt {
         path: PathBuf::from(PATH),
-        reason: "не UUID".to_owned(),
+        reason: "not a UUID".to_owned(),
     })
 }
 
-/// Разбор UUID вида `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` без зависимости
-/// на крейт uuid: нужно ровно одно место и ровно один формат.
+/// Parsing a UUID of the form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` without
+/// depending on the uuid crate: exactly one place needs it and exactly one
+/// format.
 fn parse_uuid(s: &str) -> Option<[u8; 16]> {
     let hex: Vec<u8> = s.bytes().filter(|&b| b != b'-').collect();
     if hex.len() != 32 {
@@ -445,31 +453,32 @@ mod tests {
         EpochStore::open_and_register(dir, base_us, &|| Ok(None)).unwrap()
     }
 
-    /// То же, но с известной нижней границей номера запуска: так открывается
-    /// хранилище, у которого сегменты пережили файл эпох.
+    /// The same, but with a known lower bound on the run number: this is how a
+    /// store whose segments outlived its epochs file is opened.
     fn store_with_floor(dir: &Path, base_us: u64, floor: u32) -> EpochStore {
         EpochStore::open_and_register(dir, base_us, &|| Ok(Some(floor))).unwrap()
     }
 
     #[test]
     fn a_lost_epochs_file_does_not_restart_run_numbering() {
-        // `boot_counter` попадает в имя каждого сегмента, а порядок имён
-        // объявлен временным. Начать нумерацию заново поверх сегментов,
-        // переживших потерю файла эпох, значило бы поставить новые записи в
-        // историю ПЕРЕД старыми: ротация принялась бы за свежее, а читатель
-        // отдал бы историю вперемешку.
+        // `boot_counter` goes into the name of every segment, and the order of
+        // names is declared to be chronological. Restarting the numbering on
+        // top of segments that survived the loss of the epochs file would place
+        // new records BEFORE the old ones in the history: rotation would start
+        // on the fresh ones and a reader would hand the history back jumbled.
         let dir = tempfile::tempdir().unwrap();
 
-        // Первый запуск: номер ноль, файл эпох создан.
+        // The first run: number zero, and the epochs file is created.
         assert_eq!(store(dir.path(), 1_000).current_run().boot_counter, 0);
-        // Второй помнит первый.
+        // The second remembers the first.
         assert_eq!(store(dir.path(), 2_000).current_run().boot_counter, 1);
 
-        // Файл эпох потерян (порча увела бы его в карантин — тот же исход).
+        // The epochs file is lost (corruption would quarantine it — the same
+        // outcome).
         std::fs::remove_file(dir.path().join(EPOCHS_FILE)).unwrap();
 
-        // Без границы нумерация началась бы заново; с ней — продолжается за
-        // тем номером, который виден на именах сегментов.
+        // Without the floor the numbering would start over; with it, it
+        // continues past the number visible on the segment names.
         assert_eq!(store(dir.path(), 3_000).current_run().boot_counter, 0);
         std::fs::remove_file(dir.path().join(EPOCHS_FILE)).unwrap();
         assert_eq!(
@@ -477,15 +486,15 @@ mod tests {
                 .current_run()
                 .boot_counter,
             2,
-            "нумерация продолжается за последним запуском, чьи сегменты живы"
+            "the numbering continues past the last run whose segments are alive"
         );
     }
 
     #[test]
     fn an_intact_epochs_file_is_never_second_guessed_by_the_disk() {
-        // Граница спрашивается лениво: обход имён при тысячах неймспейсов
-        // стоит дороже, чем экономит, и целому файлу эпох он не нужен —
-        // его максимум и так покрывает всё, что лежит на диске.
+        // The floor is asked for lazily: walking the names with thousands of
+        // namespaces costs more than it saves, and an intact epochs file does
+        // not need it — its maximum already covers everything on disk.
         let dir = tempfile::tempdir().unwrap();
         store(dir.path(), 1_000);
 
@@ -495,13 +504,16 @@ mod tests {
             Ok(Some(1_000_000))
         })
         .unwrap();
-        assert!(!asked.get(), "целый файл эпох не требует обхода диска");
+        assert!(
+            !asked.get(),
+            "an intact epochs file needs no walk of the disk"
+        );
         assert_eq!(next.current_run().boot_counter, 1);
     }
 
-    /// Момент времени из миллисекунд эпохи — короче, чем разбирать дату.
+    /// A moment in time from epoch milliseconds — shorter than parsing a date.
     fn utc(ms: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp_millis(ms).expect("миллисекунды в пределах эпохи")
+        DateTime::from_timestamp_millis(ms).expect("the milliseconds are within the epoch")
     }
 
     #[test]
@@ -513,36 +525,36 @@ mod tests {
 
         let b = store(dir.path(), 2_000);
         assert_eq!(b.current_run().boot_counter, 1);
-        // kernel_boot_id тот же — значит та же загрузка железа.
+        // The same kernel_boot_id means the same hardware boot.
         assert_eq!(b.current_run().hw_boot_id, 0);
-        assert_eq!(b.epochs().hw_boots.len(), 1, "новая загрузка не выдумана");
+        assert_eq!(b.epochs().hw_boots.len(), 1, "no new boot was invented");
     }
 
     #[test]
     fn anchor_is_retroactive_for_events_before_sync() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = store(dir.path(), 5_000_000); // run стартовал на 5-й секунде BOOTTIME
-        let at = BootTime::from_raw(0, 1_000_000); // BOOTTIME 6 с
+        let mut s = store(dir.path(), 5_000_000); // the run started at the 5th second of BOOTTIME
+        let at = BootTime::from_raw(0, 1_000_000); // BOOTTIME 6 s
 
-        assert_eq!(s.epochs().to_utc(at), None, "якоря ещё нет");
+        assert_eq!(s.epochs().to_utc(at), None, "there is no anchor yet");
 
-        // Синхронизация: сейчас BOOTTIME ~T, UTC = 1_700_000_000_000.
+        // Synchronization: BOOTTIME is now ~T, UTC = 1_700_000_000_000.
         let now_boottime = boottime_us();
         assert!(
             s.epochs
                 .set_anchor(0, utc(1_700_000_000_000), SyncSource::Ntp, now_boottime)
         );
 
-        let got = s.epochs().to_utc(at).expect("якорь есть");
+        let got = s.epochs().to_utc(at).expect("there is an anchor");
         let expected = 1_700_000_000_000 - (now_boottime / 1_000) as i64 + 6_000;
         assert_eq!(
             got.timestamp_millis(),
             expected,
-            "событие ДО синхронизации получило UTC"
+            "an event from BEFORE the synchronization got a UTC"
         );
 
-        // Обратный перевод возвращает то же относительное время: округление
-        // якоря до миллисекунд не должно уводить границу запроса.
+        // The reverse conversion returns the same relative time: rounding the
+        // anchor to milliseconds must not move a query bound.
         assert_eq!(
             s.epochs().from_utc(0, got),
             RunOffset::At(Micros(1_000_000))
@@ -554,7 +566,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path(), 5_000_000);
 
-        // Без якоря сравнивать нечем — и это не то же самое, что «раньше».
+        // Without an anchor there is nothing to compare with — which is not the
+        // same as "earlier".
         assert_eq!(
             s.epochs().from_utc(0, utc(1_700_000_000_000)),
             RunOffset::Unanchored
@@ -562,18 +575,19 @@ mod tests {
 
         s.epochs
             .set_anchor(0, utc(1_700_000_000_000), SyncSource::Gps, 5_000_000);
-        // Якорь = UTC при BOOTTIME 0, run стартовал на 5-й секунде.
+        // The anchor is the UTC at BOOTTIME 0; the run started at the 5th
+        // second.
         let anchor = s.epochs().hw_boot(0).unwrap().utc_anchor().unwrap();
         assert_eq!(
             s.epochs().from_utc(0, anchor),
             RunOffset::BeforeStart,
-            "момент нулевого BOOTTIME раньше старта run'а"
+            "the moment of zero BOOTTIME is earlier than the run started"
         );
         assert_eq!(
             s.epochs()
                 .from_utc(0, anchor + chrono::TimeDelta::seconds(5)),
             RunOffset::At(Micros(0)),
-            "ровно старт run'а"
+            "exactly the run's start"
         );
         assert_eq!(
             s.epochs()
@@ -591,7 +605,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path(), 1_000);
         assert!(!s.epochs().is_anchored(0));
-        assert!(!s.epochs().is_anchored(7), "неизвестный запуск");
+        assert!(!s.epochs().is_anchored(7), "an unknown run");
         s.record_sync(utc(1_700_000_000_000), SyncSource::Gps)
             .unwrap();
         assert!(s.epochs().is_anchored(0));
@@ -617,38 +631,38 @@ mod tests {
 
         assert!(
             e.set_anchor(0, utc(1_000_000), SyncSource::User, 0),
-            "первый якорь"
+            "the first anchor"
         );
         assert!(
             e.set_anchor(0, utc(2_000_000), SyncSource::Gps, 0),
-            "GPS поверх ручного"
+            "GPS over a manual entry"
         );
         assert_eq!(e.hw_boots[0].utc_anchor_ms, Some(2_000_000));
 
         assert!(
             !e.set_anchor(0, utc(3_000_000), SyncSource::User, 0),
-            "ручное поверх GPS — нет"
+            "a manual entry over GPS: no"
         );
         assert!(
             !e.set_anchor(0, utc(3_000_000), SyncSource::Ntp, 0),
-            "NTP поверх GPS — нет"
+            "NTP over GPS: no"
         );
         assert_eq!(
             e.hw_boots[0].utc_anchor_ms,
             Some(2_000_000),
-            "якорь не тронут"
+            "the anchor is untouched"
         );
 
         assert!(
             e.set_anchor(0, utc(4_000_000), SyncSource::Gps, 0),
-            "свежий GPS уточняет старый"
+            "a fresh GPS fix refines an old one"
         );
         assert_eq!(e.hw_boots[0].utc_anchor_ms, Some(4_000_000));
         assert_eq!(e.hw_boots[0].utc_anchor(), Some(utc(4_000_000)));
 
         assert!(
             !e.set_anchor(99, utc(1), SyncSource::Gps, 0),
-            "неизвестная загрузка"
+            "an unknown boot"
         );
     }
 
@@ -663,9 +677,12 @@ mod tests {
         let s = store(dir.path(), 2_000);
         assert_eq!(s.current_run().boot_counter, 1);
         let hw = s.epochs().hw_boot(0).unwrap();
-        assert!(hw.utc_anchor_ms.is_some(), "якорь пережил перезапуск");
+        assert!(
+            hw.utc_anchor_ms.is_some(),
+            "the anchor survived the restart"
+        );
         assert_eq!(hw.anchor_source, Some(SyncSource::Gps));
-        // Новый run наследует якорь своей загрузки железа.
+        // A new run inherits the anchor of its hardware boot.
         assert!(s.epochs().to_utc(BootTime::from_raw(1, 0)).is_some());
     }
 
@@ -675,18 +692,23 @@ mod tests {
         std::fs::write(dir.path().join(EPOCHS_FILE), b"\xff\xff\xff not postcard").unwrap();
 
         let s = store(dir.path(), 1_000);
-        assert_eq!(s.current_run().boot_counter, 0, "начали с чистого листа");
+        assert_eq!(
+            s.current_run().boot_counter,
+            0,
+            "we started from a clean slate"
+        );
         assert!(
             dir.path().join("epochs.corrupt").exists(),
-            "повреждённый файл сохранён для разбора, а не затёрт"
+            "the damaged file is kept for examination rather than overwritten"
         );
     }
 
     #[test]
     fn read_only_open_never_writes() {
-        // Дамп на анализ приходит с чужого прибора, иногда с носителя только
-        // для чтения, иногда как вещдок по разбираемой аварии. Читатель не
-        // имеет права его менять — даже ради карантина повреждённого файла.
+        // A dump for analysis arrives from another device, sometimes on
+        // read-only media, sometimes as evidence in the incident being
+        // investigated. A reader has no right to change it — not even to
+        // quarantine a damaged file.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(EPOCHS_FILE);
         std::fs::write(&path, b"\xff\xff\xff not postcard").unwrap();
@@ -695,20 +717,20 @@ mod tests {
         assert_eq!(
             epochs,
             Epochs::default(),
-            "без эпох — только относительное время"
+            "without epochs there is only relative time"
         );
-        assert!(path.exists(), "файл обязан остаться на месте");
+        assert!(path.exists(), "the file must stay where it is");
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"\xff\xff\xff not postcard",
-            "содержимое не тронуто"
+            "the content is untouched"
         );
         assert!(
             !dir.path().join("epochs.corrupt").exists(),
-            "карантин — операция записи, читателю она запрещена"
+            "quarantine is a write, and a reader is not allowed one"
         );
 
-        // Целый файл читается как обычно.
+        // An intact file reads as usual.
         let mut s = store(dir.path(), 1_000);
         s.record_sync(utc(1_700_000_000_000), SyncSource::Gps)
             .unwrap();
@@ -733,11 +755,15 @@ mod tests {
             anchor_captured_us: None,
         });
 
-        // Живых сегментов нет ни у кого — но текущий run обязан уцелеть.
+        // Nobody has live segments — but the current run must survive.
         s.retain_runs(&|_| false).unwrap();
         assert_eq!(s.epochs().runs.len(), 1);
         assert_eq!(s.epochs().runs[0].boot_counter, 0);
-        assert_eq!(s.epochs().hw_boots.len(), 1, "осиротевшая загрузка удалена");
+        assert_eq!(
+            s.epochs().hw_boots.len(),
+            1,
+            "the orphaned boot was removed"
+        );
     }
 
     #[test]
@@ -745,7 +771,7 @@ mod tests {
         let id = parse_uuid("0f8fad5b-d9cb-469f-a165-70867728950e").unwrap();
         assert_eq!(id[0], 0x0f);
         assert_eq!(id[15], 0x0e);
-        assert_eq!(parse_uuid("не uuid"), None);
+        assert_eq!(parse_uuid("not a uuid"), None);
         assert_eq!(parse_uuid(""), None);
         assert_eq!(parse_uuid("0f8fad5b-d9cb-469f-a165-70867728950"), None);
         assert_eq!(parse_uuid("zf8fad5b-d9cb-469f-a165-70867728950e"), None);
@@ -753,23 +779,23 @@ mod tests {
 
     #[test]
     fn real_kernel_boot_id_is_readable() {
-        // На Linux файл обязан существовать; тест ловит регресс парсера
-        // на реальном формате ядра.
-        let id = read_kernel_boot_id().expect("/proc доступен");
-        assert_ne!(id, [0u8; 16], "boot_id ядра не бывает нулевым");
+        // On Linux the file must exist; the test catches a parser regression
+        // against the real kernel format.
+        let id = read_kernel_boot_id().expect("/proc is available");
+        assert_ne!(id, [0u8; 16], "a kernel boot_id is never all zeros");
     }
 
     #[test]
     fn utc_conversion_handles_missing_data() {
         let e = Epochs::default();
-        assert_eq!(e.to_utc(BootTime::from_raw(0, 0)), None, "нет run'а");
+        assert_eq!(e.to_utc(BootTime::from_raw(0, 0)), None, "there is no run");
         assert_eq!(e.from_utc(0, utc(1_700_000_000_000)), RunOffset::Unanchored);
     }
 
     #[test]
     fn absurd_relative_time_does_not_panic() {
-        // Битый сегмент может дать любое время. Конверсия обязана вернуть
-        // `None`, а не переполниться.
+        // A corrupt segment can yield any time. The conversion has to return
+        // `None` rather than overflow.
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path(), 1_000);
         s.record_sync(utc(1_700_000_000_000), SyncSource::Gps)
