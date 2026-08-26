@@ -1,305 +1,317 @@
-# Замеры
+# Measurements
 
 `cargo bench -p dduroc --bench hot_path`
 
-Числа сняты на x86-64 (Linux, `/dev/shm`, сборка release). На armv7 они
-будут в несколько раз хуже в абсолютном выражении, но **соотношения между
-вариантами переносятся** — именно ради них замеры и существуют.
+The numbers were taken on x86-64 (Linux, `/dev/shm`, a release build). On
+armv7 they will be several times worse in absolute terms, but **the ratios
+between the variants carry over** — and those are what the measurements exist
+for.
 
-Абсолютные числа таблиц ниже привязаны к машине, на которой снимались, и с
-числами с другой машины несравнимы: тот же `read/query/all_100k` даёт 16.4 мс
-здесь и 24 мс на машине, где делался разбор аудита. Поэтому раздел
-[«Чем обошёлся разбор аудита»](#чем-обошёлся-разбор-аудита) устроен иначе —
-парами «до/после» из одного захода.
+The absolute numbers in the tables below are tied to the machine they were
+taken on and are not comparable with numbers from another: the same
+`read/query/all_100k` gives 16.4 ms here and 24 ms on the machine the audit
+review was done on. That is why the section
+[What the audit review cost](#what-the-audit-review-cost) is arranged
+differently — as before/after pairs from one sitting.
 
-Хранилище пишется в память, а долговечность в конфигурации бенчмарка
-отключена: цель — измерить стоимость собственного кода, а не скорость
-носителя разработчика. Стоимость `fdatasync` на eMMC (1–10 мс) от кода не
-зависит, зато зависит от того, сколько раз он вызван, — это проверяется
-тестом `critical_burst_is_one_group_commit`.
+The store is written to memory and durability is switched off in the
+benchmark's configuration: the goal is to measure the cost of our own code,
+not the speed of a developer's medium. The cost of `fdatasync` on eMMC
+(1–10 ms) does not depend on the code, but it does depend on how many times
+the code calls it — and that is checked by the test
+`critical_burst_is_one_group_commit`.
 
-## Какому числу верить
+## Which number to trust
 
-Групп три, и они меряют разное:
+There are three groups and they measure different things:
 
-- **`format/*`, `block/*`** — чистые функции над байтами. Числа надёжные,
-  сравнимые между запусками.
-- **`throughput/*`** — сквозная стоимость: постановка в очередь, работа
-  writer'а, синхронизация, запечатывание. **Это ориентир для «сколько стоит
-  запись».**
-- **`write/*`** — стоимость постановки в очередь, но она **не изолирована**:
-  writer работает параллельно, и число зависит от того, сколько раз
-  прикладной поток разбудил спящего потребителя. Годится для сравнения
-  вариантов внутри одного запуска; как абсолютная «цена записи» — обманчиво
-  (разбор ниже).
+- **`format/*`, `block/*`** — pure functions over bytes. The numbers are
+  reliable and comparable between runs.
+- **`throughput/*`** — the end-to-end cost: enqueueing, the writer's work,
+  syncing, sealing. **This is the reference point for "what a write costs".**
+- **`write/*`** — the cost of enqueueing, but it is **not isolated**: the
+  writer runs in parallel, and the number depends on how many times the
+  application thread woke a sleeping consumer. Good for comparing variants
+  within one run; as an absolute "price of a write" it is deceptive (the
+  analysis is below).
 
-## Кодеки формата
+## The format's codecs
 
-| Операция | Время | Пропускная способность |
+| Operation | Time | Throughput |
 |---|---|---|
-| varint, запись малого значения | 1.12 нс | 894 М/с |
-| varint, чтение | 4.82 нс | 207 М/с |
-| кодирование сообщения | 7.67 нс | 130 М/с |
-| декодирование сообщения | 18.3 нс | 55 М/с |
-| кодирование отсчёта | 7.29 нс | 137 М/с |
-| сериализация полей (1 поле) | 11.4 нс | — |
-| сериализация полей (2 поля) | 22.9 нс | — |
+| varint, writing a small value | 1.12 ns | 894 M/s |
+| varint, reading | 4.82 ns | 207 M/s |
+| encoding a message | 7.67 ns | 130 M/s |
+| decoding a message | 18.3 ns | 55 M/s |
+| encoding a sample | 7.29 ns | 137 M/s |
+| serializing fields (1 field) | 11.4 ns | — |
+| serializing fields (2 fields) | 22.9 ns | — |
 
-## Блоки
+## Blocks
 
-| Операция | На 1000 записей | На запись |
+| Operation | Per 1000 records | Per record |
 |---|---|---|
-| сборка блока без сжатия | 17.0 мкс | 17.0 нс |
-| сборка блока с LZ4 | 12.9 мкс | 12.9 нс |
-| разбор и обход блока | 30.8 мкс | 30.8 нс |
+| assembling a block without compression | 17.0 µs | 17.0 ns |
+| assembling a block with LZ4 | 12.9 µs | 12.9 ns |
+| parsing and walking a block | 30.8 µs | 30.8 ns |
 
-LZ4 быстрее «без сжатия»: тело копируется в выходной буфер уже сжатым,
-и на хорошо сжимаемых логах копировать приходится меньше.
+LZ4 is faster than "no compression": the body is copied into the output
+buffer already compressed, and on well-compressible logs there is less to
+copy.
 
-## Сквозная пропускная способность
+## End-to-end throughput
 
-Открытие хранилища, 10 000 записей, синхронизация, запечатывание, удаление —
-всё вместе.
+Opening a store, 10,000 records, syncing, sealing, deleting — all of it
+together.
 
-| Сценарий | Время | На запись | Пропускная способность |
+| Scenario | Time | Per record | Throughput |
 |---|---|---|---|
-| 10 000 событий | 1.99 мс | 199 нс | 5.0 М/с |
-| 10 000 отсчётов телеметрии | 2.12 мс | 212 нс | 4.7 М/с |
+| 10,000 events | 1.99 ms | 199 ns | 5.0 M/s |
+| 10,000 telemetry samples | 2.12 ms | 212 ns | 4.7 M/s |
 
-## Постановка в очередь
+## Enqueueing
 
-| Операция | На запись |
+| Operation | Per record |
 |---|---|
-| событие (пачка 1000) | 312 нс |
-| отсчёт телеметрии (пачка 1000) | 97 нс |
-| открытие и закрытие спана | 331 нс |
+| an event (batch of 1000) | 312 ns |
+| a telemetry sample (batch of 1000) | 97 ns |
+| opening and closing a span | 331 ns |
 
-Разрыв между событием и отсчётом — не сериализация (11–23 нс) и не
-кодирование (7 нс), а **пробуждение writer-потока**: когда потребитель
-успевает разбирать очередь, каждая постановка будит спящего.
+The gap between an event and a sample is neither serialization (11–23 ns) nor
+encoding (7 ns) but **waking the writer thread**: when the consumer keeps up
+with the queue, every enqueue wakes a sleeper.
 
-### Почему отсчёт телеметрии «подорожал» с 53 до 97 нс
+### Why a telemetry sample "grew dearer" from 53 to 97 ns
 
-После отказа от рантайм-тэгов (контейнер версии 2) этот замер вырос вдвое,
-и разобраться стоило: цифра выглядит как регресс горячего пути.
+After runtime tags were dropped (container version 2) this measurement
+doubled, and it was worth working out why: the figure looks like a regression
+of the hot path.
 
-Что проверено:
+What was checked:
 
-- **работа прикладного потока не выросла**: `Staged` остался 72 байта (тест
-  `hot_path_structs_do_not_grow_unnoticed`), а сверка типа значения перестала
-  разыменовывать полуторастабайтовый дескриптор — это дало −13%;
-- **работа writer'а строго уменьшилась**: с пути отсчёта ушли чтение
-  `RwLock` реестра рядов и клонирование описания ряда — то есть **аллокация
-  на каждый отсчёт**;
-- **единственная новая работа writer'а на отсчёт** (отметка метрики в
-  множестве footer'а) к числу отношения не имеет: с отключённой отметкой
-  замер не улучшился, а ухудшился;
-- **сквозная стоимость не пострадала**: события ускорились (2.37 → 1.99 мс на
-  10 000), чтение ускорилось на 5–26%.
+- **the application thread's work did not grow**: `Staged` stayed 72 bytes
+  (the test `hot_path_structs_do_not_grow_unnoticed`), while checking the
+  value's type stopped dereferencing a hundred-and-fifty-byte descriptor —
+  which gave −13%;
+- **the writer's work strictly decreased**: reading the series registry's
+  `RwLock` and cloning the series description left the sample path — that is,
+  **an allocation on every sample**;
+- **the only new work the writer does per sample** (noting the metric in the
+  footer's set) has nothing to do with the number: with the noting switched
+  off the measurement did not improve but got worse;
+- **the end-to-end cost did not suffer**: events got faster (2.37 → 1.99 ms
+  per 10,000) and reading got 5–26% faster.
 
-Остаётся объяснение, согласующееся со всеми четырьмя наблюдениями: writer,
-который заканчивает работу раньше, раньше и засыпает, а каждая постановка в
-пустую очередь обязана его будить. Пробуждений стало больше, и по этому
-замеру они дороже сэкономленной аллокации. Сквозная пропускная способность,
-где пробуждения амортизируются потоком записей, разницы не показывает.
+What remains is an explanation consistent with all four observations: a writer
+that finishes its work sooner falls asleep sooner, and every enqueue into an
+empty queue has to wake it. There are more wake-ups, and by this measurement
+they cost more than the allocation saved. End-to-end throughput, where the
+wake-ups are amortized over a stream of records, shows no difference.
 
-Утверждение остаётся выводом, а не прямым измерением: сквозного замера
-телеметрии до перестройки нет — бенчмарк появился вместе с разбором. Числа
-на 10 000 отсчётов (2.12 мс) стоит держать как отсчётную точку.
+The claim remains a conclusion rather than a direct measurement: there is no
+end-to-end telemetry measurement from before the rework — the benchmark
+appeared along with the analysis. The figure for 10,000 samples (2.12 ms) is
+worth keeping as a reference point.
 
-Следствие для дальнейшей работы: **узкое место записи — не сериализация и не
-формат, а пробуждение потребителя.** Оптимизировать стоит его (например, не
-сигналить, пока очередь не наберёт порог), а не байты.
+The consequence for further work: **the bottleneck of writing is neither
+serialization nor the format but waking the consumer.** That is what is worth
+optimizing (by not signalling until the queue reaches a threshold, say),
+rather than the bytes.
 
-## Масштаб
+## Scale
 
-Раньше здесь стояли два замера — на 10 и на 100 неймспейсов — и линейная
-экстраполяция на 24 тысячи: «около 3.4 с». Экстраполяция была неверна, и не
-на проценты: замер флота показал 26.8 с уже на 4 тысячах. Цену платила не
-регистрация, а **закрытие**, и росла она сверхлинейно, потому что каждый
-пишущий канал резервировал целый сегмент.
+There used to be two measurements here — at 10 and at 100 namespaces — and a
+linear extrapolation to 24 thousand: "about 3.4 s". The extrapolation was
+wrong, and not by percentages: a fleet measurement showed 26.8 s at 4 thousand
+already. What paid the price was not registration but **closing**, and it grew
+superlinearly because every writing channel reserved a whole segment.
 
-Ниже — прямой замер, а не пересчёт. Флот поднимается, каждый неймспейс
-пишет одну запись, затем `sync` и закрытие; `/dev/shm`, release.
+Below is a direct measurement rather than a recomputation. The fleet comes up,
+every namespace writes one record, then `sync` and closing; `/dev/shm`,
+release.
 
-| Неймспейсов | Регистрация | sync | Закрытие | **Итого** | Занято под нагрузкой | RSS |
+| Namespaces | Registration | sync | Closing | **Total** | Taken under load | RSS |
 |---|---|---|---|---|---|---|
-| 1 000 | 71 мс | 107 мс | 8 мс | **0.19 с** | 66 МБ | +3.9 МБ |
-| 2 000 | 140 мс | 144 мс | 19 мс | **0.30 с** | 133 МБ | +6.6 МБ |
-| 4 000 | 285 мс | 184 мс | 40 мс | **0.51 с** | 266 МБ | +12.2 МБ |
-| 24 000 | 1.95 с | 375 мс | 463 мс | **2.80 с** | 1.1 ГБ | +57 МБ |
+| 1,000 | 71 ms | 107 ms | 8 ms | **0.19 s** | 66 MB | +3.9 MB |
+| 2,000 | 140 ms | 144 ms | 19 ms | **0.30 s** | 133 MB | +6.6 MB |
+| 4,000 | 285 ms | 184 ms | 40 ms | **0.51 s** | 266 MB | +12.2 MB |
+| 24,000 | 1.95 s | 375 ms | 463 ms | **2.80 s** | 1.1 GB | +57 MB |
 
-Линейно по всем четырём столбцам: 74–81 мкс на неймспейс на регистрации,
-17–19 мкс на закрытии, ~45 КБ занятого места.
+Linear in all four columns: 74–81 µs per namespace on registration, 17–19 µs
+on closing, ~45 KB of space taken.
 
-До перехода на окно резерва (SPEC §2) те же 2000 неймспейсов давали
-закрытие 39.3 с и `sync` 2.57 с — в 2100 и 18 раз хуже, — а занимали бы
-16 ГиБ против нынешних 133 МБ. Цену платил `fallocate` на 8 МиБ и его
-нерасписанные экстенты, которые `fdatasync` обязан протолкнуть при первом же
-блоке.
+Before the move to a reserve window (SPEC §2) the same 2000 namespaces gave a
+closing time of 39.3 s and a `sync` of 2.57 s — 2100 and 18 times worse — and
+would have taken 16 GiB against today's 133 MB. The price was paid by an
+8 MiB `fallocate` and its unwritten extents, which `fdatasync` has to push
+through on the very first block.
 
-Пустой неймспейс не создаёт сегмента и не занимает ни файлового
-дескриптора, ни зарезервированных байт.
+An empty namespace creates no segment and takes neither a file descriptor nor
+a reserved byte.
 
-## Чтение
+## Reading
 
-Хранилище: 100 000 сообщений в 4 неймспейсах.
+The store: 100,000 messages in 4 namespaces.
 
-| Запрос | Время | Пропускная способность |
+| Query | Time | Throughput |
 |---|---|---|
-| все записи | 16.4 мс | 6.1 М записей/с |
-| последние 100 | 1.39 мс | — |
-| только ошибки (их нет) | 4.15 мс | — |
+| every record | 16.4 ms | 6.1 M records/s |
+| the last 100 | 1.39 ms | — |
+| errors only (there are none) | 4.15 ms | — |
 
-## Что дали изменения
+## What the changes gave
 
-Накопительно, от первой рабочей версии:
+Cumulatively, from the first working version:
 
-| Показатель | Было | Стало | Выигрыш |
+| Measure | Was | Is | Gain |
 |---|---|---|---|
-| чтение всех 100k записей | 531 мс | 16.4 мс | **32×** |
-| выборка только ошибок | 506 мс | 4.15 мс | **122×** |
-| последние 100 записей | 1.88 мс | 1.39 мс | **26%** |
-| сквозная запись 10k событий | 2.37 мс | 1.99 мс | **16%** |
-| отсчёт телеметрии (постановка в очередь) | 53 нс | 97 нс | −83% ¹ |
+| reading all 100k records | 531 ms | 16.4 ms | **32×** |
+| selecting errors only | 506 ms | 4.15 ms | **122×** |
+| the last 100 records | 1.88 ms | 1.39 ms | **26%** |
+| end-to-end write of 10k events | 2.37 ms | 1.99 ms | **16%** |
+| a telemetry sample (enqueueing) | 53 ns | 97 ns | −83% ¹ |
 
-¹ Разобрано выше: работа кода уменьшилась, выросло число пробуждений
-потребителя.
+¹ Analysed above: the code's work decreased while the number of consumer
+wake-ups grew.
 
-Что именно было исправлено по пути:
+What was fixed along the way:
 
-- **Резолв схемы читал `ns-meta` с диска на каждую запись** — файловая
-  операция на запись. Схема разрешается один раз на неймспейс.
-- **Отфильтрованные записи материализовались** — аллокация payload'а на
-  каждую из сотен тысяч отброшенных. Предикат применяется до владеющей
-  копии.
-- **Имена неймспейса и канала копировались в каждую запись ответа** — две
-  аллокации на запись, заменены на `Arc<str>`.
-- **Логирование аллоцировало промежуточный `Vec`** — postcard пишет прямо
-  в буфер, который уйдёт в очередь.
-- **Учёт потерь шёл через мьютекс и хеш-таблицу** — на горячем пути ровно
-  тогда, когда система под давлением. Заменён массивом атомиков.
-- **Поиск дескриптора по схеме был линейным** — теперь бинарный.
-- **Обход всех каналов на каждом обороте цикла writer'а** — заменён
-  списком активных: при 24 тысячах неймспейсов полный проход съедал бы
-  процессор впустую, тогда как пишущих в любой момент единицы.
-- **Идентичность ряда телеметрии восстанавливалась при чтении** — отдельная
-  запись-определение, таблица в footer'е, предварительный проход по сегменту
-  при обратном обходе и клонирование описания ряда на каждый отсчёт в
-  writer'е. Всё это исчезло вместе с рантайм-тэгами: ряд — это метрика.
-- **Сортировка батча выделяла временный буфер на каждый заход** — теперь
-  пропускается, если батч уже упорядочен (обычный случай).
-- **Множества типов в footer'е были деревьями** — `insert` вызывается на
-  каждую запись; заменены плоским отсортированным вектором с защёлкой на
-  последнее добавленное.
+- **Resolving a schema read `ns-meta` from disk for every record** — a file
+  operation per record. A schema is now resolved once per namespace.
+- **Filtered-out records were materialized** — a payload allocation for each
+  of hundreds of thousands discarded. The predicate is applied before the
+  owning copy.
+- **The namespace and channel names were copied into every answer record** —
+  two allocations per record, replaced by an `Arc<str>`.
+- **Logging allocated an intermediate `Vec`** — postcard now writes straight
+  into the buffer that goes into the queue.
+- **Loss accounting went through a mutex and a hash table** — on the hot path
+  exactly when the system is under pressure. Replaced by an array of atomics.
+- **The descriptor search over a schema was linear** — it is binary now.
+- **Every channel was walked on every turn of the writer's loop** — replaced
+  by a list of active ones: at 24 thousand namespaces a full pass would eat
+  the CPU for nothing, while only a handful write at any moment.
+- **A telemetry series' identity was reconstructed at read time** — a separate
+  definition record, a table in the footer, a preliminary pass over the
+  segment on a reverse walk and a clone of the series description for every
+  sample in the writer. All of it went along with runtime tags: a series is a
+  metric.
+- **Sorting a batch allocated a temporary buffer on every go** — it is now
+  skipped when the batch is already ordered (the ordinary case).
+- **The type sets in the footer were trees** — `insert` is called on every
+  record; they were replaced by a flat sorted vector with a latch on the last
+  insert.
 
-## Чем обошёлся разбор аудита
+## What the audit review cost
 
-Замеры A/B в один заход на одной машине: немодифицированный `cde39c6` в
-отдельном рабочем дереве против текущего. Абсолютные значения тут ниже, чем в
-таблицах выше, — машина другая; смысл имеют только пары.
+A/B measurements in one sitting on one machine: an unmodified `cde39c6` in a
+separate worktree against the current one. The absolute values here are lower
+than in the tables above — a different machine; only the pairs mean anything.
 
-**Порог значимости — около 5%** для замеров, поднимающих хранилище, и около
-1% для чистых функций. Столько даёт разброс между двумя прогонами **одного и
-того же кода**: `read/query/all_100k` дал 23.3 и 24.5 мс, `block/parse` — 28.9
-и 30.2 мкс. Всё, что укладывается в эту вилку, ниже названо неизменившимся, а
-не улучшившимся: приписать себе чужой шум легче всего.
+**The significance threshold is about 5%** for measurements that bring a store
+up and about 1% for pure functions. That is the spread between two runs of
+**one and the same code**: `read/query/all_100k` gave 23.3 and 24.5 ms,
+`block/parse` gave 28.9 and 30.2 µs. Everything inside that range is called
+unchanged below rather than improved: claiming someone else's noise is the
+easiest thing there is.
 
-| Замер | До | После | |
+| Measurement | Before | After | |
 |---|---|---|---|
-| `format/record/encode_message` | 8.62 нс | 9.34 нс | **+8%** |
-| `format/record/encode_sample` | 6.77 нс | 7.81 нс | **+15%** |
-| `format/record/decode_message` | 19.2 нс | 19.1 нс | без изменений |
-| `format/varint/*`, `format/payload/*` | | | без изменений |
-| `block/build/*`, `block/parse_and_iterate/lz4` | | | в пределах шума |
-| `write/*` | | | в пределах шума |
-| `throughput/end_to_end/10k_events` | 1.426 мс | 1.430 мс | без изменений |
-| `throughput/end_to_end/10k_samples` | 1.405 мс | 1.412 мс | без изменений |
-| `scale/open_namespaces/100` | 8.00 мс | 8.26 мс | +3%, см. ниже |
-| `read/query/*` | | | в пределах шума |
+| `format/record/encode_message` | 8.62 ns | 9.34 ns | **+8%** |
+| `format/record/encode_sample` | 6.77 ns | 7.81 ns | **+15%** |
+| `format/record/decode_message` | 19.2 ns | 19.1 ns | unchanged |
+| `format/varint/*`, `format/payload/*` | | | unchanged |
+| `block/build/*`, `block/parse_and_iterate/lz4` | | | within the noise |
+| `write/*` | | | within the noise |
+| `throughput/end_to_end/10k_events` | 1.426 ms | 1.430 ms | unchanged |
+| `throughput/end_to_end/10k_samples` | 1.405 ms | 1.412 ms | unchanged |
+| `scale/open_namespaces/100` | 8.00 ms | 8.26 ms | +3%, see below |
+| `read/query/*` | | | within the noise |
 
-### Кодирование записи подорожало, и это осознанно
+### Encoding a record grew dearer, and that was deliberate
 
-`encode` перестал быть неотказным: `SpanId(0)` — зарезервированное значение,
-декодер его отвергает, и кодек не имеет права порождать байты, на которых сам
-же останавливается. Раньше такую запись можно было получить через публичный
-`Namespace::log_raw(.., Some(SpanId(0)))`, и читатель терял на ней **весь
-остаток блока**, а не одну запись.
+`encode` stopped being infallible: `SpanId(0)` is a reserved value, the decoder
+rejects it, and a codec has no right to produce bytes it stops at itself. Such
+a record used to be reachable through the public
+`Namespace::log_raw(.., Some(SpanId(0)))`, and a reader lost **the whole rest
+of the block** on it rather than one record.
 
-Цена — около наносекунды: появился `Result`, который вызывающий обязан
-проверить. Переносить проверку в границу вызова или сворачивать её в один
-разбор варианта пробовалось — не помогает, стоит сама возможность отказа, а не
-её место. Наносекунда при сквозной стоимости записи около 140 нс не видна:
-`throughput/*` не сдвинулся.
+The price is about a nanosecond: a `Result` appeared that the caller has to
+check. Moving the check to the call boundary or folding it into one variant
+dispatch was tried — it does not help; what costs is the possibility of
+failure itself, not where it sits. A nanosecond against an end-to-end write
+cost of about 140 ns is invisible: `throughput/*` did not move.
 
-### Что этими замерами не проверяется
+### What these measurements do not check
 
-Половина правок аудита адресует масштаб, которого в бенчмарке нет. Слияние
-потоков переведено с перебора всех курсоров на двоичную кучу, обход дедлайнов
-writer'а — на список активных каналов, отбор сегментов при чтении перестал
-делать `stat` на каждый файл. При четырёх неймспейсах и восьми курсорах всё
-это неразличимо — и в таблице выше честно стоит «в пределах шума». Выигрыш
-появляется на заявленных двадцати четырёх тысячах неймспейсов; такой замер
-теперь есть — см. «Масштаб».
+Half of the audit's changes address a scale the benchmark does not have.
+Merging streams moved from scanning every cursor to a binary heap, walking the
+writer's deadlines moved to a list of active channels, and selecting segments
+at read time stopped doing a `stat` per file. With four namespaces and eight
+cursors all of that is indistinguishable — and the table above honestly says
+"within the noise". The gain appears at the twenty-four thousand namespaces
+claimed; such a measurement now exists — see "Scale".
 
-`scale/open_namespaces/100` подрос на 3% (на границе шума) по понятной
-причине: при подъёме канала добавилось чтение четырёх байт — проверка, не
-остался ли сегмент прошлого запуска незапечатанным. Одно чтение на канал за
-подъём против возвращённого хвоста окна резерва — обмен очевидный.
+`scale/open_namespaces/100` grew by 3% (on the edge of the noise) for a plain
+reason: bringing a channel up gained a read of four bytes — a check for
+whether a segment of the previous run was left unsealed. One read per channel
+per bring-up against a returned reserve-window tail is an obvious trade.
 
-## Память пути записи
+## The memory of the write path
 
-Замер RSS (`/proc/self/status`), хранилище в `/dev/shm`, release:
+An RSS measurement (`/proc/self/status`), the store in `/dev/shm`, release:
 
-| Контрольная точка | До правок | После |
+| Checkpoint | Before the changes | After |
 |---|---|---|
-| открытие Store + неймспейс | +1.0 МиБ | +1.0 МиБ |
-| 10 000 мелких событий + sync | +1.4 МиБ | +1.5 МиБ |
-| **один blob 8 МиБ, затем sync** | **+16.3 МиБ навсегда** | **+0** |
-| 3 секунды бездействия | не возвращалось | +0 |
+| opening a Store plus a namespace | +1.0 MiB | +1.0 MiB |
+| 10,000 small events plus a sync | +1.4 MiB | +1.5 MiB |
+| **one 8 MiB blob, then a sync** | **+16.3 MiB forever** | **+0** |
+| 3 seconds of idleness | never returned | +0 |
 
-+16 МиБ складывались из буфера блока и scratch: оба вырастали до размера
-крупнейшего блока и не сжимались никогда. Теперь канал, которому нечего
-обслуживать, отдаёт буферы целиком; цена — реаллокация при пробуждении, не
-чаще периода синхронизации канала.
+The +16 MiB was the block buffer and the scratch: both grew to the size of the
+largest block and were never shrunk. Now a channel with nothing to service
+gives its buffers back whole; the price is a reallocation on waking, no more
+often than the channel's sync period.
 
-Ей соответствует пара чисел LZ4-сборки: `block/build/lz4` (холодный
-накопитель — первый flush после пробуждения) подорожал с 13.8 до 15.7 мкс
-на 1000 записей, потому что `compress_into` инициализирует переиспользуемый
-буфер; зато `block/build/lz4_steady` (накопитель живёт между flush'ами — так
-канал работает всю жизнь) стоит 12.1 мкс — быстрее старого холодного пути,
-без единой аллокации на flush. Числа сняты под посторонней нагрузкой
-(LA ~3–5) и сравнимы только между собой.
+A pair of LZ4-assembly numbers corresponds to it: `block/build/lz4` (a cold
+accumulator — the first flush after waking from idleness) grew dearer from
+13.8 to 15.7 µs per 1000 records, because `compress_into` initializes the
+reused buffer; `block/build/lz4_steady` (the accumulator lives between
+flushes — how a channel works all its life), meanwhile, costs 12.1 µs, faster
+than the old cold path and without a single allocation per flush. The numbers
+were taken under unrelated load (LA ~3–5) and are comparable only with each
+other.
 
-Фиксированную часть утилизации стоит знать: очереди writer'а преаллоцируются
-целиком при открытии хранилища (8192 + 1024 слота × 72 байта ≈ 660 КиБ,
-настраивается `StoreConfig::with_queues`), батч-буфер writer'а держит до
-~290 КиБ после первого пика. Реестр рантайм-пределов больше не выделяет
-слоты, пока переопределений нет (было ~10 КиБ на неймспейс при сотне метрик
-— сотни мегабайт на 24k неймспейсов за пустоту).
+The fixed part of the footprint is worth knowing: the writer's queues are
+allocated whole when a store is opened (8192 + 1024 slots × 72 bytes ≈
+660 KiB, configurable with `StoreConfig::with_queues`), and the writer's batch
+buffer holds up to ~290 KiB after the first peak. The registry of runtime
+limits no longer allocates slots while there are no overrides (it used to be
+~10 KiB per namespace at a hundred metrics — hundreds of megabytes for 24k
+namespaces of emptiness).
 
-## Объём данных: плотность нумерации метрик
+## Data volume: the density of metric numbering
 
-Отдельный замер, не входящий в criterion-набор: `metric_id` попадает в каждый
-отсчёт varint'ом, поэтому раскладка идентификаторов влияет на объём.
+A separate measurement, not part of the criterion set: `metric_id` goes into
+every sample as a varint, so the layout of the identifiers affects the volume.
 
-| раскладка id метрик | сырые байты | после LZ4 |
+| metric id layout | raw bytes | after LZ4 |
 |---|---|---|
-| плотно от 1 | базовый | базовый |
-| по группам (`0x0101`, `0x0201`…) | **+10%** | **+15%** |
-| крупные (`0x4000`+) | **+23%** | **+29…33%** |
+| dense from 1 | baseline | baseline |
+| grouped (`0x0101`, `0x0201`…) | **+10%** | **+15%** |
+| large (`0x4000`+) | **+23%** | **+29…33%** |
 
-150 метрик, секундный скан, минута данных. Сжатие не спасает: на шумных
-значениях расхождение растёт. Вывод — нумеровать метрики плотно от 1;
-подробнее в докстринге `dduroc_format::ids`.
+150 metrics, a one-second scan, a minute of data. Compression does not rescue
+it: on noisy values the gap widens. The conclusion is to number metrics
+densely from 1; more in the docstring of `dduroc_format::ids`.
 
-## Чего эти замеры не меряют
+## What these measurements do not measure
 
-- **Носитель.** Долговечность в бенчмарке отключена; `fdatasync` на eMMC
-  стоит 1–10 мс и в числа не входит.
-- **armv7.** Все числа с x86-64. Кросс-сборка проверяется, замеры на цели —
-  нет.
-- **Сжатие реальных данных.** `block/build/lz4` работает на однородном
-  наборе; коэффициент сжатия реальной телеметрии другой.
-- **Долгая работа.** Ротация, фрагментация каталогов, рост `epochs.bin` при
-  тысячах перезапусков — вне охвата.
+- **The medium.** Durability is switched off in the benchmark; an `fdatasync`
+  on eMMC costs 1–10 ms and is not in the numbers.
+- **armv7.** Every number is from x86-64. Cross-building is checked, measuring
+  on the target is not.
+- **Compressing real data.** `block/build/lz4` works on a uniform set; the
+  compression ratio of real telemetry is different.
+- **Long operation.** Rotation, directory fragmentation and the growth of
+  `epochs.bin` over thousands of restarts are out of scope.
