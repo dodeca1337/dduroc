@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Версия и компоненты берутся из rust-toolchain.toml.
+      # The version and the components come from rust-toolchain.toml.
       - name: Toolchain
         run: rustup show active-toolchain
 
@@ -26,14 +26,14 @@ jobs:
       - run: cargo test --workspace
       - run: cargo doc --workspace --no-deps
 
-  # Цель устройств 32-битная, а разработка идёт на x86-64: допущения про
-  # ширину usize (ёмкости по счётчикам из файла, размеры буферов, арифметика
-  # смещений) на хосте не проявляются вовсе. Проверка компиляции ловит их
-  # раньше, чем прибор.
+  # The device target is 32-bit while development happens on x86-64:
+  # assumptions about the width of usize (capacities from counters in a file,
+  # buffer sizes, offset arithmetic) never show up on the host. A compilation
+  # check catches them sooner than a device does.
   #
-  # Именно `check`, а не `build`: линковка потребовала бы кросс-тулчейна, а
-  # проверять надо тип-чек, а не компоновщик. Тесты под целью не гоняются —
-  # для этого нужен эмулятор, и это отдельная задача.
+  # `check` rather than `build`: linking would need a cross toolchain, and what
+  # has to be checked is the type check, not the linker. Tests are not run on
+  # the target — that needs an emulator, which is a task of its own.
   armv7:
     runs-on: ubuntu-latest
     steps:

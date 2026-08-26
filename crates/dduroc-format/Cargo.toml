@@ -1,6 +1,6 @@
 [package]
 name = "dduroc-format"
-description = "Байтовый формат хранения dduroc: сегменты, блоки, записи"
+description = "The dduroc on-disk byte format: segments, blocks, records"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

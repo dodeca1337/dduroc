@@ -17,22 +17,23 @@ members = [
 ]
 
 [workspace.dependencies]
-# ── ядро (sync, armv7-friendly) ───────────────────────────────────────────────
+# ── the core (sync, armv7-friendly) ───────────────────────────────────────────
 crc32c = "0.6"
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 thiserror = "2.0"
 rustix = { version = "1.1", features = ["fs", "time", "process"] }
 crossbeam-channel = "0.5"
 smallvec = { version = "1", features = ["union"] }
-# Настенное время — только UTC: часовые пояса прибору не нужны, а `clock`
-# притащил бы базу зон (iana-time-zone). `now` даёт `Utc::now()` без неё.
+# Wall-clock time is UTC only: a device does not need time zones, and `clock`
+# would drag in the zone database (iana-time-zone). `now` gives `Utc::now()`
+# without it.
 chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
 
 # ── serde / payload ───────────────────────────────────────────────────────────
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1.1", features = ["alloc"] }
 
-# ── тесты ─────────────────────────────────────────────────────────────────────
+# ── tests ─────────────────────────────────────────────────────────────────────
 proptest = "1.7"
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
@@ -41,14 +42,14 @@ serde_json = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tempfile = "3"
 
-# ── внутренние ────────────────────────────────────────────────────────────────
+# ── internal ──────────────────────────────────────────────────────────────────
 dduroc-format = { path = "crates/dduroc-format" }
 dduroc-engine = { path = "crates/dduroc-engine" }
 dduroc-read = { path = "crates/dduroc-read" }
 dduroc-macros = { path = "crates/dduroc-macros" }
 
 [profile.release]
-# Целевая платформа — armv7 с ограниченным флешем: размер бинаря значим.
+# The target platform is armv7 with limited flash: the binary size matters.
 opt-level = 2
 lto = "thin"
 codegen-units = 1

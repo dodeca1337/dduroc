@@ -1,6 +1,6 @@
 [package]
 name = "dduroc-macros"
-description = "Макрос декларации схемы dduroc"
+description = "The dduroc schema declaration macro"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

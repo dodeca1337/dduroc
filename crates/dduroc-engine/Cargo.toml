@@ -1,6 +1,6 @@
 [package]
 name = "dduroc-engine"
-description = "Движок хранилища dduroc: неймспейсы, каналы, writer, ротация, миграции"
+description = "The dduroc storage engine: namespaces, channels, the writer, rotation, migrations"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

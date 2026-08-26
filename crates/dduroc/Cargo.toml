@@ -1,6 +1,6 @@
 [package]
 name = "dduroc"
-description = "Система логирования и телеметрии для embedded Linux"
+description = "A logging and telemetry system for embedded Linux"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,9 +8,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# Слой чтения включён по умолчанию: на устройстве журнал показывает сам прибор.
-# Прошивке, которая только пишет, его можно отключить — на armv7 с ограниченным
-# флешем размер бинаря значим.
+# The read layer is on by default: on a device the journal is shown by the
+# device itself. Firmware that only writes can turn it off — on armv7 with
+# limited flash the binary size matters.
 default = ["read"]
 read = ["dep:dduroc-read"]
 

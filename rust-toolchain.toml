@@ -1,14 +1,15 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
-# Цель устройств — armv7-unknown-linux-gnueabihf, кросс-сборка через
-# cargo-zigbuild. Target здесь намеренно не объявлен: иначе любая локальная
-# `cargo test` требовала бы его скачивания. Для кросс-сборки один раз:
+# The device target is armv7-unknown-linux-gnueabihf, cross-built with
+# cargo-zigbuild. The target is deliberately not declared here: otherwise any
+# local `cargo test` would require downloading it. For cross-building, once:
 #   rustup target add armv7-unknown-linux-gnueabihf
 #   cargo zigbuild --release --target armv7-unknown-linux-gnueabihf
 #
-# Тип-чек под 32-битной целью линковщика не требует и потому доступен сразу
-# после `rustup target add` — в CI он отдельной работой (.github/workflows):
+# A type check for the 32-bit target needs no linker and is therefore available
+# right after `rustup target add` — in CI it is a job of its own
+# (.github/workflows):
 #   cargo check --workspace --all-targets --target armv7-unknown-linux-gnueabihf
-# Допущения про ширину usize на x86-64 не проявляются вовсе, а на приборе
-# оборачиваются паникой «capacity overflow» на чужом файле.
+# Assumptions about the width of usize never show up on x86-64, while on a
+# device they turn into a "capacity overflow" panic over someone else's file.

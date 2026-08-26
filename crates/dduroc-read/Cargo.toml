@@ -1,6 +1,6 @@
 [package]
 name = "dduroc-read"
-description = "Чтение хранилища dduroc: выборка, слияние потоков, резолв схемы"
+description = "Reading a dduroc store: selection, merging streams, resolving the schema"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

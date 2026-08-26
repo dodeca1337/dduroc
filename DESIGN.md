@@ -1,312 +1,338 @@
-# dduroc — система логирования для embedded Linux
+# dduroc — a logging system for embedded Linux
 
-Проектный документ. Реализация: крейты `dduroc-format`, `dduroc-engine`,
-`dduroc-read`, `dduroc-macros`, `dduroc`. Байтовый формат — [SPEC.md](SPEC.md),
-замеры — [BENCHMARKS.md](BENCHMARKS.md).
+A design document. The implementation: the crates `dduroc-format`,
+`dduroc-engine`, `dduroc-read`, `dduroc-macros`, `dduroc`. The byte format is
+in [SPEC.md](SPEC.md), the measurements in [BENCHMARKS.md](BENCHMARKS.md).
 
-Не реализовано (осознанно отложено):
+Not implemented (deliberately deferred):
 
-- **веб-слой** (`dduroc-graphql`, `dduroc-web`, `dduroc-viewer`) и фронтенд;
-- **мост из tracing/log** — тип записи `Text` в формате есть, моста нет;
-- **продолжение записи в сегмент прошлого запуска**: `SegmentWriter::reopen`
-  реализован и протестирован, но не используется — по формату сегмент не
-  пересекает границу run'а, а при старте `boot_counter` всегда новый.
-  Оборванный сегмент вместо этого запечатывается (см. ниже), и `reopen`
-  остаётся заготовкой под восстановление внутри одного запуска.
+- **the web layer** (`dduroc-graphql`, `dduroc-web`, `dduroc-viewer`) and the
+  frontend;
+- **the bridge from tracing/log** — the `Text` record kind exists in the
+  format, the bridge does not;
+- **continuing to write into a segment of a previous run**:
+  `SegmentWriter::reopen` is implemented and tested but unused — by the format
+  a segment does not cross a run boundary, and at start `boot_counter` is
+  always new. A torn segment is sealed instead (see below), and `reopen`
+  remains a groundwork for recovery within one run.
 
-## Цели и ограничения
+## Goals and constraints
 
-- Rust, embedded Linux (без RTC), носители — eMMC и SD-карты.
-- Относительная система времени; конверсия в UTC — best-effort слой поверх.
-- Минимальный объём хранимых данных и минимальный износ флеша.
-- Бюджет хранилища кастомный: расчётный ориентир ~20 ГБ, масштабирование
-  от 2–8 ГБ до сотен ГБ. Библиотека переиспользуется в разных проектах.
-- Долговечность в рамках одного движка: критические сообщения синхронизируются
-  сразу — это определение их класса, — у остальных настраивается лишь интервал
-  `fdatasync`. Класс хранения указывается на уровне сообщения.
-- Масштабы: до ~200 типов микросервисов × до 64 экземпляров (неймспейсов
-  до ~12.8k); до ~150 типов сообщений и ~100 метрик на юнит.
-- Целевая архитектура — **armv7** (32-bit), кросс-компиляция —
-  **cargo-zigbuild**. Следствия: размеры/смещения файлов — всегда `u64`,
-  не `usize`; mmap больших сегментов не используем (pread — и так решено);
-  CRC32C на armv7 без аппаратной инструкции (появилась в ARMv8) —
-  программный fallback крейта `crc32c`, на наших скоростях достаточно.
+- Rust, embedded Linux (no RTC), the media are eMMC and SD cards.
+- A relative time system; conversion to UTC is a best-effort layer on top.
+- The minimum volume of stored data and the minimum flash wear.
+- The storage budget is custom: the design reference point is ~20 GB, scaling
+  from 2–8 GB to hundreds of GB. The library is reused across projects.
+- Durability within one engine: critical messages are synced at once — that is
+  the definition of their class — while the rest only have their `fdatasync`
+  interval configured. The storage class is stated per message.
+- Scale: up to ~200 microservice types × up to 64 instances (up to ~12.8k
+  namespaces); up to ~150 message types and ~100 metrics per unit.
+- The target architecture is **armv7** (32-bit), cross-compiled with
+  **cargo-zigbuild**. The consequences: file sizes and offsets are always
+  `u64`, never `usize`; large segments are not mmapped (pread — already
+  decided); CRC32C on armv7 has no hardware instruction (it appeared in
+  ARMv8) — the `crc32c` crate's software fallback is enough at our speeds.
 
-## Решения (принято)
+## Decisions (settled)
 
-### Отказ от LSM
+### Rejecting LSM
 
-Прототип (radio-hog: fjall + redb) отвергнут: ключи логов монотонны,
-сортировка LSM не нужна; write amplification ≥2× (WAL + flush memtable)
-вреден флешу; кэши и фоновые воркеры избыточны. FIFO-компакция fjall — то же
-удаление старых файлов, но с оверхедом.
+The prototype (radio-hog: fjall plus redb) was rejected: log keys are
+monotonic and LSM's sorting is not needed; a write amplification of ≥2×
+(a WAL plus a memtable flush) is bad for flash; the caches and background
+workers are superfluous. fjall's FIFO compaction is the same deletion of old
+files, but with overhead on top.
 
-### Сегментированный append-only лог
+### A segmented append-only log
 
-- **Сегмент** — файл `<boot>-<µs первой записи>.log` в директории канала.
-  Только append. Запечатывается по достижении лимита размера или смене boot.
-  Ротация = `unlink` старейшего сегмента при превышении бюджета канала.
-- **Блок** — единица записи и flush (= батч writer'а):
-  `header{base_time, count, uncompressed_len, compressed_len, crc32c}` +
-  записи, опционально LZ4/zstd на блок. Блок может содержать одну запись
-  (критический канал).
-- **Запись внутри блока**: `varint Δµs от base_time` + заголовок события +
-  postcard payload. Дельта-кодирование времени: 1–3 байта вместо 10-байтового
-  ключа LSM.
-- **Recovery**: WAL не нужен — лог сам WAL. Скан последнего сегмента по CRC
-  блоков, обрыв на первом битом/нулевом заголовке, truncate хвоста.
-  Выполняется при подъёме канала: оборванный сегмент прошлого запуска
-  обрезается до конца целых данных и **запечатывается** — footer собирается
-  тем же обходом, которым ищется этот конец, второго прохода не нужно.
-  Дело не в удобстве чтения: пока сегмент не запечатан, за ним числится
-  нерасписанный хвост окна резерва, и несколько аварийных остановок подряд
-  выедают бюджет канала пустотой, после чего ротация принимается за живую
-  историю. Трогается только
-  сегмент чужого run'а — в сегмент текущего может писать живое состояние
-  этого же процесса.
-- **Чтение**: бинарный поиск по именам сегментов → footer-индекс блоков
-  запечатанного сегмента (или скан заголовков активного) → распаковка блока.
-- **Spans** — без отдельного keyspace и без update-семантики: обычные события
-  `SpanStart`/`SpanEnd` в общем потоке, дерево собирается при чтении.
-  Спаны ротируются вместе с событиями — висячих span_id нет.
+- **A segment** is a file `<boot>-<µs of the first record>.log` in a channel's
+  directory. Append only. It is sealed on reaching the size limit or on a
+  change of boot. Rotation is an `unlink` of the oldest segment when a
+  channel's budget is exceeded.
+- **A block** is the unit of writing and of a flush (= a writer batch):
+  `header{base_time, count, uncompressed_len, compressed_len, crc32c}` plus
+  the records, optionally LZ4/zstd per block. A block may hold a single record
+  (the critical channel).
+- **A record inside a block**: `varint Δµs from base_time` plus an event
+  header plus a postcard payload. Delta-encoded time: 1–3 bytes instead of
+  LSM's 10-byte key.
+- **Recovery**: no WAL is needed — the log is the WAL. A scan of the last
+  segment by block CRCs, stopping at the first broken or zero header, and a
+  truncation of the tail. It is done when a channel comes up: a torn segment
+  of a previous run is truncated to the end of the intact data and **sealed** —
+  the footer is assembled in the same walk that looks for that end, so no
+  second pass is needed. The point is not the convenience of reading: while a
+  segment is unsealed, the unwritten tail of its reserve window is counted
+  against it, and several crash stops in a row eat the channel's budget with
+  emptiness, after which rotation starts on live history. Only a segment of a
+  foreign run is touched — the live state of this same process may be writing
+  into one of the current run.
+- **Reading**: a binary search over the segment names → the footer's block
+  index for a sealed segment (or a scan of the headers for an active one) →
+  decompressing a block.
+- **Spans** — with no keyspace of their own and no update semantics: ordinary
+  `SpanStart`/`SpanEnd` events in the shared stream, and the tree is assembled
+  at read time. Spans rotate along with the events — there are no dangling
+  span ids.
 
-### Модель данных
+### The data model
 
-Один процесс ОС; «микросервисы» — задачи/потоки внутри него. Один writer-таск,
-span-контекст через task_local.
+One OS process; the "microservices" are tasks and threads inside it. One
+writer task, with the span context in a task_local.
 
-**Неймспейсы вместо origin.** Разделяются два понятия:
-- **Схема** — compile-time: декларации событий/спанов/метрик
-  (`register_events!`), версия протокола, цепочка миграций. Принадлежит коду
-  микросервиса.
-- **Неймспейс** — runtime: именованная область хранения, которую микросервис
-  поднимает при старте, привязывая к схеме. Физически — поддиректория
-  `<root>/<namespace>/<channel>/…` со своими сегментами и метой
-  (имя схемы, версия протокола).
+**Namespaces instead of an origin.** Two notions are kept apart:
+- **A schema** is compile-time: the declarations of events, spans and metrics
+  (`register_events!`), the protocol version, the migration chain. It belongs
+  to the microservice's code.
+- **A namespace** is runtime: a named storage area a microservice brings up at
+  start, binding it to a schema. Physically a subdirectory
+  `<root>/<namespace>/<channel>/…` with its own segments and metadata (the
+  schema name, the protocol version).
 
-Записи **не хранят origin вообще** — принадлежность имплицитна из
-местоположения. У каждого микросервиса уникальное имя и id: четыре
-экземпляра сервиса усилителя = четыре неймспейса `orc-radio-0` …
-`orc-radio-3` с общей схемой. Отдельного понятия instance нет нигде.
+Records **do not store an origin at all** — belonging is implicit from where
+they lie. Every microservice has a unique name and id: four instances of an
+amplifier service are four namespaces `orc-radio-0` … `orc-radio-3` sharing a
+schema. There is no separate notion of an instance anywhere.
 
-**Группы неймспейсов** — по префиксу имени: `orc-*` — оркестраторы,
-`apt-*` — адаптеры. Группа используется для запросов («все логи
-оркестраторов») и как уровень конфигурации по умолчанию (каналы/бюджеты
-наследуются группой → неймспейсом).
+**Namespace groups** go by name prefix: `orc-*` for orchestrators, `apt-*` for
+adapters. A group is used for queries ("all the orchestrators' logs") and as a
+level of default configuration (channels and budgets are inherited group →
+namespace).
 
-**Бюджеты ротации** — per storage class, общие на всё хранилище: «вся
-телеметрия — столько-то». Вытесняется старейший сегмент класса через границы
-неймспейсов; личная квота неймспейса — необязательный предел внутри общего
-(`NsQuota` при открытии). У класса может быть свой корень (`custom_root:`) — критика
-на защищённом разделе.
+**Rotation budgets** are per storage class, shared across the whole store:
+"all telemetry gets this much". The class's oldest segment is evicted across
+namespace boundaries; a namespace's personal quota is an optional limit inside
+the shared one (`NsQuota` at open time). A class may have a root of its own
+(`custom_root:`) — critical data on a protected partition.
 
-Чтение «всё за период» — k-way merge потоков (неймспейсы × каналы) по
-времени. Цена модели: активный буфер блока на каждый (namespace, channel);
-group commit Immediate-каналов работает per-namespace.
+Reading "everything over a period" is a k-way merge of streams (namespaces ×
+channels) by time. The price of the model: an active block buffer per
+(namespace, channel); the group commit of Immediate channels works per
+namespace.
 
-**Сообщение**:
-- тип события — id в пределах схемы неймспейса (`register_events!`);
-- span_id (из runtime-контекста);
-- **данные** — типизированные поля события, на диске postcard; текст не
-  хранится — рендерится при чтении из шаблона в бинарнике.
+**A message**:
+- the event type — an id within the namespace's schema (`register_events!`);
+- the span_id (from the runtime context);
+- **the data** — the event's typed fields, postcard on disk; the text is not
+  stored but rendered at read time from a template in the binary.
 
-**Языки шаблонов настраиваемы**: en/ru — частный случай одного проекта;
-другому может быть нужно en+ja+zh. Приложение декларирует список языков
-один раз (const), макрос требует шаблон каждого языка у каждого события,
-API чтения принимает код языка. Библиотека к набору языков агностична.
+**Template languages are configurable**: en/ru is one project's particular
+case; another may need en+ja+zh. An application declares the list of languages
+once (a const), the macro demands a template in every language for every
+event, and the read API accepts a language code. The library is agnostic to
+the set.
 
-На диск пишется только динамика. Всё статическое свойство типа живёт в
-реестре бинарника и на диске не занимает ни байта:
-- **level** — у конкретного типа события конкретный уровень, известен при
-  компиляции; резолвится при чтении через реестр;
-- **тэги** — только статические, в декларации типа события; динамических
-  (runtime) тэгов нет.
+Only what varies is written to disk. Every static property of a type lives in
+the binary's registry and takes not a byte on disk:
+- **level** — a given event type has a given level, known at compile time; it
+  is resolved at read time through the registry;
+- **tags** — static only, in the event type's declaration; there are no
+  dynamic (runtime) tags.
 
-Читаемость старых записей обеспечивается не самоописанием, а **миграциями**
-(см. ниже): хранилище всегда приведено к схеме текущего билда.
+Old records stay readable not through self-description but through
+**migrations** (see below): the store is always brought up to the schema of
+the current build.
 
-**Span** — метка работы системы (пример: калибровка усилителя → дочерний
-span «подъём мощности» → сообщения привязываются к нему). Две записи в общем
-потоке: `SpanStart{span_id, kind, parent}` и `SpanEnd{span_id}`.
-Одни и те же типы сообщений привязываются к разным спанам в рантайме —
-контекст распространяется через task_local, как в прототипе (drop-guard
-фиксирует завершение при отмене future). span_id глобален для процесса
-(один аллокатор): `SpanStart` лежит в неймспейсе инициатора, сообщения
-других неймспейсов ссылаются на span_id — резолв при merge-чтении.
+**A span** marks a stretch of the system's work (an example: an amplifier
+calibration → a child span "power ramp" → messages attached to it). Two
+records in the shared stream: `SpanStart{span_id, kind, parent}` and
+`SpanEnd{span_id}`. One and the same message types attach to different spans
+at runtime — the context propagates through a task_local, as in the prototype
+(a drop guard records the end on cancellation of a future). A span_id is
+global to the process (one allocator): the `SpanStart` lies in the initiator's
+namespace, and other namespaces' messages refer to the span_id — resolved
+during a merged read.
 
-**Телеметрия** — история изменения значений. **Ряд — это метрика, и ничего
-кроме.** Рантайм-размерностей нет: несколько однотипных датчиков выражаются
-разными метриками схемы (`temp_pa`, `temp_lna`), а не одной метрикой с тэгом.
-Причина та же, по которой у сообщений нет рантайм-тэгов: различающий признак
-известен при компиляции, и платить за него байтами в каждом отсчёте незачем.
+**Telemetry** is the history of how values change. **A series is a metric and
+nothing else.** There are no runtime dimensions: several sensors of one kind
+are expressed as different schema metrics (`temp_pa`, `temp_lna`) rather than
+as one metric with a tag. The reason is the one messages have no runtime tags
+for: what tells them apart is known at compile time, and there is no reason to
+pay bytes for it in every sample.
 
-Отсчёт — `[Δt varint][metric_id 1–2B][значение]`, 4–8 байт до сжатия. Никакой
-служебной записи, никакого интернирования, никакой таблицы в footer'е: отсчёт
-самодостаточен, и восстанавливать по нему нечего.
+A sample is `[Δt varint][metric_id 1–2B][the value]`, 4–8 bytes before
+compression. No bookkeeping record, no interning, no table in the footer: a
+sample is self-sufficient and there is nothing to reconstruct from it.
 
-> Так было не сразу. В версии 1 контейнера ряд был парой `(метрика, тэги)`,
-> отсчёт ссылался на сегментно-локальный номер, а связывала их запись
-> `SeriesDef`. Это дало ровно один критический дефект — идентичность ряда
-> терялась при чтении в обратном порядке (режим по умолчанию), после
-> перескока по времени и через границу сегмента, — и целый механизм её
-> восстановления, включая дубль таблицы в footer'е. Отказ от рантайм-тэгов
-> убрал и дефект, и механизм.
+> It was not always so. In container version 1 a series was the pair
+> `(metric, tags)`, a sample referred to a segment-local number, and a
+> `SeriesDef` record tied them together. That gave exactly one critical
+> defect — a series' identity was lost when reading in reverse (the default
+> mode), after a jump in time and across a segment boundary — and a whole
+> mechanism for restoring it, a duplicate table in the footer included.
+> Dropping runtime tags removed both the defect and the mechanism.
 
-**Что живёт в схеме, а не на диске** (сверх общего правила про статику):
+**What lives in the schema rather than on disk** (beyond the general rule
+about statics):
 
-- **подписи и важность состояний** метрики-перечисления;
-- **вид метрики**: `gauge` интерполируется, `state` держится ступенькой,
-  `counter` монотонен. Соединять состояния прямой значит показать значения,
-  которых не было, — это не косметика, а ложь на графике;
-- **пределы значений**: диапазон нормы, вне которого значение тревожно
-  (`warn:`), и диапазон, вне которого аварийно (`alarm:`); для форм, которые
-  диапазоном не выразить, — предикаты срабатывания `warn_if:`/`alarm_if:`.
+- **the labels and severities of the states** of an enum metric;
+- **the metric's kind**: a `gauge` is interpolated, a `state` is held as a
+  step, a `counter` is monotonic. Joining states with a straight line means
+  showing values that never were — that is not cosmetic but a lie on a chart;
+- **the value limits**: the range of what is normal, outside which a value is
+  a warning (`warn:`), and the range outside which it is a fault (`alarm:`);
+  for shapes a range cannot express there are the trigger predicates
+  `warn_if:`/`alarm_if:`.
 
-**Метрики-перечисления.** Конечный автомат (`los | sync | lock`) — временной
-ряд, на графике полоса состояний. Формат под это не менялся: код состояния —
-обычное целое, один байт для кодов меньше 128. Коды объявляются **явно**:
-позиционная нумерация сдвинулась бы при вставке состояния в середину списка,
-и уже записанные сегменты стали бы читаться неверно. Макрос порождает
-Rust-тип, поэтому на месте вызова стоит `link.sample_state(LinkState::Lock)`,
-а не голое число.
+**Enum metrics.** A state machine (`los | sync | lock`) is a time series, a
+band of states on a chart. The format did not change for it: a state code is
+an ordinary integer, one byte for codes below 128. The codes are declared
+**explicitly**: positional numbering would shift when a state was inserted
+into the middle of the list, and segments already written would start reading
+wrongly. The macro generates a Rust type, so the call site reads
+`link.sample_state(LinkState::Lock)` rather than a bare number.
 
-**Пределы значений.** Важность называется `warn` / `alarm`, а не
-`warn` / `critical`: слово `critical` занято классом хранения
-(`store: critical` — устойчивость к потере питания), и в объявлении метрики
-они стоят рядом. Это разные оси: класс хранения говорит, *как записать*,
-важность — *что значение означает*.
+**Value limits.** The severity is called `warn` / `alarm` rather than
+`warn` / `critical`: the word `critical` is taken by the storage class
+(`store: critical` — resilience to a power loss), and in a metric declaration
+the two stand side by side. They are different axes: the storage class says
+*how to write*, the severity *what the value means*.
 
-Форм пределов три, и у них осознанно разные роли:
+There are three forms of limit, and their roles differ deliberately:
 
-- **диапазоны нормы** (`warn: -40.0..=70.0`) — данные: по ним рисуются полосы
-  на графиках, их переопределяет рантайм (`set_thresholds`). Диапазон описывает
-  именно норму, потому что двустороннее условие выражается одним диапазоном;
-- **предикаты срабатывания** (`alarm_if: v > 3.0 || v < 1.0`) — произвольная
-  логика, которую диапазоном не выразить. Полярность у предиката обратная
-  диапазону, поэтому и ключ другой — перепутать формы молча нельзя. Предикат
-  компилируется в fn дескриптора и работает у любого читателя этой схемы, но
-  непрозрачен: полос на графике по нему нет. С диапазонами складывается по
-  правилу «тяжелейший диагноз побеждает»;
-- **рантайм-замыкание** (`ns.set_severity_fn(metric, |v| …)`) — крайняя форма:
-  захваченный контекст (модель железа, гистерезис) и полная власть — оно
-  побеждает и схему, и переопределения данных, пока его не снимут.
+- **ranges of what is normal** (`warn: -40.0..=70.0`) are data: the bands on
+  charts are drawn from them and the runtime overrides them
+  (`set_thresholds`). A range describes what is normal precisely because a
+  two-sided condition is expressed by a single range;
+- **trigger predicates** (`alarm_if: v > 3.0 || v < 1.0`) are arbitrary logic
+  a range cannot express. A predicate's polarity is the opposite of a range's,
+  hence a different key — the forms cannot be confused silently. A predicate
+  compiles into a descriptor fn and works for any reader of this schema, but
+  it is opaque: no bands on a chart come from it. It composes with ranges by
+  the rule "the heaviest diagnosis wins";
+- **a runtime closure** (`ns.set_severity_fn(metric, |v| …)`) is the extreme
+  form: captured context (the hardware model, hysteresis) and full authority —
+  it beats both the schema and the data overrides until it is removed.
 
-Предел — свойство **установки**, а не измерения: одна и та же температура
-нормальна для одного усилителя и аварийна для другого.
-Отсюда три следствия:
+A limit is a property of the **installation**, not of the measurement: one and
+the same temperature is normal for one amplifier and critical for another.
+Hence three consequences:
 
-- пределы **не пишутся на диск** никогда. Иначе история оказалась бы размечена
-  по порогам, которые уже никто не считает верными;
-- дефолты объявляются в схеме, а **переопределяются в рантайме** — внешняя
-  система, определив модель железа, выставляет свои. Переопределение живёт
-  в памяти на уровне **неймспейса**: у каждого экземпляра своё железо, общие
-  на процесс пределы были бы неверны для всех сразу;
-- офлайн-вьюер видит только дефолты схемы. Это цена, а не недосмотр:
-  рантайм-настройки принадлежат работающему процессу.
+- limits are **never written to disk**. Otherwise the history would be marked
+  up by thresholds nobody considers right any more;
+- the defaults are declared in the schema and are **overridden at runtime** —
+  an external system, having determined the hardware model, sets its own. An
+  override lives in memory at the **namespace** level: every instance has
+  hardware of its own, and process-wide limits would be wrong for all of them
+  at once;
+- an offline viewer sees only the schema's defaults. That is a price, not an
+  oversight: runtime settings belong to a running process.
 
-Движок пределы **не применяет сам**: он не решает за приложение, что делать с
-выходом за границы, и не порождает событий. Он лишь отвечает на вопрос
-«насколько это значение требует внимания» — приложению и будущему веб-слою.
+The engine does **not apply** the limits itself: it does not decide for the
+application what to do about a bound being crossed, and it raises no events.
+It only answers the question "how much does this value call for attention" —
+to the application and to the future web layer.
 
-**Разреженность рядов состояний.** Состояния пишут по изменению, иначе в них
-нет смысла. Значит окно запроса может не содержать ни одного отсчёта ряда,
-который всё это время держал одно значение. Читатель по запросу дотягивает
-последний отсчёт каждого ряда-состояния **до** начала окна — отдельным полем
-ответа, чтобы не нарушать обещание «всё внутри диапазона». Поиск ограничен
-двумя сегментами назад и отбрасывает сегменты без нужных метрик по множеству
-идентификаторов из footer'а; ряд, не менявшийся очень долго, останется без
-затравки — это честнее, чем читать всю историю ради одного значения.
+**The sparseness of state series.** States are written on change, or there is
+no point to them. So a query's window may hold not one sample of a series that
+held one value the whole time. On request the reader carries the last sample
+of every state series through to **before** the window's start — as a separate
+field of the answer, so as not to break the promise that everything is inside
+the range. The search is bounded to two segments back and discards segments
+without the metrics wanted by the set of identifiers in the footer; a series
+unchanged for a very long time will be left without a seed — which is more
+honest than reading the whole history for one value.
 
-### Версия протокола и миграции
+### The protocol version and migrations
 
-Схема сообщений может меняться между версиями прошивки. Решение — **система
-миграций** (а не самоописание сегментов):
+A message schema can change between firmware versions. The answer is a system
+of **migrations** (rather than self-describing segments):
 
-- **Версия протокола — per схема, применяется per неймспейс**: монотонный
-  номер в декларации схемы; каждый неймспейс мигрирует независимо (обновление
-  одного сервиса мигрирует только его неймспейсы). Библиотека даёт механизм,
-  номер и шаги принадлежат коду микросервиса.
-- Каждый **сегмент** несёт версию (на момент записи) в заголовке; мета
-  неймспейса — версию последней завершённой миграции. Смешанное состояние
-  легально, миграция идемпотентна («переписать сегменты с версией < текущей»).
-- **Шаги миграции** `vN → vN+1` пишутся разработчиком вместе с изменением
-  схемы: переименование/удаление события, добавление поля с дефолтом,
-  ремап id. Шаг объявляется **ключом-источником**: `1 => migrate_v1` это
-  шаг из версии 1 в версию 2, и цепочка обязана быть непрерывной от 1 до
-  текущей. Цепочка шагов покрывает прыжок через несколько версий.
-  Ремап id миграцией снимает остроту проблемы позиционных авто-ID прототипа.
-- **Crash-safety**: миграция посегментно — rewrite во временный файл →
-  fdatasync → atomic rename → unlink старого. Обрыв питания = продолжение
-  на следующем старте.
-- **Экономия износа**: footer сегмента хранит множества id типов событий и
-  метрик, встречающихся в сегменте. Миграция переписывает только сегменты с
-  затронутыми типами; остальные не трогаются (версию хранит мета неймспейса,
-  in-place штамп сегмента не нужен). У сырого fn затронутые типы объявляются
-  **явно** — `1 => migrate_v1 { events: [PowerSet] }`, — и их отсутствие
-  означает «затрагивает всё»: забытый список не должен молча превращаться в
-  «не трогаем ничего». Множества при этом **связывающие**: шаг видит только
-  записи объявленных типов, так что объявленное и фактическое не расходятся.
-- **Типизированные правила** — основная форма шага. Старая раскладка
-  объявляется в `history {}` (макрос порождает `v1::PowerSet` с
-  `Deserialize` и старым id), а шаг пишется правилами по ключам:
-  `v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) }`
-  (декод, преобразование, энкод генерируются), `event(0x05): drop`
-  (удалённый тип — по голому id), `metric(0x07): metrics::TempPa` (ремап).
-  Затронутые типы **выводятся** из ключей, неиспользованная history-запись —
-  ошибка компиляции. Сырой fn остаётся люком.
-- **Значения отсчётов и виды спанов** мигрируют теми же правилами:
-  `metrics::Level: |v: u64| v as f32 / 10.0` (величина стала писаться в своих
-  единицах), `span(0x01): spans::Calibration` (вид переименован). Значению
-  `history` не нужна: оно самоописуемо — тип лежит в самой записи, — и тип
-  называет параметр замыкания; проверка строгая, приведение молча не делается.
-  Возврат при этом держит схема: правило, дающее не объявленный метрике тип,
-  не собирается — иначе миграция стала бы щелью в той самой проверке, ради
-  которой типизирован `sample`. По этой же причине значение преобразуется
-  только у метрики, названной по имени: у голого id объявленного типа нет.
-  У спана меняется только **вид**: номер и родитель — личность записи, на
-  которую ссылаются её конец, её сообщения и её дети. По той же причине
-  начало спана не удаляется правилом вовсе.
-  Экономии на сегментах спаны не дают: множества видов в footer'е нет, и
-  ответить «таких спанов здесь не бывает» нечем — шаг со спанами переписывает
-  каждый сегмент. Решить «нет» наугад значило бы оставить эти записи в прежней
-  раскладке навсегда: прогон отчитался бы об успехе и заштамповал мету.
-- **Чтение применяет цепочку на лету**: сегмент старой версии корректно
-  читается и до физического прогона — прогон меняет носитель, а не ответ.
-  Когда его звать, решает приложение (`Namespace::migrate`); долг виден в
+- **The protocol version is per schema and applied per namespace**: a
+  monotonic number in the schema declaration; every namespace migrates
+  independently (updating one service migrates only its namespaces). The
+  library provides the mechanism, while the number and the steps belong to the
+  microservice's code.
+- Every **segment** carries a version (as of write time) in its header, while
+  a namespace's metadata carries the version of the last completed migration.
+  A mixed state is legitimate, and a migration is idempotent ("rewrite the
+  segments whose version is below the current one").
+- **Migration steps** `vN → vN+1` are written by the developer along with the
+  schema change: renaming or removing an event, adding a field with a default,
+  remapping an id. A step is declared by its **source key**: `1 =>
+  migrate_v1` is the step from version 1 to version 2, and the chain has to be
+  unbroken from 1 to the current version. A chain of steps covers a jump
+  across several versions. Remapping an id by a migration takes the edge off
+  the prototype's positional auto-id problem.
+- **Crash safety**: a migration goes segment by segment — rewrite into a
+  temporary file → fdatasync → an atomic rename → unlink the old one. A power
+  loss means continuing at the next start.
+- **Saving wear**: a segment's footer holds the sets of event and metric type
+  ids occurring in the segment. A migration rewrites only the segments with
+  affected types; the rest are not touched (the version is held by the
+  namespace's metadata, and an in-place stamp on a segment is not needed). For
+  a raw fn the affected types are declared **explicitly** — `1 => migrate_v1 {
+  events: [PowerSet] }` — and their absence means "it affects everything": a
+  forgotten list must not silently turn into "we touch nothing". The sets are
+  **binding** at the same time: a step sees only records of the declared
+  types, so what is declared and what is done do not diverge.
+- **Typed rules** are a step's main form. The old layout is declared in
+  `history {}` (the macro generates `v1::PowerSet` with `Deserialize` and the
+  old id), and a step is written as rules keyed by it:
+  `v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) }` (the
+  decoding, the transformation and the encoding are generated),
+  `event(0x05): drop` (a removed type, by its bare id), `metric(0x07):
+  metrics::TempPa` (a remap). The affected types are **inferred** from the
+  keys, and an unused history entry is a compile error. The raw fn remains as
+  a hatch.
+- **Sample values and span kinds** migrate by the same rules:
+  `metrics::Level: |v: u64| v as f32 / 10.0` (a quantity is now written in its
+  own units), `span(0x01): spans::Calibration` (a kind was renamed). A value
+  needs no `history`: it is self-describing — the type lies in the record
+  itself — and the type is named by the closure's parameter; the check is
+  strict and no conversion happens silently. The return, meanwhile, is held by
+  the schema: a rule that yields a type the metric does not declare will not
+  compile — otherwise a migration would become a gap in the very check `sample`
+  is typed for. For the same reason a value is transformed only on a metric
+  named by name: a bare id has no declared type. Only a span's **kind**
+  changes: its number and parent are the record's identity, referred to by its
+  end, its messages and its children. For the same reason a rule does not
+  delete a span's start at all. Spans save no segments: there is no set of
+  kinds in the footer and nothing to answer "there are no such spans here"
+  with — a step with spans rewrites every segment. Deciding "no" on a guess
+  would leave those records in the earlier layout forever: the run would report
+  success and stamp the metadata.
+- **Reading applies the chain on the fly**: a segment of an old version reads
+  correctly even before a physical run — a run changes the medium, not the
+  answer. When to call it is the application's decision
+  (`Namespace::migrate`); the debt is visible in
   `Namespace::pending_migration()`.
 
-### Каналы (storage classes)
+### Channels (storage classes)
 
-Движок = набор именованных **каналов**. Канал — директория сегментов + конфиг:
+The engine is a set of named **channels**. A channel is a directory of
+segments plus a configuration:
 
 ```
 ChannelConfig {
-    budget_bytes,        // бюджет КЛАССА на всё хранилище
-    segment_bytes,       // ПРЕДЕЛ роста, он же граница ротации (8 MiB; у
-                         // critical 4 MiB). Не размер файла: место берётся
-                         // окном от 64 KiB, восьмыми долями предела
-    root,                // свой носитель класса (критика — на jffs)
-    block_max_bytes,     // размер буфера блока (напр. 64 KiB)
-    flush_interval,      // макс. задержка выталкивания блока
-    sync_interval,       // см. ниже
+    budget_bytes,        // the budget of the CLASS across the whole store
+    segment_bytes,       // the growth LIMIT, which is also the rotation
+                         // boundary (8 MiB; 4 MiB for critical). Not the
+                         // file's size: space is taken as a window from
+                         // 64 KiB, by eighths of the limit
+    root,                // the class's own medium (critical data on jffs)
+    block_max_bytes,     // the block buffer's size (64 KiB, say)
+    flush_interval,      // the longest delay before flushing a block
+    sync_interval,       // see below
     compression,         // None | Lz4 | Zstd(level)
 }
 ```
 
-Синхронизация per канал — один интервал (`sync_interval`): `fdatasync` не
-чаще него, плюс всегда при запечатывании сегмента и на завершении. Ноль —
-сразу после каждой групповой фиксации (group commit: забирает всё
-накопившееся); так работает критический канал, и для него это не настройка,
-а **определение** — `Store::open` отвергает критический канал с ненулевым
-интервалом. Отдельных состояний «Immediate»/«Relaxed» нет: немедленность —
-это нулевой интервал, «только на запечатывании» — большой.
+Syncing is per channel with one interval (`sync_interval`): an `fdatasync` no
+more often than that, plus always on sealing a segment and at shutdown. Zero
+means right after every group commit (a group commit takes everything that has
+piled up); that is how the critical channel works, and for it this is not a
+setting but a **definition** — `Store::open` refuses a critical channel with a
+non-zero interval. There are no separate "Immediate"/"Relaxed" states:
+immediacy is a zero interval, and "on sealing only" is a large one.
 
-Настройки класса — общие на всё хранилище, и это верно ровно до тех пор,
-пока неймспейсы однородны. Двадцать четыре тысячи однородными не бывают, и
-разницу выражает **группа** — префикс имени, тот же самый, которым отбирает
-`Query::group`: «журналы оркестраторов» и «настройки оркестраторов» обязаны
-обозначать одно множество, поэтому правило отбора одно на чтение и на запись
-(`in_group`).
+A class's settings are shared by the whole store, and that holds exactly as
+long as the namespaces are uniform. Twenty-four thousand never are, and the
+difference is expressed by a **group** — a name prefix, the very one
+`Query::group` selects by: "the orchestrators' journals" and "the
+orchestrators' settings" have to denote one set, so the selection rule is one
+and the same for reading and for writing (`in_group`).
 
 ```rust
 StoreConfig::new("/data/logs").group("orc-", GroupPolicy::new()
@@ -314,175 +340,191 @@ StoreConfig::new("/data/logs").group("orc-", GroupPolicy::new()
     .limit_bytes(StorageClass::Telemetry, 1 << 30))
 ```
 
-Совпало несколько префиксов — они **накладываются** от общего к частному:
-`orc-radio-` уточняет `orc-`, а не заменяет его, и настройка, которую
-уточняющая группа не упомянула, приходит от общей. Иначе уточнение одного
-размера сегмента молча снимало бы квоту, сжатие и интервалы, заданные для всех
-оркестраторов. Настройки, названные при открытии неймспейса, бьют групповые. Группа задаёт только то, что принадлежит **каждому пишущему каналу
-по отдельности**: размер сегмента и блока, интервалы, сжатие, личную квоту.
-Бюджет класса и его носитель ей недоступны, и не как упущение: бюджет общий на
-класс и есть потолок занятости («вся телеметрия — столько-то»), а группа со
-своим бюджетом либо подняла бы этот потолок выше объявленного, либо развела
-один класс по двум носителям, где общий бюджет перестал бы что-либо означать.
-Групповая квота — предел **внутри** бюджета класса и назначается каждому
-неймспейсу группы по отдельности: «ни один оркестратор не занимает больше
-гигабайта», а не «все вместе». Проверяется группа теми же правилами, что и
-класс: настройка, негодная классу, не становится годной оттого, что её задали
-группе.
+When several prefixes match they **lay over** one another from the general to
+the specific: `orc-radio-` refines `orc-` rather than replacing it, and a
+setting the refining group did not mention comes from the general one.
+Otherwise refining one segment size would silently remove the quota, the
+compression and the intervals set for every orchestrator. Settings named when
+a namespace is opened beat the group's. A group sets only what belongs to
+**each writing channel separately**: the segment and block sizes, the
+intervals, the compression, the personal quota. The class budget and its
+medium are not available to it, and not as an oversight: the budget is shared
+by the class and is the occupancy ceiling ("all telemetry gets this much"),
+and a group with a budget of its own would either raise that ceiling above
+what was declared or spread one class across two media, where a shared budget
+would stop meaning anything. A group's quota is a limit **inside** the class
+budget and is assigned to every namespace of the group separately: "no
+orchestrator takes more than a gigabyte", not "all of them together". A group
+is validated by the same rules as a class: a setting unfit for a class does
+not become fit by being given to a group.
 
-Маршрутизация — **значимость декларируется на типе**: и типы сообщений, и
-метрики (и виды спанов) объявляют класс хранения в `register_events!`
-(например `store: critical`). Значимые пишутся в критический канал
-(fdatasync на всплеск), незначимые — в обычный (батчи,
-отложенная синхронизация). Дефолт — обычный канал. Один формат блока/записи
-во всех каналах — различаются только политики.
+Routing works by **significance declared on the type**: message types, metrics
+(and span kinds) all declare a storage class in `register_events!` (`store:
+critical`, for instance). What matters is written to the critical channel (an
+fdatasync per burst), what does not to the ordinary one (batches, deferred
+syncing). The default is the ordinary channel. One block and record format in
+every channel — only the policies differ.
 
-Классов ровно три: `default`, `critical`, `telemetry`. Незнакомое имя в
-`store:` — **ошибка компиляции**, а не новый класс: описка в `critical` иначе
-давала бы канал с другим именем, другой политикой долговечности и другим
-бюджетом, то есть ровно то, от чего класс хранения защищает, и без единого
-признака. Обычный канал у неймспейса есть **всегда**, даже если его не
-объявил ни один тип: свободному тексту (мост из чужих логов, обработчик
-паники, однократное объявление дефекта сборки) своего класса взять неоткуда, а
-писать его надо.
+There are exactly three classes: `default`, `critical`, `telemetry`. An
+unfamiliar name in `store:` is a **compile error** rather than a new class:
+otherwise a typo in `critical` would give a channel with a different name, a
+different durability policy and a different budget — that is, exactly what a
+storage class protects against, and with no sign at all. A namespace
+**always** has the ordinary channel, even if no type declared it: free text
+(the bridge from foreign logs, the panic handler, the one-off announcement of
+a build defect) has nowhere to get a class of its own, and it has to be
+written.
 
-#### Очереди
+#### The queues
 
-Очередей две — обычная и критическая, — и обе выделяются целиком при открытии
-хранилища. Ёмкости настраиваются (`StoreConfig::with_queues`): значения по
-умолчанию (8192 / 1024) стоят около трёх четвертей мегабайта на процесс, что
-на armv7 не всегда уместно. Меньшая очередь экономит память, но раньше
-начинает терять записи на всплесках.
+There are two queues — ordinary and critical — and both are allocated whole
+when a store is opened. The capacities are configurable
+(`StoreConfig::with_queues`): the defaults (8192 / 1024) cost about three
+quarters of a megabyte per process, which is not always appropriate on armv7.
+A smaller queue saves memory but starts losing records sooner on bursts.
 
-Ожидание места в критической очереди — единственное место, где запись
-блокирует вызывающего, и на него есть исключение: **`SpanGuard::drop` не ждёт
-никогда**. Уничтожение стража случается и при развёртке стека после паники, а
-там пятисекундное ожидание превратило бы аварийное завершение в зависание,
-причём вложенные стражи сложили бы свои таймауты друг к другу. Цена —
-потерянный под давлением конец спана; он учтён счётчиком и отметкой в потоке,
-а незакрытый спан читатель обязан уметь показать в любом случае: спан,
-оборванный крахом процесса, выглядит так же. Кому нужна гарантия — вызывает
-`SpanGuard::close()` явно, там действует обычная политика канала.
+Waiting for room in the critical queue is the only place where writing blocks
+the caller, and there is an exception to it: **`SpanGuard::drop` never
+waits**. A guard is dropped during stack unwinding after a panic too, and
+there a five-second wait would turn an emergency shutdown into a hang, with
+nested guards stacking their timeouts on top of one another. The price is a
+span's end lost under pressure; it is counted and noted in the stream, and a
+reader has to be able to show an unclosed span in any case: a span cut short
+by a process crash looks the same. Whoever needs the guarantee calls
+`SpanGuard::close()` explicitly, where the channel's ordinary policy applies.
 
-### Флеш-специфика (eMMC/SD)
+### Flash specifics (eMMC/SD)
 
-- Аппенды последовательные; размер блока ~кратен странице FTL (4–64 KiB).
-- `fallocate` сегмента на полный размер при создании + `fdatasync` вместо
-  `fsync`: append не трогает метаданные ФС, sync дешевле. Хвост нулей
-  преаллоцированного файла естественно терминирует recovery-скан.
-- «Постоянная» durability реализуется как group commit — один fdatasync
-  на всплеск критических записей (~1–10 мс на eMMC), не на каждую запись.
+- The appends are sequential; the block size is roughly a multiple of the
+  FTL's page (4–64 KiB).
+- Reserving a segment's space up front plus `fdatasync` instead of `fsync`: an
+  append does not touch the filesystem's metadata, so the sync is cheaper. The
+  tail of zeros in a reserved file naturally terminates a recovery scan.
+- "Permanent" durability is implemented as a group commit — one fdatasync per
+  burst of critical records (~1–10 ms on eMMC), not per record.
 
-### Масштабирование
+### Scaling
 
-- RAM на канал: активный буфер блока + каталог сегментов (имя → первый ключ),
-  сотни байт на сегмент. 200 ГБ при 256 MiB сегментах ≈ 800 записей каталога.
-- Block-индекс сегмента загружается только при чтении этого сегмента.
-- **Дескрипторы и место считаются по пишущим, а не по заведённым каналам.**
-  Открытый сегмент — это дескриптор и окно резерва; и то, и другое
-  возвращается, когда канал молчит (SPEC §5). Поэтому обе величины
-  ограничены числом каналов, писавших за последние минуты, а не общим их
-  числом: при ~24k неймспейсов × 2–3 канала разница между «десятки тысяч» и
-  «единицы» и есть разница между работающим прибором и упёршимся в `ulimit`.
-  Отпущенный сегмент при этом **продолжается**, а не закрывается: иначе
-  редко пишущий канал платил бы за экономию файлом на каждое пробуждение, и
-  инодов не стало бы раньше, чем места.
-- **Потолок памяти буферов** (`StoreConfig::buffer_ceiling_bytes`) —
-  необязательный и по умолчанию отсутствует: пишущих в любой момент единицы.
-  Он нужен там, где это перестаёт быть правдой, и ограничивает **оперативную
-  память**, а не место: бюджет принадлежит классу и носителю, потолок —
-  процессу. Превышение снимается возвратом буферов, а не отброшенными
-  записями; невыполнимый потолок виден в `Stats::buffer_overruns`.
-- **Предел масштаба задаёт записанное, а не сконфигурированное.** Активный
-  сегмент вытеснить нельзя, поэтому бюджет класса обязан покрывать сумму
-  живых сегментов — но числятся они своим окном резерва, а не `segment_bytes`
-  (SPEC §2). Канал, написавший сто байт, стоит 64 КиБ, а не 8 МиБ: тот же
-  8-гигабайтный бюджет держит не ~1000 одновременно пишущих каналов, а весь
-  заявленный флот в 24k, пока они пишут понемногу. Превышение по-прежнему
-  видно в `Stats::budget_overruns`, а не в кончившемся месте.
+- RAM per channel: the active block buffer plus the segment inventory (a name
+  → the first key), hundreds of bytes per segment. 200 GB at 256 MiB segments
+  is about 800 inventory entries.
+- A segment's block index is loaded only when that segment is read.
+- **Descriptors and space are counted by the writers rather than by the
+  channels that exist.** An open segment is a descriptor and a reserve window;
+  both come back once a channel goes quiet (SPEC §5). So both quantities are
+  bounded by the number of channels that wrote in the last few minutes rather
+  than by their total number: at ~24k namespaces × 2–3 channels, the
+  difference between "tens of thousands" and "a handful" is the difference
+  between a working device and one that hit its `ulimit`. A released segment
+  is **continued** rather than closed: otherwise a rarely writing channel
+  would pay for the saving with a file per wake-up, and the inodes would run
+  out before the space did.
+- **The buffer memory ceiling** (`StoreConfig::buffer_ceiling_bytes`) is
+  optional and absent by default: only a handful write at any moment. It is
+  for where that stops being true, and it bounds **RAM** rather than space:
+  the budget belongs to a class and a medium, the ceiling to the process. An
+  excess is removed by giving buffers back rather than by discarding records;
+  an unmeetable ceiling is visible in `Stats::buffer_overruns`.
+- **The scale limit is set by what was written, not by what was
+  configured.** An active segment cannot be evicted, so a class budget has to
+  cover the sum of the live segments — but they are counted by their reserve
+  window rather than by `segment_bytes` (SPEC §2). A channel that wrote a
+  hundred bytes costs 64 KiB rather than 8 MiB: the same 8-gigabyte budget
+  holds not ~1000 channels writing at once but the whole 24k fleet claimed, as
+  long as they write a little at a time. An excess is still visible in
+  `Stats::budget_overruns` rather than in the medium running out.
 
-  Замер флота (одна запись на неймспейс, затем закрытие):
+  A fleet measurement (one record per namespace, then closing):
 
-  | Неймспейсов | Подъём | Занято под нагрузкой | Было бы при резерве целиком |
+  | Namespaces | Bring-up | Taken under load | Would be with a whole-segment reserve |
   |---|---|---|---|
-  | 1 000 | 0.19 с | 66 МБ | 8 ГиБ |
-  | 4 000 | 0.51 с | 266 МБ | 32 ГиБ |
-  | 24 000 | 2.80 с | 1.1 ГБ | 192 ГиБ |
+  | 1,000 | 0.19 s | 66 MB | 8 GiB |
+  | 4,000 | 0.51 s | 266 MB | 32 GiB |
+  | 24,000 | 2.80 s | 1.1 GB | 192 GiB |
 
-## Наследуется из прототипа (проверенные решения)
+## Inherited from the prototype (proven decisions)
 
-- Модель времени: `BootTime` = `(boot_counter, µs от старта run)` **одним
-  типом** (порознь эти числа моментом не являются: `Micros` разных запусков
-  несравнимы), источник CLOCK_BOOTTIME; идентичность HW-boot через
-  `/proc/sys/kernel/random/boot_id`; ретроактивный
-  UTC-якорь per hw-boot. Настенное время наружу — `chrono::DateTime<Utc>`.
-  **Якорь обновляемый, с приоритетом источников**:
-  User/Manual < NTP < GPS. Новая синхронизация перезаписывает якорь, только
-  если её приоритет ≥ текущего (GPS поверх ручного — да, ручное поверх GPS —
-  нет; свежий GPS уточняет старый GPS). Конверсия выполняется при чтении,
-  поэтому уточнение якоря ретроактивно улучшает UTC всех событий boot'а.
-- postcard-payload + декодеры/шаблоны (en/ru) в бинарнике, не на диске.
-- Декларативный макрос регистрации событий с явными ID.
-- Единый writer-таск с батчингом.
-- Drop-guard для завершения спанов (фиксация при отмене future).
+- The time model: `BootTime` = `(boot_counter, µs since the run started)` as
+  **one type** (apart, those numbers are not a moment: `Micros` of different
+  runs are not comparable), the source is CLOCK_BOOTTIME; the identity of a
+  hardware boot comes from `/proc/sys/kernel/random/boot_id`; the UTC anchor
+  is retroactive and per hardware boot. Wall-clock time is handed out as a
+  `chrono::DateTime<Utc>`. **The anchor is updatable, with source priority**:
+  User/Manual < NTP < GPS. A new synchronization overwrites the anchor only if
+  its priority is ≥ the current one (GPS over a manual entry yes, a manual
+  entry over GPS no; a fresh GPS fix refines an old one). The conversion
+  happens at read time, so refining an anchor retroactively improves the UTC
+  of every event of that boot.
+- A postcard payload plus decoders and templates (en/ru) in the binary, not on
+  disk.
+- A declarative macro for registering events with explicit IDs.
+- A single writer task with batching.
+- A drop guard for ending spans (recorded on cancellation of a future).
 
-## Известные проблемы прототипа, требующие решения в новом дизайне
+## Known prototype problems the new design has to solve
 
-- [ ] Ширина boot_counter: u16 в Time vs u32 в эпохах — унифицировать.
-- [ ] Позиционные авто-ID событий → тихий перемап исторических логов.
-- [ ] Схема только в бинарнике: логи старой прошивки нечитаемы; нет
-      версионирования формы payload.
-- [ ] Тихие потери: события до старта writer'а, переполнение канала.
-- [ ] Глобальные синглтоны — нетестируемость.
+- [ ] The width of boot_counter: u16 in Time against u32 in the epochs —
+      unify it.
+- [ ] Positional auto-ids for events → a silent remapping of historical logs.
+- [ ] The schema only in the binary: an old firmware's logs are unreadable;
+      there is no versioning of the payload's shape.
+- [ ] Silent losses: events before the writer starts, channel overflow.
+- [ ] Global singletons — untestability.
 
-## Крейты и API
+## The crates and the API
 
-Решения: веб-интерфейс — **на устройстве + офлайн-вьюер дампов**; протокол —
-**GraphQL** (как в прототипе); эргономика — **явный handle** неймспейса. Фронтенд SPA — **TypeScript + Svelte** (графики uPlot/ECharts).
-Имя проекта/префикс крейтов — **dduroc**.
+Decisions: the web interface is **on the device plus an offline dump viewer**;
+the protocol is **GraphQL** (as in the prototype); the ergonomics are an
+**explicit handle** for a namespace. The frontend SPA is **TypeScript plus
+Svelte** (charts with uPlot/ECharts). The project name and crate prefix are
+**dduroc**.
 
-**Очередь writer'а**: обычный канал — drop + счётчик overflow (как
-прототип); критический канал — **backpressure**: `ns.log()` критического
-события блокируется (с таймаутом) до освобождения места — критические
-события редки, блокировка практически недостижима, но гарантия честная.
+**The writer's queue**: the ordinary channel drops plus counts an overflow (as
+the prototype did); the critical channel applies **back pressure**:
+`ns.log()` of a critical event blocks (with a timeout) until room frees up —
+critical events are rare, so blocking is all but unreachable, but the
+guarantee is honest.
 
-**tracing/log-мост** (перехват логов сторонних крейтов и panic'ов) — во
-вторую очередь; тип записи Text (0x5) зарезервирован в формате сразу.
+**The tracing/log bridge** (intercepting third-party crates' logs and panics)
+comes second; the Text record kind (0x5) is reserved in the format from the
+start.
 
-**Готовые крейты**: postcard/serde (payload), crc32c (HW CRC), lz4_flex,
-zstd (опц.), rustix (syscalls), crossbeam-channel (очередь writer'а),
-globset, chrono (read-слой), thiserror, syn/quote, axum + async-graphql +
-tokio (веб), proptest (тесты формата). Своё — только движок (альтернатив
-без LSM/B-tree-оверхеда в экосистеме нет), формат и schema-макрос
-(tracing не подходит фронтендом: нет стабильных id, схемы, i18n, миграций).
+**Off-the-shelf crates**: postcard/serde (the payload), crc32c (a hardware
+CRC), lz4_flex, zstd (optional), rustix (syscalls), crossbeam-channel (the
+writer's queue), globset, chrono (the read layer), thiserror, syn/quote,
+axum plus async-graphql plus tokio (the web), proptest (the format's tests).
+What is our own is only the engine (there is no alternative in the ecosystem
+without LSM or B-tree overhead), the format and the schema macro (tracing does
+not do as a frontend: no stable ids, no schema, no i18n, no migrations).
 
-### Workspace
+### The workspace
 
-| Крейт | Содержимое | Зависимости |
+| Crate | Contents | Dependencies |
 |---|---|---|
-| `dduroc-format` | байтовый формат: сегменты/блоки/записи, varint, CRC | минимум, sync, без tokio |
-| `dduroc-engine` | движок: Store, неймспейсы, каналы, writer-поток, ротация, recovery, миграции, epochs | format; **без tokio** — writer = выделенный OS-поток |
-| `dduroc-macros` | proc-macro декларации схемы | syn/quote |
-| `dduroc` | фасад: re-exports, Namespace/Span/Series handles, trait LogEvent | engine, macros |
-| `dduroc-read` | reader: k-way merge, фильтры, резолв схемы, UTC | format, engine (или standalone-открытие директории) |
-| `dduroc-graphql` | GraphQL-схема поверх read; subscription-заглушка под live | async-graphql |
-| `dduroc-web` | axum-роутер: GraphQL endpoint + вшитая SPA-статика | graphql, tokio |
-| `dduroc-viewer` | библиотека офлайн-вьюера: открыть дамп → поднять локально тот же dduroc-web | read, web |
+| `dduroc-format` | the byte format: segments, blocks, records, varint, CRC | minimal, sync, no tokio |
+| `dduroc-engine` | the engine: Store, namespaces, channels, the writer thread, rotation, recovery, migrations, epochs | format; **no tokio** — the writer is a dedicated OS thread |
+| `dduroc-macros` | the proc-macro for the schema declaration | syn/quote |
+| `dduroc` | the facade: re-exports, the Namespace/Span/Series handles, the LogEvent trait | engine, macros |
+| `dduroc-read` | the reader: the k-way merge, filters, schema resolution, UTC | format, engine (or a standalone open of a directory) |
+| `dduroc-graphql` | a GraphQL schema over read; a subscription stub for live | async-graphql |
+| `dduroc-web` | an axum router: the GraphQL endpoint plus the embedded SPA statics | graphql, tokio |
+| `dduroc-viewer` | the offline viewer library: open a dump and bring the same dduroc-web up locally | read, web |
 
-Ядро (format+engine) синхронно и tokio-независимо: переиспользуемость в
-проектах без async, простой writer (OS-поток, mpsc). tokio появляется
-только в веб-слое. Span-контекст фасада: явные handle'ы (см. ниже), для
-async-кода — feature `tokio` с task_local-пропагацией опционально.
+The core (format plus engine) is synchronous and independent of tokio: it can
+be reused in projects without async, and the writer is simple (an OS thread,
+an mpsc). tokio appears only in the web layer. The facade's span context: the
+explicit handles below, and for async code an optional `tokio` feature with
+task_local propagation.
 
-**Вьюер и схема**: расшифровка требует схемы, поэтому универсального
-вьюера нет — каждый проект собирает свой бинарь-вьюер: линкует свои
-схема-крейты + `dduroc-viewer` (это ~10 строк main). Записи неизвестных
-типов отображаются как «unknown» (скип по payload_len).
+**The viewer and the schema**: decoding requires a schema, so there is no
+universal viewer — every project builds its own viewer binary: it links its
+schema crates plus `dduroc-viewer` (about 10 lines of main). Records of
+unknown types are shown as "unknown" (skipped by payload_len).
 
-### Эскиз API
+### A sketch of the API
 
 ```rust
-// Крейт сервиса — декларация схемы:
+// A service's crate — the schema declaration:
 dduroc::schema! {
     name: radio, version: 3, languages: [en, ru],
     events {
@@ -495,8 +537,8 @@ dduroc::schema! {
         Spectrum = 0x02 { type: blob, store: critical },
     }
     spans { Calibration = 0x01 }
-    // Ключ — версия, ИЗ которой мигрируем; цепочка непрерывна от 1.
-    // Затронутые типы необязательны, но их отсутствие значит «всё».
+    // The key is the version being migrated FROM; the chain is unbroken from 1.
+    // The affected types are optional, but their absence means "everything".
     migrations {
         1 => migrate_v1 { events: [PowerSet], metrics: [Temp] },
         2 => migrate_v2,
@@ -504,178 +546,189 @@ dduroc::schema! {
 }
 
 // main:
-let store = Store::open(StoreConfig::new("/data/logs"))?; // epochs, boot-регистрация
+let store = Store::open(StoreConfig::new("/data/logs"))?; // epochs, boot registration
 
-// подъём неймспейса экземпляром сервиса (политики каналов — из настроек
-// хранилища и группы, которой неймспейс принадлежит по префиксу имени):
+// a service instance brings its namespace up (the channel policies come from
+// the store's settings and from the group the namespace belongs to by name
+// prefix):
 let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
 
-// незавершённая миграция называется, а не подразумевается: в каталоге
-// лежат сегменты прежней раскладки, и это стоит записать в журнал.
+// an unfinished migration is named rather than implied: the directory holds
+// segments of an earlier layout, and that is worth writing to the journal.
 if let Some((from, to)) = ns.pending_migration() { /* … */ }
 
-// сообщения — ничего не возвращают: логирование не влияет на управление,
-// потери учтены в store.stats() и объявлены в самом потоке:
+// messages return nothing: logging does not influence control flow, and
+// losses are counted in store.stats() and announced in the stream itself:
 ns.log(radio::events::PowerSet { dbm: 27.5 });
 
-// телеметрия: тип отсчёта приходит из константы метрики (Metric<f32>),
-// поэтому `sample(36u64)` — ошибка компиляции, а не отказ в рантайме:
+// telemetry: a sample's type comes from the metric constant (Metric<f32>), so
+// `sample(36u64)` is a compile error rather than a runtime refusal:
 let temp = ns.series(radio::metrics::Temp)?;
 temp.sample(36.6);
 
-// состояние — тот же sample; чужое перечисление не пройдёт проверку типов:
+// a state is the same sample; another metric's enum fails the type check:
 ns.series(radio::metrics::LinkState)?.sample(radio::metrics::LinkState::Lock);
 
-// спаны — guard, SpanEnd на drop (и при отмене future):
-let cal = ns.span(radio::spans::Calibration);              // корневой
-let sub = cal.child(radio::spans::PowerRamp);              // дочерний
-ns.log_in(&sub, radio::events::PowerSet { dbm: 30.0 });    // привязка к спану
-// sub.id() : SpanId — Copy, передаётся другим сервисам для кросс-ns привязки
+// spans are a guard, with SpanEnd on drop (and on cancellation of a future):
+let cal = ns.span(radio::spans::Calibration);              // a root span
+let sub = cal.child(radio::spans::PowerRamp);              // a child
+ns.log_in(&sub, radio::events::PowerSet { dbm: 30.0 });    // attached to the span
+// sub.id() : SpanId — Copy, passed to other services for a cross-namespace link
 
-// кому нужен вердикт на месте вызова — парный try_*:
+// whoever needs a verdict at the call site has the paired try_*:
 if let Err(e) = ns.try_log(radio::events::Overheat { t: 91.0 }) {
-    if e.loses_record() { /* диск отстаёт */ } else { /* дефект сборки */ }
+    if e.loses_record() { /* the disk is behind */ } else { /* a build defect */ }
 }
 ```
 
-Границы значений, известные только в рантайме (внешняя система определила
-модель железа) — теми же range-выражениями, что и в схеме; на диск не пишутся:
+Value bounds known only at runtime (an external system determined the hardware
+model) — with the same range expressions as in the schema; never written to
+disk:
 
 ```rust
 ns.set_thresholds(radio::metrics::Temp, ..=60.0, ..=75.0)?;
-ns.clear_limits(radio::metrics::Temp)?;   // снова действует схема
+ns.clear_limits(radio::metrics::Temp)?;   // the schema applies again
 ```
 
-Границы записываются тем же типом, что и отсчёты (`NumericValue`), поэтому
-метрике-перечислению или `type: blob` их не задать: раньше такой вызов
-собирался и падал `BadLimits` на устройстве. Метрику из рантайма обслуживает
-`set_thresholds_raw` — там опереться компилятору не на что, и рантайм-проверка
-остаётся. Так же типизирован и вопрос о важности:
-`ns.severity_of(metrics::Temp, 65.0)`, `link.severity_of(LinkState::Los)`, —
-собирать `OwnedValue` руками не нужно нигде, кроме путей `*_raw`.
+The bounds are written with the same type as the samples (`NumericValue`), so
+they cannot be set on an enum metric or on `type: blob`: such a call used to
+compile and then fail with `BadLimits` on the device. A metric known only at
+runtime is served by `set_thresholds_raw` — there the compiler has nothing to
+lean on and the runtime check remains. The question of severity is typed the
+same way: `ns.severity_of(metrics::Temp, 65.0)`,
+`link.severity_of(LinkState::Los)` — an `OwnedValue` need not be assembled by
+hand anywhere except the `*_raw` paths.
 
-Чтение (тот же API на устройстве и в вьюере):
+Reading (the same API on a device and in a viewer):
 
 ```rust
-// Живой читатель: параллелен записи по построению. Создаётся один раз;
-// корни (включая вынесенные носители классов), схемы поднятых неймспейсов
-// и якоря времени спрашиваются у хранилища на каждый запрос — устареть им
-// не из чего. Ротация под ногами и дописываемый хвост сегмента — штатные
-// события, а не порча.
+// A live reader: parallel to writing by construction. Created once; the roots
+// (the media of classes moved out included), the schemas of the namespaces
+// that came up and the time anchors are asked of the store on every query —
+// there is nothing for them to go stale from. Rotation underfoot and a
+// segment's growing tail are ordinary events rather than damage.
 let reader = store.reader();
-// Чужой дамп — руками, ВСЕ корни разом: `Store` там открывать нельзя, он
-// берёт блокировку корня и подметает временные файлы. Дамп без дерева
-// какого-то класса отвергается при открытии — молча показать часть истории
-// нельзя. Снимок замораживается при открытии, и любая недописанность честно
-// доносится как повреждение.
+// A foreign dump goes by hand, with EVERY root at once: a `Store` must not be
+// opened there — it takes a lock on the root and sweeps temporary files. A
+// dump missing some class's tree is refused at open time; showing part of the
+// history silently is not allowed. The snapshot is frozen at open time, and
+// anything unfinished is honestly reported as damage.
 let reader = Reader::open_dump([path, vault], &[radio::SCHEMA])?;
 let q = Query::new()
-    .group("orc-")                            // все экземпляры оркестратора
-    .since(Utc::now() - TimeDelta::hours(2))   // или .since(BootTime)
+    .group("orc-")                             // every orchestrator instance
+    .since(Utc::now() - TimeDelta::hours(2))   // or .since(BootTime)
     .min_level(Level::Warn)
     .order(Order::Newest)
     .limit(500);
 
 let result = reader.query(&q)?;
-// result.entries       — слитый по времени поток Message | Span | Sample | Text
-// result.damaged       — что не прочиталось; пусто → ответ полон
-// result.unanchored    — запуски, выпавшие из настенного окна: якоря нет
-println!("{:?}", reader.render(&result.entries[0], "ru"));  // текст по схеме записи
+// result.entries       — a time-merged stream of Message | Span | Sample | Text
+// result.damaged       — what did not read; empty means the answer is complete
+// result.unanchored    — the runs that dropped out of a wall-clock window: no anchor
+println!("{:?}", reader.render(&result.entries[0], "en"));  // the text from the record's schema
 
-// то же лениво: память ограничена одним блоком на канал, а не размером ответа.
-// Единственный способ читать много: ответ без `limit` на 200 ГБ в память не
-// поместится.
+// the same lazily: memory is bounded by one block per channel rather than by
+// the answer's size. The only way to read a lot: an answer without a `limit`
+// over 200 GB will not fit in memory.
 for entry in reader.stream(&q)? {
-    if done() { break; }                        // обход можно прервать
+    if done() { break; }                        // the walk can be broken off
 }
-// Дескрипторов при этом не держится: курсор заводится на каждую пару
-// (неймспейс, канал), а слияние требует головы от каждого, — постоянный
-// открытый файл у каждого означал бы десятки тысяч дескрипторов на запрос.
-// Разобранное (заголовок, footer, границы блоков) живёт в памяти, файл
-// открывается на время чтения порции.
+// No descriptors are held meanwhile: a cursor is created per (namespace,
+// channel) pair and the merge needs a head from each of them, so a permanently
+// open file for each would mean tens of thousands of descriptors per query.
+// What has been parsed (the header, the footer, the block bounds) lives in
+// memory, and the file is opened for the duration of reading a batch.
 
-// подписка: то же окно, но поток не заканчивается на конце данных, а ждёт
-// продолжения. Читатель спит, пока писать нечего, и просыпается на первом же
-// блоке, легшем в файл, — опрос по таймеру не нужен.
+// a subscription: the same window, but the stream does not end at the end of
+// the data — it waits for more. The reader sleeps while there is nothing to
+// write and wakes on the very first block that lands in a file, so no polling
+// on a timer is needed.
 let mut tail = reader.follow(&Query::new().since(ns.now()).order(Order::Oldest))?;
 loop {
     match tail.next(Duration::from_millis(200)) {
         Tail::Entry(e) => draw(&e),
-        Tail::Idle     => if stopping() { break; },  // тишина, а не конец
-        Tail::Ended    => break,                     // писать больше некому
+        Tail::Idle     => if stopping() { break; },  // silence, not the end
+        Tail::Ended    => break,                     // nobody left to write
     }
 }
 ```
 
-Подписка отвергает то, чего не может пообещать, вместо того чтобы подогнать
-запрос молча: обратный порядок (`Order::Newest` — «последние сто» у потока без
-последней записи ничего не значат), верхнюю границу окна (она читает то, чего
-ещё нет) и дамп (его никто не дописывает). Границы окна считаются один раз при
-открытии: настенная граница переводится в шкалу запуска по якорю, а
-синхронизация времени ретроактивна — пересчёт возил бы окно под ногами у
-подписки, которая часть потока уже прошла и вернуться назад не может. Якоря при
-этом обновляются: UTC у записи появляется от синхронизации, случившейся позже
-самой записи.
+A subscription refuses what it cannot promise instead of adjusting the query
+silently: reverse order (`Order::Newest` — "the last hundred" of a stream with
+no last record means nothing), an upper window bound (it reads what is not
+there yet) and a dump (nobody appends to it). The window's bounds are computed
+once at open time: a wall-clock bound is converted into a run's scale by an
+anchor, and time synchronization is retroactive — recomputing would move the
+window under a subscription that has already walked part of the stream and
+cannot go back. The anchors, meanwhile, are refreshed: a record's UTC comes
+from a synchronization that happened after the record itself.
 
-Порядок между каналами — по времени в пределах того, что видно на момент
-пробуждения, и это всё, что честно обещается: каналы синхронизируются по своим
-политикам (критический — сразу, обычный — раз в секунду), поэтому запись
-обычного канала может стать видимой позже критической, случившейся после неё.
-Внутри одного канала порядок точен — он и есть порядок на диске.
+The order between channels is by time within what is visible at the moment of
+waking, and that is all that is honestly promised: channels sync by their own
+policies (the critical one at once, the ordinary one once a second), so an
+ordinary channel's record may become visible later than a critical one that
+happened after it. Within one channel the order is exact — it is the order on
+disk.
 
-Три стыка, на которых подписка обязана не терять, и все три её отличают от
-разового запроса: **недописанный хвост** блока откладывается, а не
-пропускается (у запроса есть следующий запрос, у подписки — нет);
-**смена сегмента** — каталог перечисляется заново, но только когда хранилище
-объявило, что сегменты менялись, иначе подписка не делает ни одного `readdir`;
-**неймспейс, поднятый позже** подписки, подхватывается — вьюер, стартовавший
-раньше сервиса, обычный порядок на приборе.
+There are three seams a subscription must not lose anything at, and all three
+set it apart from a one-off query: an **unfinished tail** of a block is
+deferred rather than skipped (a query has a next query, a subscription does
+not); **a change of segment** — the directory is listed anew, but only when
+the store has announced that the segments changed, or a subscription does not
+do a single `readdir`; **a namespace brought up later** than the subscription
+is picked up — a viewer that started before a service is the ordinary order on
+a device.
 
-Отметок поэтому три, и различаются они ценой ответа: «лёг блок» — дочитать
-хвост открытого сегмента; «сменился сегмент» — перечислить каталог **того**
-канала; «поднялся неймспейс» — обойти корень, прочитать `ns-meta` у каждого
-подходящего каталога и завести курсоры новичкам. Последнее — единственная
-работа, пропорциональная всему хранилищу, и заводит её только подъём
-неймспейса: слитая с ротацией, она означала бы обход двадцати четырёх тысяч
-каталогов каждые полсекунды ради сегмента, сменившегося в одном канале.
-Остальное дочитывание — по курсору на канал за пробуждение, и это цена
-отметки, общей на хранилище: какой канал написал, она не говорит. Дешевле
-всего её платит тот, кто сузил запрос — подписка на группу платит за свою
-группу.
+That is why there are three marks, and they differ in the cost of the answer:
+"a block landed" means reading on through the tail of an open segment; "the
+segment changed" means listing the directory of **that** channel; "a namespace
+came up" means walking the root, reading `ns-meta` in every matching directory
+and opening cursors for the newcomers. The last is the only work proportional
+to the whole store, and only a namespace coming up triggers it: fused with
+rotation it would mean walking twenty-four thousand directories every half
+second for the sake of a segment that changed in one channel. The rest of the
+reading-on is one cursor per channel per wake-up, and that is the price of a
+mark shared by the store: it does not say which channel wrote. Whoever
+narrowed the query pays the least — a subscription to a group pays for its
+group.
 
-Повреждения подписка отдаёт разницей (`take_damage`), а не накопленным
-списком: живёт она долго, и список, который только растёт, повторял бы одно и
-то же повреждение в каждой порции.
+A subscription hands out damage as a difference (`take_damage`) rather than as
+an accumulated list: it lives a long time, and a list that only grows would
+repeat one and the same damage in every batch.
 
-Границы окна — один тип, `Timestamp`: либо `BootTime` (запуск + µs от его
-старта), либо `DateTime<Utc>`. Настенная граница переводится в шкалу каждого
-запуска по его якорю **до** сканирования; запуск без якоря сопоставить с
-настенными часами нечем, он выпадает из выборки и называется в
-`result.unanchored` — молчание выглядело бы как «прибор в эти часы ничего не
-писал».
+The window's bounds are one type, `Timestamp`: either a `BootTime` (a run plus
+µs since it started) or a `DateTime<Utc>`. A wall-clock bound is converted
+into every run's scale by its anchor **before** scanning; a run with no anchor
+cannot be matched against a wall clock, drops out of the selection and is
+named in `result.unanchored` — silence would look like "the device wrote
+nothing in those hours".
 
-GraphQL — тонкая обёртка над `dduroc-read`: queries `logs / spans /
-series / namespaces / storageStats`, cursor-пагинация (base64 позиции),
-`subscription { tail }` — поверх `Reader::follow`.
+GraphQL is a thin wrapper over `dduroc-read`: the queries `logs / spans /
+series / namespaces / storageStats`, cursor pagination (base64 positions) and
+`subscription { tail }` over `Reader::follow`.
 
-## Открытые вопросы
+## Open questions
 
-- Побайтовый формат заголовка записи (id типа события, span_id) —
-  origin/instance не хранится; level и тэги на диске не хранятся.
-- Идентификатор span_id: разрядность, уникальность между boot'ами
-  (в прототипе — персистентный монотонный u32).
-- Хранение эпох и конфигов: файл с atomic-rename vs redb.
-- Составные телеметрические значения (спектр): формат payload, стоит ли
-  отдельный тип блока для высокочастотных серий.
-- Поведение при переполнении очереди writer'а для критического канала
-  (backpressure vs drop).
-- **Курсор пагинации для веб-слоя.** `stream` позволяет читать лениво и
-  прерывать обход, но продолжить его в следующем HTTP-запросе нечем:
-  возобновление «с последней записи» неточно, потому что часы монотонны, но не
-  строго возрастают — в одну микросекунду попадает несколько записей, и
-  граница `since(last.at)` либо повторит их, либо потеряет. Нужен токен вида
-  (момент, порядковый номер внутри момента); пока не спроектирован.
+- The byte-level format of a record header (the event type id, the span_id) —
+  the origin/instance is not stored; the level and the tags are not stored on
+  disk.
+- The span_id: its width and its uniqueness across boots (in the prototype a
+  persistent monotonic u32).
+- Storing the epochs and the configs: a file with an atomic rename against
+  redb.
+- Composite telemetry values (a spectrum): the payload's format, and whether a
+  separate block type for high-frequency series is worth it.
+- The behaviour on a writer queue overflow for the critical channel (back
+  pressure against dropping).
+- **A pagination cursor for the web layer.** `stream` makes it possible to
+  read lazily and break the walk off, but there is nothing to continue it with
+  in the next HTTP request: resuming "from the last record" is imprecise,
+  because the clock is monotonic but not strictly increasing — several records
+  land in one microsecond, and a `since(last.at)` bound either repeats them or
+  loses them. What is needed is a token of the form (moment, ordinal within
+  the moment); it is not designed yet.
 
-  Подписка (`Reader::follow`) этого вопроса не закрывает и не должна: она
-  держит своё место сама, в памяти процесса, и живёт ровно столько, сколько
-  живёт её объект. Токен нужен там, где место переживает соединение.
+  A subscription (`Reader::follow`) does not close this question and should
+  not: it holds its own place, in the process's memory, and lives exactly as
+  long as its object does. A token is needed where the place outlives the
+  connection.
