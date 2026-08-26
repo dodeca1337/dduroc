@@ -277,7 +277,7 @@ impl Writer {
             drops_seen: 0,
             active: Vec::new(),
             groups,
-            segments_seen: 0,
+            occupancy_seen: 0,
             pressured_roots: 0,
             buffer_ceiling,
             pulse,
@@ -662,9 +662,10 @@ impl ChannelState {
 
     /// Запечатать сегмент, оборванный прошлым запуском.
     ///
-    /// Смысл — вернуть преаллокацию: незапечатанный сегмент числится в бюджете
-    /// канала целиком, и несколько аварийных остановок подряд выедают бюджет
-    /// пустотой, после чего ротация принимается за живую историю.
+    /// Смысл — вернуть хвост окна резерва: незапечатанный сегмент числится в
+    /// бюджете канала вместе с ним, и несколько аварийных остановок подряд
+    /// выедают бюджет пустотой, после чего ротация принимается за живую
+    /// историю.
     ///
     /// Трогается **только** сегмент чужого запуска. Сегмент текущего может
     /// быть открыт живым состоянием этого же процесса (неймспейс подняли
@@ -760,15 +761,15 @@ struct WriterLoop {
     /// Бюджетные группы: по одной на класс хранения. Индекс группы несут
     /// каналы ([`ChannelState::group`]); писателю не нужны имена классов.
     groups: Vec<GroupBudget>,
-    /// Значение [`Counters::segments_opened`] на момент последней проверки
+    /// Значение [`Counters::occupancy_raised`] на момент последней проверки
     /// бюджетов групп.
     ///
     /// Сторож полного прохода по флоту, как `drops_seen` у отметок о потерях:
     /// суммарная занятость растёт **только** когда канал берёт сегмент в
-    /// работу — создаёт новый или возвращает отпущенный; запечатывание,
-    /// отпускание и вытеснение её уменьшают. Поэтому неизменившийся счётчик
-    /// доказывает, что считать нечего.
-    segments_seen: u64,
+    /// работу или раздвигает окно резерва; запечатывание, отпускание и
+    /// вытеснение её уменьшают. Поэтому неизменившийся счётчик доказывает,
+    /// что считать нечего.
+    occupancy_seen: u64,
     /// Потолок суммарных байт, которые пишущие каналы держат под блоки.
     /// `None` — потолка нет.
     buffer_ceiling: Option<u64>,
@@ -1143,7 +1144,7 @@ impl WriterLoop {
         let data_end = seg.data_end();
         seg.close_unsealed()?;
         // Бюджет обязан увидеть возврат: незапечатанный сегмент числился в
-        // нём целиком, вместе с преаллокацией.
+        // нём вместе с нерасписанным хвостом окна.
         ch.inventory.update_size_bytes(name, data_end);
         ch.parked_segment = Some(name);
         Ok(())
@@ -1155,7 +1156,7 @@ impl WriterLoop {
     /// файлом никто не следил, а восстановление позиции по обходу — уже
     /// написанный и проверенный путь. Платится он ровно раз на пробуждение и
     /// только теми каналами, которые молчали, — то есть теми, у кого сегмент
-    /// мал.
+    /// мал. Места возврат не просит: окно резерва раздвинет первая запись.
     fn unpark(ch: &mut ChannelState, counters: &Counters) -> bool {
         let Some(name) = ch.parked_segment.take() else {
             return false;
@@ -1167,11 +1168,11 @@ impl WriterLoop {
             Some(ch.config.segment_bytes),
         ) {
             Ok(seg) => {
-                // Преаллокация вернулась — занятость носителя выросла ровно
-                // так же, как от нового сегмента, и сторож бюджета обязан это
-                // заметить.
-                ch.inventory
-                    .update_size_bytes(name, seg.remaining() + seg.data_end());
+                // Места открытие не просило: файл так и остался обрезанным до
+                // конца данных, окно восстановит первая запись. Но в бюджете
+                // сегмент числился обрезанным, и сверить его с носителем
+                // всё равно надо — восстановление могло отбросить хвост.
+                ch.inventory.update_size_bytes(name, seg.capacity());
                 ch.segment = Some(seg);
                 Counters::bump(&counters.segments_opened);
                 true
@@ -1225,14 +1226,24 @@ impl WriterLoop {
             };
             match SegmentWriter::create(&ch.dir, header, ch.config.segment_bytes) {
                 Ok(seg) => {
+                    // В бюджете сегмент числится тем, что занял на носителе, —
+                    // первым окном резерва, а не пределом роста. Числить предел
+                    // значило бы вытеснять чужую историю ради пустоты, а на
+                    // флоте — упереть практический предел одновременно пишущих
+                    // каналов в `budget_bytes / segment_bytes`.
                     ch.inventory.push_newest(SegmentEntry {
                         name: SegmentName::new(boot, base),
-                        size_bytes: ch.config.segment_bytes,
+                        size_bytes: seg.capacity(),
                     });
                     ch.segment = Some(seg);
                     ch.footer.reset();
                     Counters::bump(&counters.segments_created);
                     Counters::bump(&counters.segments_opened);
+                    // Занятость выросла на первое окно резерва — бюджет
+                    // обязан пересчитаться. Возвращение отпущенного сегмента
+                    // (`unpark`), наоборот, места не просит: файл остаётся
+                    // обрезанным, и числится он тем же, чем числился.
+                    Counters::bump(&counters.occupancy_raised);
                     // Новый сегмент занял место — освобождаем старые.
                     Self::rotate(ch, counters)?;
                     return Ok(());
@@ -1359,10 +1370,9 @@ impl WriterLoop {
         out: &mut [u8],
         header: &BlockHeader,
     ) -> Result<Placement> {
-        // Резерв в `ensure_room` рассчитан по `block_max_bytes`, но одна
-        // крупная запись могла перевалить порог: писать за границу
-        // преаллокации нельзя — там нет зарезервированного на носителе места,
-        // и запись упёрлась бы в ENOSPC уже посреди блока.
+        // Проверка в `ensure_room` рассчитана по `block_max_bytes`, но одна
+        // крупная запись могла перевалить порог: писать за предел роста
+        // нельзя — это граница ротации, за ней начинается следующий сегмент.
         let fits = ch
             .segment
             .as_ref()
@@ -1373,12 +1383,11 @@ impl WriterLoop {
             let next_seq = {
                 let seg = ch.segment.as_ref().ok_or(Error::WriterDead)?;
                 // Свежий сегмент тоже может не вместить блок: одна запись
-                // бывает крупнее целого сегмента (несжимаемый blob). Писать её
-                // всё равно значило бы выйти за преаллокацию, то есть
-                // отказаться от единственной гарантии, ради которой она
-                // делается: ENOSPC приходит один раз, при создании сегмента,
-                // а не посреди записи критического события. Блок
-                // отбрасывается, потеря объявляется отметкой в потоке.
+                // бывает крупнее целого сегмента (несжимаемый blob). Растить
+                // окно за предел значило бы отменить границу ротации: сегмент
+                // рос бы под одну запись сколько угодно, а бюджет класса
+                // вытесняет только целыми сегментами. Блок отбрасывается,
+                // потеря объявляется отметкой в потоке.
                 if !seg.fits(out.len() as u64) {
                     let lost = u64::from(header.count);
                     Counters::add(&counters.dropped, lost);
@@ -1390,8 +1399,59 @@ impl WriterLoop {
             // Нумерация блоков в новом сегменте начинается заново.
             dduroc_format::restamp_seq(out, next_seq)?;
         }
+        let before = ch.segment.as_ref().ok_or(Error::WriterDead)?.capacity();
+        let mut placed = ch
+            .segment
+            .as_mut()
+            .ok_or(Error::WriterDead)?
+            .append_block(out);
+        // Окно не раздвинулось — на носителе кончилось место. Сперва канал
+        // освобождает своё, как и при создании сегмента: неудача на
+        // расширении окна ничем не отличается от неудачи на создании файла,
+        // и отвечать на неё потерей блока, не попробовав отдать собственную
+        // историю, было бы непоследовательно.
+        //
+        // Попытка ровно одна: вытеснение отдаёт целый сегмент, а просят —
+        // одну восьмую его. Не хватило места после этого — дело не в канале,
+        // и дальше нужен взгляд на весь носитель (`enforce_limits`).
+        //
+        // Ошибка самого вытеснения проглатывается намеренно: наверх обязана
+        // уйти исходная причина — кончившееся место, — а не то, что вдобавок
+        // не удалось удалить файл. Она уже сосчитана в `io_errors`.
+        if placed.as_ref().err().is_some_and(Error::is_no_space)
+            && Self::rotate_one(ch, counters).unwrap_or(false)
+        {
+            placed = ch
+                .segment
+                .as_mut()
+                .ok_or(Error::WriterDead)?
+                .append_block(out);
+        }
+        let offset = placed?;
         let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
-        Ok(Placement::At(seg.append_block(out)?))
+        // Окно резерва могло раздвинуться под этот блок — тогда занятость
+        // носителя выросла, и бюджет обязан увидеть рост там же, где он
+        // случился. Сверка вместо безусловной записи не бережливость, а
+        // условие: `update_size_bytes` ищет сегмент по имени, а зовётся это
+        // на каждый блок.
+        if seg.capacity() != before {
+            let name = SegmentName::new(seg.header().boot, seg.header().base);
+            let grown = seg.capacity();
+            ch.inventory.update_size_bytes(name, grown);
+            Counters::bump(&counters.occupancy_raised);
+            // Личная квота неймспейса — предел по занятому, и проверять её
+            // надо там, где занятое растёт. Одного создания сегмента для
+            // этого мало: между двумя созданиями окно доходит от одного блока
+            // до целого сегмента, и всё это время канал был бы над квотой.
+            //
+            // Ошибка ротации не означает потери блока — он уже лёг на
+            // носитель, — поэтому наверх она не идёт: вернуть её значило бы
+            // объявить потерянными записи, которые записаны.
+            if Self::rotate(ch, counters).is_err() {
+                Counters::bump(&counters.io_errors);
+            }
+        }
+        Ok(Placement::At(offset))
     }
 
     fn sync_channel(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
@@ -1445,6 +1505,9 @@ impl WriterLoop {
     ///
     /// Без квоты поканальной ротации нет вовсе: предел держит бюджет группы,
     /// и старейшее вытесняется по всему классу (`enforce_groups`).
+    ///
+    /// Зовётся в обеих точках роста занятости: при создании сегмента и при
+    /// расширении окна резерва.
     fn rotate(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
         let Some(quota_bytes) = ch.quota_bytes else {
             return Ok(());
@@ -1474,7 +1537,7 @@ impl WriterLoop {
     /// Занятость каждой группы: один проход по флоту.
     ///
     /// Полный проход дорог при десятках тысяч каналов — поэтому вызывается
-    /// только когда сумма действительно могла вырасти (см. `segments_seen`),
+    /// только когда сумма действительно могла вырасти (см. `occupancy_seen`),
     /// а не на каждом обороте цикла.
     fn group_totals(&self) -> Vec<u64> {
         let mut totals = vec![0u64; self.groups.len()];
@@ -1493,8 +1556,10 @@ impl WriterLoop {
 
     /// Самый крупный сегмент среди каналов носителя `root`.
     ///
-    /// Мера того, сколько надо освободить, чтобы попытка записи имела шанс:
-    /// сегмент выделяется целиком, и половина его — не помощь.
+    /// Мера того, сколько надо освободить, чтобы попытка записи имела шанс.
+    /// Меньше целого сегмента брать незачем: канал под давлением по месту уже
+    /// испробовал свою ротацию, и освобождать надо с запасом на его рост, а не
+    /// на один блок — иначе каждый оборот стоил бы ещё одной потери.
     fn max_segment_bytes_on(&self, root: u8) -> u64 {
         self.namespaces
             .iter()
@@ -1527,8 +1592,7 @@ impl WriterLoop {
     /// канала, и через границу неймспейса.
     ///
     /// Живой сегмент неприкосновенен — и открытый, и отпущенный по
-    /// бездействию: в первый пишут, второй продолжат, и преаллокация обоих
-    /// есть та единственная гарантия, ради которой она делается.
+    /// бездействию: в первый пишут, второй продолжат.
     fn evict_oldest_where(&mut self, pick: impl Fn(&ChannelState) -> bool) -> Option<u64> {
         let mut victim: Option<(usize, usize, SegmentEntry)> = None;
         for (ns_idx, slot) in self.namespaces.iter().enumerate() {
@@ -1564,7 +1628,7 @@ impl WriterLoop {
 
     /// Отпустить сегменты каналов, молчащих не меньше `quiet_for`, досрочно.
     ///
-    /// Возвращает непрописанный хвост преаллокации: файл обрезается до
+    /// Возвращает нерасписанный хвост окна резерва: файл обрезается до
     /// фактических данных. Это и есть ответ на «тихий канал держит место,
     /// пока шумный голодает» — занятое, но неиспользованное отдаётся первым,
     /// до того как вытеснение примется за чью-то историю.
@@ -1612,8 +1676,8 @@ impl WriterLoop {
             // Место на носителе кончилось. Ротация внутри канала, который в
             // него упёрся, уже испробована и не помогла — освобождаем там, где
             // место действительно занято, и на ТОМ ЖЕ носителе: сперва
-            // непрописанные хвосты преаллокации у молчащих каналов, потом
-            // старейшая история.
+            // нерасписанные хвосты окон у молчащих каналов, потом старейшая
+            // история.
             //
             // Освобождать надо не «что-нибудь», а хотя бы целый сегмент:
             // меньшего не хватит на следующую попытку, и каждый оборот стоил
@@ -1634,16 +1698,17 @@ impl WriterLoop {
             }
         }
 
-        // Сумма растёт только когда канал берёт сегмент в работу; пока счётчик
-        // не сдвинулся, обходить флот незачем.
-        let opened = self
+        // Сумма растёт только когда канал берёт сегмент в работу или
+        // раздвигает окно резерва; пока счётчик не сдвинулся, обходить флот
+        // незачем.
+        let raised = self
             .counters
-            .segments_opened
+            .occupancy_raised
             .load(std::sync::atomic::Ordering::Relaxed);
-        if opened == self.segments_seen && pressured == 0 {
+        if raised == self.occupancy_seen && pressured == 0 {
             return;
         }
-        self.segments_seen = opened;
+        self.occupancy_seen = raised;
         self.enforce_groups();
     }
 
@@ -1655,9 +1720,9 @@ impl WriterLoop {
             let budget_bytes = self.groups[g].budget_bytes;
             totals[g] = self.evict_group_down_to(g, budget_bytes, totals[g]);
             if totals[g] > budget_bytes && !parked {
-                // Вытеснять больше нечего, но остались непрописанные хвосты
-                // преаллокации у молчащих каналов — отдать их дешевле, чем
-                // объявлять бюджет невыполнимым.
+                // Вытеснять больше нечего, но остались нерасписанные хвосты
+                // окон у молчащих каналов — отдать их дешевле, чем объявлять
+                // бюджет невыполнимым.
                 parked = true;
                 if self.park_idle(RELEASE_AFTER) > 0 {
                     totals = self.group_totals();
@@ -1765,10 +1830,10 @@ impl WriterLoop {
                 // возврат на месте стоил бы пары аллокаций на каждую
                 // аварийную запись.
                 //
-                // Потом сегмент: он стоит дескриптора и целиком числится в
-                // бюджете, хотя записанного в нём может быть сто байт
-                // (см. `PARK_AFTER`). Запечатывание обрезает файл до
-                // фактических данных и закрывает дескриптор; из списка
+                // Потом сегмент: он стоит дескриптора и числится в бюджете
+                // вместе с нерасписанным хвостом окна, хотя записанного в нём
+                // может быть сто байт (см. `PARK_AFTER`). Отпускание обрезает
+                // файл до фактических данных и закрывает дескриптор; из списка
                 // обслуживаемых канал уходит только здесь — иначе отдавать
                 // сегмент стало бы некому.
                 let idle_since = *ch.idle_since.get_or_insert(now);
@@ -2359,7 +2424,7 @@ mod tests {
                 budget_bytes: group_budget.unwrap_or(u64::MAX),
                 root_key: 0,
             }],
-            segments_seen: 0,
+            occupancy_seen: 0,
             pressured_roots: 0,
             buffer_ceiling: None,
             pulse: Arc::new(crate::pulse::Pulse::new()),
@@ -2653,7 +2718,15 @@ mod tests {
             .path()
             .to_owned();
         let full = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(full, 8 << 20, "файл преаллоцирован на весь сегмент");
+        assert_eq!(
+            full,
+            64 << 10,
+            "резерв взят окном в один блок, а не на весь сегмент"
+        );
+        assert!(
+            full < channel_of(&w).config.segment_bytes,
+            "иначе тест пуст: окно совпало с пределом роста"
+        );
         assert_eq!(
             open_fds_under(dir.path()),
             1,
@@ -2978,13 +3051,169 @@ mod tests {
     }
 
     #[test]
-    fn waking_a_parked_channel_counts_against_the_ceiling_again() {
-        // Возвращение отпущенного сегмента восстанавливает его преаллокацию —
-        // занятость носителя растёт ровно так же, как от нового сегмента.
-        // Сторож пересчёта бюджета считает именно «канал взял сегмент в
-        // работу», а не «создал файл»: со счётом созданий пробуждение прошло бы
-        // мимо, и хранилище сидело бы над потолком до чьей-нибудь следующей
-        // ротации — то есть неопределённо долго.
+    fn the_budget_counts_what_a_segment_occupies_not_what_it_may_grow_into() {
+        // Живой сегмент числится в бюджете класса своим окном резерва, а не
+        // пределом роста. Разница — не бухгалтерская: числить предел значит
+        // объявить занятыми мегабайты, которых на носителе нет, и вытеснять
+        // за них чужую историю. На флоте это упирает практический предел
+        // одновременно пишущих каналов в `budget_bytes / segment_bytes` —
+        // тридцать два канала на бюджет в четверть гигабайта.
+        let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+        // Бюджет с запасом покрывает четыре окна и вчетверо меньше того, что
+        // заняли бы четыре предела роста.
+        let budget = 4 * ChannelConfig::new(0).segment_bytes / 2;
+        let mut w = empty_loop(Some(budget));
+        let counters = Arc::clone(&w.counters);
+        for (i, dir) in dirs.iter().enumerate() {
+            let ns = add_namespace(
+                &mut w,
+                &format!("ns-{i}"),
+                dir.path(),
+                vec![ChannelConfig::new(64 << 20)],
+            );
+            w.batch.push(blob(ns, 1, 8));
+            w.apply_batch();
+            WriterLoop::flush_block(
+                &mut w.namespaces[ns.0 as usize].as_mut().unwrap().channels[0],
+                &counters,
+            )
+            .unwrap();
+        }
+
+        let occupied = w.group_totals().iter().sum::<u64>();
+        assert!(
+            occupied < budget,
+            "четыре канала заняли {occupied} при бюджете {budget}"
+        );
+        assert!(
+            4 * ChannelConfig::new(0).segment_bytes > budget,
+            "иначе тест пуст: пределы роста и так влезли бы в бюджет"
+        );
+
+        let paths: Vec<_> = (0..4).map(|i| open_segment_path(&w, NsId(i))).collect();
+        w.tick();
+        assert_eq!(
+            w.counters.snapshot().budget_overruns,
+            0,
+            "бюджет выдержан: занято {occupied} из {budget}"
+        );
+        assert_eq!(
+            w.counters.snapshot().segments_rotated,
+            0,
+            "вытеснять нечего"
+        );
+        for path in &paths {
+            assert!(path.exists(), "живой сегмент не тронут: {path:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_that_cannot_grow_costs_the_oldest_segment_not_the_block() {
+        // Резерв берётся окном, поэтому ENOSPC приходит и посреди сегмента —
+        // на расширении окна, а не только при создании файла. Это новый род
+        // отказа, и отвечать на него надо тем же, чем на отказ при создании:
+        // канал сперва отдаёт СВОЁ старейшее и пробует ещё раз. Иначе
+        // мгновенная нехватка места стоила бы целого блока записей при живой,
+        // никому не нужной истории рядом.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = empty_loop(Some(u64::MAX));
+        let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
+
+        // Несколько сегментов истории — есть чем расплатиться.
+        for i in 0..48 {
+            w.batch.push(blob(ns, 1_000 + i, 64 << 10));
+        }
+        w.apply_batch();
+        let history: Vec<_> = {
+            let ch = &w.namespaces[ns.0 as usize].as_ref().unwrap().channels[0];
+            ch.inventory.iter().map(|e| e.path(&ch.dir)).collect()
+        };
+        assert!(history.len() >= 2, "иначе платить нечем: {history:?}");
+        let before = w.counters.snapshot();
+
+        // Носитель отказывает ровно один раз — на ближайшем расширении окна.
+        // Три блока: окно растёт не под каждый (шаг — восьмая доля предела),
+        // но за три раза расширение случается наверняка, а до конца сегмента
+        // их ещё больше десятка — значит отказ придётся именно на рост окна,
+        // и это доказывает неизменившийся счётчик созданий.
+        crate::segment::fault::no_space_for(1);
+        for i in 0..3 {
+            w.batch.push(blob(ns, 9_000 + i, 64 << 10));
+        }
+        w.apply_batch();
+        crate::segment::fault::no_space_for(0);
+
+        let after = w.counters.snapshot();
+        assert_eq!(
+            after.segments_created, before.segments_created,
+            "отказ пришёлся на рост окна, а не на создание сегмента"
+        );
+        assert_eq!(after.dropped, before.dropped, "блок не потерян");
+        assert!(
+            after.segments_rotated > before.segments_rotated,
+            "старейшее обязано быть отдано: {before:?} → {after:?}"
+        );
+        assert!(!history[0].exists(), "отдано именно старейшее");
+    }
+
+    #[test]
+    fn a_window_that_cannot_grow_with_nothing_to_give_counts_the_loss() {
+        // Тот же отказ, но отдать нечего: единственный сегмент — тот, в
+        // который пишут. Тогда блок теряется, и это обязано быть видно и в
+        // общем счётчике, и поканально — иначе дыра в потоке осталась бы
+        // необъявленной, а хранилище отчиталось бы о благополучии.
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = empty_loop(Some(u64::MAX));
+        let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
+
+        // Один блок помещается в первое окно — сегмент заводится без роста.
+        w.batch.push(blob(ns, 1, 8));
+        w.apply_batch();
+        let path = open_segment_path(&w, ns);
+        let counters = Arc::clone(&w.counters);
+        WriterLoop::flush_block(
+            &mut w.namespaces[ns.0 as usize].as_mut().unwrap().channels[0],
+            &counters,
+        )
+        .unwrap();
+        let before = w.counters.snapshot();
+        assert_eq!(
+            w.namespaces[ns.0 as usize].as_ref().unwrap().channels[0]
+                .inventory
+                .len(),
+            1,
+            "иначе тест не про «отдать нечего»"
+        );
+
+        // Дальше носитель не даёт ни байта.
+        crate::segment::fault::free_space(0);
+        w.batch.push(blob(ns, 9_000, 64 << 10));
+        w.apply_batch();
+        crate::segment::fault::unlimited_space();
+
+        let after = w.counters.snapshot();
+        assert!(
+            after.dropped > before.dropped,
+            "потеря обязана быть сосчитана: {before:?} → {after:?}"
+        );
+        assert!(
+            after.io_errors > before.io_errors,
+            "и отказ носителя — тоже"
+        );
+        assert!(path.exists(), "сегмент, в который писали, цел");
+        assert_ne!(w.pressured_roots, 0, "носитель отмечен как переполненный");
+    }
+
+    #[test]
+    fn writing_after_a_park_counts_against_the_ceiling_again() {
+        // Проснувшийся канал занимает место не пробуждением, а записью: файл
+        // остаётся обрезанным, пока в него не лёг блок, и вот тогда окно
+        // резерва раздвигается заново.
+        //
+        // Сторож пересчёта бюджета считает именно «занятость выросла», а не
+        // «создан файл»: со счётом созданий этот рост прошёл бы мимо, и
+        // хранилище сидело бы над потолком до чьей-нибудь следующей ротации —
+        // то есть неопределённо долго.
         let quiet_dir = tempfile::tempdir().unwrap();
         let noisy_dir = tempfile::tempdir().unwrap();
         let mut w = empty_loop(Some(u64::MAX));
@@ -3025,12 +3254,36 @@ mod tests {
             "пока всё на своих местах"
         );
 
-        // Тихий просыпается: преаллокация возвращается, потолок пробит.
+        // Тихий просыпается. Само пробуждение места не просит — файл как был
+        // обрезан, так и остался.
         w.batch.push(blob(quiet, 2, 8));
         w.apply_batch();
         assert!(
+            w.namespaces[quiet.0 as usize].as_ref().unwrap().channels[0]
+                .segment
+                .is_some(),
+            "сегмент вернулся в работу"
+        );
+        assert_eq!(
+            w.group_totals().iter().sum::<u64>(),
+            cap,
+            "пробуждение без записи места не занимает"
+        );
+
+        // А вот лёгший блок раздвигает окно — и потолок пробит.
+        {
+            let ch = &mut w.namespaces[quiet.0 as usize].as_mut().unwrap().channels[0];
+            ch.block_opened = Instant::now().checked_sub(Duration::from_secs(60));
+        }
+        let counters = std::sync::Arc::clone(&w.counters);
+        WriterLoop::flush_block(
+            &mut w.namespaces[quiet.0 as usize].as_mut().unwrap().channels[0],
+            &counters,
+        )
+        .unwrap();
+        assert!(
             w.group_totals().iter().sum::<u64>() > cap,
-            "иначе тест пуст: пробуждение обязано занять место"
+            "иначе тест пуст: запись обязана занять место"
         );
 
         w.tick();
@@ -3043,13 +3296,14 @@ mod tests {
 
     #[test]
     fn an_unreachable_ceiling_is_reported_rather_than_pretended() {
-        // Вытеснить можно только запечатанный сегмент: в активный пишут, и его
-        // преаллокация — та самая гарантия, ради которой она делается.
-        // Потолок ниже одного активного сегмента невыполним по построению, и
-        // единственный честный исход — сказать об этом, а не удалить файл
-        // из-под записи и не сделать вид, что всё в порядке.
+        // Вытеснить можно только запечатанный сегмент: в активный пишут.
+        // Потолок ниже того, что занял один активный сегмент, невыполним по
+        // построению, и единственный честный исход — сказать об этом, а не
+        // удалить файл из-под записи и не сделать вид, что всё в порядке.
         let dir = tempfile::tempdir().unwrap();
-        let mut w = empty_loop(Some(64 << 10));
+        // Потолок ниже одного окна резерва: канал занял 64 КиБ первым же
+        // блоком, и отдать их можно только вместе с сегментом, в который пишут.
+        let mut w = empty_loop(Some(8 << 10));
         let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
 
         w.batch.push(blob(ns, 1, 8));
