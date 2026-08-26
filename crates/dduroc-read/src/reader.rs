@@ -1,4 +1,4 @@
-//! Читатель: слияние потоков и резолв схемы.
+//! The reader: merging streams and resolving the schema.
 
 use crate::cursor::{ChannelCursor, Damage, OwnedRecord, OwnedSampleValue};
 use crate::error::{ReadError, Result};
@@ -15,15 +15,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-/// Сколько сегментов назад искать состояние на левый край окна.
+/// How many segments back to look for the state at a window's left edge.
 ///
-/// Граница нужна, чтобы поиск не уходил в историю на всю глубину хранения:
-/// ряд, не менявшийся месяц, обошёлся бы чтением месяца данных ради одного
-/// значения. Два сегмента — это десятки мегабайт истории при типичном
-/// размере, чего хватает состоянию, которое пишут при каждом изменении.
+/// The bound is there so the search does not walk back through the whole
+/// retention depth: a series unchanged for a month would cost reading a month
+/// of data for one value. Two segments are tens of megabytes of history at a
+/// typical size, which is enough for a state written on every change.
 const SEED_SEGMENTS: usize = 2;
 
-/// Одолжить владеющее значение как значение формата — для вычисления важности.
+/// Borrow an owning value as a format value — for computing severity.
 fn as_format_value(v: &OwnedSampleValue) -> Value<'_> {
     match v {
         OwnedSampleValue::F32(x) => Value::F32(*x),
@@ -35,26 +35,27 @@ fn as_format_value(v: &OwnedSampleValue) -> Value<'_> {
     }
 }
 
-/// Разновидность записи в ответе.
+/// The kind of a record in an answer.
 ///
-/// Перечисление **закрытое** намеренно, в отличие от [`QueryResult`] и
-/// [`Damage`]. Разница в том, чего стоит молчание: лишнее поле в отчёте можно
-/// не читать, а вид записи, которого показывающий код не знает, — это строчка,
-/// молча пропавшая с экрана. Пусть лучше сборка не соберётся. Записи, вида
-/// которых не знает **сам билд**, приходят как [`EntryKind::Ext`] — для них
-/// ветка есть всегда.
+/// The enum is deliberately **closed**, unlike [`QueryResult`] and [`Damage`].
+/// The difference is what silence costs: a surplus field in a report can go
+/// unread, whereas a record kind the displaying code does not know is a line
+/// that silently vanished from the screen. Better that the build not compile.
+/// Records of a kind **this build itself** does not know arrive as
+/// [`EntryKind::Ext`] — there is always an arm for those.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntryKind {
-    /// Схемное сообщение.
+    /// A schema message.
     Message {
         event: EventId,
-        /// Имя типа из схемы; `None` — схема неизвестна этому билду.
+        /// The type name from the schema; `None` means the schema is unknown to
+        /// this build.
         name: Option<&'static str>,
         level: Option<Level>,
         tags: &'static [&'static str],
         payload: Vec<u8>,
     },
-    /// Свободный текст без схемы (мост из tracing, panic-handler).
+    /// Free text without a schema (the tracing bridge, a panic handler).
     Text {
         level: Level,
         target: String,
@@ -68,59 +69,63 @@ pub enum EntryKind {
     SpanEnd {
         span: SpanId,
     },
-    /// Отсчёт телеметрии.
+    /// A telemetry sample.
     ///
-    /// Из записи приходят только метрика и значение; всё, что нужно для
-    /// показа, резолвится по схеме и на диске места не занимает. Поля
-    /// `Option`, потому что схема может быть неизвестна этому билду — тогда
-    /// остаются идентификатор и число, и это честнее, чем выдумать имя.
+    /// Only the metric and the value come from the record; everything needed to
+    /// display it is resolved from the schema and takes no room on disk. The
+    /// fields are `Option` because the schema may be unknown to this build —
+    /// then the identifier and the number remain, which is more honest than
+    /// inventing a name.
     Sample {
         metric: MetricId,
         metric_name: Option<&'static str>,
         unit: Option<&'static str>,
-        /// Статические тэги-категории метрики.
+        /// The metric's static category tags.
         tags: &'static [&'static str],
-        /// Как величину рисовать: состояние держится ступенькой, непрерывная
-        /// величина интерполируется. Прямая через значения, которых не было,
-        /// это не косметика, а ложь на графике.
+        /// How to draw the quantity: a state is held as a step, a continuous
+        /// quantity is interpolated. A straight line through values that never
+        /// were is not cosmetic but a lie on the chart.
         kind: Option<MetricKind>,
-        /// Подпись состояния, если метрика — перечисление и код объявлен.
+        /// The state's label, if the metric is an enum and the code is
+        /// declared.
         state_name: Option<&'static str>,
-        /// Важность значения по пределам **из схемы**.
+        /// The value's severity by the limits **from the schema**.
         ///
-        /// Рантайм-переопределения читателю недоступны by design: он может
-        /// читать дамп с чужого прибора, где действовали другие настройки, а
-        /// в сам дамп пределы не пишутся (см. `dduroc_engine::limits`).
+        /// Runtime overrides are unavailable to a reader by design: it may be
+        /// reading a dump from another device where different settings applied,
+        /// and the limits are never written into a dump (see
+        /// `dduroc_engine::limits`).
         severity: Option<Severity>,
         value: OwnedSampleValue,
     },
-    /// Нераспознанное расширение формата.
+    /// An unrecognized format extension.
     Ext {
         bytes: Vec<u8>,
     },
 }
 
-/// Запись ответа.
+/// A record in an answer.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Entry {
     pub namespace: std::sync::Arc<str>,
-    /// Класс хранения, в чьём канале лежала запись. Канал и есть класс:
-    /// строкового имени у него нет — есть каталог, названный по классу.
+    /// The storage class whose channel the record lay in. A channel is a class:
+    /// it has no string name — it has a directory named after the class.
     pub channel: StorageClass,
-    /// Относительное время: запуск плюс микросекунды от его старта. Есть
-    /// всегда — прибору для этого не нужны ни RTC, ни синхронизация.
+    /// Relative time: a run plus microseconds since it started. Always present
+    /// — a device needs neither an RTC nor a synchronization for it.
     pub at: BootTime,
-    /// Настенное время. `None` — для загрузки железа нет якоря
-    /// синхронизации, и абсолютного времени у записи просто нет.
+    /// Wall-clock time. `None` means the hardware boot has no synchronization
+    /// anchor, and the record simply has no absolute time.
     pub utc: Option<DateTime<Utc>>,
-    /// Спан, к которому привязана запись.
+    /// The span the record is attached to.
     pub span: Option<SpanId>,
     pub kind: EntryKind,
 }
 
 impl Entry {
-    /// Уровень записи: у сообщений — из схемы, у текста — из самой записи.
+    /// The record's level: from the schema for messages, from the record itself
+    /// for text.
     pub fn level(&self) -> Option<Level> {
         match &self.kind {
             EntryKind::Message { level, .. } => *level,
@@ -129,13 +134,13 @@ impl Entry {
         }
     }
 
-    /// Отметка движка о потерянных записях: сколько их выпало прямо перед
-    /// этой отметкой.
+    /// The engine's notice about lost records: how many dropped out right
+    /// before this notice.
     ///
-    /// Потери объявляются в самом потоке — дыра, о которой нигде не сказано,
-    /// неотличима от тишины. Формат отметки принадлежит движку
-    /// ([`dduroc_engine::diag`]), и разбирать её текст руками прикладному
-    /// коду не нужно.
+    /// Losses are announced in the stream itself — a hole nobody mentions is
+    /// indistinguishable from silence. The notice's format belongs to the
+    /// engine ([`dduroc_engine::diag`]), and application code has no need to
+    /// parse its text by hand.
     pub fn dropped_records(&self) -> Option<u64> {
         match &self.kind {
             EntryKind::Text { target, text, .. } => {
@@ -146,47 +151,49 @@ impl Entry {
     }
 }
 
-/// Ответ на запрос.
+/// The answer to a query.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct QueryResult {
     pub entries: Vec<Entry>,
-    /// Состояния на левый край окна: последний отсчёт каждого
-    /// ряда-состояния **до** `from` (см. [`Query::seed_states`]).
+    /// The states carried through to the window's left edge: the last sample of
+    /// every state series **before** `from` (see [`Query::seed_states`]).
     ///
-    /// Лежат отдельно от `entries` намеренно: их время вне запрошенного
-    /// диапазона, и подмешивать их к остальным значило бы нарушить обещание
-    /// «всё в ответе внутри окна».
+    /// They lie apart from `entries` deliberately: their time is outside the
+    /// range asked for, and mixing them in with the rest would break the
+    /// promise that everything in the answer is inside the window.
     pub seeds: Vec<Entry>,
-    /// Фрагменты, которые не удалось прочитать. Пустой список — ответ полон.
+    /// The fragments that could not be read. An empty list means the answer is
+    /// complete.
     pub damaged: Vec<Damage>,
-    /// Ответ обрезан по `limit`.
+    /// The answer was cut short by `limit`.
     pub truncated: bool,
-    /// Запуски, чьи сегменты попали бы в выборку, но выпали: границы заданы
-    /// настенным временем, а якоря синхронизации у этих запусков нет —
-    /// сравнивать их записи с настенными часами нечем.
+    /// The runs whose segments would have reached the selection but dropped
+    /// out: the bounds are in wall-clock time and those runs have no
+    /// synchronization anchor — there is nothing to compare their records with
+    /// a wall clock with.
     ///
-    /// Непустой список означает, что часть истории в ответ не попала, и **не
-    /// потому, что её нет**. Без этого поля такой ответ выглядел бы как «в
-    /// запрошенные часы прибор ничего не писал».
+    /// A non-empty list means part of the history did not reach the answer, and
+    /// **not because it is not there**. Without this field such an answer would
+    /// look like "the device wrote nothing in the hours asked for".
     pub unanchored: Vec<BootCounter>,
 }
 
 impl QueryResult {
-    /// Полон ли ответ: ничего не пропущено из-за повреждений.
+    /// Whether the answer is complete: nothing was skipped because of damage.
     pub fn is_complete(&self) -> bool {
         self.damaged.is_empty()
     }
 }
 
-/// Голова курсора в куче слияния.
+/// A cursor's head in the merge heap.
 ///
-/// [`BinaryHeap`] — максимальная куча, поэтому «лучший» обязан оказаться
-/// наибольшим, и сравнение переворачивается для порядка от старого к новому.
-/// При равном времени побеждает курсор с меньшим номером: одинаковые моменты
-/// — обычное дело (часы монотонны, но не строго возрастают), и порядок между
-/// ними обязан быть устойчивым, иначе один и тот же запрос выдавал бы записи
-/// вразнобой от раза к разу.
+/// A [`BinaryHeap`] is a max-heap, so the "best" has to come out greatest, and
+/// the comparison is inverted for oldest-to-newest order. On equal times the
+/// cursor with the smaller number wins: identical moments are ordinary (the
+/// clock is monotonic but not strictly increasing), and the order between them
+/// has to be stable, or one and the same query would hand records back in a
+/// different order each time.
 #[derive(Debug, PartialEq, Eq)]
 struct Head {
     at: BootTime,
@@ -211,42 +218,45 @@ impl PartialOrd for Head {
     }
 }
 
-/// Поток записей запроса: слияние каналов по времени без сборки ответа целиком.
+/// The record stream of a query: channels merged by time without assembling
+/// the whole answer.
 ///
-/// Порядок тот же, что у [`Reader::query`]: курсоры сливаются по полному
-/// моменту (запуск, µs), а не по микросекундам — сравнивать их между разными
-/// запусками бессмысленно.
+/// The order is the same as [`Reader::query`]'s: the cursors are merged by the
+/// full moment (run, µs) rather than by microseconds, which are meaningless to
+/// compare across runs.
 ///
-/// Слияние идёт кучей, а не перебором курсоров на каждую запись: курсор
-/// заводится на каждую пару (неймспейс, канал), и при заявленных двадцати
-/// четырёх тысячах неймспейсов линейный поиск головы означал бы десятки тысяч
-/// сравнений на **каждую** выданную строчку.
+/// The merge uses a heap rather than scanning the cursors on every record: a
+/// cursor is created per (namespace, channel) pair, and with the twenty-four
+/// thousand namespaces claimed a linear search for the head would mean tens of
+/// thousands of comparisons for **every** line handed out.
 #[derive(Debug)]
 pub struct EntryStream<'a> {
     reader: &'a Reader,
-    /// Копия запроса: разбор записи сверяется с фильтром на каждой.
+    /// A copy of the query: parsing a record checks it against the filter each
+    /// time.
     query: Query,
-    /// Снимок эпох на весь поток: границы окна и UTC записей считаются
-    /// одними якорями, даже если у живого хранилища они меняются под ногами.
+    /// A snapshot of the epochs for the whole stream: the window's bounds and
+    /// the records' UTC are computed from one set of anchors, even if a live
+    /// store's change underfoot.
     epochs: Epochs,
     bounds: Bounds,
     cursors: Vec<ChannelCursor>,
-    /// Схема на каждый курсор, в том же порядке.
+    /// A schema per cursor, in the same order.
     schemas: Vec<Option<Schema>>,
-    /// Головы непустых курсоров.
+    /// The heads of the non-empty cursors.
     heads: BinaryHeap<Head>,
-    /// Каталоги, которые не удалось прочитать — известны сразу при открытии.
+    /// The directories that could not be read — known at once when opening.
     damaged: Vec<Damage>,
     limit: usize,
     yielded: usize,
     truncated: bool,
-    /// Обход окончен: повторный вызов не должен выдавать записи после того,
-    /// как поток уже ответил `None`.
+    /// The walk is over: a repeat call must not hand out records after the
+    /// stream has already answered `None`.
     done: bool,
 }
 
 impl EntryStream<'_> {
-    /// Вернуть голову курсора в кучу, если она есть.
+    /// Return a cursor's head to the heap, if it has one.
     fn requeue(&mut self, idx: usize) {
         let newest_first = self.query.order == Order::Newest;
         if let Some(head) = self.cursors[idx].peek() {
@@ -276,8 +286,8 @@ impl Iterator for EntryStream<'_> {
             self.requeue(idx);
             let Some(raw) = taken else { continue };
 
-            // Записи вне окна пропускаются, но обход продолжается: сегмент мог
-            // начаться раньше нижней границы.
+            // Records outside the window are skipped but the walk goes on: the
+            // segment may have begun before the lower bound.
             if !self.bounds.contains(raw.at) {
                 continue;
             }
@@ -292,11 +302,12 @@ impl Iterator for EntryStream<'_> {
                 &self.query,
                 &self.epochs,
             ) {
-                // Обрезка объявляется, только когда очередная запись
-                // действительно **есть**, а места в ответе уже нет. Ставить
-                // отметку при входе значило бы объявлять обрезанным всякий
-                // ответ ровно в `limit` записей, даже если больше их и не было
-                // — а для веб-слоя это вечная кнопка «дальше».
+                // Truncation is declared only when there really **is** another
+                // record and there is no room left in the answer. Setting the
+                // mark on entry would mean declaring every answer of exactly
+                // `limit` records truncated even when there were no more — and
+                // for the web layer that is a "next" button that never goes
+                // away.
                 if self.yielded >= self.limit {
                     self.truncated = true;
                     self.done = true;
@@ -310,13 +321,13 @@ impl Iterator for EntryStream<'_> {
 }
 
 impl EntryStream<'_> {
-    /// Фрагменты, которые не удалось прочитать.
+    /// The fragments that could not be read.
     ///
-    /// Список отражает всё, что обнаружено **к этому моменту**, включая
-    /// повреждения в недочитанных сегментах: обход обрывается по `limit`, и
-    /// ответ, из которого часть данных выпала из-за порчи, не имеет права
-    /// выглядеть полным. Дальше по потоку список может только пополниться —
-    /// повреждение обнаруживается при чтении блока.
+    /// The list reflects everything found **so far**, damage in half-read
+    /// segments included: the walk breaks off on `limit`, and an answer that
+    /// data dropped out of because of corruption has no right to look complete.
+    /// Further along the stream the list can only grow — damage is discovered
+    /// when a block is read.
     pub fn damaged(&self) -> Vec<Damage> {
         let mut out = self.damaged.clone();
         for c in &self.cursors {
@@ -325,8 +336,8 @@ impl EntryStream<'_> {
         out
     }
 
-    /// Запуски, чьи сегменты выпали из выборки за неимением якоря — см.
-    /// [`QueryResult::unanchored`].
+    /// The runs whose segments dropped out of the selection for want of an
+    /// anchor — see [`QueryResult::unanchored`].
     pub fn unanchored(&self) -> Vec<BootCounter> {
         let mut out: Vec<BootCounter> = Vec::new();
         for c in &self.cursors {
@@ -340,117 +351,124 @@ impl EntryStream<'_> {
         out
     }
 
-    /// Оборван ли обход по `limit` запроса.
+    /// Whether the walk was cut short by the query's `limit`.
     pub fn truncated(&self) -> bool {
         self.truncated
     }
 
-    /// Сколько записей уже выдано.
+    /// How many records have been handed out.
     pub fn yielded(&self) -> usize {
         self.yielded
     }
 }
 
-/// Дольше этого одно ожидание подписки не длится.
+/// No single wait of a subscription lasts longer than this.
 ///
-/// Опрашивать реже раза в час нечего и незачем, а `Duration::MAX` в сроке
-/// — это паника на сложении, то есть худший из возможных ответов на просьбу
-/// подождать подольше. Тот же предел, что у самой отметки: два числа с одним
-/// обоснованием разошлись бы.
+/// There is nothing to poll for less often than once an hour and no reason to,
+/// while a `Duration::MAX` deadline is a panic on the addition, that is, the
+/// worst possible answer to a request to wait a while longer. The same limit
+/// as the mark's own: two numbers with one justification would drift apart.
 const MAX_WAIT: Duration = dduroc_engine::pulse::LONGEST_WAIT;
 
-/// Не чаще этого подписка обходит корни в поисках новых неймспейсов.
+/// No more often than this does a subscription walk the roots for new
+/// namespaces.
 ///
-/// Задержка появления сервиса на живом экране; выбрана так, чтобы её не
-/// замечал человек, но замечал прибор с тысячами неймспейсов.
+/// It is the delay before a service appears on a live screen; chosen so that a
+/// human does not notice it but a device with thousands of namespaces does.
 const ADOPT_EVERY: Duration = Duration::from_millis(500);
 
-/// Что подписка отдала на этот раз.
+/// What a subscription handed out this time.
 ///
-/// Перечисление **закрытое** намеренно: новый исход подписки — это новое
-/// решение вызывающего, а не то, что можно молча пропустить. Отметить его
-/// `#[non_exhaustive]` значило бы заставить каждый цикл опроса завести
-/// `_ => {}` — то есть заранее проглотить всё, что появится потом.
+/// The enum is deliberately **closed**: a new subscription outcome is a new
+/// decision for the caller, not something to be passed over silently. Marking
+/// it `#[non_exhaustive]` would force every polling loop to carry a `_ => {}` —
+/// that is, to swallow in advance whatever appears later.
 #[derive(Debug)]
 pub enum Tail {
-    /// Очередная запись.
+    /// The next record.
     Entry(Box<Entry>),
-    /// За отведённое время нового не появилось. Спросить снова — можно и нужно:
-    /// это не конец, а тишина.
+    /// Nothing new appeared in the time allotted. Asking again is possible and
+    /// right: this is silence, not an end.
     Idle,
-    /// Писать больше некому: хранилище остановлено, и всё, что успело лечь на
-    /// носитель, уже отдано. Дальше будет только `Ended`.
+    /// There is nobody left to write: the store has stopped, and everything
+    /// that reached the medium has been handed out. From here on it is only
+    /// `Ended`.
     Ended,
 }
 
-/// Подписка на поток записей живого хранилища.
+/// A subscription to the record stream of a live store.
 ///
-/// Читает то же и теми же средствами, что и [`Reader::query`], — но не
-/// заканчивается на конце данных, а ждёт продолжения. Отличий от запроса три,
-/// и все они следуют из того, что запись ещё идёт:
+/// It reads the same things by the same means as [`Reader::query`] — but
+/// instead of ending at the end of the data it waits for more. There are three
+/// differences from a query, and all of them follow from writing still going
+/// on:
 ///
-/// - **порядок только от старого к новому** ([`Order::Oldest`]): «последние
-///   сто» у потока, у которого нет последней записи, ничего не означают;
-/// - **верхней границы окна нет**: подписка читает то, чего ещё нет;
-/// - **недописанное откладывается**, а не пропускается: и хвост блока, и
-///   сегмент, застигнутый в момент рождения. У разового запроса есть
-///   следующий запрос, у подписки — нет, и пройти мимо значит потерять.
+/// - **oldest-to-newest order only** ([`Order::Oldest`]): "the last hundred" of
+///   a stream that has no last record means nothing;
+/// - **there is no upper window bound**: a subscription reads what is not there
+///   yet;
+/// - **what is unfinished is deferred** rather than skipped: both a block's
+///   tail and a segment caught at birth. A one-off query has a next query, a
+///   subscription does not, and passing something by means losing it.
 ///
-/// Порядок между каналами — по времени в пределах того, что видно на момент
-/// пробуждения, и это всё, что честно можно обещать: каналы синхронизируются
-/// по своим политикам (критический — сразу, обычный — раз в секунду), поэтому
-/// запись обычного канала может стать видимой позже критической, случившейся
-/// после неё. Внутри одного канала порядок точен — он и есть порядок на диске.
+/// The order between channels is by time within what is visible at the moment
+/// of waking, and that is all that can honestly be promised: channels sync by
+/// their own policies (the critical one at once, the ordinary one once a
+/// second), so an ordinary channel's record may become visible later than a
+/// critical one that happened after it. Within one channel the order is exact —
+/// it is the order on disk.
 ///
-/// Подписка держит хранилище живым, как и всякий читатель: пока она жива, не
-/// отработает и остановка writer'а.
+/// A subscription keeps the store alive, as any reader does: while it lives,
+/// the writer's stop will not complete either.
 #[derive(Debug)]
 pub struct Follow<'a> {
     reader: &'a Reader,
     query: Query,
-    /// Границы окна, посчитанные один раз при открытии.
+    /// The window's bounds, computed once at open time.
     ///
-    /// Пересчитывать их на каждое пробуждение нельзя: настенная граница
-    /// переводится в шкалу запуска по якорю, а синхронизация времени
-    /// ретроактивна — окно ездило бы под ногами у подписки, которая уже
-    /// прошла часть потока и вернуться назад не может.
+    /// They must not be recomputed on every wake-up: a wall-clock bound is
+    /// converted into a run's scale by an anchor, and time synchronization is
+    /// retroactive — the window would move under a subscription that has
+    /// already walked part of the stream and cannot go back.
     bounds: Bounds,
-    /// Якоря времени — наоборот, свежие на каждое пробуждение: UTC у записи
-    /// появляется от синхронизации, случившейся позже самой записи.
+    /// The time anchors, by contrast, are fresh on every wake-up: a record's
+    /// UTC comes from a synchronization that happened after the record itself.
     epochs: Epochs,
     cursors: Vec<ChannelCursor>,
     schemas: Vec<Option<Schema>>,
     heads: BinaryHeap<Head>,
-    /// Чья голова сейчас в куче. Курсор, исчерпавшийся до подхода новых
-    /// данных, из кучи выпадает, и вернуть его туда больше нечему.
+    /// Whose head is in the heap right now. A cursor that ran dry before new
+    /// data arrived falls out of the heap, and there is nothing left to put it
+    /// back.
     queued: Vec<bool>,
-    /// Что уже открыто: неймспейс → маска классов по [`StorageClass::index`].
+    /// What is already open: namespace → a mask of classes by
+    /// [`StorageClass::index`].
     ///
-    /// Подписка на группу обязана подхватить сервис, стартовавший позже неё, —
-    /// но открывать заново то, что уже открыто, ей незачем. Маска, а не
-    /// множество пар: спросить «знаком ли этот канал» стоит одного хэша имени,
-    /// без построения ключа, а имя хранится по разу на неймспейс, а не по разу
-    /// на канал.
+    /// A subscription to a group has to pick up a service that started after it
+    /// — but there is no reason for it to reopen what is already open. A mask
+    /// rather than a set of pairs: asking "is this channel familiar" costs one
+    /// hash of the name, without building a key, and the name is stored once
+    /// per namespace rather than once per channel.
     known: HashMap<String, u8>,
-    /// О чём из увиденного при обходе корней уже сказано.
+    /// Which of what the root walk saw has already been reported.
     ///
-    /// Обход повторяется, когда в хранилище появляются каталоги, а нечитаемый
-    /// каталог никуда не девается — без этой памяти подписка объявляла бы одно
-    /// и то же повреждение при каждом обходе. Множество ограничено числом
-    /// сломанных путей, а не числом обходов.
+    /// The walk repeats when directories appear in the store, and an unreadable
+    /// directory does not go anywhere — without this memory a subscription
+    /// would announce one and the same damage on every walk. The set is bounded
+    /// by the number of broken paths, not by the number of walks.
     reported: HashSet<(PathBuf, String)>,
     damaged: Vec<Damage>,
     pulse: Arc<dduroc_engine::pulse::Pulse>,
     seen: dduroc_engine::pulse::Beat,
     seeds: std::vec::IntoIter<Entry>,
-    /// Когда корни в последний раз обходились ради новых неймспейсов.
-    /// `None` — ещё ни разу.
+    /// When the roots were last walked for new namespaces. `None` means never
+    /// yet.
     last_adopt: Option<Instant>,
-    /// Последний обход после остановки хранилища уже сделан.
+    /// The last walk after the store stopped has already been done.
     swept: bool,
-    /// Состав хранилища менялся, а обход отложен по частоте: его долг не имеет
-    /// права пропасть — неймспейс, о котором объявили один раз, иначе не
-    /// подхватился бы никогда.
+    /// The store's roster changed while a walk was deferred by rate: that debt
+    /// has no right to disappear — a namespace announced once would otherwise
+    /// never be picked up.
     adopt_due: bool,
     limit: usize,
     yielded: usize,
@@ -458,26 +476,27 @@ pub struct Follow<'a> {
 }
 
 impl Follow<'_> {
-    /// Дождаться очередной записи, но не дольше `wait`.
+    /// Wait for the next record, but no longer than `wait`.
     ///
-    /// [`Tail::Idle`] означает «пока тихо», а не «конец»: подписку опрашивают
-    /// в цикле, и таймаут задаёт, как быстро этот цикл сможет заметить
-    /// остановку, заданную самим приложением.
+    /// [`Tail::Idle`] means "quiet for now", not "the end": a subscription is
+    /// polled in a loop, and the timeout sets how quickly that loop can notice
+    /// a stop the application itself ordered.
     pub fn next(&mut self, wait: Duration) -> Tail {
         if let Some(seed) = self.seeds.next() {
             return Tail::Entry(Box::new(seed));
         }
         if self.ended || self.limit == 0 {
-            // Ноль записей — это ноль записей, а не «одна и хватит»: проверка
-            // после выдачи отдала бы первую и только потом остановилась.
+            // Zero records means zero records, not "one will do": a check after
+            // handing out would give the first one away and only then stop.
             self.ended = true;
             return Tail::Ended;
         }
-        // Срок считается один раз на вызов: пробуждение на чужих данных
-        // (отметка одна на всё хранилище) не имеет права продлевать ожидание
-        // сверх обещанного. Срок насыщается: подписке, попросившей ждать
-        // дольше, чем часы умеют считать, отвечают часом — паника вместо
-        // ожидания была бы худшим прочтением такой просьбы.
+        // The deadline is computed once per call: waking on someone else's data
+        // (the mark is one for the whole store) has no right to extend the wait
+        // beyond what was promised. The deadline saturates: a subscription that
+        // asked to wait longer than the clock can count is answered with an
+        // hour — a panic instead of a wait would be the worst reading of such a
+        // request.
         let deadline = Instant::now()
             .checked_add(wait.min(MAX_WAIT))
             .unwrap_or_else(Instant::now);
@@ -490,17 +509,18 @@ impl Follow<'_> {
             }
             if self.seen.closed {
                 if !self.swept {
-                    // Один обход напоследок. Отметка читается тремя полями, и
-                    // остановка могла случиться между ними: тогда «закрыто»
-                    // придёт вместе с ещё не увиденным устройством хранилища,
-                    // и последний сегмент остался бы неперечисленным. После
-                    // остановки носитель окончателен — одного обхода хватает.
+                    // One last walk. The mark is read as three fields, and the
+                    // stop may have happened between them: then "closed"
+                    // arrives together with a shape of the store not yet seen,
+                    // and the last segment would stay unlisted. After the stop
+                    // the medium is final — one walk is enough.
                     self.swept = true;
                     self.adopt_new_channels();
                     self.rearm(true);
                     continue;
                 }
-                // Хранилище остановлено, и всё, что легло на носитель, отдано.
+                // The store has stopped, and everything that reached the medium
+                // has been handed out.
                 self.ended = true;
                 return Tail::Ended;
             }
@@ -511,24 +531,24 @@ impl Follow<'_> {
             if now >= deadline {
                 return Tail::Idle;
             }
-            // Ожидание укорачивается до срока отложенного обхода: иначе
-            // подписка с длинным таймаутом узнала бы о новом сервисе только
-            // после того, как кто-нибудь что-нибудь напишет.
+            // The wait is shortened to the deferred walk's deadline: otherwise
+            // a subscription with a long timeout would learn of a new service
+            // only after somebody wrote something.
             let mut rest = deadline - now;
             if let Some(at) = self.adopt_deadline() {
                 rest = rest.min(at);
             }
             let beat = self.pulse.wait(self.seen, rest);
             if beat == self.seen {
-                // Поток writer'а, снятый паникой, отметку о закрытии выставить
-                // не успевает: без этой проверки подписка ждала бы вечно того,
-                // кого уже некому писать.
+                // A writer thread killed by a panic never gets to set the close
+                // mark: without this check a subscription would wait forever
+                // for someone there is nobody left to write for.
                 if !self.reader.writer_alive() {
                     self.ended = true;
                     return Tail::Ended;
                 }
-                // Проснулись раньше своего срока — значит, ради отложенного
-                // обхода: тишиной это объявлять рано.
+                // We woke before our own deadline — so it was for the deferred
+                // walk: it is too early to declare silence.
                 if Instant::now() < deadline {
                     continue;
                 }
@@ -541,11 +561,12 @@ impl Follow<'_> {
         }
     }
 
-    /// Забрать повреждения, обнаруженные с прошлого раза.
+    /// Take the damage found since last time.
     ///
-    /// Именно забрать: подписка живёт долго, и список, который только растёт,
-    /// повторял бы одно и то же повреждение в каждой порции — а заодно рос бы
-    /// без предела. Пустой ответ означает, что с прошлого раза всё прочиталось.
+    /// Take, specifically: a subscription lives a long time, and a list that
+    /// only grows would repeat one and the same damage in every batch — and
+    /// grow without bound besides. An empty answer means everything read
+    /// cleanly since last time.
     pub fn take_damage(&mut self) -> Vec<Damage> {
         let mut out = std::mem::take(&mut self.damaged);
         for c in &mut self.cursors {
@@ -554,12 +575,13 @@ impl Follow<'_> {
         out
     }
 
-    /// Запуски, выпавшие из настенного окна за неимением якоря —
-    /// см. [`QueryResult::unanchored`].
+    /// The runs that dropped out of a wall-clock window for want of an anchor —
+    /// see [`QueryResult::unanchored`].
     ///
-    /// Считается по курсорам каждый раз, а не запоминается при открытии:
-    /// подписка перечисляет каталоги заново, и запуск, чьи сегменты нашлись
-    /// позже, обязан попасть в ответ — иначе о нём не сказал бы никто.
+    /// Computed from the cursors each time rather than remembered at open time:
+    /// a subscription lists the directories anew, and a run whose segments
+    /// turned up later has to reach the answer — otherwise nobody would mention
+    /// it.
     pub fn unanchored(&self) -> Vec<BootCounter> {
         let mut out: Vec<BootCounter> = Vec::new();
         for c in &self.cursors {
@@ -573,12 +595,12 @@ impl Follow<'_> {
         out
     }
 
-    /// Сколько записей уже отдано.
+    /// How many records have been handed out.
     pub fn yielded(&self) -> usize {
         self.yielded
     }
 
-    /// Взять запись из того, что уже прочитано с носителя.
+    /// Take a record from what has already been read off the medium.
     fn pop_ready(&mut self) -> Option<Entry> {
         loop {
             let Head { idx, .. } = self.heads.pop()?;
@@ -622,36 +644,37 @@ impl Follow<'_> {
         }
     }
 
-    /// Забрать всё, что появилось с прошлого пробуждения.
+    /// Take everything that has appeared since the last wake-up.
     fn refresh(&mut self, shape_changed: bool, roster_changed: bool) {
         self.epochs = self.reader.epochs_now().into_owned();
-        // Обход корней заводится только составом хранилища — то есть подъёмом
-        // неймспейса. Пока он заводился и ротацией, подписка перечисляла всё
-        // хранилище каждые полсекунды подряд: сегменты сменяются постоянно, а
-        // сервисы стартуют раз за свою жизнь.
+        // A root walk is triggered only by the store's roster — that is, by a
+        // namespace coming up. While rotation triggered it too, a subscription
+        // listed the whole store every half second on end: segments change
+        // constantly, while services start once in their life.
         if roster_changed {
             self.adopt_due = true;
         }
         self.rearm(shape_changed);
     }
 
-    /// Дочитать курсоры и вернуть в кучу тех, кто из неё выпал.
+    /// Read the cursors on and return to the heap those that fell out of it.
     ///
-    /// Выпадает курсор, исчерпавшийся до подхода новых данных, и вернуть его
-    /// туда больше нечему — в том числе только что открытому курсору нового
-    /// неймспейса: без этого он лежал бы с данными мимо слияния.
+    /// A cursor that ran dry before new data arrived falls out, and there is
+    /// nothing left to put it back — including a cursor just opened for a new
+    /// namespace: without this it would lie there with its data outside the
+    /// merge.
     ///
-    /// Соблазнительно пропускать здесь курсоры, чья голова уже в куче: всё
-    /// новое ляжет за ней, очереди выдачи не изменит, а дочитывание стоит
-    /// обращения к носителю. Толку не будет: сюда попадают **только** после
-    /// того, как [`Follow::pop_ready`] вернула `None`, а это значит, что куча
-    /// пуста и в ней нет ничьей головы. Пропускать нечего, и проверка была бы
-    /// веткой, которая не исполняется никогда.
+    /// It is tempting to skip the cursors whose head is already in the heap:
+    /// the new data will queue behind it, the order of hand-outs will not
+    /// change, and reading on costs a trip to the medium. It would gain
+    /// nothing: this is reached **only** after [`Follow::pop_ready`] returned
+    /// `None`, which means the heap is empty and holds nobody's head. There is
+    /// nothing to skip, and the check would be a branch that never runs.
     fn rearm(&mut self, relist: bool) {
         for idx in 0..self.cursors.len() {
-            // Обход каталога — только когда хранилище объявило, что сегменты
-            // менялись: пока писатель льёт в тот же файл, подписка обходится
-            // одним чтением хвоста.
+            // The directory is walked only when the store has announced that
+            // the segments changed: while the writer pours into the same file,
+            // a subscription gets by with one read of the tail.
             self.cursors[idx].extend(relist);
             if !self.queued[idx] {
                 self.requeue(idx);
@@ -659,13 +682,14 @@ impl Follow<'_> {
         }
     }
 
-    /// Обойти корни, если пора. `true` — обошли, стоит посмотреть заново.
+    /// Walk the roots if it is time. `true` means we walked and it is worth
+    /// looking again.
     ///
-    /// Обход — самое дорогое, что делает подписка (перечисление корня и чтение
-    /// меты у каждого подходящего каталога), а заводится он от смены
-    /// устройства хранилища, то есть от каждой ротации. Поэтому он ограничен
-    /// по частоте, но не отменяется: долг помнится и отдаётся, когда срок
-    /// подойдёт.
+    /// The walk is the most expensive thing a subscription does (listing the
+    /// root and reading the metadata of every matching directory), and it is
+    /// triggered by a change in the store's shape, that is, by every rotation.
+    /// So it is rate limited but not cancelled: the debt is remembered and paid
+    /// when the time comes.
     fn adopt_if_due(&mut self) -> bool {
         if !self.adopt_due || self.adopt_deadline().is_some() {
             return false;
@@ -677,7 +701,8 @@ impl Follow<'_> {
         true
     }
 
-    /// Сколько ещё ждать до отложенного обхода. `None` — ждать нечего.
+    /// How much longer to wait for the deferred walk. `None` means there is
+    /// nothing to wait for.
     fn adopt_deadline(&self) -> Option<Duration> {
         if !self.adopt_due {
             return None;
@@ -688,7 +713,7 @@ impl Follow<'_> {
             .filter(|d| !d.is_zero())
     }
 
-    /// Объявить повреждение обхода, если о нём ещё не говорили.
+    /// Announce damage from the walk, if it has not been mentioned yet.
     fn note_once(&mut self, damage: Damage) {
         if self
             .reported
@@ -698,11 +723,13 @@ impl Follow<'_> {
         }
     }
 
-    /// Открыть каналы неймспейсов, поднятых уже после начала подписки.
+    /// Open the channels of namespaces that came up after the subscription
+    /// began.
     ///
-    /// Знакомые каналы отсеиваются **до** открытия курсора, а не после: иначе
-    /// каждый обход заново перечислял каталог и открывал сегмент у каждого уже
-    /// читаемого канала, чтобы тут же выбросить результат.
+    /// Familiar channels are filtered out **before** a cursor is opened rather
+    /// than after: otherwise every walk would list the directory anew and open
+    /// a segment for each channel already being read, only to throw the result
+    /// away.
     fn adopt_new_channels(&mut self) {
         let opened = self.reader.open_cursors_beyond(
             &self.query,
@@ -718,15 +745,15 @@ impl Follow<'_> {
             damaged,
         } = match opened {
             Ok(o) => o,
-            // Каталог не перечислился — почти всегда потому, что его меняли
-            // прямо сейчас. Подписку это ронять не должно, а молчать нельзя:
-            // неймспейс, который так и не подхватился, выглядел бы как
-            // невзлетевший сервис.
+            // The directory did not list — almost always because it was being
+            // changed right then. That must not bring a subscription down, and
+            // silence is not allowed either: a namespace that never got picked
+            // up would look like a service that never came up.
             Err(e) => {
                 self.note_once(Damage {
                     path: self.reader.root().to_owned(),
                     offset: 0,
-                    reason: format!("неймспейсы не перечислились: {e}"),
+                    reason: format!("the namespaces did not list: {e}"),
                 });
                 return;
             }
@@ -748,10 +775,11 @@ impl Follow<'_> {
     }
 }
 
-/// Неймспейс, найденный сканом корней: каналы вместе с их каталогами.
+/// A namespace found by a scan of the roots: the channels together with their
+/// directories.
 ///
-/// Каталог у каждого канала свой: класс мог быть вынесен на отдельный
-/// носитель, и путь не восстановить из одного корня.
+/// Every channel has a directory of its own: a class may have been moved to a
+/// separate medium, and the path cannot be reconstructed from one root.
 #[derive(Debug)]
 struct NsScan {
     name: String,
@@ -760,117 +788,119 @@ struct NsScan {
     channels: Vec<(StorageClass, PathBuf)>,
 }
 
-/// Открытые под запрос курсоры вместе с разрешёнными схемами.
+/// The cursors opened for a query together with the schemas resolved.
 #[derive(Debug)]
 struct OpenedCursors {
     cursors: Vec<ChannelCursor>,
-    /// Схема на каждый курсор, в том же порядке.
+    /// A schema per cursor, in the same order.
     schemas: Vec<Option<Schema>>,
-    /// Каталоги, которые не удалось прочитать.
+    /// The directories that could not be read.
     damaged: Vec<Damage>,
 }
 
-/// Сведения о неймспейсе хранилища.
+/// Information about a namespace of the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct NamespaceInfo {
     pub name: String,
     pub schema_name: String,
     pub protocol_version: u16,
-    /// Классы хранения, чьи каналы есть у неймспейса, в порядке
-    /// [`StorageClass::index`].
+    /// The storage classes the namespace has channels for, in
+    /// [`StorageClass::index`] order.
     pub channels: Vec<StorageClass>,
-    /// Суммарный размер сегментов, байт.
+    /// The total size of the segments, in bytes.
     pub total_bytes: u64,
 }
 
-/// Что нашлось в корне при перечислении неймспейсов.
+/// What was found in the root when the namespaces were listed.
 ///
-/// Отдельный тип, а не просто список: перечисление, из которого молча выпал
-/// нечитаемый неймспейс, выглядит как «такого сервиса на приборе нет» — то же
-/// молчание, против которого заведено [`QueryResult::damaged`]. Пустой
-/// `damaged` означает, что перечислено всё.
+/// A type of its own rather than just a list: a listing that an unreadable
+/// namespace silently dropped out of looks like "there is no such service on
+/// the device" — the same silence [`QueryResult::damaged`] exists against. An
+/// empty `damaged` means everything was listed.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct NamespaceListing {
     pub namespaces: Vec<NamespaceInfo>,
-    /// Каталоги, опознанные как неймспейсы, но не поддавшиеся чтению.
+    /// The directories recognized as namespaces but not readable.
     pub damaged: Vec<Damage>,
 }
 
 impl NamespaceListing {
-    /// Перечислено ли всё, что есть в корне.
+    /// Whether everything in the root was listed.
     pub fn is_complete(&self) -> bool {
         self.damaged.is_empty()
     }
 }
 
-/// Откуда читатель берёт правду о хранилище.
+/// Where the reader takes its truth about the store from.
 #[derive(Debug)]
 enum Source {
-    /// Живое хранилище этого же процесса: корни, схемы и эпохи спрашиваются
-    /// у него в момент каждого запроса — устареть им не из чего. Хранилище
-    /// удерживается живым, как его удерживает и ручка неймспейса.
+    /// The live store of this same process: the roots, the schemas and the
+    /// epochs are asked of it at the moment of every query — there is nothing
+    /// for them to go stale from. The store is kept alive, as a namespace
+    /// handle keeps it.
     Store(Arc<Store>),
-    /// Дамп: все корни названы при открытии, всё прочитано с диска и
-    /// заморожено. Для дампа это не изъян, а определение — его никто не
-    /// дописывает.
+    /// A dump: every root is named at open time, everything is read from disk
+    /// and frozen. For a dump that is not a flaw but a definition — nobody is
+    /// appending to it.
     Dump { roots: Vec<PathBuf>, epochs: Epochs },
 }
 
-/// Читатель хранилища.
+/// The store's reader.
 ///
-/// Живёт в двух режимах, и различие между ними — источник правды:
+/// It lives in two modes, and what separates them is the source of truth:
 ///
-/// - **живой** ([`Reader::of_store`]) — читает хранилище, которое этот же
-///   процесс пишет прямо сейчас. Работать параллельно с записью — его
-///   определение: каждый запрос видит свежие корни, схемы и якоря времени,
-///   ротация под ногами и дописываемый хвост сегмента — штатные события,
-///   а не порча;
-/// - **дамп** ([`Reader::open_dump`]) — снимок, который никто не дописывает:
-///   все корни названы при открытии и проверены на полноту, а любой признак
-///   недописанности честно доносится как повреждение.
+/// - **live** ([`Reader::of_store`]) reads a store this same process is writing
+///   right now. Working in parallel with writing is its definition: every query
+///   sees fresh roots, schemas and time anchors, while rotation underfoot and a
+///   segment's growing tail are ordinary events rather than damage;
+/// - **a dump** ([`Reader::open_dump`]) is a snapshot nobody appends to: every
+///   root is named at open time and checked for completeness, and any sign of
+///   something unfinished is honestly reported as damage.
 #[derive(Debug)]
 pub struct Reader {
     source: Source,
-    /// Схемы, названные руками (при открытии и [`Reader::with_schema`]).
-    /// Живой читатель поверх них видит схемы поднятых неймспейсов.
+    /// The schemas named by hand (at open time and by [`Reader::with_schema`]).
+    /// A live reader sees the schemas of namespaces that came up on top of
+    /// them.
     schemas: HashMap<String, Schema>,
-    /// Идентичность хранилища; `None` — не проверять (чтение чужого дампа
-    /// разрешено явно).
+    /// The store's identity; `None` means do not check (reading a foreign dump
+    /// is allowed explicitly).
     store_id: Option<u64>,
-    /// Схема, разрешённая по имени неймспейса. Резолв читает `ns-meta` с
-    /// диска, а спрашивают о нём на **каждую** показываемую запись — файловая
-    /// операция на запись была бы ровно тем дефектом, который уже убран с
-    /// пути запроса. `None` в значении — «неймспейс есть, схемы к нему у
-    /// этого билда нет»; такой ответ тоже стоит запомнить.
+    /// The schema resolved by namespace name. Resolution reads `ns-meta` from
+    /// disk, and it is asked for on **every** record displayed — a file
+    /// operation per record would be exactly the defect already removed from
+    /// the query path. A `None` value means "the namespace exists, this build
+    /// has no schema for it"; that answer is worth remembering too.
     schema_cache: RwLock<HashMap<String, Option<Schema>>>,
 }
 
 impl Reader {
-    /// Открыть дамп хранилища: **все** его корни и схемы — разом.
+    /// Open a dump of a store: **all** of its roots and schemas at once.
     ///
-    /// Первый корень — основной (в нём живут `ns-meta`, эпохи и идентичность
-    /// хранилища); остальные — деревья классов, вынесенных на свои носители
-    /// ([`ChannelConfig::custom_root`]). Корни именно перечисляются, а не
-    /// добавляются по одному опциональным строителем: хранилище с критикой на
-    /// защищённом разделе — это два дерева, и читатель, которому назвали не
-    /// все, показывал бы историю без критики, ничем не выдав пропажу.
-    /// Полнота проверяется при открытии по схемам: у каждого неймспейса
-    /// известной схемы каждый объявленный ею класс обязан найтись в одном из
-    /// корней — иначе [`ReadError::IncompleteDump`], а не молча короткий
-    /// ответ.
+    /// The first root is the main one (`ns-meta`, the epochs and the store's
+    /// identity live in it); the rest are the trees of classes moved to media
+    /// of their own ([`ChannelConfig::custom_root`]). The roots are enumerated
+    /// rather than added one at a time by an optional builder: a store with
+    /// critical data on a protected partition is two trees, and a reader that
+    /// was not told all of them would show the history without the critical
+    /// part, giving nothing away. Completeness is checked at open time against
+    /// the schemas: for every namespace of a known schema, every class it
+    /// declares has to be found in one of the roots — otherwise
+    /// [`ReadError::IncompleteDump`] rather than a silently short answer.
     ///
-    /// Только чтение: ни восстановления, ни уборки временных файлов. Вьюер
-    /// не имеет права изменять дамп, который ему дали посмотреть. `Store`
-    /// для дампа не открывают вовсе — тот берёт блокировку корня и подметает
-    /// временные файлы, поэтому корни и схемы называются руками.
+    /// Reading only: no recovery, no cleanup of temporary files. A viewer has
+    /// no right to change a dump it was given to look at. A `Store` is not
+    /// opened for a dump at all — that takes a lock on the root and sweeps
+    /// temporary files, which is why the roots and schemas are named by hand.
     ///
-    /// Хранилищу, которое пишет этот же процесс, нужен [`Reader::of_store`]:
-    /// снимок эпох и схем, сделанный здесь, устаревает первой же
-    /// синхронизацией времени или подъёмом нового неймспейса.
+    /// A store this same process writes needs [`Reader::of_store`]: a snapshot
+    /// of the epochs and schemas taken here goes stale with the first time
+    /// synchronization or the first new namespace.
     ///
-    /// [`ChannelConfig::custom_root`]: dduroc_engine::channel::ChannelConfig::custom_root
+    /// [`ChannelConfig::custom_root`]:
+    /// dduroc_engine::channel::ChannelConfig::custom_root
     pub fn open_dump<P: Into<PathBuf>>(
         roots: impl IntoIterator<Item = P>,
         schemas: &[Schema],
@@ -878,20 +908,20 @@ impl Reader {
         let roots: Vec<PathBuf> = roots.into_iter().map(Into::into).collect();
         let Some(main_root) = roots.first() else {
             return Err(ReadError::Io {
-                context: "открытие дампа".to_owned(),
+                context: "opening a dump".to_owned(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "не назван ни один корень",
+                    "not one root was named",
                 ),
             });
         };
-        // Опечатка в пути не имеет права выглядеть как пустое хранилище.
+        // A typo in a path has no right to look like an empty store.
         if !main_root.is_dir() {
             return Err(ReadError::Io {
-                context: format!("открытие дампа {}", main_root.display()),
+                context: format!("opening dump {}", main_root.display()),
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotFound,
-                    "основной корень не существует",
+                    "the main root does not exist",
                 ),
             });
         }
@@ -907,13 +937,13 @@ impl Reader {
         Ok(reader)
     }
 
-    /// Убедиться, что среди корней дампа есть дерево каждого класса.
+    /// Make sure every class has a tree among the dump's roots.
     ///
-    /// Проверка структурная и не зависит от того, куда дамп перенесли:
-    /// схема неймспейса объявляет его классы, каталог каждого класса
-    /// создаётся при подъёме неймспейса — значит, каждый обязан найтись в
-    /// одном из названных корней. Неймспейс неизвестной схемы проверить
-    /// нечем — его записи и так останутся идентификаторами.
+    /// The check is structural and does not depend on where the dump was moved
+    /// to: a namespace's schema declares its classes, and every class's
+    /// directory is created when the namespace comes up — so each has to be
+    /// found in one of the roots named. A namespace of an unknown schema cannot
+    /// be checked — its records will stay identifiers anyway.
     fn check_dump_completeness(&self) -> Result<()> {
         let mut damaged = Vec::new();
         for ns in self.scan_namespaces(&mut damaged)? {
@@ -932,34 +962,37 @@ impl Reader {
         Ok(())
     }
 
-    /// Живой читатель: параллелен записи по построению.
+    /// A live reader: parallel to writing by construction.
     ///
-    /// Правда берётся у самого хранилища в момент **каждого запроса**, а не
-    /// при создании читателя, поэтому создать его можно один раз при старте
-    /// и держать сколько угодно:
+    /// The truth is taken from the store itself at the moment of **every
+    /// query** rather than when the reader is created, so it can be created
+    /// once at start and held for as long as you like:
     ///
-    /// - корни — все, включая вынесенные носители классов
-    ///   ([`ChannelConfig::custom_root`]): читатель, которому назвали не все
-    ///   деревья, показывал бы историю без критики, ничем не выдав пропажу;
-    /// - схемы — поднятых к этому моменту неймспейсов: сервис, стартовавший
-    ///   после создания читателя, читается с текстами, а не голыми id;
-    /// - эпохи — с якорями на этот момент: синхронизация времени ретроактивна,
-    ///   и запрос после неё показывает UTC у записей, сделанных до.
+    /// - the roots — all of them, the media of classes moved out included
+    ///   ([`ChannelConfig::custom_root`]): a reader that was not told every tree
+    ///   would show the history without the critical part, giving nothing away;
+    /// - the schemas — of the namespaces that have come up by now: a service that
+    ///   started after the reader was created is read with its texts rather than
+    ///   bare ids;
+    /// - the epochs — with the anchors as of this moment: time synchronization is
+    ///   retroactive, and a query after one shows a UTC for records made before it.
     ///
-    /// Внутри одного запроса снимок один: все записи ответа переведены в UTC
-    /// одними и теми же якорями.
+    /// Within one query the snapshot is single: every record of the answer is
+    /// converted to UTC by one and the same set of anchors.
     ///
-    /// Ротация и дописывание не мешают чтению: сегмент, вытесненный между
-    /// листингом и открытием, молча пропускается (его данные вытеснены, а не
-    /// потеряны), недописанный хвост живого сегмента — «ещё не данные», а не
-    /// порча. У дампа то и другое честно объявляется повреждением.
+    /// Rotation and appending do not get in the way of reading: a segment
+    /// evicted between the listing and the open is passed over silently (its
+    /// data was evicted, not lost), and the unfinished tail of a live segment
+    /// is "not data yet" rather than damage. In a dump both are honestly
+    /// declared damage.
     ///
-    /// Видно ровно то, что уже на носителе: записи, ещё лежащие в очереди
-    /// writer'а, не видны никакому читателю — их сперва надо вытолкнуть
-    /// ([`Store::sync`]). Читатель держит хранилище живым, как держит его
-    /// ручка неймспейса.
+    /// What is visible is exactly what is on the medium: records still sitting
+    /// in the writer's queue are visible to no reader — they have to be flushed
+    /// first ([`Store::sync`]). A reader keeps the store alive, as a namespace
+    /// handle does.
     ///
-    /// [`ChannelConfig::custom_root`]: dduroc_engine::channel::ChannelConfig::custom_root
+    /// [`ChannelConfig::custom_root`]:
+    /// dduroc_engine::channel::ChannelConfig::custom_root
     pub fn of_store(store: &Arc<Store>) -> Self {
         let store_id = store.meta().store_id;
         Self {
@@ -970,12 +1003,12 @@ impl Reader {
         }
     }
 
-    /// Живой ли это читатель — см. [`Reader::of_store`].
+    /// Whether this is a live reader — see [`Reader::of_store`].
     fn live(&self) -> bool {
         matches!(self.source, Source::Store(_))
     }
 
-    /// Все корни хранилища в порядке обхода; первый — основной.
+    /// Every root of the store in walk order; the first is the main one.
     fn all_roots(&self) -> Vec<PathBuf> {
         match &self.source {
             Source::Store(store) => store.roots().to_vec(),
@@ -983,9 +1016,9 @@ impl Reader {
         }
     }
 
-    /// Эпохи на этот момент: у живого читателя — из памяти хранилища, у
-    /// дампа — снимок открытия. Берутся один раз на запрос: все записи
-    /// одного ответа обязаны быть переведены в UTC одними якорями.
+    /// The epochs as of this moment: from the store's memory for a live reader,
+    /// from the open-time snapshot for a dump. Taken once per query: every
+    /// record of one answer has to be converted to UTC by one set of anchors.
     fn epochs_now(&self) -> std::borrow::Cow<'_, Epochs> {
         match &self.source {
             Source::Store(store) => std::borrow::Cow::Owned(store.epochs()),
@@ -993,8 +1026,8 @@ impl Reader {
         }
     }
 
-    /// Схема по имени: названные руками — прежде всего (они — явное решение
-    /// вызывающего), затем схемы поднятых неймспейсов живого хранилища.
+    /// The schema by name: those named by hand first (they are the caller's
+    /// explicit decision), then the schemas of a live store's namespaces.
     fn schema_by_name(&self, name: &str) -> Option<Schema> {
         if let Some(s) = self.schemas.get(name) {
             return Some(*s);
@@ -1005,8 +1038,8 @@ impl Reader {
         }
     }
 
-    /// Все известные схемы: названные руками плюс — у живого читателя —
-    /// схемы поднятых неймспейсов.
+    /// Every schema known: those named by hand plus — for a live reader — the
+    /// schemas of the namespaces that came up.
     fn all_schemas(&self) -> Vec<Schema> {
         let mut out: HashMap<&'static str, Schema> = match &self.source {
             Source::Store(store) => store.schemas().into_iter().map(|s| (s.name, s)).collect(),
@@ -1018,26 +1051,26 @@ impl Reader {
         out.into_values().collect()
     }
 
-    /// Добавить схему, которой не было среди переданных при открытии.
+    /// Add a schema that was not among those passed at open time.
     ///
-    /// Нужно, когда в хранилище есть неймспейс чужого сервиса: его записи без
-    /// схемы остаются идентификаторами. Схема с тем же именем заменяет
-    /// прежнюю.
+    /// Needed when the store holds another service's namespace: without a
+    /// schema its records stay identifiers. A schema of the same name replaces
+    /// the earlier one.
     pub fn with_schema(mut self, schema: Schema) -> Self {
         self.schemas.insert(schema.name.to_owned(), schema);
         self
     }
 
-    /// Не проверять принадлежность сегментов этому хранилищу.
+    /// Do not check that the segments belong to this store.
     ///
-    /// Нужно для разбора чужого дампа, собранного из нескольких приборов;
-    /// абсолютное время таких записей доверять нельзя.
+    /// Needed for examining a foreign dump assembled from several devices; the
+    /// absolute time of such records cannot be trusted.
     pub fn allow_foreign_segments(mut self) -> Self {
         self.store_id = None;
         self
     }
 
-    /// Основной корень хранилища.
+    /// The store's main root.
     pub fn root(&self) -> &Path {
         match &self.source {
             Source::Store(store) => store.root(),
@@ -1045,43 +1078,46 @@ impl Reader {
         }
     }
 
-    /// Эпохи на этот момент. У живого читателя ответ меняется от вызова к
-    /// вызову — по мере синхронизаций времени; у дампа он заморожен открытием.
+    /// The epochs as of this moment. For a live reader the answer changes from
+    /// call to call, as time is synchronized; for a dump it is frozen at open
+    /// time.
     pub fn epochs(&self) -> Epochs {
         self.epochs_now().into_owned()
     }
 
-    /// Текст записи на указанном языке.
+    /// A record's text in the given language.
     ///
-    /// `None` — рендерить нечего: это не сообщение схемы, либо схема
-    /// неизвестна этому билду (тогда у записи остаются идентификатор и
-    /// payload, и выдумывать текст читатель не станет).
+    /// `None` means there is nothing to render: this is not a schema message,
+    /// or the schema is unknown to this build (then the record keeps its
+    /// identifier and payload, and the reader will not invent a text).
     ///
-    /// Схема ищется по неймспейсу самой записи. Раньше её приходилось искать
-    /// вызывающему и передавать вручную — а он мог передать чужую, и тогда
-    /// payload разбирался бы декодером другого события: текст получался бы
-    /// правдоподобным и неверным.
+    /// The schema is looked up by the record's own namespace. It used to be the
+    /// caller's job to find it and pass it in by hand — and it could pass a
+    /// foreign one, in which case the payload would be parsed by another
+    /// event's decoder: the text would come out plausible and wrong.
     pub fn render(&self, entry: &Entry, lang: &str) -> Option<String> {
         match &entry.kind {
             EntryKind::Message { event, payload, .. } => {
                 let schema = self.schema_of(&entry.namespace)?;
                 render(&schema, *event, payload, lang)
             }
-            // Свободный текст уже текст: у него нет ни шаблона, ни языков.
+            // Free text is already text: it has neither a template nor
+            // languages.
             EntryKind::Text { text, .. } => Some(text.clone()),
             _ => None,
         }
     }
 
-    /// Схема неймспейса — по его метаданным на диске.
+    /// A namespace's schema — from its metadata on disk.
     ///
-    /// Ищется имя схемы каталога, а не первая подходящая: два неймспейса могут
-    /// жить под разными схемами в одном хранилище.
+    /// The directory's schema name is looked up rather than the first that
+    /// fits: two namespaces may live under different schemas in one store.
     ///
-    /// Ответ запоминается: `ns-meta` читается один раз на неймспейс, а не на
-    /// каждый вызов. [`Reader::render`] зовут на каждую показываемую запись, и
-    /// без этого отрисовка пятисот строк стоила бы пятисот открытий файла.
-    /// Схема — `Copy` и лежит в `.rodata`, копия ничего не стоит.
+    /// The answer is remembered: `ns-meta` is read once per namespace rather
+    /// than on every call. [`Reader::render`] is called for every record
+    /// displayed, and without this, drawing five hundred lines would cost five
+    /// hundred file opens. A schema is `Copy` and lies in `.rodata`; a copy
+    /// costs nothing.
     pub fn schema_of(&self, namespace: &str) -> Option<Schema> {
         if let Ok(cache) = self.schema_cache.read()
             && let Some(found) = cache.get(namespace)
@@ -1090,9 +1126,10 @@ impl Reader {
         }
         let resolved = read_ns_meta(&self.root().join(namespace))
             .and_then(|meta| self.schema_by_name(&meta.schema_name));
-        // Живому читателю «схемы нет» запоминать нельзя: неймспейс мог ещё
-        // не подняться, и закешированный `None` прятал бы его тексты до
-        // конца жизни читателя. Найденная схема неизменна в обоих режимах.
+        // A live reader must not remember "there is no schema": the namespace
+        // may not have come up yet, and a cached `None` would hide its texts
+        // for the reader's whole life. A schema once found is immutable in both
+        // modes.
         if (resolved.is_some() || !self.live())
             && let Ok(mut cache) = self.schema_cache.write()
         {
@@ -1101,15 +1138,16 @@ impl Reader {
         resolved
     }
 
-    /// Перечислить неймспейсы вместе с занятым объёмом.
+    /// List the namespaces together with the space they occupy.
     ///
-    /// Объём стоит `stat` каждого сегмента, поэтому путь запроса им не
-    /// пользуется: ему хватает имён неймспейсов и каналов.
+    /// The size costs a `stat` per segment, so the query path does not use it:
+    /// the names of the namespaces and channels are enough for it.
     ///
-    /// Неймспейс с нечитаемой метой попадает не в список, а в
-    /// [`NamespaceListing::damaged`]: показать его нечем, но и промолчать
-    /// нельзя — иначе перечисление объявляло бы полным ответ, из которого
-    /// целый неймспейс выпал, и его данные исчезли бы бесследно.
+    /// A namespace with unreadable metadata goes not into the list but into
+    /// [`NamespaceListing::damaged`]: there is nothing to show it with, but
+    /// silence is not allowed either — otherwise the listing would declare
+    /// complete an answer a whole namespace dropped out of, and its data would
+    /// vanish without trace.
     pub fn namespaces(&self) -> Result<NamespaceListing> {
         let mut damaged = Vec::new();
         let found = self.scan_namespaces(&mut damaged)?;
@@ -1135,21 +1173,22 @@ impl Reader {
         })
     }
 
-    /// Неймспейсы и их каналы — без обращения к размерам файлов.
+    /// The namespaces and their channels — without touching file sizes.
     ///
-    /// Нечитаемая мета и каталоги неизвестных классов копятся в `damaged`.
+    /// Unreadable metadata and directories of unknown classes pile up in
+    /// `damaged`.
     fn scan_namespaces(&self, damaged: &mut Vec<Damage>) -> Result<Vec<NsScan>> {
         self.scan_namespaces_matching(damaged, |_| true)
     }
 
-    /// То же, но с отбором по имени **до** чтения метаданных.
+    /// The same, but with selection by name **before** the metadata is read.
     ///
-    /// Имя неймспейса — это имя каталога, и запрос почти всегда отбирает по
-    /// нему: один сервис, одна группа. Читать `ns-meta` у всех, чтобы потом
-    /// выбросить почти всех, — файловая операция на каждый из заявленных
-    /// двадцати четырёх тысяч каталогов; на пути подписки, которая обходит
-    /// корни на каждую смену устройства хранилища, это разница между «дёшево»
-    /// и «неприемлемо».
+    /// A namespace's name is its directory's name, and a query almost always
+    /// selects by it: one service, one group. Reading `ns-meta` for all of them
+    /// only to throw almost all away is a file operation for each of the
+    /// twenty-four thousand directories claimed; on the path of a subscription
+    /// that walks the roots on every change of the store's shape, that is the
+    /// difference between cheap and unacceptable.
     fn scan_namespaces_matching(
         &self,
         damaged: &mut Vec<Damage>,
@@ -1163,7 +1202,7 @@ impl Reader {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(source) => {
                 return Err(ReadError::Io {
-                    context: format!("чтение {}", main_root.display()),
+                    context: format!("reading {}", main_root.display()),
                     source,
                 });
             }
@@ -1181,24 +1220,25 @@ impl Reader {
                 continue;
             }
             let Some(meta) = read_ns_meta(&path) else {
-                // Каталог без метаданных — не неймспейс (чужая директория в
-                // корне хранилища). Каталог с НЕЧИТАЕМОЙ метой — это
-                // неймспейс, который мы не можем показать, и молчать об этом
-                // нельзя: его данные просто исчезли бы из всех ответов.
+                // A directory with no metadata is not a namespace (a foreign
+                // directory in the store root). A directory with UNREADABLE
+                // metadata is a namespace we cannot show, and silence about it
+                // is not allowed: its data would simply disappear from every
+                // answer.
                 if path.join(NS_META).exists() {
                     damaged.push(Damage {
                         path,
                         offset: 0,
-                        reason: "метаданные неймспейса не читаются".to_owned(),
+                        reason: "the namespace metadata does not read".to_owned(),
                     });
                 }
                 continue;
             };
 
-            // Каналы неймспейса собираются по всем корням: класс мог быть
-            // вынесен на свой носитель, и его каталог живёт не рядом с
-            // ns-meta. Имя канала уникально в пределах неймспейса — класс
-            // живёт ровно в одном корне.
+            // A namespace's channels are gathered across every root: a class
+            // may have been moved to a medium of its own, and its directory
+            // does not live next to ns-meta. A channel name is unique within a
+            // namespace — a class lives in exactly one root.
             let mut channels: Vec<(StorageClass, PathBuf)> = Vec::new();
             for root in &roots {
                 let ns_dir = root.join(name);
@@ -1216,14 +1256,15 @@ impl Reader {
                         .and_then(StorageClass::from_dir_name);
                     match class {
                         Some(class) => channels.push((class, ch_path)),
-                        // Каталог, не являющийся каналом ни одного класса
-                        // этой сборки, — либо чужая директория, либо дамп из
-                        // будущей версии с новым классом. Разбирать его
-                        // нечем, а выпасть молча он не имеет права.
+                        // A directory that is the channel of no class this
+                        // build knows is either a foreign directory or a dump
+                        // from a future version with a new class. There is
+                        // nothing to parse it with, and it has no right to drop
+                        // out silently.
                         None => damaged.push(Damage {
                             path: ch_path,
                             offset: 0,
-                            reason: "каталог не является каналом известного класса хранения"
+                            reason: "the directory is not the channel of any known storage class"
                                 .to_owned(),
                         }),
                     }
@@ -1242,24 +1283,25 @@ impl Reader {
         Ok(out)
     }
 
-    /// Открыть запрос потоком: записи разбираются по мере обхода.
+    /// Open a query as a stream: records are parsed as the walk goes.
     ///
-    /// Память ограничена одним распакованным блоком на канал — тем же, чем
-    /// ограничен курсор. Это единственный способ читать много: [`Reader::query`]
-    /// собирает ответ целиком, и запрос без `limit` по двухсотгигабайтному
-    /// хранилищу не поместился бы в памяти armv7.
+    /// Memory is bounded by one decompressed block per channel — the same bound
+    /// a cursor has. This is the only way to read a lot: [`Reader::query`]
+    /// assembles the whole answer, and a query without a `limit` over a
+    /// two-hundred-gigabyte store would not fit in armv7's memory.
     ///
-    /// Обход можно прервать в любой момент; о повреждениях и выпавших запусках
-    /// поток сообщает теми же средствами, что и `query`, — но полны эти
-    /// сведения только после того, как поток исчерпан либо оставлен.
+    /// The walk can be broken off at any moment; the stream reports damage and
+    /// dropped runs by the same means as `query` — but that information is
+    /// complete only once the stream is exhausted or abandoned.
     pub fn stream(&self, q: &Query) -> Result<EntryStream<'_>> {
-        // Эпохи берутся один раз на весь поток: и границы окна, и UTC каждой
-        // записи считаются одними якорями — ответ внутренне согласован, даже
-        // если синхронизация времени придёт посреди обхода.
+        // The epochs are taken once for the whole stream: both the window's
+        // bounds and every record's UTC are computed from one set of anchors —
+        // the answer is internally consistent even if a time synchronization
+        // arrives mid-walk.
         let epochs = self.epochs_now().into_owned();
-        // Границы приводятся к относительной шкале один раз: настенная
-        // граница требует якоря на каждый запуск, и делать это на запись
-        // значило бы линейный поиск по эпохам на каждую из сотен тысяч.
+        // The bounds are brought to the relative scale once: a wall-clock bound
+        // needs an anchor per run, and doing that per record would mean a
+        // linear search through the epochs for each of hundreds of thousands.
         let bounds = q.resolve(&epochs).bounds;
         let OpenedCursors {
             mut cursors,
@@ -1267,8 +1309,8 @@ impl Reader {
             damaged,
         } = self.open_cursors(q, &bounds)?;
 
-        // Кучу заряжаем сразу: пустой курсор в неё просто не попадает, и
-        // дальше слияние не тратит на него ни одного сравнения.
+        // The heap is loaded straight away: an empty cursor simply never enters
+        // it, and the merge then spends not one comparison on it.
         let newest_first = q.order == Order::Newest;
         let mut heads = BinaryHeap::with_capacity(cursors.len());
         for (idx, cursor) in cursors.iter_mut().enumerate() {
@@ -1297,59 +1339,60 @@ impl Reader {
         })
     }
 
-    /// Подписаться на поток записей: читать по мере появления.
+    /// Subscribe to the record stream: read as records appear.
     ///
-    /// Живой читатель видит записи опросом, и без подписки опрос пришлось бы
-    /// делать по таймеру — частому (обращения к носителю впустую, а на приборе
-    /// это ещё и износ флеша) или редкому (график отстаёт на период). Подписка
-    /// спит, пока писать нечего, и просыпается на первом же блоке, легшем в
-    /// файл.
+    /// A live reader sees records by polling, and without a subscription the
+    /// polling would have to be done on a timer — a frequent one (trips to the
+    /// medium for nothing, and on a device flash wear besides) or a rare one (a
+    /// chart lagging by the period). A subscription sleeps while there is
+    /// nothing to write and wakes on the very first block that lands in a file.
     ///
-    /// Начинается там, где начинается запрос: `Query::new()` без границ —
-    /// с начала истории, `since(...)` — с указанного момента, `since(ns.now())`
-    /// — с этой секунды. Отдельной ручки «только новое» нет: это и есть окно
-    /// запроса.
+    /// It begins where a query begins: `Query::new()` with no bounds from the
+    /// start of the history, `since(...)` from the given moment,
+    /// `since(ns.now())` from this second. There is no separate "new only"
+    /// knob: that is what a query's window is.
     ///
-    /// Что подписке нельзя, то отвергается, а не подгоняется молча: обратный
-    /// порядок ([`Order::Newest`]) и верхняя граница окна. Дамп подписки не
-    /// принимает вовсе — его никто не дописывает.
+    /// What a subscription cannot do is refused rather than silently adjusted:
+    /// reverse order ([`Order::Newest`]) and an upper window bound. A dump does
+    /// not accept a subscription at all — nobody appends to it.
     ///
-    /// Неймспейсы, поднятые уже после начала подписки, подхватываются: сервис,
-    /// стартовавший позже вьюера, не должен требовать его перезапуска. Обход
-    /// корней ради них ограничен по частоте — он перечисляет всё хранилище, —
-    /// поэтому появление нового сервиса на экране отстаёт на доли секунды.
+    /// Namespaces that came up after the subscription began are picked up: a
+    /// service that started after the viewer must not require restarting it.
+    /// The root walk for their sake is rate limited — it lists the whole store
+    /// — so a new service appears on screen a fraction of a second late.
     ///
-    /// Подписка отдаёт то, что доживает до неё. Вытеснение по бюджету может
-    /// забрать сегмент, до которого она ещё не дошла: это штатное событие
-    /// хранилища (`Stats::segments_rotated`), а не повреждение, и подписка,
-    /// не поспевающая за ротацией, отстаёт от истории по определению.
+    /// A subscription hands out what survives until it gets there. Budget
+    /// eviction may take a segment it has not reached yet: that is an ordinary
+    /// event of the store (`Stats::segments_rotated`) rather than damage, and a
+    /// subscription that cannot keep up with rotation falls behind the history
+    /// by definition.
     ///
-    /// Затравки состояний (`Query::with_state_seed`) идут первыми и несут
-    /// время **до** окна — как и в [`Reader::query`], где они лежат отдельным
-    /// полем: ряд, не менявшийся с прошлой недели, иначе выглядел бы на живом
-    /// графике пустым.
+    /// State seeds (`Query::with_state_seed`) come first and carry a time
+    /// **before** the window — as in [`Reader::query`], where they lie in a
+    /// field of their own: a series unchanged since last week would otherwise
+    /// look empty on a live chart.
     pub fn follow(&self, q: &Query) -> Result<Follow<'_>> {
         let Source::Store(store) = &self.source else {
             return Err(ReadError::NotFollowable(
-                "дамп никто не дописывает — подписываться не на что",
+                "nobody appends to a dump — there is nothing to subscribe to",
             ));
         };
         if q.order == Order::Newest {
             return Err(ReadError::NotFollowable(
-                "поток идёт от старого к новому: `Order::Newest` у него нечего означать",
+                "a stream runs oldest to newest: `Order::Newest` has nothing to mean for it",
             ));
         }
         if q.to.is_some() {
             return Err(ReadError::NotFollowable(
-                "у подписки нет верхней границы окна: она читает то, чего ещё нет",
+                "a subscription has no upper window bound: it reads what is not there yet",
             ));
         }
 
         let pulse = Arc::clone(store.pulse());
-        // Отметка снимается ДО открытия курсоров: всё, что ляжет между этими
-        // двумя моментами, курсоры либо уже увидят сами, либо покажет первое
-        // же пробуждение. Обратный порядок терял бы такие записи до следующей
-        // отметки.
+        // The mark is taken BEFORE the cursors are opened: whatever lands
+        // between those two moments the cursors will either see themselves or
+        // the very first wake-up will show. The reverse order would lose such
+        // records until the next mark.
         let seen = pulse.beat();
 
         let epochs = self.epochs_now().into_owned();
@@ -1377,8 +1420,8 @@ impl Reader {
             }
         }
 
-        // Затравка состояний — та же, что у `query`: ряд, не менявшийся с
-        // прошлой недели, иначе выглядел бы у живого графика пустым.
+        // The state seed is the same as `query`'s: a series unchanged since
+        // last week would otherwise look empty on a live chart.
         let seeds = if q.seed_states && q.from.is_some() {
             self.collect_state_seeds(q, &bounds, &mut damaged, &epochs)?
         } else {
@@ -1412,7 +1455,8 @@ impl Reader {
         })
     }
 
-    /// Жив ли поток writer'а хранилища; у дампа писать некому по определению.
+    /// Whether the store's writer thread is alive; a dump has nobody to write
+    /// by definition.
     fn writer_alive(&self) -> bool {
         match &self.source {
             Source::Store(store) => store.is_writing(),
@@ -1420,19 +1464,19 @@ impl Reader {
         }
     }
 
-    /// Выполнить запрос, собрав ответ целиком.
+    /// Run a query, assembling the whole answer.
     ///
-    /// Годится, когда объём ответа ограничен — `limit`, узкое окно, редкий тип
-    /// событий. Для всего остального есть [`Reader::stream`].
+    /// Suitable when the answer's size is bounded — a `limit`, a narrow window,
+    /// a rare event type. For everything else there is [`Reader::stream`].
     pub fn query(&self, q: &Query) -> Result<QueryResult> {
         let mut stream = self.stream(q)?;
         let entries: Vec<Entry> = stream.by_ref().collect();
         let mut result = QueryResult {
             entries,
             truncated: stream.truncated(),
-            // Повреждения собираются и при обрезке по лимиту: ответ, из
-            // которого часть данных выпала из-за порчи, не должен выглядеть
-            // полным.
+            // Damage is gathered even when the answer is cut short by the
+            // limit: an answer that data dropped out of because of corruption
+            // must not look complete.
             damaged: stream.damaged(),
             unanchored: stream.unanchored(),
             seeds: Vec::new(),
@@ -1446,16 +1490,17 @@ impl Reader {
         Ok(result)
     }
 
-    /// Найти последний отсчёт каждого ряда-состояния до начала окна.
+    /// Find the last sample of every state series before the window begins.
     ///
-    /// Ищется обратным обходом от `from` назад, и он **ограничен**
-    /// [`SEED_SEGMENTS`] сегментами: ряд, не менявшийся очень долго, останется
-    /// без затравки, и это честнее, чем читать всю историю ради одного
-    /// значения. Приложению, которому важна полная картина, стоит писать
-    /// состояние ещё и при старте — тогда затравка всегда рядом.
+    /// It is searched for by walking back from `from`, and the walk is
+    /// **bounded** by [`SEED_SEGMENTS`] segments: a series unchanged for a very
+    /// long time will be left without a seed, and that is more honest than
+    /// reading the whole history for one value. An application that needs the
+    /// full picture should write the state at start as well — then the seed is
+    /// always close by.
     ///
-    /// Сегменты, в которых нужных метрик нет вовсе, отбрасываются по множеству
-    /// идентификаторов из footer'а, без чтения блоков.
+    /// Segments holding none of the metrics wanted are discarded by the set of
+    /// identifiers in the footer, without reading any blocks.
     fn collect_state_seeds(
         &self,
         q: &Query,
@@ -1467,15 +1512,16 @@ impl Reader {
             return Ok(Vec::new());
         };
 
-        // Ряды-состояния собираются по схемам, а не по данным: их немного, и
-        // знать их заранее дешевле, чем выяснять чтением.
+        // The state series are gathered from the schemas rather than from the
+        // data: there are few of them, and knowing them in advance is cheaper
+        // than finding out by reading.
         //
-        // Объединение по всем схемам нужно только для отсечения сегментов по
-        // множеству из footer'а: там оно работает как «в этом сегменте нет
-        // ничего похожего», и лишний номер приводит лишь к лишнему открытию.
-        // Отбирать записи по нему нельзя — пространство `metric_id` своё у
-        // каждой схемы, и метрика чужой схемы с тем же номером означает
-        // совсем другую величину.
+        // The union over all schemas is needed only for cutting segments off by
+        // the footer set: there it works as "there is nothing like this in this
+        // segment", and a superfluous number costs only a superfluous open.
+        // Records must not be selected by it — the `metric_id` space belongs to
+        // each schema, and a metric of a foreign schema with the same number
+        // means an entirely different quantity.
         let union: HashSet<MetricId> = self
             .all_schemas()
             .iter()
@@ -1488,8 +1534,8 @@ impl Reader {
         }
         let union = std::sync::Arc::new(union);
 
-        // Ищем строго ДО `from`, порядок — от свежих к старым, чтобы первым
-        // встреченным отсчётом ряда оказался последний по времени.
+        // We search strictly BEFORE `from`, newest to oldest, so that the first
+        // sample of a series encountered is the latest in time.
         let probe = Query {
             from: None,
             to: Some(from.just_before()),
@@ -1514,23 +1560,24 @@ impl Reader {
         })?;
         damaged.extend(open_damaged);
 
-        // Первое встреченное значение ряда и есть последнее по времени.
+        // The first value of a series encountered is the latest in time.
         let mut seen: HashSet<(usize, MetricId)> = HashSet::new();
         let mut out: Vec<Entry> = Vec::new();
 
         for (idx, cursor) in cursors.iter_mut().enumerate() {
-            // Ряды-состояния берутся из схемы ЭТОГО неймспейса: номера метрик
-            // у разных схем свои, и общий набор дал бы затравку из чужого
-            // ряда — с чужой подписью состояния.
+            // The state series come from THIS namespace's schema: metric
+            // numbers belong to each schema, and a shared set would give a seed
+            // from a foreign series — with a foreign state label.
             let wanted = state_metrics(schemas[idx].as_ref());
             if wanted.is_empty() {
                 continue;
             }
             while let Some(raw) = cursor.next_entry() {
-                // Затравка обязана лежать строго ДО окна. Проверяется именно
-                // «не внутри окна», а не «раньше границы на микросекунду»:
-                // граница может быть настенной, а у запуска, начавшегося с
-                // нулевой микросекунды, вычитать не из чего.
+                // A seed has to lie strictly BEFORE the window. What is checked
+                // is "not inside the window" rather than "a microsecond earlier
+                // than the bound": the bound may be a wall-clock one, and for a
+                // run that began at microsecond zero there is nothing to
+                // subtract from.
                 if window.contains(raw.at) || !probe_bounds.contains(raw.at) {
                     continue;
                 }
@@ -1548,15 +1595,16 @@ impl Reader {
                 {
                     out.push(entry);
                 }
-                // Все ряды этого канала найдены — дальше читать нечего.
+                // Every series of this channel has been found — there is
+                // nothing more to read.
                 if wanted.iter().all(|m| seen.contains(&(idx, *m))) {
                     break;
                 }
             }
         }
-        // Поиск затравки обрывается, едва найдены все нужные ряды, — то есть
-        // почти всегда посреди сегмента. Повреждения недочитанного сегмента
-        // обязаны попасть в отчёт и отсюда.
+        // The seed search breaks off the moment every series wanted is found —
+        // that is, almost always mid-segment. Damage in the half-read segment
+        // has to reach the report from here too.
         for c in &cursors {
             damaged.extend(c.damaged());
         }
@@ -1565,17 +1613,17 @@ impl Reader {
         Ok(out)
     }
 
-    /// Открыть курсоры и разрешить схему **один раз на неймспейс**.
+    /// Open the cursors and resolve the schema **once per namespace**.
     ///
-    /// Резолв схемы читает `ns-meta` с диска. Делать это на каждую запись,
-    /// как было поначалу, означало бы файловую операцию на запись — именно
-    /// это и оказалось главным ограничителем скорости чтения.
+    /// Resolving a schema reads `ns-meta` from disk. Doing that per record, as
+    /// it was at first, would mean a file operation per record — and that
+    /// turned out to be the main limiter on read speed.
     fn open_cursors(&self, q: &Query, bounds: &Bounds) -> Result<OpenedCursors> {
         self.open_cursors_with(q, bounds, |_| {})
     }
 
-    /// То же с правкой параметров открытия — для поиска затравок, где нужны
-    /// граница просмотра и отсечение сегментов по метрикам.
+    /// The same with the open parameters adjusted — for the seed search, which
+    /// needs a look-at bound and segment cut-off by metric.
     fn open_cursors_with(
         &self,
         q: &Query,
@@ -1585,13 +1633,13 @@ impl Reader {
         self.open_cursors_beyond(q, bounds, adjust, &HashMap::new())
     }
 
-    /// То же, минуя уже открытые каналы: `known` — маска классов по имени
-    /// неймспейса ([`StorageClass::index`]).
+    /// The same, skipping channels already open: `known` is a mask of classes
+    /// by namespace name ([`StorageClass::index`]).
     ///
-    /// Нужно подписке: она обходит корни снова и снова, а открыть курсор — это
-    /// перечислить каталог канала и разобрать заголовок сегмента. Платить это
-    /// за каналы, которые уже читаются, значит платить за всё хранилище ради
-    /// одного новичка.
+    /// A subscription needs it: it walks the roots again and again, and opening
+    /// a cursor means listing a channel's directory and parsing a segment
+    /// header. Paying that for channels already being read means paying for the
+    /// whole store for the sake of one newcomer.
     fn open_cursors_beyond(
         &self,
         q: &Query,
@@ -1614,8 +1662,9 @@ impl Reader {
                 prefilter: Some(build_prefilter(q, schema)),
                 max_segments: None,
                 require_metrics: None,
-                // Сегменты прежних версий приводятся к текущей прямо при
-                // чтении: корректность ответа не ждёт физического прогона.
+                // Segments of earlier versions are brought to the current one
+                // as they are read: the answer's correctness does not wait for
+                // a physical run.
                 migrations: schema.as_ref().map(crate::cursor::MigrationCtx::of),
                 liveness: if self.live() {
                     crate::cursor::Liveness::Live
@@ -1650,12 +1699,12 @@ impl Reader {
         })
     }
 
-    /// Собрать запись ответа из прочитанной.
+    /// Assemble an answer record from one that was read.
     ///
-    /// Прочитанная берётся **по значению**: её payload (текст, blob) уже
-    /// скопирован из буфера блока курсором, и вторая копия ради того же
-    /// содержимого — аллокация на каждую показанную запись. Отфильтрованная
-    /// запись при этом просто уничтожается здесь же.
+    /// The record read is taken **by value**: its payload (text, blob) has
+    /// already been copied out of the block buffer by the cursor, and a second
+    /// copy of the same content is an allocation per record displayed. A record
+    /// that is filtered out is simply destroyed right here.
     #[allow(clippy::too_many_arguments)]
     fn build_entry(
         &self,
@@ -1668,11 +1717,12 @@ impl Reader {
     ) -> Option<Entry> {
         let crate::cursor::RawEntry { at, record } = raw;
         let kinds = q.filter.kinds;
-        // Фильтры, говорящие о содержимом. Запись, у которой такого свойства
-        // нет (текст без тэгов, спан без типа события), удовлетворить им не
-        // может и исключается — иначе фильтр «только с тэгом rf» пропускал бы
-        // то, у чего тэгов не бывает. `min_level` сюда не входит: уровень есть
-        // у сообщений и текста, а телеметрия и спаны вне шкалы уровней.
+        // The filters that speak about content. A record without such a
+        // property (text with no tags, a span with no event type) cannot
+        // satisfy them and is excluded — otherwise the filter "only with the rf
+        // tag" would let through things that never have tags. `min_level` is
+        // not among them: messages and text have a level, while telemetry and
+        // spans are outside the level scale.
         let content_filtered = !q.filter.any_tags.is_empty()
             || q.filter.events.is_some()
             || !q.filter.event_names.is_empty();
@@ -1686,14 +1736,15 @@ impl Reader {
                     return None;
                 }
                 let desc = schema.and_then(|s| s.event(event));
-                // Уровень и тэги — статические свойства типа, поэтому фильтр
-                // применяется здесь, без чтения payload'а.
+                // The level and the tags are static properties of the type, so
+                // the filter is applied here, without reading the payload.
                 if let Some(min) = q.filter.min_level {
                     match desc.map(|d| d.level) {
                         Some(l) if l >= min => {}
-                        // Уровень неизвестен — запись не отбрасывается: это
-                        // событие удалённого из схемы типа, и молча прятать
-                        // его от того, кто ищет проблему, нельзя.
+                        // The level is unknown — the record is not discarded:
+                        // this is an event of a type removed from the schema,
+                        // and hiding it silently from whoever is looking for a
+                        // problem is not allowed.
                         None => {}
                         _ => return None,
                     }
@@ -1777,12 +1828,13 @@ impl Reader {
                 if !kinds.samples || q.filter.events.is_some() || !q.filter.event_names.is_empty() {
                     return None;
                 }
-                // Идентичность ряда лежит в самой записи: метрика и есть ряд.
-                // Всё остальное — имя, единица, подпись состояния, важность,
-                // поведение между отсчётами — резолвится по схеме и на диске
-                // места не занимает.
+                // A series is identified by the record itself: the metric is
+                // the series. Everything else — the name, the unit, the state
+                // label, the severity, the behaviour between samples — is
+                // resolved from the schema and takes no room on disk.
                 let desc = schema.and_then(|s| s.metric(metric));
-                // Тэги у отсчёта есть — метрики: фильтр по ним применяется.
+                // A sample does have tags — its metric's: the filter on them
+                // applies.
                 if !q.filter.any_tags.is_empty() {
                     let tags = desc.map(|d| d.tags).unwrap_or(&[]);
                     if !q
@@ -1800,8 +1852,8 @@ impl Reader {
                     OwnedSampleValue::Bool(b) => Some(u64::from(*b)),
                     _ => None,
                 };
-                // Важность считается до переноса значения: одалживать его
-                // потом было бы уже нечему.
+                // The severity is computed before the value is moved:
+                // afterwards there would be nothing left to borrow.
                 let severity = desc.map(|d| d.severity_of(&as_format_value(&value)));
                 (
                     EntryKind::Sample {
@@ -1825,8 +1877,8 @@ impl Reader {
             }
         };
 
-        // Записи вне спанов отбрасываются вместе со всеми, чей спан не
-        // назван: «привязана к этому спану» неверно для обеих.
+        // Records outside any span are discarded along with all those whose
+        // span is not named: "attached to this span" is false for both.
         if let Some(want) = &q.filter.spans
             && !span.is_some_and(|s| want.contains(&s))
         {
@@ -1844,11 +1896,11 @@ impl Reader {
     }
 }
 
-/// Собрать предикат отбора, применяемый до материализации записи.
+/// Build the selection predicate applied before a record is materialized.
 ///
-/// Уровни и тэги — статические свойства типов, поэтому запрос вроде
-/// «только ошибки» решается по схеме, без чтения payload'а; отброшенная
-/// запись не стоит ни аллокации, ни копирования.
+/// Levels and tags are static properties of types, so a query like "errors
+/// only" is decided from the schema without reading any payload; a record that
+/// is filtered out costs neither an allocation nor a copy.
 fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilter {
     let kinds = q.filter.kinds;
     let min_level = q.filter.min_level;
@@ -1870,9 +1922,9 @@ fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilte
             if let Some(min) = min_level {
                 match desc.map(|d| d.level) {
                     Some(l) if l >= min => {}
-                    // Уровень неизвестен — запись не прячем: это событие
-                    // типа, удалённого из схемы, и скрыть его от того, кто
-                    // ищет проблему, нельзя.
+                    // The level is unknown — the record is not hidden: this is
+                    // an event of a type removed from the schema, and hiding it
+                    // from whoever is looking for a problem is not allowed.
                     None => {}
                     _ => return false,
                 }
@@ -1891,11 +1943,11 @@ fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilte
             }
             true
         }
-        // Контентные фильтры исключают записи, которые не могут им
-        // удовлетворить: у текста и спанов нет ни тэгов, ни типа события,
-        // и «прошёл фильтр по тэгу» для них было бы ложью. Уровень — не
-        // контентный фильтр: у текста он есть и проверяется, телеметрия и
-        // спаны вне шкалы уровней и им не отсеиваются.
+        // Content filters exclude the records that cannot satisfy them: text
+        // and spans have neither tags nor an event type, and "passed the tag
+        // filter" would be a lie for them. The level is not a content filter:
+        // text has one and it is checked, while telemetry and spans are outside
+        // the level scale and are not filtered out by it.
         dduroc_format::Record::Text(t) => {
             kinds.text
                 && min_level.is_none_or(|min| t.level >= min)
@@ -1910,7 +1962,8 @@ fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilte
             if !kinds.samples || events.is_some() || !event_names.is_empty() {
                 return false;
             }
-            // Тэги у отсчёта есть — метрики: фильтр по ним применяется.
+            // A sample does have tags — its metric's: the filter on them
+            // applies.
             if !any_tags.is_empty() {
                 let tags = schema
                     .and_then(|sc| sc.metric(s.metric))
@@ -1928,7 +1981,8 @@ fn build_prefilter(q: &Query, schema: Option<Schema>) -> crate::cursor::Prefilte
     })
 }
 
-/// Метрики-состояния одной схемы. Пусто, если схема этому билду неизвестна.
+/// The state metrics of one schema. Empty if the schema is unknown to this
+/// build.
 fn state_metrics(schema: Option<&Schema>) -> HashSet<MetricId> {
     schema.map_or_else(HashSet::new, |s| {
         s.metrics
@@ -1957,13 +2011,15 @@ fn read_store_id(root: &Path) -> Option<u64> {
         .map(|m| m.store_id)
 }
 
-/// Отрендерить сообщение по шаблону схемы.
+/// Render a message from the schema's template.
 ///
-/// Низкоуровневый путь: схему приходится искать самому. Обычно нужен
-/// [`Reader::render`] — он берёт её по неймспейсу записи.
+/// A low-level path: the schema has to be found by the caller. Usually
+/// [`Reader::render`] is what is wanted — it takes the schema from the
+/// record's namespace.
 ///
-/// Шаблоны на диске не хранятся: `{поле}` подставляется декодером,
-/// сгенерированным макросом схемы. Без декодера возвращается сам шаблон.
+/// Templates are not stored on disk: `{field}` is substituted by the decoder
+/// generated by the schema macro. Without a decoder the template itself comes
+/// back.
 pub fn render(schema: &Schema, event: EventId, payload: &[u8], lang: &str) -> Option<String> {
     let desc = schema.event(event)?;
     let lang_index = schema.language_index(lang).unwrap_or(0);
@@ -2071,11 +2127,11 @@ mod tests {
         }
     }
 
-    /// Типизированные константы метрик — то, что порождает макрос схемы.
+    /// Typed metric constants — what the schema macro produces.
     const TEMP: dduroc_engine::metric::Metric<f32> =
         dduroc_engine::metric::Metric::new(MetricId(1));
 
-    /// Наполнить хранилище и закрыть его.
+    /// Fill the store and close it.
     fn populate(root: &Path) {
         let store =
             Store::open(StoreConfig::new(root).with_budget_per_class(16 * 1024 * 1024)).unwrap();
@@ -2111,18 +2167,18 @@ mod tests {
 
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let listing = reader.namespaces().unwrap();
-        assert!(listing.is_complete(), "все неймспейсы перечислены");
+        assert!(listing.is_complete(), "every namespace was listed");
         let namespaces = listing.namespaces;
-        assert_eq!(namespaces.len(), 3, "три неймспейса");
+        assert_eq!(namespaces.len(), 3, "three namespaces");
         assert_eq!(namespaces[0].name, "apt-modem-0");
         assert_eq!(namespaces[0].schema_name, "radio");
         assert!(namespaces[0].total_bytes > 0);
 
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
-        assert!(result.is_complete(), "повреждений быть не должно");
+        assert!(result.is_complete(), "there must be no damage");
         assert!(!result.entries.is_empty());
 
-        // Сообщения обеих экземпляров и модема на месте.
+        // The messages of both instances and of the modem are there.
         let messages = result
             .entries
             .iter()
@@ -2131,7 +2187,7 @@ mod tests {
         assert_eq!(
             messages,
             2 * 22 + 1,
-            "20 + аварийное + внутри спана, ×2, +1"
+            "20 + the alarm + the one inside a span, ×2, +1"
         );
     }
 
@@ -2157,14 +2213,18 @@ mod tests {
                     }
                 )
             })
-            .expect("имя события восстановлено по схеме");
-        assert_eq!(msg.level(), Some(Level::Info), "уровень взят из схемы");
+            .expect("the event name was restored from the schema");
+        assert_eq!(
+            msg.level(),
+            Some(Level::Info),
+            "the level was taken from the schema"
+        );
 
         let sample = result
             .entries
             .iter()
             .find(|e| matches!(e.kind, EntryKind::Sample { .. }))
-            .expect("сэмпл найден");
+            .expect("the sample was found");
         match &sample.kind {
             EntryKind::Sample {
                 metric,
@@ -2176,16 +2236,19 @@ mod tests {
                 severity,
                 value,
             } => {
-                assert_eq!(*metric, MetricId(1), "идентификатор пришёл из записи");
+                assert_eq!(*metric, MetricId(1), "the identifier came from the record");
                 assert_eq!(*metric_name, Some("temp"));
                 assert_eq!(*unit, Some("°C"));
                 assert_eq!(tags, &["thermal"]);
                 assert_eq!(*kind, Some(MetricKind::Gauge));
-                assert_eq!(*state_name, None, "не перечисление — подписи нет");
-                assert!(severity.is_some(), "важность посчитана по схеме");
+                assert_eq!(*state_name, None, "not an enum, so there is no label");
+                assert!(
+                    severity.is_some(),
+                    "the severity was computed from the schema"
+                );
                 assert!(value.as_f64().unwrap() >= 20.0);
             }
-            other => panic!("ожидался сэмпл: {other:?}"),
+            other => panic!("expected a sample: {other:?}"),
         }
 
         let span = result.entries.iter().find(|e| {
@@ -2197,7 +2260,7 @@ mod tests {
                 }
             )
         });
-        assert!(span.is_some(), "вид спана восстановлен");
+        assert!(span.is_some(), "the span kind was restored");
     }
 
     #[test]
@@ -2206,16 +2269,17 @@ mod tests {
         populate(dir.path());
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
-        // Только оркестраторы.
+        // Orchestrators only.
         let orc = reader
             .query(&Query::new().group("orc-").order(Order::Oldest))
             .unwrap();
         assert!(
             orc.entries.iter().all(|e| e.namespace.starts_with("orc-")),
-            "группа отобрана по префиксу"
+            "the group was selected by prefix"
         );
 
-        // Только ошибки: уровень — свойство типа, читать payload не нужно.
+        // Errors only: the level is a property of the type, so no payload need
+        // be read.
         let errors = reader
             .query(
                 &Query::new()
@@ -2224,7 +2288,7 @@ mod tests {
                     .order(Order::Oldest),
             )
             .unwrap();
-        assert_eq!(errors.entries.len(), 2, "по одной аварии на экземпляр");
+        assert_eq!(errors.entries.len(), 2, "one alarm per instance");
         assert!(
             errors
                 .entries
@@ -2232,7 +2296,7 @@ mod tests {
                 .all(|e| e.level() == Some(Level::Error))
         );
 
-        // Только телеметрия.
+        // Telemetry only.
         let telemetry = reader
             .query(
                 &Query::new()
@@ -2240,7 +2304,7 @@ mod tests {
                     .order(Order::Oldest),
             )
             .unwrap();
-        assert_eq!(telemetry.entries.len(), 20, "10 сэмплов × 2 экземпляра");
+        assert_eq!(telemetry.entries.len(), 20, "10 samples × 2 instances");
         assert!(
             telemetry
                 .entries
@@ -2251,28 +2315,28 @@ mod tests {
 
     #[test]
     fn content_filters_skip_records_that_cannot_match_them() {
-        // Фильтр «только с тэгом rf» не имеет права пропустить свободный
-        // текст: у текста тэгов нет, и совпадением это не было бы. Раньше
-        // текст и спаны проходили любой фильтр по тэгам и типам — отметки о
-        // потерях всплывали посреди ответа «только события подсистемы rf».
-        // Тэги при этом есть не только у событий: отсчёт несёт тэги своей
-        // метрики, и по ним фильтр обязан работать.
+        // The filter "only with the rf tag" has no right to let free text
+        // through: text has no tags, and that would be no match. Text and spans
+        // used to pass any filter on tags and types — loss notices surfaced in
+        // the middle of an answer meant to be "only rf subsystem events". And
+        // tags belong not only to events: a sample carries its metric's tags,
+        // and the filter has to work on those.
         let dir = tempfile::tempdir().unwrap();
         {
             let store =
                 Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024))
                     .unwrap();
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
-            ns.log_raw(EventId(1), &[7], None); // PowerSet, тэг rf
-            ns.log_raw(EventId(2), &[1], None); // Alarm, тэг fault
-            ns.log_text(Level::Warn, "app", "свободный текст без тэгов", None);
-            ns.series(TEMP).unwrap().sample(21.0); // метрика temp, тэг thermal
+            ns.log_raw(EventId(1), &[7], None); // PowerSet, tag rf
+            ns.log_raw(EventId(2), &[1], None); // Alarm, tag fault
+            ns.log_text(Level::Warn, "app", "free text with no tags", None);
+            ns.series(TEMP).unwrap().sample(21.0); // metric temp, tag thermal
             ns.series_untyped(MetricId(2))
                 .unwrap()
-                .sample_raw(dduroc_engine::staged::OwnedValue::U64(1)); // link, тэг rf
+                .sample_raw(dduroc_engine::staged::OwnedValue::U64(1)); // link, tag rf
             {
                 let cal = ns.span(SpanKindId(1));
-                cal.log_raw(EventId(1), &[8]); // rf, внутри спана
+                cal.log_raw(EventId(1), &[8]); // rf, inside a span
             }
             ns.sync().unwrap();
             store.shutdown();
@@ -2289,14 +2353,14 @@ mod tests {
             match &e.kind {
                 EntryKind::Message { .. } => messages += 1,
                 EntryKind::Sample { .. } => samples += 1,
-                other => panic!("{other:?} не несёт тэга и не мог пройти фильтр"),
+                other => panic!("{other:?} carries no tag and could not have passed the filter"),
             }
         }
-        assert_eq!(messages, 2, "PowerSet сам по себе и внутри спана");
-        assert_eq!(samples, 1, "отсчёт link прошёл по тэгу своей метрики");
+        assert_eq!(messages, 2, "PowerSet on its own and inside a span");
+        assert_eq!(samples, 1, "the link sample passed by its metric's tag");
 
-        // Фильтр по типу события: отсчёты, текст и спаны событиями не
-        // являются и удовлетворить ему не могут.
+        // A filter on event type: samples, text and spans are not events and
+        // cannot satisfy it.
         let alarms = reader
             .query(&Query::new().event(EventId(2)).order(Order::Oldest))
             .unwrap();
@@ -2317,10 +2381,10 @@ mod tests {
 
     #[test]
     fn telemetry_keeps_identity_in_newest_order() {
-        // Определение серии пишется в тело один раз, перед первым сэмплом.
-        // При обратном обходе — режиме по умолчанию — сэмпл встречается
-        // РАНЬШЕ своего определения, поэтому восстанавливать идентичность
-        // из потока нельзя: вся телеметрия приходила бы обезличенной.
+        // A series definition is written into the body once, before the first
+        // sample. On a reverse walk — the default mode — a sample is met BEFORE
+        // its definition, so identity cannot be restored from the stream: all
+        // the telemetry would arrive anonymous.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
@@ -2329,7 +2393,7 @@ mod tests {
             let result = reader
                 .query(&Query::new().kinds(KindFilter::TELEMETRY).order(order))
                 .unwrap();
-            assert_eq!(result.entries.len(), 20, "порядок {order:?}");
+            assert_eq!(result.entries.len(), 20, "order {order:?}");
             for e in &result.entries {
                 match &e.kind {
                     EntryKind::Sample {
@@ -2338,11 +2402,11 @@ mod tests {
                         tags,
                         ..
                     } => {
-                        assert_eq!(*metric_name, Some("temp"), "порядок {order:?}");
+                        assert_eq!(*metric_name, Some("temp"), "order {order:?}");
                         assert_eq!(*unit, Some("°C"));
                         assert_eq!(tags, &["thermal"]);
                     }
-                    other => panic!("ожидался сэмпл: {other:?}"),
+                    other => panic!("expected a sample: {other:?}"),
                 }
             }
         }
@@ -2350,20 +2414,20 @@ mod tests {
 
     #[test]
     fn sparse_state_series_gets_seeded_at_the_window_edge() {
-        // Состояния пишут по изменению. Окно, внутри которого состояние не
-        // менялось, не содержит ни одного отсчёта — и полоса на графике
-        // оказалась бы пустой, хотя состояние было известно всё это время.
+        // States are written on change. A window inside which the state did not
+        // change holds not one sample — and the band on a chart would come out
+        // empty although the state was known the whole time.
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
         let store = Store::open(cfg.clone()).unwrap();
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        // Переход в Lock — единственный отсчёт состояния, рано.
+        // The transition to Lock is the only state sample, and it is early.
         let link = ns.series_untyped(MetricId(2)).unwrap();
         link.sample_raw(dduroc_engine::staged::OwnedValue::U64(1));
         let after_state = ns.now();
 
-        // Дальше идёт только температура: окно будет без состояний.
+        // After that only temperature: the window will be without states.
         let temp = ns.series(TEMP).unwrap();
         for i in 0..20 {
             temp.sample(20.0 + i as f32);
@@ -2383,7 +2447,7 @@ mod tests {
             ..Query::new()
         };
 
-        // Без затравки состояния в ответе нет вовсе.
+        // Without a seed there is no state in the answer at all.
         let plain = reader.query(&window).unwrap();
         assert!(plain.seeds.is_empty());
         assert!(
@@ -2394,21 +2458,21 @@ mod tests {
                     ..
                 }
             )),
-            "в окне действительно нет ни одного состояния"
+            "the window really holds not one state"
         );
 
-        // С затравкой — приходит последний отсчёт до окна, отдельно.
+        // With a seed the last sample before the window arrives, separately.
         let seeded = reader
             .query(&Query {
                 seed_states: true,
                 ..window
             })
             .unwrap();
-        assert_eq!(seeded.seeds.len(), 1, "по одному на ряд-состояние");
+        assert_eq!(seeded.seeds.len(), 1, "one per state series");
         let seed = &seeded.seeds[0];
         assert!(
             seed.at <= after_state,
-            "затравка обязана лежать ДО окна: {} vs {}",
+            "a seed must lie BEFORE the window: {} vs {}",
             seed.at,
             after_state
         );
@@ -2421,26 +2485,26 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*metric, MetricId(2));
-                assert_eq!(*state_name, Some("Lock"), "подпись состояния из схемы");
+                assert_eq!(*state_name, Some("Lock"), "the state label from the schema");
                 assert_eq!(*kind, Some(MetricKind::State));
                 assert_eq!(*severity, Some(Severity::Normal));
             }
-            other => panic!("ожидался сэмпл состояния: {other:?}"),
+            other => panic!("expected a state sample: {other:?}"),
         }
-        // Окно от затравки не изменилось.
+        // The window itself is unchanged by the seed.
         assert_eq!(seeded.entries.len(), plain.entries.len());
     }
 
     #[test]
     fn state_seeds_come_from_the_schema_of_their_own_namespace() {
-        // Пространство `metric_id` своё у каждой схемы. Ряды-состояния,
-        // собранные объединением по всем схемам, дали бы затравку из чужого
-        // ряда: метрика номер 2 у «radio» — конечный автомат, у «modem» —
-        // обычная непрерывная величина, и подписывать её состояниями нельзя.
+        // The `metric_id` space belongs to each schema. State series gathered
+        // as a union over all schemas would give a seed from a foreign series:
+        // metric number 2 in "radio" is a state machine, in "modem" an ordinary
+        // continuous quantity, and labelling it with states is not allowed.
         static OTHER_METRICS: &[MetricDesc] = &[MetricDesc {
             warn_if: None,
             alarm_if: None,
-            id: MetricId(2), // тот же номер, другая величина
+            id: MetricId(2), // the same number, a different quantity
             name: "voltage",
             value_type: ValueType::F32,
             class: StorageClass::Default,
@@ -2477,7 +2541,7 @@ mod tests {
                 .sample_raw(dduroc_engine::staged::OwnedValue::F32(3.3));
 
             after = radio.now();
-            // Дальше — только то, что окно и увидит.
+            // From here on, only what the window will see.
             radio.series(TEMP).unwrap().sample(21.0);
             radio.sync().unwrap();
             modem.sync().unwrap();
@@ -2501,7 +2565,7 @@ mod tests {
         assert_eq!(
             seeded.seeds.len(),
             1,
-            "затравка только у настоящего ряда-состояния: {:?}",
+            "only a real state series gets a seed: {:?}",
             seeded.seeds
         );
         let seed = &seeded.seeds[0];
@@ -2513,14 +2577,14 @@ mod tests {
                 assert_eq!(*state_name, Some("Lock"));
                 assert_eq!(*kind, Some(MetricKind::State));
             }
-            other => panic!("ожидалось состояние: {other:?}"),
+            other => panic!("expected a state: {other:?}"),
         }
     }
 
     #[test]
     fn state_seed_is_absent_when_there_is_nothing_before_the_window() {
-        // Запрос от начала времён: до окна ничего нет, и выдумывать затравку
-        // неоткуда.
+        // A query from the beginning of time: there is nothing before the
+        // window, and nowhere to invent a seed from.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
@@ -2538,9 +2602,9 @@ mod tests {
 
     #[test]
     fn telemetry_identity_survives_an_unsealed_segment() {
-        // Живое хранилище: сегмент ещё пишется, footer'а нет, а с ним нет и
-        // таблицы серий. Идентичность приходится собирать проходом по телам —
-        // тем же, которым находятся смещения блоков.
+        // A live store: the segment is still being written, there is no footer
+        // and with it no series table. Identity has to be gathered by a pass
+        // over the bodies — the same pass that finds the block offsets.
         let dir = tempfile::tempdir().unwrap();
         let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
         let store = Store::open(cfg.clone()).unwrap();
@@ -2549,14 +2613,14 @@ mod tests {
         for i in 0..10 {
             temp.sample(20.0 + i as f32);
         }
-        ns.sync().unwrap(); // данные на диске, но сегмент не запечатан
+        ns.sync().unwrap(); // the data is on disk but the segment is not sealed
 
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         for order in [Order::Oldest, Order::Newest] {
             let result = reader
                 .query(&Query::new().kinds(KindFilter::TELEMETRY).order(order))
                 .unwrap();
-            assert_eq!(result.entries.len(), 10, "порядок {order:?}");
+            assert_eq!(result.entries.len(), 10, "order {order:?}");
             assert!(
                 result.entries.iter().all(|e| matches!(
                     &e.kind,
@@ -2566,7 +2630,7 @@ mod tests {
                         ..
                     }
                 )),
-                "порядок {order:?}: серия обезличена в незапечатанном сегменте"
+                "order {order:?}: the series is anonymous in an unsealed segment"
             );
         }
         store.shutdown();
@@ -2574,8 +2638,8 @@ mod tests {
 
     #[test]
     fn telemetry_identity_survives_time_range_seek() {
-        // Запрос с нижней границей пропускает начальные блоки по
-        // footer-индексу — вместе с лежащими там определениями серий.
+        // A query with a lower bound skips the leading blocks by the footer
+        // index — and the series definitions that lie in them with them.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
@@ -2609,7 +2673,7 @@ mod tests {
                     ..
                 }
             )),
-            "идентичность серии обязана пережить перескок по времени"
+            "a series identity must survive a jump in time"
         );
     }
 
@@ -2623,13 +2687,13 @@ mod tests {
             .query(&Query::new().order(Order::Newest).limit(5))
             .unwrap();
         assert_eq!(newest.entries.len(), 5);
-        assert!(newest.truncated, "ответ обрезан по лимиту");
+        assert!(newest.truncated, "the answer is cut short by the limit");
 
-        // Время не возрастает.
+        // Time does not increase.
         let times: Vec<BootTime> = newest.entries.iter().map(|e| e.at).collect();
         assert!(
             times.windows(2).all(|w| w[0] >= w[1]),
-            "порядок от нового к старому: {times:?}"
+            "newest to oldest order: {times:?}"
         );
 
         let oldest = reader
@@ -2641,36 +2705,37 @@ mod tests {
 
     #[test]
     fn truncation_is_announced_only_when_something_was_left_out() {
-        // Отметка ставилась при входе в выдачу, а не тогда, когда запись
-        // действительно не влезла: ответ ровно в `limit` записей объявлялся
-        // обрезанным, даже если больше их и не было. Для веб-слоя это вечная
-        // кнопка «дальше», ведущая в пустоту.
+        // The mark used to be set on entering the hand-out rather than when a
+        // record really did not fit: an answer of exactly `limit` records was
+        // declared truncated even when there were no more. For a web layer that
+        // is a "next" button that never goes away and leads nowhere.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
 
         let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         let total = all.entries.len();
-        assert!(!all.truncated, "запрос без лимита не бывает обрезан");
+        assert!(!all.truncated, "a query without a limit is never truncated");
 
-        // Лимит ровно по числу записей: обрезать было нечего.
+        // A limit exactly equal to the record count: there was nothing to
+        // truncate.
         let exact = reader
             .query(&Query::new().order(Order::Oldest).limit(total))
             .unwrap();
         assert_eq!(exact.entries.len(), total);
         assert!(
             !exact.truncated,
-            "записей ровно {total}, больше нет — ответ полон"
+            "exactly {total} records and no more — the answer is complete"
         );
 
-        // На единицу меньше — обрезан по-настоящему.
+        // One less — truncated for real.
         let cut = reader
             .query(&Query::new().order(Order::Oldest).limit(total - 1))
             .unwrap();
         assert_eq!(cut.entries.len(), total - 1);
-        assert!(cut.truncated, "одна запись осталась за бортом");
+        assert!(cut.truncated, "one record was left out");
 
-        // Пустой ответ при нулевом лимите: записи есть, места нет.
+        // An empty answer at a zero limit: there are records, there is no room.
         let none = reader
             .query(&Query::new().order(Order::Oldest).limit(0))
             .unwrap();
@@ -2680,10 +2745,10 @@ mod tests {
 
     #[test]
     fn render_resolves_the_schema_without_touching_the_disk() {
-        // Резолв схемы читал `ns-meta` на КАЖДЫЙ вызов: отрисовка пятисот
-        // строк стоила пятисот открытий файла — ровно тот дефект, который
-        // уже убран с пути запроса. Проверяется тем, что рендер продолжает
-        // работать, когда файла на диске больше нет.
+        // Resolving a schema read `ns-meta` on EVERY call: drawing five hundred
+        // lines cost five hundred file opens — exactly the defect already
+        // removed from the query path. It is checked by the fact that rendering
+        // goes on working once the file is no longer on disk.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
@@ -2701,7 +2766,7 @@ mod tests {
         assert_eq!(
             reader.render(msg, "ru").as_deref(),
             Some("мощность задана"),
-            "схема обязана быть разрешена один раз, а не на каждый вызов"
+            "the schema must be resolved once rather than on every call"
         );
     }
 
@@ -2715,9 +2780,9 @@ mod tests {
         let keys: Vec<BootTime> = all.entries.iter().map(|e| e.at).collect();
         assert!(
             keys.windows(2).all(|w| w[0] <= w[1]),
-            "слияние обязано давать глобальный порядок по времени"
+            "the merge must give a global order by time"
         );
-        // В ответе присутствуют оба неймспейса вперемешку.
+        // Both namespaces are present in the answer, interleaved.
         let namespaces: std::collections::HashSet<_> =
             all.entries.iter().map(|e| &*e.namespace).collect();
         assert!(namespaces.len() >= 2);
@@ -2727,11 +2792,14 @@ mod tests {
     fn unknown_schema_leaves_raw_identifiers() {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
-        // Читаем без схем — как чужой билд.
+        // Read without schemas — as a foreign build would.
         let reader = Reader::open_dump([dir.path()], &[]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
 
-        assert!(!result.entries.is_empty(), "записи всё равно читаются");
+        assert!(
+            !result.entries.is_empty(),
+            "the records are read all the same"
+        );
         let msg = result
             .entries
             .iter()
@@ -2739,8 +2807,8 @@ mod tests {
             .unwrap();
         match &msg.kind {
             EntryKind::Message { name, level, .. } => {
-                assert!(name.is_none(), "имя без схемы неизвестно");
-                assert!(level.is_none(), "уровень без схемы неизвестен");
+                assert!(name.is_none(), "without a schema the name is unknown");
+                assert!(level.is_none(), "without a schema the level is unknown");
             }
             other => panic!("{other:?}"),
         }
@@ -2771,7 +2839,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
 
-        // Подменяем store-meta: сегменты станут «чужими».
+        // Substitute the store metadata: the segments become "foreign".
         let meta_path = dir.path().join("store-meta");
         #[derive(serde::Serialize)]
         struct Meta {
@@ -2792,11 +2860,11 @@ mod tests {
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         assert!(
             !result.is_complete(),
-            "чужие сегменты обязаны попасть в список повреждений, а не исчезнуть"
+            "foreign segments must reach the damage list rather than vanish"
         );
         assert!(result.entries.is_empty());
 
-        // Явное разрешение читает их как есть.
+        // An explicit permission reads them as they are.
         let reader = Reader::open_dump([dir.path()], &[schema()])
             .unwrap()
             .allow_foreign_segments();
@@ -2809,7 +2877,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
 
-        // Портим середину одного сегмента.
+        // Damage the middle of one segment.
         let ch = dir.path().join("orc-radio-0").join("default");
         let seg = std::fs::read_dir(&ch)
             .unwrap()
@@ -2825,34 +2893,31 @@ mod tests {
 
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
-        assert!(
-            !result.is_complete(),
-            "о повреждении обязано быть сказано явно"
-        );
-        // Данные других неймспейсов не пострадали.
+        assert!(!result.is_complete(), "damage must be reported explicitly");
+        // The other namespaces' data is unharmed.
         assert!(
             result
                 .entries
                 .iter()
                 .any(|e| &*e.namespace == "orc-radio-1" || &*e.namespace == "apt-modem-0"),
-            "порча одного сегмента не должна прятать остальные"
+            "corruption of one segment must not hide the others"
         );
     }
 
     #[test]
     fn damage_is_reported_even_when_the_walk_stops_early() {
-        // Повреждения переезжали из сегмента в отчёт только при его
-        // закрытии, а обход обрывается по `limit` посреди сегмента. Ответ, из
-        // которого выпал блок, объявлял себя полным — то есть врал ровно в том
-        // поле, ради которого оно заведено.
+        // Damage moved from a segment into the report only when the segment
+        // closed, while the walk breaks off on `limit` mid-segment. An answer a
+        // block had dropped out of declared itself complete — that is, lied in
+        // exactly the field that exists for it.
         let dir = tempfile::tempdir().unwrap();
         {
             let store =
                 Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024))
                     .unwrap();
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
-            // Восемь блоков в одном сегменте: `sync` закрывает блок, поэтому
-            // сегмент заведомо не будет дочитан до конца под лимитом.
+            // Eight blocks in one segment: `sync` closes a block, so the
+            // segment is knowably not read to the end under the limit.
             for round in 0..8u8 {
                 for i in 0..5u8 {
                     ns.log_raw(EventId(1), &[round, i], None);
@@ -2870,8 +2935,8 @@ mod tests {
             .find(|p| p.extension().is_some_and(|x| x == "seg"))
             .unwrap();
         {
-            // Первый блок сегмента: заголовок начинается сразу за заголовком
-            // сегмента (32 байта).
+            // The segment's first block: its header begins right after the
+            // segment header (32 bytes).
             use std::os::unix::fs::FileExt;
             let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
             f.write_all_at(&[0xFF; 16], 40).unwrap();
@@ -2881,20 +2946,23 @@ mod tests {
         let result = reader
             .query(&Query::new().order(Order::Oldest).limit(1))
             .unwrap();
-        assert_eq!(result.entries.len(), 1, "лимит соблюдён");
-        assert!(result.truncated, "обход оборван, сегмент не дочитан");
+        assert_eq!(result.entries.len(), 1, "the limit is honoured");
+        assert!(
+            result.truncated,
+            "the walk broke off and the segment was not read to the end"
+        );
         assert!(
             !result.is_complete(),
-            "часть данных выпала из-за порчи — ответ не полон"
+            "some data dropped out because of corruption — the answer is not complete"
         );
 
-        // Тот же ответ у ленивого пути: читатель обязан признаваться в
-        // пропаже и когда обход прерывает сам вызывающий.
+        // The same answer on the lazy path: a reader has to admit a loss when
+        // the caller breaks off the walk too.
         let mut stream = reader.stream(&Query::new().order(Order::Oldest)).unwrap();
-        let _first = stream.next().expect("хоть одна запись есть");
+        let _first = stream.next().expect("there is at least one record");
         assert!(
             !stream.damaged().is_empty(),
-            "повреждение видно, не дожидаясь конца обхода"
+            "the damage is visible without waiting for the end of the walk"
         );
     }
 
@@ -2921,18 +2989,18 @@ mod tests {
         let entry = &result.entries[0];
         let utc = entry
             .utc
-            .expect("якорь ретроактивен: событие записано ДО синхронизации");
+            .expect("the anchor is retroactive: the event was written BEFORE the synchronization");
         assert!(
             (1_699_999_000_000..1_700_001_000_000).contains(&utc.timestamp_millis()),
-            "UTC рядом с точкой синхронизации: {utc}"
+            "the UTC is close to the synchronization point: {utc}"
         );
     }
 
     #[test]
     fn wall_clock_window_selects_the_same_records_as_the_relative_one() {
-        // Синхронизированный прибор: одно и то же окно, заданное настенными
-        // часами и относительным временем, обязано дать одну выборку.
-        // Иначе граница «с 12:00» врала бы ровно на ошибку конверсии.
+        // A synchronized device: one and the same window given by a wall clock
+        // and by relative time has to yield one selection. Otherwise the bound
+        // "from 12:00" would lie by exactly the conversion error.
         let dir = tempfile::tempdir().unwrap();
         {
             let cfg = StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024);
@@ -2955,7 +3023,7 @@ mod tests {
         let all = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         assert_eq!(all.entries.len(), 40);
         let mid = &all.entries[all.entries.len() / 2];
-        let mid_utc = mid.utc.expect("якорь есть");
+        let mid_utc = mid.utc.expect("there is an anchor");
 
         let by_wall = reader
             .query(&Query::new().order(Order::Oldest).since(mid_utc))
@@ -2964,16 +3032,16 @@ mod tests {
             .query(&Query::new().order(Order::Oldest).since(mid.at))
             .unwrap();
 
-        assert!(by_wall.unanchored.is_empty(), "запуск синхронизирован");
+        assert!(by_wall.unanchored.is_empty(), "the run is synchronized");
         assert_eq!(
             by_wall.entries, by_relative.entries,
-            "настенное и относительное окно обязаны дать одну выборку: \
-             конверсия по якорю точна до микросекунды"
+            "a wall-clock and a relative window must give one selection: \
+             conversion by the anchor is exact to the microsecond"
         );
         assert!(by_wall.entries.iter().all(|e| e.at >= mid.at));
         assert!(by_wall.entries.len() < all.entries.len());
 
-        // Верхняя граница — симметрично.
+        // The upper bound, symmetrically.
         let until_wall = reader
             .query(&Query::new().order(Order::Oldest).until(mid_utc))
             .unwrap();
@@ -2982,9 +3050,10 @@ mod tests {
             .unwrap();
         assert_eq!(until_wall.entries, until_relative.entries);
         assert!(until_wall.entries.iter().all(|e| e.at <= mid.at));
-        // Вместе половины покрывают всё; пересечение — записи ровно на
-        // границе, а их может быть больше одной: часы монотонны, но не строго
-        // возрастают, и во всплеске два события получают одну микросекунду.
+        // Together the halves cover everything; the intersection is the records
+        // exactly on the bound, and there may be more than one: the clock is
+        // monotonic but not strictly increasing, and in a burst two events get
+        // one microsecond.
         let on_edge = all.entries.iter().filter(|e| e.at == mid.at).count();
         assert_eq!(
             until_wall.entries.len() + by_wall.entries.len(),
@@ -2994,9 +3063,9 @@ mod tests {
 
     #[test]
     fn wall_clock_window_reports_runs_it_had_to_drop() {
-        // Прибор без синхронизации. Запрос по настенным часам не может
-        // сказать, попадают ли его записи в окно, — и обязан сообщить, что
-        // выборка неполна, а не показать пустоту.
+        // A device with no synchronization. A query by the wall clock cannot
+        // say whether its records fall in the window — and has to report that
+        // the selection is incomplete rather than show emptiness.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
 
@@ -3006,16 +3075,16 @@ mod tests {
             .query(&Query::new().order(Order::Oldest).since(utc))
             .unwrap();
 
-        assert!(r.entries.is_empty(), "сопоставить нечем");
+        assert!(r.entries.is_empty(), "there is nothing to match with");
         assert_eq!(
             r.unanchored,
             vec![BootCounter(0)],
-            "выпавший запуск обязан быть назван: молчание выглядело бы как \
-             «прибор ничего не писал»"
+            "a run that dropped out must be named: silence would look like \
+             \"the device wrote nothing\""
         );
 
-        // Относительное окно работает и без синхронизации — оно ни от чего
-        // не зависит.
+        // A relative window works without a synchronization too — it depends on
+        // nothing.
         let r = reader
             .query(
                 &Query::new()
@@ -3029,27 +3098,27 @@ mod tests {
 
     #[test]
     fn stream_reads_without_collecting_everything() {
-        // Ради этого поток и существует: ответ на запрос без `limit` по
-        // большому хранилищу в память не поместился бы, а прервать обход
-        // посередине `query` не позволяет.
+        // This is what the stream exists for: the answer to a query without a
+        // `limit` over a large store would not fit in memory, and `query` does
+        // not allow breaking the walk off half way.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
         let q = Query::new().order(Order::Oldest);
 
-        // Первые пять записей — и обход прекращён, остальные сегменты даже не
-        // дочитаны.
+        // The first five records — and the walk stops; the remaining segments
+        // are not even read to the end.
         let head: Vec<Entry> = reader.stream(&q).unwrap().take(5).collect();
         assert_eq!(head.len(), 5);
 
-        // Поток и собранный ответ обязаны совпадать запись в запись: иначе
-        // «то же самое, но лениво» было бы неправдой.
+        // The stream and the assembled answer have to match record for record:
+        // otherwise "the same thing, but lazily" would not be true.
         let whole: Vec<Entry> = reader.stream(&q).unwrap().collect();
         let collected = reader.query(&q).unwrap();
         assert_eq!(whole, collected.entries);
         assert_eq!(&whole[..5], &head[..]);
 
-        // Лимит и признак обрезки работают и в потоке.
+        // The limit and the truncation flag work in the stream too.
         let mut limited = reader.stream(&q.clone().limit(3)).unwrap();
         assert_eq!(limited.by_ref().count(), 3);
         assert!(limited.truncated());
@@ -3058,9 +3127,9 @@ mod tests {
 
     #[test]
     fn render_finds_the_schema_by_the_entry_itself() {
-        // Схему больше не надо искать вызывающему: передать чужую значило бы
-        // разобрать payload декодером другого события — текст вышел бы
-        // правдоподобным и неверным.
+        // The caller no longer has to find the schema: passing a foreign one
+        // would mean parsing the payload with another event's decoder — the text
+        // would come out plausible and wrong.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
@@ -3075,20 +3144,20 @@ mod tests {
             .unwrap();
         assert_eq!(reader.render(msg, "ru").as_deref(), Some("мощность задана"));
         assert_eq!(reader.render(msg, "en").as_deref(), Some("power set"));
-        // Неизвестный язык — первый объявленный, а не отказ.
+        // An unknown language falls back to the first declared, not to a refusal.
         assert_eq!(reader.render(msg, "de").as_deref(), Some("power set"));
 
-        // Читателю без схем рендерить нечем, и выдумывать он не станет.
+        // A reader without schemas has nothing to render with, and will not invent.
         let blind = Reader::open_dump([dir.path()], &[]).unwrap();
         assert_eq!(blind.render(msg, "ru"), None);
     }
 
     #[test]
     fn dump_without_epochs_file_still_names_its_runs() {
-        // Дамп скопировали без `epochs.bin` — так бывает, когда забирают
-        // только каталог. Записи на месте, но настенного времени у них нет ни
-        // у одной, а перечислить выпавшие запуски по эпохам невозможно:
-        // единственный источник — имена сегментов.
+        // The dump was copied without `epochs.bin` — which happens when only the
+        // directory is taken. The records are there, but not one of them has a
+        // wall-clock time, and the runs that dropped out cannot be listed from the
+        // epochs: the only source is the segment names.
         let dir = tempfile::tempdir().unwrap();
         populate(dir.path());
         std::fs::remove_file(dir.path().join(dduroc_engine::epochs::EPOCHS_FILE)).unwrap();
@@ -3103,11 +3172,11 @@ mod tests {
         assert_eq!(
             r.unanchored,
             vec![BootCounter(0)],
-            "без реестра эпох запуск известен только по имени сегмента"
+            "without the epoch registry a run is known only by a segment name"
         );
 
-        // Без настенных границ дамп читается как обычно: относительное время
-        // лежит в самих файлах.
+        // Without wall-clock bounds a dump reads as usual: relative time lies in
+        // the files themselves.
         let r = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         assert!(!r.entries.is_empty());
         assert!(r.entries.iter().all(|e| e.utc.is_none()));
