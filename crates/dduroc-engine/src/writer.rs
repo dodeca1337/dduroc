@@ -1,31 +1,31 @@
-//! Writer: единственный поток, который пишет в файлы.
+//! The writer: the single thread that writes to files.
 //!
-//! # Почему один поток
+//! # Why one thread
 //!
-//! Сегмент — append-only файл: два писателя в него означали бы блокировку на
-//! каждую запись. Один поток снимает вопрос вовсе, а батчинг превращает
-//! всплеск событий в один блок и один `fdatasync`.
+//! A segment is an append-only file, and two writers into it would mean a lock
+//! on every record. One thread removes the question entirely, and batching
+//! turns a burst of events into one block and one `fdatasync`.
 //!
-//! # Две очереди, а не одна
+//! # Two queues rather than one
 //!
-//! Критические и обычные записи разведены по разным очередям. С общей
-//! очередью поток телеметрии в тысячи сэмплов в секунду вставал бы перед
-//! аварийным сообщением — классическая инверсия приоритетов, при которой
-//! «критический» канал критичен только на бумаге.
+//! Critical and ordinary records travel on separate queues. With a shared one,
+//! a telemetry stream of thousands of samples a second would queue up ahead of
+//! a critical message — the classic priority inversion in which a "critical"
+//! channel is critical only on paper.
 //!
-//! - обычная очередь: при переполнении запись **отбрасывается**, счётчик
-//!   растёт, а в поток попадает отметка о потере — дыра не должна быть
-//!   неотличима от тишины;
-//! - критическая: вызывающий **ждёт** места (с таймаутом). Критические
-//!   события редки, поэтому ожидание практически недостижимо, но обещание
-//!   «не потеряно» становится честным.
+//! - the ordinary queue: on overflow a record is **discarded**, the counter
+//!   grows, and a loss notice goes into the stream — a hole must not be
+//!   indistinguishable from silence;
+//! - the critical one: the caller **waits** for room (with a timeout). Critical
+//!   events are rare, so waiting is all but unreachable, but the promise "not
+//!   lost" becomes an honest one.
 //!
-//! # Чего writer не делает
+//! # What the writer does not do
 //!
-//! Он **не логирует через публичный API**. Освободить очередь может только он
-//! сам, поэтому запись из его собственного потока — гарантированный
-//! самоблок при заполненной очереди. Вся диагностика — атомарные счётчики
-//! ([`crate::stats`]) и отметки, вставляемые прямо в поток записей.
+//! It does **not log through the public API**. Only it can free the queue, so
+//! writing from its own thread is a guaranteed self-deadlock once the queue is
+//! full. All the diagnostics are atomic counters ([`crate::stats`]) and notices
+//! inserted straight into the record stream.
 
 use crate::channel::ChannelConfig;
 use crate::error::{Error, IoContext, Result};
@@ -42,18 +42,18 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Ёмкости очередей.
+/// The queue capacities.
 ///
-/// Очередь выделяется целиком при открытии хранилища: crossbeam резервирует
-/// весь буфер сразу. При 32-байтовом inline-payload'е запись занимает под
-/// сотню байт, то есть значения по умолчанию стоят около трёх четвертей
-/// мегабайта на процесс — на armv7 это заметно, и прибор, который пишет
-/// редко, вправе выбрать очередь поменьше.
+/// A queue is allocated whole when the store is opened: crossbeam reserves the
+/// entire buffer up front. With a 32-byte inline payload a record takes under a
+/// hundred bytes, so the defaults cost about three quarters of a megabyte per
+/// process — noticeable on armv7, and a device that writes rarely is entitled
+/// to choose a smaller queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueSizes {
-    /// Обычная очередь: при переполнении запись теряется.
+    /// The ordinary queue: on overflow a record is lost.
     pub normal: usize,
-    /// Критическая: при переполнении вызывающий ждёт места.
+    /// The critical one: on overflow the caller waits for room.
     pub critical: usize,
 }
 
@@ -67,9 +67,9 @@ impl Default for QueueSizes {
 }
 
 impl QueueSizes {
-    /// Нулевая ёмкость означала бы рандеву на каждой записи: писать стало бы
-    /// можно только в темпе writer'а, и обычный канал перестал бы отличаться
-    /// от критического.
+    /// A zero capacity would mean a rendezvous on every record: writing would
+    /// only be possible at the writer's pace, and the ordinary channel would
+    /// stop differing from the critical one.
     fn sanitized(self) -> Self {
         Self {
             normal: self.normal.max(1),
@@ -78,120 +78,127 @@ impl QueueSizes {
     }
 }
 
-/// Сколько записей writer забирает за один заход перед тем, как заняться
-/// таймерами. Ограничение нужно, чтобы поток телеметрии не заморозил
-/// обслуживание flush- и sync-дедлайнов.
+/// How many records the writer takes in one go before turning to the timers.
+/// The bound is needed so that a telemetry stream does not freeze the servicing
+/// of flush and sync deadlines.
 const DRAIN_LIMIT: usize = 4096;
 
-/// Максимальное ожидание места в критической очереди.
+/// The longest wait for room in the critical queue.
 const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Сон, когда обслуживать нечего.
+/// How long to sleep when there is nothing to service.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Нижняя граница ожидания в цикле: без неё просроченный дедлайн даёт
-/// нулевой таймаут и вырождается в busy-wait на целое ядро.
+/// The lower bound on the loop's wait: without it an overdue deadline gives a
+/// zero timeout and degenerates into a busy-wait on a whole core.
 const MIN_TIMEOUT: Duration = Duration::from_millis(1);
 
-/// Потолок числа проходов при вычерпывании очередей перед `sync`/`shutdown`.
+/// The ceiling on the number of passes when draining the queues before
+/// `sync`/`shutdown`.
 ///
-/// Без него поток, пишущий быстрее, чем успевает writer, не дал бы
-/// завершиться ни `sync`, ни `shutdown` — процесс не смог бы остановиться.
+/// Without it a thread writing faster than the writer can keep up would let
+/// neither `sync` nor `shutdown` finish — the process could not stop.
 const DRAIN_ROUNDS: usize = 64;
 
-/// Сколько канал должен простоять без дела, прежде чем отдаст буферы.
+/// How long a channel has to sit idle before it gives its buffers back.
 ///
-/// Мгновенный возврат неверен: канал с немедленной синхронизацией
-/// (`sync_interval == 0` — критический) оказывается «без дела» после
-/// **каждой** групповой фиксации — блок вытолкнут,
-/// синхронизировать нечего, — и отдавал бы буфер блока со scratch'ем на
-/// каждом батче, чтобы тут же выделить их снова. Это ровно горячий путь
-/// критических записей. Пауза его не касается, а настоящее бездействие от
-/// неё не убежит: держать пик лишние секунды дешевле, чем платить парой
-/// аллокаций за каждую аварийную запись.
+/// Giving them back at once is wrong: a channel with immediate syncing
+/// (`sync_interval == 0`, the critical one) turns out to be "idle" after
+/// **every** group commit — the block is flushed and there is nothing to sync —
+/// and would give up its block buffer and scratch on every batch only to
+/// allocate them again. That is precisely the hot path of critical records. The
+/// pause does not affect it, and genuine idleness will not escape it: holding a
+/// peak for a few extra seconds is cheaper than paying a couple of allocations
+/// for every critical record.
 const RELEASE_AFTER: Duration = Duration::from_secs(2);
 
-/// Сколько канал должен простоять, прежде чем отдаст **сегмент**.
+/// How long a channel has to sit idle before it gives up its **segment**.
 ///
-/// Открытый сегмент стоит дескриптора и целиком числится в бюджете: файл
-/// преаллоцирован на полный размер, и записанного в нём может быть сто байт.
-/// При заявленных десятках тысяч каналов это десятки тысяч дескрипторов и
-/// сотни гигабайт зарезервированного места за каналами, которые молчат.
+/// An open segment costs a descriptor and is counted in the budget together
+/// with the unwritten tail of its reserve window, while what is written in it
+/// may be a hundred bytes. With the tens of thousands of channels claimed,
+/// that is tens of thousands of descriptors held by channels that have gone
+/// quiet.
 ///
-/// Отпускание возвращает и то, и другое: файл обрезается до фактических
-/// данных и закрывается. Но **не запечатывается** — следующая запись
-/// продолжит его, а не заведёт новый (см. [`WriterLoop::unpark`]). Разница
-/// принципиальна: канал, пишущий раз в час, при запечатывании оставлял бы по
-/// файлу на запись — тысячи крохотных сегментов в год на канал, которых
-/// байтовая ротация не тронет, потому что байт в них почти нет.
+/// Releasing gives both back: the file is truncated to its actual data and
+/// closed. But it is **not sealed** — the next write continues it rather than
+/// starting a new one (see [`WriterLoop::unpark`]). The difference matters: a
+/// channel writing once an hour would, if sealing, leave a file per record —
+/// thousands of tiny segments a year per channel, which byte-based rotation
+/// will not touch because there are hardly any bytes in them.
 ///
-/// Пауза заметно длиннее [`RELEASE_AFTER`], потому что цена другая: буферы
-/// стоят пары аллокаций, а сегмент — `fdatasync` и `ftruncate`, и обхода
-/// файла при возвращении.
+/// The pause is noticeably longer than [`RELEASE_AFTER`] because the price is
+/// different: buffers cost a couple of allocations, a segment an `fdatasync`
+/// and an `ftruncate`, and a walk over the file when it comes back.
 const PARK_AFTER: Duration = Duration::from_secs(300);
 
-/// Источник отметок о служебных событиях в потоке записей.
+/// The source of notices about the engine's own events in the record stream.
 const DIAG_TARGET: &str = crate::diag::TARGET;
 
 // ════════════════════════════════════════════════════════════════════════════
-// Команды
+// Commands
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Управляющая команда.
+/// A control command.
 ///
-/// Команды идут отдельной очередью, поэтому сами по себе **обгоняют** данные,
-/// находящиеся в полёте. Чтобы `sync` не отчитался об успехе, пока часть
-/// записей ещё лежит в очереди, а `shutdown` не запечатал сегменты поверх
-/// недописанного, обе команды сперва вычерпывают очереди данных досуха
-/// (см. [`WriterLoop::drain_pending`]).
+/// Commands travel on a separate queue, so on their own they **overtake** data
+/// in flight. So that `sync` does not report success while some records are
+/// still in the queue, and `shutdown` does not seal segments over what has not
+/// been written, both commands first drain the data queues dry (see
+/// [`WriterLoop::drain_pending`]).
 #[derive(Debug)]
 enum Control {
-    /// Зарегистрировать неймспейс.
+    /// Register a namespace.
     Register(Box<NsSetup>, Sender<Result<NsId>>),
-    /// Отпустить неймспейс: запечатать его сегменты и освободить слот.
+    /// Release a namespace: seal its segments and free the slot.
     ///
-    /// Идёт той же очередью, что и `Register`, поэтому повторный подъём того
-    /// же имени гарантированно обрабатывается **после** освобождения. Иначе на
-    /// один каталог пришлось бы два состояния канала со своими инвентарями, и
-    /// ротация одного удаляла бы сегмент, открытый другим, — записи уходили бы
-    /// в файл без имени и пропадали при закрытии.
+    /// It travels on the same queue as `Register`, so bringing the same name up
+    /// again is guaranteed to be handled **after** the release. Otherwise one
+    /// directory would have two channel states with inventories of their own,
+    /// and one's rotation would delete a segment the other had open — records
+    /// would go into a file with no name and vanish when it closed.
     Release(NsId),
-    /// Вытолкнуть и синхронизировать всё накопленное неймспейсом.
+    /// Flush and sync everything a namespace has accumulated.
     Sync(Option<NsId>, Sender<Result<()>>),
-    /// Подменить сегмент результатом миграции (или удалить опустевший).
+    /// Swap a segment for the result of a migration (or delete an emptied one).
     ///
-    /// Тяжёлая работа миграции — чтение, преобразование, запись временного
-    /// файла — идёт на потоке вызывающего; сюда приходит только **фиксация**:
-    /// rename поверх старого имени и правка инвентаря. Делать её мимо writer'а
-    /// нельзя — он единственный владелец инвентаря и ротации, и внешняя
-    /// подмена файла гонялась бы с удалением этого же файла ротацией.
+    /// A migration's heavy work — reading, transforming, writing the temporary
+    /// file — happens on the calling thread; only the **commit** arrives here:
+    /// a rename over the old name and an edit to the inventory. It cannot be
+    /// done behind the writer's back — it is the sole owner of the inventory
+    /// and of rotation, and an external file swap would race with rotation
+    /// deleting that same file.
     CommitMigration {
         ns: NsId,
         channel: ChannelIdx,
         name: SegmentName,
         commit: MigrationCommit,
-        /// `Ok(false)` — сегмента больше нет (ротирован), фиксировать нечего.
+        /// `Ok(false)` means the segment is gone (rotated) and there is nothing
+        /// to commit.
         reply: Sender<Result<bool>>,
     },
-    /// Запечатать активные сегменты и завершить работу.
+    /// Seal the active segments and finish.
     Shutdown(Sender<()>),
 }
 
-/// Чем закончилась миграция одного сегмента.
+/// How the migration of one segment ended.
 #[derive(Debug)]
 pub(crate) enum MigrationCommit {
-    /// Подменить файл сегмента временным (он уже записан и синхронизирован).
+    /// Replace the segment file with the temporary one (already written and
+    /// synced).
     Replace {
         tmp: PathBuf,
-        /// Размер нового файла — инвентарь обязан узнать его сразу, а не при
-        /// следующем скане: по суммам ходит ротация и потолок хранилища.
+        /// The new file's size — the inventory has to learn it at once rather
+        /// than at the next scan: rotation and the store ceiling walk those
+        /// sums.
         size: u64,
     },
-    /// Удалить сегмент: все его записи удалены шагами миграции.
+    /// Delete the segment: every record of it was deleted by the migration
+    /// steps.
     Remove,
 }
 
-/// Параметры регистрации неймспейса.
+/// The parameters for registering a namespace.
 #[derive(Debug)]
 pub struct NsSetup {
     pub name: String,
@@ -202,61 +209,66 @@ pub struct NsSetup {
     pub drops: Arc<DropCounters>,
 }
 
-/// Один канал неймспейса глазами writer'а. Классов хранения writer не знает:
-/// его дело — каталог, политика, группа бюджета и личная квота.
+/// One channel of a namespace as the writer sees it. The writer knows nothing
+/// of storage classes: its business is the directory, the policy, the budget
+/// group and the personal quota.
 #[derive(Debug)]
 pub struct ChannelSpec {
-    /// Полный путь каталога канала — уже с учётом корня класса.
+    /// The full path of the channel directory — with the class root already
+    /// applied.
     pub dir: PathBuf,
-    /// Бюджетная группа (индекс в списке групп writer'а).
+    /// The budget group (an index into the writer's list of groups).
     pub group: usize,
-    /// Личная квота неймспейса в группе. `None` — канал черпает из общего
-    /// бюджета группы без индивидуального предела.
+    /// The namespace's personal quota within the group. `None` means the
+    /// channel draws on the group's shared budget with no individual limit.
     pub quota_bytes: Option<u64>,
     pub config: ChannelConfig,
 }
 
-/// Бюджетная группа: общий предел суммарного размера сегментов её каналов.
+/// A budget group: the shared limit on the total size of its channels'
+/// segments.
 #[derive(Debug, Clone, Copy)]
 pub struct GroupBudget {
     pub budget_bytes: u64,
-    /// Ключ носителя: группы с одним `root_key` живут на одном разделе и
-    /// делят давление ENOSPC.
+    /// The medium key: groups with one `root_key` live on one partition and
+    /// share ENOSPC pressure.
     pub root_key: u8,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Ручка
+// The handle
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Ручка writer'а: то, чем пользуются прикладные потоки.
+/// The writer's handle: what application threads use.
 #[derive(Debug)]
 pub struct Writer {
     normal: Sender<Staged>,
     critical: Sender<Staged>,
     control: Sender<Control>,
     counters: Arc<Counters>,
-    /// Началась остановка: очередь ещё принимает, но разбирать её уже некому.
+    /// Stopping has begun: the queue still accepts, but there is nobody left to
+    /// drain it.
     ///
-    /// Между вычерпыванием очереди в `shutdown` и выходом потока очередь жива,
-    /// и `try_send` отвечал бы `Ok` записям, которые затем гибнут в
-    /// деструкторе канала — без счётчика, без отметки, без ответа вызывающему.
-    /// Отказ здесь честнее: [`Error::ShuttingDown`] и без того объявлен
-    /// потерей ([`Error::loses_record`]), просто до сих пор его никто не
-    /// порождал.
+    /// Between draining the queue in `shutdown` and the thread exiting the
+    /// queue is alive, and `try_send` would answer `Ok` to records that then
+    /// die in the channel's destructor — with no counter, no notice and no
+    /// answer to the caller. Refusing here is more honest:
+    /// [`Error::ShuttingDown`] is already declared a loss
+    /// ([`Error::loses_record`]), it is simply that nobody produced it until
+    /// now.
     ///
-    /// Цена — одно расслабленное чтение на запись; предсказуемое ветвление,
-    /// на armv7 неразличимое на фоне самой постановки в очередь.
+    /// The price is one relaxed read per record; a predictable branch,
+    /// indistinguishable on armv7 against the enqueueing itself.
     stopping: std::sync::atomic::AtomicBool,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Writer {
-    /// Запустить writer-поток.
+    /// Start the writer thread.
     ///
-    /// `groups` — бюджетные группы (по одной на класс хранения): writer не
-    /// знает классов, ему достаточно «каналы такой-то группы делят такой-то
-    /// бюджет на таком-то носителе».
+    /// `groups` are the budget groups (one per storage class): the writer knows
+    /// nothing of classes, "the channels of such a group share such a budget on
+    /// such a medium" is enough for it.
     pub fn spawn(
         counters: Arc<Counters>,
         queues: QueueSizes,
@@ -290,7 +302,7 @@ impl Writer {
             .name("dduroc-writer".to_owned())
             .spawn(move || loop_state.run(normal_rx, critical_rx, control_rx))
             .map_err(|source| Error::Io {
-                context: "запуск writer-потока".to_owned(),
+                context: "starting the writer thread".to_owned(),
                 source,
             })?;
 
@@ -304,7 +316,7 @@ impl Writer {
         }))
     }
 
-    /// Зарегистрировать неймспейс, получив его идентификатор.
+    /// Register a namespace, receiving its identifier.
     pub fn register(&self, setup: NsSetup) -> Result<NsId> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.control
@@ -313,11 +325,11 @@ impl Writer {
         rx.recv().map_err(|_| Error::WriterDead)?
     }
 
-    /// Поставить запись в очередь.
+    /// Put a record in the queue.
     ///
-    /// `critical` выбирает поведение при переполнении: ожидание вместо потери.
-    /// `drops` — счётчики канала: потеря должна быть отмечена там, где
-    /// образовалась дыра.
+    /// `critical` chooses the behaviour on overflow: waiting instead of losing.
+    /// `drops` are the channel's counters: a loss has to be marked where the
+    /// hole appeared.
     #[inline]
     pub fn write(&self, item: Staged, critical: bool, drops: &DropCounters) -> Result<()> {
         if critical {
@@ -327,18 +339,19 @@ impl Writer {
         }
     }
 
-    /// Поставить запись, ни при каких условиях не блокируя вызывающего.
+    /// Put a record in the queue, blocking the caller under no circumstances.
     ///
-    /// Очередь выбирается та же, что и обычно, — порядок критических записей
-    /// между собой сохраняется; отличается только реакция на переполнение.
-    /// Нужно там, где ожидание недопустимо в принципе: `Drop` стража спана
-    /// вызывается в том числе при развёртке стека после паники, и пятисекундное
-    /// ожидание места превратило бы аварийное завершение в зависание.
+    /// The queue chosen is the usual one — the order of critical records among
+    /// themselves is preserved; only the reaction to overflow differs. Needed
+    /// where waiting is unacceptable in principle: a span guard's `Drop` is
+    /// called during stack unwinding after a panic too, and a five-second wait
+    /// for room would turn an emergency shutdown into a hang.
     #[inline]
     pub fn write_no_wait(&self, item: Staged, critical: bool, drops: &DropCounters) -> Result<()> {
-        // Идёт остановка — очередь ещё принимает, но разбирать её уже некому:
-        // всё, что ляжет в неё сейчас, умрёт в деструкторе канала. Отказать
-        // честнее, чем ответить `Ok` записи, которой не будет на носителе.
+        // Stopping is under way — the queue still accepts, but there is nobody
+        // left to drain it: everything put in now will die in the channel's
+        // destructor. Refusing is more honest than answering `Ok` to a record
+        // that will not be on the medium.
         if self.stopping.load(std::sync::atomic::Ordering::Relaxed) {
             drops.record(item.channel);
             Counters::publish(&self.counters.dropped);
@@ -352,11 +365,12 @@ impl Writer {
         match queue.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(item)) => {
-                // Порядок обязателен: сначала поканальный счётчик, потом
-                // общий — и общий с публикацией. По его изменению writer
-                // решает, обходить ли каналы за отметками о потерях, и с
-                // обратным порядком он мог бы застать обход пустым, счесть
-                // отметку выданной и оставить дыру необъявленной.
+                // The order is mandatory: the per-channel counter first, then
+                // the total — and the total with publication. The writer
+                // decides whether to walk the channels for loss notices by its
+                // change, and with the reverse order it could find the walk
+                // empty, consider the notice issued and leave the hole
+                // unannounced.
                 drops.record(item.channel);
                 Counters::publish(&self.counters.dropped);
                 Err(Error::QueueFull)
@@ -371,8 +385,8 @@ impl Writer {
     }
 
     fn write_critical(&self, item: Staged, drops: &DropCounters) -> Result<()> {
-        // См. `write_no_wait`: ждать места в очереди, которую уже никто не
-        // разбирает, значило бы ждать пять секунд ради гарантированной потери.
+        // See `write_no_wait`: waiting for room in a queue nobody is draining
+        // any more would mean waiting five seconds for a guaranteed loss.
         if self.stopping.load(std::sync::atomic::Ordering::Relaxed) {
             drops.record(item.channel);
             Counters::publish(&self.counters.dropped);
@@ -382,12 +396,12 @@ impl Writer {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(item)) => {
                 Counters::bump(&self.counters.backpressure_waits);
-                // Ждём с таймаутом: вечная блокировка на отказавшем носителе
-                // подвесила бы прикладные потоки навсегда.
+                // Wait with a timeout: blocking forever on a failed medium
+                // would hang the application threads for good.
                 match self.critical.send_timeout(item, BACKPRESSURE_TIMEOUT) {
                     Ok(()) => Ok(()),
                     Err(crossbeam_channel::SendTimeoutError::Timeout(item)) => {
-                        // Порядок тот же и по той же причине, что в
+                        // The same order and for the same reason as in
                         // `write_no_wait`.
                         drops.record(item.channel);
                         Counters::publish(&self.counters.dropped);
@@ -402,30 +416,31 @@ impl Writer {
         }
     }
 
-    /// Учесть запись, потерянную из-за смерти writer'а.
+    /// Account for a record lost to the writer's death.
     ///
-    /// Отказ очереди из-за отсутствия потребителя — такая же потеря, как
-    /// переполнение, и обязан быть виден в `Stats`: иначе `is_clean()`
-    /// отчитался бы о благополучии на хранилище, в которое давно ничего
-    /// не пишется.
+    /// A queue refusing because there is no consumer is as much a loss as an
+    /// overflow, and it has to be visible in `Stats`: otherwise `is_clean()`
+    /// would report all is well over a store nothing has been written to in a
+    /// long time.
     #[cold]
     fn writer_died(&self, _item: Staged) -> Error {
         Counters::bump(&self.counters.dropped);
         Error::WriterDead
     }
 
-    /// Отпустить неймспейс: writer запечатает его сегменты и освободит слот.
+    /// Release a namespace: the writer will seal its segments and free the
+    /// slot.
     ///
-    /// Вызывается при уничтожении последней ручки. Без ответа: вызывающий —
-    /// `Drop`, и ждать носитель в нём нельзя. Порядок с последующим
-    /// `register` сохраняет сама очередь команд.
+    /// Called when the last handle is dropped. With no reply: the caller is a
+    /// `Drop`, and waiting for the medium in one is not allowed. The order with
+    /// a subsequent `register` is kept by the command queue itself.
     pub fn release(&self, ns: NsId) {
         let _ = self.control.send(Control::Release(ns));
     }
 
-    /// Вытолкнуть накопленное и дождаться `fdatasync`.
+    /// Flush what has accumulated and wait for the `fdatasync`.
     ///
-    /// `None` — все неймспейсы.
+    /// `None` means every namespace.
     pub fn sync(&self, ns: Option<NsId>) -> Result<()> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.control
@@ -434,7 +449,8 @@ impl Writer {
         rx.recv().map_err(|_| Error::WriterDead)?
     }
 
-    /// Зафиксировать миграцию сегмента. `Ok(false)` — сегмент уже ротирован.
+    /// Commit a segment's migration. `Ok(false)` means the segment was already
+    /// rotated.
     pub(crate) fn commit_migration(
         &self,
         ns: NsId,
@@ -455,11 +471,12 @@ impl Writer {
         rx.recv().map_err(|_| Error::WriterDead)?
     }
 
-    /// Завершить работу: дописать, запечатать, дождаться потока.
+    /// Finish: write out, seal, wait for the thread.
     pub fn shutdown(&self) {
-        // Флаг ставится ДО команды: между вычерпыванием очереди в потоке и
-        // его выходом очередь остаётся живой, и без флага `try_send` отвечал
-        // бы `Ok` записям, которые затем гибнут вместе с каналом.
+        // The flag is set BEFORE the command: between the thread draining the
+        // queue and exiting, the queue stays alive, and without the flag
+        // `try_send` would answer `Ok` to records that then die with the
+        // channel.
         self.stopping
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -473,23 +490,23 @@ impl Writer {
         }
     }
 
-    /// Счётчики, общие с хранилищем: путь записи учитывает в них и то, о чём
-    /// вызывающему уже не сообщает.
+    /// The counters shared with the store: the write path accounts in them for
+    /// what it no longer tells the caller about.
     pub fn counters(&self) -> &Counters {
         &self.counters
     }
 
-    /// Жив ли writer-поток.
+    /// Whether the writer thread is alive.
     ///
-    /// Спрашивается у самого потока, а не у очередей: заполненная очередь
-    /// означает лишь отставание диска, а пустая — что писать нечего. Ни то,
-    /// ни другое не говорит, работает ли потребитель.
+    /// Asked of the thread itself rather than of the queues: a full queue only
+    /// means the disk is behind, and an empty one that there is nothing to
+    /// write. Neither says whether the consumer is running.
     pub fn is_alive(&self) -> bool {
         match self.handle.lock() {
-            // `None` — поток уже присоединён в `shutdown`.
+            // `None` means the thread was already joined in `shutdown`.
             Ok(guard) => guard.as_ref().is_some_and(|h| !h.is_finished()),
-            // Мьютекс отравлен паникой в `shutdown`; сам поток при этом
-            // жив-здоров, а очередь на приём работает.
+            // The mutex was poisoned by a panic in `shutdown`; the thread
+            // itself is alive and well, and the receiving queue works.
             Err(poisoned) => poisoned
                 .into_inner()
                 .as_ref()
@@ -499,13 +516,14 @@ impl Writer {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Состояние канала
+// Channel state
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Неизменные атрибуты, которые уходят в заголовок каждого сегмента канала.
+/// The immutable attributes that go into the header of every segment of a
+/// channel.
 ///
-/// Одним типом, а не тремя полями рядом: они всегда передаются вместе и
-/// всегда попадают в один и тот же заголовок.
+/// One type rather than three fields side by side: they always travel together
+/// and always end up in one and the same header.
 #[derive(Debug, Clone, Copy)]
 struct SegmentIdentity {
     protocol_version: ProtocolVersion,
@@ -516,59 +534,61 @@ struct SegmentIdentity {
 struct ChannelState {
     config: ChannelConfig,
     dir: PathBuf,
-    /// Бюджетная группа канала (класс хранения глазами writer'а).
+    /// The channel's budget group (a storage class as the writer sees it).
     group: usize,
-    /// Ключ носителя группы — копия [`GroupBudget::root_key`], чтобы путь
-    /// ошибки не ходил по таблице групп.
+    /// The group's medium key — a copy of [`GroupBudget::root_key`] so that the
+    /// error path does not walk the table of groups.
     root_key: u8,
-    /// Личная квота неймспейса, байт. `None` — только общий бюджет группы.
+    /// The namespace's personal quota in bytes. `None` means the group budget
+    /// only.
     quota_bytes: Option<u64>,
-    /// Свой номер и счётчики потерь неймспейса: потерю, обнаруженную уже в
-    /// writer'е, надо отметить там же, где образовалась дыра, — иначе она не
-    /// попадёт в поток отдельной записью.
+    /// The namespace's own number and loss counters: a loss discovered inside
+    /// the writer has to be marked where the hole appeared, or it will not
+    /// reach the stream as a record of its own.
     index: ChannelIdx,
     drops: Arc<DropCounters>,
     identity: SegmentIdentity,
     inventory: Inventory,
-    /// Открытый сегмент. `None` — канал ещё ничего не писал либо отпустил
-    /// сегмент по бездействию ([`PARK_AFTER`]): молчащий неймспейс не должен
-    /// занимать ни файлового дескриптора, ни преаллоцированных байт.
+    /// The open segment. `None` means the channel has written nothing yet or
+    /// gave its segment up for idleness ([`PARK_AFTER`]): a namespace that has
+    /// gone quiet should hold neither a descriptor nor reserved bytes.
     segment: Option<SegmentWriter>,
-    /// Отпущенный по бездействию сегмент: файл обрезан до данных и закрыт, но
-    /// **не запечатан** — следующая запись продолжит именно его.
+    /// A segment released for idleness: the file is truncated to its data and
+    /// closed, but **not sealed** — the next write continues that very one.
     ///
-    /// Без этого молчащий канал заводил бы новый файл на каждое пробуждение:
-    /// раз в час — восемь тысяч крохотных сегментов в год, и байтовая ротация
-    /// не убрала бы ни одного, потому что байт в них почти нет. Файлы
-    /// кончились бы раньше места.
+    /// Without this a quiet channel would start a new file on every wake-up:
+    /// once an hour is eight thousand tiny segments a year, and byte-based
+    /// rotation would remove none of them because there are hardly any bytes in
+    /// them. The files would run out before the space did.
     parked_segment: Option<SegmentName>,
     builder: BlockBuilder,
     footer: FooterBuilder,
-    /// Буфер сериализации блока. Переиспользуется: аллокация и рост на
-    /// каждый flush — лишняя работа на пути, который выполняется тысячи раз
-    /// в секунду.
+    /// The block serialization buffer. Reused: allocating and growing it on
+    /// every flush is wasted work on a path taken thousands of times a second.
     scratch: Vec<u8>,
-    /// Максимальное записанное время: время, ушедшее назад, подтягивается
-    /// вперёд, чтобы индекс блоков оставался сортированным.
+    /// The greatest time written: time that went backwards is pulled forward so
+    /// the block index stays sorted.
     last_time: Micros,
     block_opened: Option<Instant>,
     last_sync: Instant,
     dirty_since_sync: bool,
-    /// Числится ли канал в списке `active` writer'а.
+    /// Whether the channel is listed in the writer's `active` list.
     ///
-    /// Флаг, а не `active.contains(..)`: проверка выполняется на **каждую**
-    /// запись, и линейный поиск по списку в десятки тысяч пар превращал бы
-    /// раскладку батча в квадрат от числа пишущих каналов.
+    /// A flag rather than `active.contains(..)`: the check runs on **every**
+    /// record, and a linear search over a list of tens of thousands of pairs
+    /// would make laying out a batch quadratic in the number of writing
+    /// channels.
     is_in_active_list: bool,
-    /// С какого момента каналу нечего обслуживать. `None` — есть.
+    /// Since when the channel has had nothing to service. `None` means it has.
     ///
-    /// Отсрочка возврата ресурсов: сперва буферы ([`RELEASE_AFTER`]), затем
-    /// сегмент ([`PARK_AFTER`]).
+    /// Resources are given back in stages: the buffers first
+    /// ([`RELEASE_AFTER`]), then the segment ([`PARK_AFTER`]).
     idle_since: Option<Instant>,
-    /// Отданы ли уже буферы этого простоя.
+    /// Whether the buffers of this idle spell have already been given back.
     ///
-    /// Без отметки возврат повторялся бы на каждом обороте цикла всю паузу до
-    /// отпускания сегмента — четыре раза в секунду, без всякой пользы.
+    /// Without the mark the return would repeat on every turn of the loop for
+    /// the whole pause before the segment is released — four times a second, to
+    /// no purpose at all.
     buffers_released: bool,
 }
 
@@ -587,18 +607,19 @@ impl ChannelState {
             quota_bytes,
             config,
         } = spec;
-        // След прерванной миграции: обрыв до rename оставляет `*.tmp`, чьё
-        // содержимое уже никем не адресуется. Подмести обязан тот, кто первым
-        // приходит в каталог, — то есть регистрация канала.
+        // The trace of an interrupted migration: an interruption before the
+        // rename leaves a `*.tmp` whose contents nothing addresses any more.
+        // Whoever comes to the directory first has to sweep it — that is,
+        // registering the channel.
         crate::fsutil::sweep_tmp(&dir)?;
         let mut inventory = Inventory::scan(&dir)?;
         Self::recover_orphan(&dir, &mut inventory, identity, counters);
         let now = Instant::now();
         Ok(Self {
-            // Буфер растёт при первой записи: неймспейс, который ничего не
-            // пишет, не должен занимать памяти. При двадцати четырёх тысячах
-            // неймспейсов предварительное выделение по 64 КиБ на канал стоило
-            // бы гигабайты на 32-битной цели.
+            // The buffer grows on the first record: a namespace that writes
+            // nothing should take no memory. With twenty-four thousand
+            // namespaces, reserving 64 KiB per channel up front would cost
+            // gigabytes on a 32-bit target.
             builder: BlockBuilder::new(),
             config,
             dir,
@@ -623,58 +644,61 @@ impl ChannelState {
         })
     }
 
-    /// Вернуть память бездействующего канала аллокатору.
+    /// Return an idle channel's memory to the allocator.
     ///
-    /// Буферы канала растут до крупнейшего блока, прошедшего через них, и без
-    /// возврата остаются такими навсегда: один мегабайтный blob закреплял бы
-    /// ~2× своего размера за каналом до конца жизни процесса, а стационарные
-    /// 64–128 КиБ на канал при заявленных десятках тысяч каналов складывались
-    /// бы в гигабайты. Поэтому при уходе в бездействие память отдаётся
-    /// **целиком**, а не сжимается до порога: пишущих в любой момент единицы,
-    /// и держать пустые буферы за молчащими нечем оправдать.
+    /// A channel's buffers grow to the largest block that passed through them
+    /// and, without a return, stay that way forever: one megabyte blob would
+    /// pin ~2× its own size to a channel for the life of the process, and a
+    /// steady 64–128 KiB per channel with the tens of thousands of channels
+    /// claimed would add up to gigabytes. So on going idle the memory is given
+    /// back **whole** rather than shrunk to a threshold: only a handful of
+    /// channels write at any moment, and there is nothing to justify keeping
+    /// empty buffers behind quiet ones.
     ///
-    /// Цена возврата — реаллокация при следующем пробуждении, но канал уходит
-    /// в бездействие не раньше, чем выполнит sync, то есть не чаще периода
-    /// синхронизации: одна аллокация в несколько секунд на канал не видна
-    /// даже на armv7.
+    /// The price of the return is a reallocation on the next wake-up, but a
+    /// channel does not go idle before it has synced, that is, no more often
+    /// than its sync period: one allocation every few seconds per channel is
+    /// invisible even on armv7.
     ///
-    /// Индекс блоков в footer'е сюда не входит: он описывает **открытый**
-    /// сегмент и будет расти дальше. Его ёмкость возвращается после
-    /// запечатывания, когда индекс уже не нужен.
+    /// The footer's block index is not included here: it describes the **open**
+    /// segment and will go on growing. Its capacity is returned after sealing,
+    /// when the index is no longer needed.
     fn release_buffers(&mut self) {
         self.builder.shrink_to(0);
         self.scratch = Vec::new();
     }
 
-    /// Байты, которые канал держит в памяти под блоки.
+    /// The bytes a channel holds in memory for blocks.
     ///
-    /// Считается ёмкость, а не занятое: буферы растут до крупнейшего
-    /// прошедшего блока и остаются такими до возврата — держит канал именно
-    /// ёмкость. `scratch` входит наравне с накопителем: он хранит целый
-    /// сериализованный блок, и без него счёт занижался бы примерно на блок.
+    /// Capacity is counted rather than what is occupied: the buffers grow to
+    /// the largest block that passed through and stay that way until they are
+    /// returned — capacity is exactly what a channel holds. `scratch` counts on
+    /// equal terms with the accumulator: it holds a whole serialized block, and
+    /// without it the count would be short by roughly a block.
     ///
-    /// Индекс блоков footer'а сюда не входит намеренно: он описывает открытый
-    /// сегмент, живыми записями возвращён быть не может и уходит только с
-    /// запечатыванием. Потолок же — про то, что можно отдать.
+    /// The footer's block index is deliberately not included: it describes the
+    /// open segment, cannot be returned while its entries are live and goes
+    /// only with sealing. The ceiling, meanwhile, is about what can be given
+    /// back.
     fn held_bytes(&self) -> u64 {
         (self.builder.capacity() + self.scratch.capacity()) as u64
     }
 
-    /// Запечатать сегмент, оборванный прошлым запуском.
+    /// Seal a segment cut short by a previous run.
     ///
-    /// Смысл — вернуть хвост окна резерва: незапечатанный сегмент числится в
-    /// бюджете канала вместе с ним, и несколько аварийных остановок подряд
-    /// выедают бюджет пустотой, после чего ротация принимается за живую
-    /// историю.
+    /// The point is to give back the tail of the reserve window: an unsealed
+    /// segment is counted in the channel's budget together with it, and several
+    /// crash stops in a row eat the budget with emptiness, after which rotation
+    /// starts on live history.
     ///
-    /// Трогается **только** сегмент чужого запуска. Сегмент текущего может
-    /// быть открыт живым состоянием этого же процесса (неймспейс подняли
-    /// повторно), и обрезать его под ним значило бы потерять данные. Смены
-    /// запуска для этого достаточно: сегмент по формату не пересекает её
-    /// границу, поэтому в чужой уже никто не пишет.
+    /// **Only** a segment of a foreign run is touched. One of the current run may
+    /// be open in the live state of this same process (the namespace was brought up
+    /// again), and truncating it from under that would lose data. A change of run
+    /// is enough for this: by the format a segment does not cross that boundary, so
+    /// nobody is writing into a foreign one any more.
     ///
-    /// Отказ восстановления не фатален: сегмент останется незапечатанным и
-    /// будет читаться сканом — ровно так, как было до этой правки.
+    /// A failed recovery is not fatal: the segment stays unsealed and will be
+    /// read by scanning.
     fn recover_orphan(
         dir: &Path,
         inventory: &mut Inventory,
@@ -696,21 +720,22 @@ impl ChannelState {
                 }
             }
             Ok(None) => {}
-            // Сегмент, принесённый с другого прибора, — не отказ носителя, а
-            // законное состояние каталога: кто-то положил сюда чужой дамп.
-            // Трогать его нельзя, а объявлять хранилище неисправным — тем
-            // более: об этих файлах честно сообщает читатель.
+            // A segment brought from another device is not a failure of the
+            // medium but a legitimate state of the directory: someone put a
+            // foreign dump here. It must not be touched, and declaring the
+            // store broken over it even less so: the reader reports these files
+            // honestly.
             Err(Error::ForeignSegment { .. }) => {}
             Err(_) => Counters::bump(&counters.io_errors),
         }
     }
 
-    /// Пора ли вытолкнуть неполный блок.
+    /// Whether it is time to flush an incomplete block.
     fn flush_deadline(&self) -> Option<Instant> {
         self.block_opened.map(|t| t + self.config.flush_interval)
     }
 
-    /// Пора ли синхронизировать.
+    /// Whether it is time to sync.
     fn sync_deadline(&self) -> Option<Instant> {
         if !self.dirty_since_sync {
             return None;
@@ -720,7 +745,7 @@ impl ChannelState {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Состояние неймспейса
+// Namespace state
 // ════════════════════════════════════════════════════════════════════════════
 
 struct NsState {
@@ -731,68 +756,69 @@ struct NsState {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Цикл writer'а
+// The writer loop
 // ════════════════════════════════════════════════════════════════════════════
 
 struct WriterLoop {
-    /// Слоты неймспейсов. `None` — отпущенный: [`NsId`] это индекс, поэтому
-    /// освобождённый слот обнуляется и переиспользуется, а не удаляется —
-    /// сдвиг индексов увёл бы записи в полёте в чужой неймспейс.
+    /// The namespace slots. `None` means released: a [`NsId`] is an index, so a
+    /// freed slot is zeroed and reused rather than removed — shifting the
+    /// indices would carry records in flight into the wrong namespace.
     namespaces: Vec<Option<NsState>>,
     counters: Arc<Counters>,
-    /// Источник отметок о потерях — один на всю жизнь writer'а: `Arc::from`
-    /// аллоцирует, а отметки появляются ровно тогда, когда система под
-    /// давлением.
+    /// The source of loss notices — one for the writer's whole life:
+    /// `Arc::from` allocates, and notices appear exactly when the system is
+    /// under pressure.
     diag_target: Arc<str>,
-    /// Переиспользуемый буфер батча.
+    /// The reusable batch buffer.
     batch: Vec<Staged>,
-    /// Значение общего счётчика потерь на момент последнего обхода отметок.
+    /// The value of the total loss counter at the last walk over the notices.
     ///
-    /// Сторож полного прохода по флоту — см. [`WriterLoop::emit_drop_notices`].
+    /// The watchdog for a full walk over the fleet — see
+    /// [`WriterLoop::emit_drop_notices`].
     drops_seen: u64,
-    /// Каналы, которым есть что обслуживать: открытый блок, несинхронизованные
-    /// данные или незапечатанный сегмент.
+    /// The channels that have something to service: an open block, unsynced
+    /// data or an unsealed segment.
     ///
-    /// Обходить все каналы подряд нельзя: при заявленных двадцати четырёх
-    /// тысячах неймспейсов их десятки тысяч, и полный проход на каждом
-    /// обороте цикла съел бы процессор впустую. Пишущих в любой момент —
-    /// единицы.
+    /// Walking every channel is not an option: with the twenty-four thousand
+    /// namespaces claimed there are tens of thousands of them, and a full pass
+    /// on every turn of the loop would eat the CPU for nothing. Only a handful
+    /// write at any moment.
     active: Vec<(usize, usize)>,
-    /// Бюджетные группы: по одной на класс хранения. Индекс группы несут
-    /// каналы ([`ChannelState::group`]); писателю не нужны имена классов.
+    /// The budget groups: one per storage class. Channels carry the group index
+    /// ([`ChannelState::group`]); the writer does not need the class names.
     groups: Vec<GroupBudget>,
-    /// Значение [`Counters::occupancy_raised`] на момент последней проверки
-    /// бюджетов групп.
+    /// The value of [`Counters::occupancy_raised`] at the last check of the
+    /// group budgets.
     ///
-    /// Сторож полного прохода по флоту, как `drops_seen` у отметок о потерях:
-    /// суммарная занятость растёт **только** когда канал берёт сегмент в
-    /// работу или раздвигает окно резерва; запечатывание, отпускание и
-    /// вытеснение её уменьшают. Поэтому неизменившийся счётчик доказывает,
-    /// что считать нечего.
+    /// The watchdog for a full walk over the fleet, like `drops_seen` for the
+    /// loss notices: the total occupancy grows **only** when a channel takes a
+    /// segment into work or extends its reserve window; sealing, releasing and
+    /// eviction reduce it. So an unchanged counter proves there is nothing to
+    /// count.
     occupancy_seen: u64,
-    /// Потолок суммарных байт, которые пишущие каналы держат под блоки.
-    /// `None` — потолка нет.
+    /// The ceiling on the total bytes writing channels hold for blocks. `None`
+    /// means there is no ceiling.
     buffer_ceiling: Option<u64>,
-    /// Отметки для подписки читателя. Поднимаются раз в оборот цикла, а не на
-    /// каждый блок: за один оборот writer успевает записать целый батч, и
-    /// будить читателя чаще значило бы будить его на ту же порцию данных.
+    /// The marks for a reader's subscription. Raised once per turn of the loop
+    /// rather than per block: in one turn the writer manages a whole batch, and
+    /// waking the reader more often would mean waking it for the same data.
     pulse: Arc<crate::pulse::Pulse>,
-    /// Значение [`Counters::blocks_written`] на момент последней отметки.
+    /// The value of [`Counters::blocks_written`] at the last mark.
     pulsed_blocks: u64,
-    /// Сумма счётчиков событий с сегментами на момент последней отметки.
+    /// The sum of the segment event counters at the last mark.
     pulsed_shape: u64,
-    /// В этом обороте поднялся неймспейс: в хранилище появились каталоги, о
-    /// которых читатель не знает, а счётчиками сегментов это не видно — пустой
-    /// канал файлов ещё не завёл.
+    /// A namespace came up in this turn: directories the reader does not know
+    /// about appeared in the store, and the segment counters do not show it —
+    /// an empty channel has not created a file yet.
     roster_changed: bool,
-    /// Битовая маска корней ([`GroupBudget::root_key`]), отказавших по месту
-    /// с прошлого обхода.
+    /// The bit mask of roots ([`GroupBudget::root_key`]) that refused for want
+    /// of space since the last walk.
     ///
-    /// Освобождать надо там, где место занято, а не там, где оно
-    /// понадобилось: ротация внутри канала, упёршегося в ENOSPC, оставляет
-    /// молчащему каналу его преаллокацию нетронутой. И именно на **том же
-    /// носителе**: классы могут жить на разных разделах, и вытеснение на
-    /// одном не освобождает байт на другом.
+    /// Space has to be freed where it is taken, not where it was needed:
+    /// rotation inside a channel that hit ENOSPC leaves a quiet channel's
+    /// reserve window untouched. And on **the same medium** at that: classes
+    /// may live on different partitions, and evicting on one frees no bytes on
+    /// another.
     pressured_roots: u8,
 }
 
@@ -804,8 +830,8 @@ impl WriterLoop {
         control: Receiver<Control>,
     ) {
         loop {
-            // Критические записи забираются первыми и целиком: обычный поток
-            // не имеет права задерживать аварийные сообщения.
+            // Critical records are taken first and in full: the ordinary stream
+            // has no right to hold up critical messages.
             let mut got = self.drain(&critical);
             got += self.drain(&normal);
 
@@ -818,18 +844,18 @@ impl WriterLoop {
                 ControlOutcome::Stop => break,
             }
 
-            // Перед сном — объявить сделанное. Команда, пришедшая на пустых
-            // очередях (например `sync`), выталкивает блок прямо здесь, а
-            // отметка иначе дождалась бы конца оборота, то есть истечения
-            // таймаута сна: подписка узнавала бы о синхронизации через
-            // секунды после неё.
+            // Announce what was done before sleeping. A command arriving on
+            // empty queues (`sync`, say) flushes the block right here, and the
+            // mark would otherwise wait for the end of the turn, that is, for
+            // the sleep to time out: a subscription would learn of a sync
+            // seconds after it happened.
             self.publish_pulse();
 
             if got == 0 {
-                // Ждём либо новую запись, либо ближайший дедлайн.
-                // Просроченный дедлайн даёт нулевой таймаут, а нулевой
-                // таймаут в `select!` — мгновенный возврат: цикл сжёг бы
-                // целое ядро. Нижняя граница делает такой оборот безвредным.
+                // Wait for either a new record or the nearest deadline. An
+                // overdue deadline gives a zero timeout, and a zero timeout in
+                // `select!` returns immediately: the loop would burn a whole
+                // core. The lower bound makes such a turn harmless.
                 let timeout = self
                     .next_deadline()
                     .unwrap_or(IDLE_TIMEOUT)
@@ -859,29 +885,32 @@ impl WriterLoop {
         }
 
         self.finish();
-        // Дописанное на остановке — тоже данные, и объявить о них надо до
-        // закрытия: подписка обязана дочитать поток до конца, а не оборваться
-        // на последней порции.
+        // What was written out at the stop is data too, and it has to be
+        // announced before closing: a subscription has to read the stream to
+        // its end rather than break off on the last batch.
         self.publish_pulse();
-        // Ожидающих больше некому будить: без этого подписка на остановленном
-        // хранилище висела бы до таймаута и выглядела бы как молчащий прибор.
+        // There is nobody left to wake those waiting: without this a
+        // subscription to a stopped store would hang until its timeout and look
+        // like a device gone quiet.
         self.pulse.close();
     }
 
-    /// Объявить читателям то, что случилось за оборот цикла.
+    /// Announce to the readers what happened in this turn of the loop.
     ///
-    /// Считается по уже существующим счётчикам: отдельный учёт в `flush_block`
-    /// пришлось бы протаскивать через все шесть его вызывающих, а разница
-    /// между «блоков стало больше» и «блок лёг вот сюда» подписке не нужна —
-    /// она всё равно дочитывает сегмент с последнего своего места.
+    /// It is computed from counters that already exist: separate accounting in
+    /// `flush_block` would have to be threaded through all six of its callers,
+    /// and a subscription does not need the difference between "there are more
+    /// blocks" and "a block landed right here" — it reads the segment on from
+    /// its own last position anyway.
     fn publish_pulse(&mut self) {
         let blocks = self.counters.blocks_written.load(Ordering::Relaxed);
         if blocks != self.pulsed_blocks {
             self.pulsed_blocks = blocks;
             self.pulse.data_written();
         }
-        // Устройство каналов меняют ровно четыре события, и все они уже
-        // считаются: сегмент создан, взят в работу, запечатан, вытеснен.
+        // Exactly four events change the shape of the channels, and all four
+        // are already counted: a segment was created, taken into work, sealed,
+        // evicted.
         let shape = self.counters.segments_created.load(Ordering::Relaxed)
             + self.counters.segments_opened.load(Ordering::Relaxed)
             + self.counters.segments_sealed.load(Ordering::Relaxed)
@@ -890,23 +919,23 @@ impl WriterLoop {
             self.pulsed_shape = shape;
             self.pulse.shape_changed();
         }
-        // Состав хранилища — отдельная отметка и по отдельной причине: ответ
-        // на неё пропорционален всему хранилищу, а поднимается она раз за
-        // жизнь сервиса. Смешать её с ротацией значило бы заставить подписку
-        // обходить двадцать четыре тысячи каталогов каждые полсекунды.
+        // The store's roster is a separate mark for a separate reason:
+        // answering it is proportional to the whole store, and it is raised
+        // once in a service's life. Merging it with rotation would make a
+        // subscription walk twenty-four thousand directories every half second.
         if self.roster_changed {
             self.roster_changed = false;
             self.pulse.roster_changed();
         }
     }
 
-    /// Вычерпать обе очереди данных досуха.
+    /// Drain both data queues dry.
     ///
-    /// Вызывается перед `sync` и `shutdown`: команды идут отдельной очередью
-    /// и без этого обгоняли бы записи, уже стоящие в очереди данных. Тогда
-    /// `sync` отчитывался бы об успехе, не записав их, а `shutdown` запечатывал
-    /// сегменты поверх недописанного — записи исчезали бы, хотя `log()`
-    /// вернул `Ok`.
+    /// Called before `sync` and `shutdown`: the commands travel on a separate
+    /// queue and without this would overtake records already in the data queue.
+    /// Then `sync` would report success without having written them, and
+    /// `shutdown` would seal segments over what was unwritten — the records
+    /// would disappear although `log()` returned `Ok`.
     fn drain_pending(
         &mut self,
         normal: &Receiver<Staged>,
@@ -916,10 +945,10 @@ impl WriterLoop {
         self.drain_pending_rounds(normal, critical, leftovers, DRAIN_ROUNDS)
     }
 
-    /// То же с явным числом проходов: воспроизвести исчерпание отведённых
-    /// проходов подбором нагрузки нельзя — оно зависит от того, кому
-    /// планировщик дал ход, а поведение на этой границе как раз и решает,
-    /// сохранятся записи или будут уничтожены.
+    /// The same with an explicit number of passes: running out of the allotted
+    /// passes cannot be reproduced by tuning the load — it depends on which
+    /// thread the scheduler let run, and the behaviour at that boundary is
+    /// exactly what decides whether records survive or are destroyed.
     fn drain_pending_rounds(
         &mut self,
         normal: &Receiver<Staged>,
@@ -934,22 +963,23 @@ impl WriterLoop {
             }
             self.apply_batch();
         }
-        // Очередь всё ещё пополняется быстрее, чем вычерпывается. Дальше
-        // ждать нельзя: остановка процесса не должна зависеть от того,
-        // перестанут ли прикладные потоки писать.
+        // The queue is still filling faster than it drains. Waiting any longer
+        // is not an option: stopping the process must not depend on whether the
+        // application threads stop writing.
         if leftovers == Leftovers::Keep {
-            // Записывать их ещё будет кому — обычным ходом цикла. Выбросить
-            // их значило бы уничтожить принятое ради операции, которая
-            // ничего от этого не выигрывает: очередь и так продолжит
-            // разбираться. Вызывающему сообщается, что обещание выполнено
-            // не до конца.
+            // There will still be someone to write them — the ordinary course
+            // of the loop. Throwing them away would mean destroying what was
+            // accepted for the sake of an operation that gains nothing by it:
+            // the queue will go on being drained regardless. The caller is told
+            // the promise was not kept in full.
             return false;
         }
-        // Остаток забирается поимённо, а не просто пересчитывается: потеря
-        // обязана быть отмечена в канале, где образовалась дыра, — иначе она
-        // не попадёт в поток отдельной записью и станет неотличима от тишины.
-        // Число проходов ограничено снимком длины: производитель, пишущий
-        // быстрее, не должен удерживать остановку.
+        // The remainder is taken by name rather than merely counted: a loss has
+        // to be marked in the channel where the hole appeared, or it will not
+        // reach the stream as a record of its own and will become
+        // indistinguishable from silence. The number of passes is bounded by a
+        // snapshot of the length: a producer writing faster must not hold up
+        // the stop.
         let mut leftover = 0u64;
         for rx in [critical, normal] {
             for _ in 0..rx.len() {
@@ -970,7 +1000,7 @@ impl WriterLoop {
         false
     }
 
-    /// Забрать из очереди сколько получится, не превышая лимит.
+    /// Take what can be taken from the queue without exceeding the limit.
     fn drain(&mut self, rx: &Receiver<Staged>) -> usize {
         let mut n = 0;
         while self.batch.len() < DRAIN_LIMIT {
@@ -985,18 +1015,18 @@ impl WriterLoop {
         n
     }
 
-    /// Разложить батч по каналам.
+    /// Lay a batch out across the channels.
     fn apply_batch(&mut self) {
-        // Сортировка по времени внутри канала: записи от разных потоков
-        // приходят переупорядоченными (поток взял метку и был вытеснен),
-        // а блок и индекс должны остаться монотонными. Сортировка
-        // устойчивая — SpanStart не обгонит одновременный SpanEnd.
+        // Sorting by time within a channel: records from different threads
+        // arrive reordered (a thread took its stamp and was preempted), while
+        // the block and the index have to stay monotonic. The sort is stable —
+        // a SpanStart will not overtake a simultaneous SpanEnd.
         //
-        // Проверка «уже отсортировано» не украшение: устойчивая сортировка
-        // выделяет временный буфер на половину батча, то есть до полутора
-        // сотен килобайт на каждый заход. Батч приходит упорядоченным почти
-        // всегда — очередь FIFO, а время монотонно, — и линейная проверка
-        // избавляет от этой аллокации в общем случае.
+        // The "already sorted" check is no ornament: a stable sort allocates a
+        // temporary buffer for half the batch, that is, up to a hundred and
+        // fifty kilobytes per go. A batch arrives ordered almost always — the
+        // queue is FIFO and time is monotonic — and a linear check spares that
+        // allocation in the common case.
         let key = |s: &Staged| (s.ns.0, s.channel.0, s.at.0);
         if !self.batch.is_sorted_by_key(key) {
             self.batch.sort_by_key(key);
@@ -1005,14 +1035,15 @@ impl WriterLoop {
         let batch = std::mem::take(&mut self.batch);
         for item in &batch {
             if let Err(e) = self.push(item) {
-                // Логировать нельзя — очередь наша собственная; падать тоже:
-                // отказ носителя не должен уносить с собой весь механизм
-                // логирования, включая остальные каналы. Считаем и идём
-                // дальше, ошибка видна через `Stats::io_errors`.
+                // Logging is not an option — the queue is our own; nor is
+                // falling over: a failure of the medium must not take the whole
+                // logging mechanism with it, the other channels included. Count
+                // it and move on; the error is visible through
+                // `Stats::io_errors`.
                 Counters::bump(&self.counters.io_errors);
-                // Кончилось место: канал уже попробовал освободить его у себя
-                // и не смог. Дальше нужен взгляд на весь носитель, а он есть
-                // только у обхода — см. `enforce_limits`.
+                // Out of space: the channel already tried to free some of its
+                // own and could not. What is needed next is a view of the whole
+                // medium, and only the walk has one — see `enforce_limits`.
                 if e.is_no_space() {
                     self.note_pressure(item.ns.0 as usize, item.channel.0 as usize);
                 }
@@ -1021,11 +1052,11 @@ impl WriterLoop {
         self.batch = batch;
         self.batch.clear();
 
-        // Group commit: критический канал синхронизируется ОДИН раз на батч.
-        // Синхронизация на каждую запись, как было поначалу, превращала
-        // всплеск из пятисот аварийных сообщений в пятьсот блоков и пятьсот
-        // fdatasync — секунды записи и лишний износ флеша там, где хватает
-        // одного обращения к носителю.
+        // Group commit: the critical channel syncs ONCE per batch. Syncing per
+        // record, as it was at first, turned a burst of five hundred critical
+        // messages into five hundred blocks and five hundred fdatasyncs —
+        // seconds of writing and needless flash wear where one trip to the
+        // medium suffices.
         let counters = Arc::clone(&self.counters);
         let mut pressured = 0u8;
         for &(ns_idx, ch_idx) in &self.active {
@@ -1060,29 +1091,31 @@ impl WriterLoop {
             .and_then(|n| n.as_ref())
             .is_some_and(|n| ch_idx < n.channels.len());
         if !exists {
-            // Адрес не существует либо неймспейс уже отпущен — записать
-            // некуда. Молчать нельзя: это ошибка вызывающего, и она обязана
-            // быть видна в счётчиках.
+            // The address does not exist, or the namespace has already been
+            // released — there is nowhere to write. Silence is not an option:
+            // this is the caller's mistake and it has to be visible in the
+            // counters.
             Counters::bump(&self.counters.dropped);
             return Ok(());
         }
 
         let ch = &mut self.namespaces[ns_idx]
             .as_mut()
-            .expect("наличие проверено выше")
+            .expect("presence was checked above")
             .channels[ch_idx];
 
-        // Монотонность внутри канала: время из прошлого подтягивается вперёд.
-        // Считается ДО открытия блока: именем и базой нового сегмента должно
-        // стать время его первой записи, как требует формат, а не время
-        // предыдущей (у нового канала — ноль).
+        // Monotonicity within a channel: time from the past is pulled forward.
+        // It is computed BEFORE the block is opened: a new segment's name and
+        // base have to be the time of its first record, as the format requires,
+        // rather than the time of the previous one (zero for a new channel).
         let at = Micros(item.at.0.max(ch.last_time.0));
         ch.last_time = at;
 
-        // Запись, не дошедшая до накопителя (нет места под сегмент, не
-        // закодировалась), — потеряна, и учесть её надо там, где образовалась
-        // дыра: `io_errors` скажет «что-то сломалось», но не «сколько записей
-        // пропало», и отметка в поток без поканального счётчика не попадёт.
+        // A record that never reached the accumulator (no room for a segment,
+        // it failed to encode) is lost, and it has to be accounted for where
+        // the hole appeared: `io_errors` would say "something broke" but not
+        // "how many records went missing", and a notice will not reach the
+        // stream without a per-channel counter.
         if ch.builder.is_empty() {
             if let Err(e) = Self::ensure_room(ch, at, &self.counters) {
                 Counters::bump(&self.counters.dropped);
@@ -1098,8 +1131,8 @@ impl WriterLoop {
             return Err(e.into());
         }
         Counters::bump(&self.counters.records_written);
-        // Множества типов в footer'е: миграция по ним решает, переписывать ли
-        // сегмент, а читатель — что в сегменте вообще есть.
+        // The type sets in the footer: a migration decides from them whether to
+        // rewrite the segment, and a reader what is in the segment at all.
         let (event, metric) = item.footer_ids();
         if let Some(id) = event {
             ch.footer.add_event(id);
@@ -1108,8 +1141,8 @@ impl WriterLoop {
             ch.footer.add_metric(id);
         }
         ch.dirty_since_sync = true;
-        // Канал снова при деле: отсчёт бездействия начнётся заново, когда
-        // ему опять станет нечего обслуживать.
+        // The channel has work again: the idleness count will restart when it
+        // once more has nothing to service.
         ch.idle_since = None;
         ch.buffers_released = false;
         if !ch.is_in_active_list {
@@ -1123,19 +1156,19 @@ impl WriterLoop {
         Ok(())
     }
 
-    /// Отпустить сегмент бездействующего канала, сохранив возможность
-    /// продолжить его.
+    /// Release an idle channel's segment while keeping the option of continuing
+    /// it.
     ///
-    /// Файл обрезается до фактических данных (`ftruncate` после `fdatasync`)
-    /// и закрывается — возвращаются и дескриптор, и непрописанный хвост
-    /// преаллокации. Footer **не** пишется: индекс блоков остаётся в памяти и
-    /// достроится, когда канал проснётся. Если не проснётся до остановки
-    /// процесса, сегмент останется незапечатанным — он читается сканом, а
-    /// footer ему допишет `recover_orphan` при следующем запуске.
+    /// The file is truncated to its actual data (`ftruncate` after `fdatasync`)
+    /// and closed — both the descriptor and the unwritten tail of the reserve
+    /// window come back. The footer is **not** written: the block index stays
+    /// in memory and will be finished when the channel wakes. If it does not
+    /// wake before the process stops, the segment stays unsealed — it reads by
+    /// scanning, and `recover_orphan` will append its footer on the next start.
     fn park_segment(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
-        // Накопленное — на диск, прежде чем отпускать файл. Штатный путь сюда
-        // приходит с уже вытолкнутым блоком, но опираться на это незачем:
-        // пустой накопитель делает вызов бесплатным.
+        // What has accumulated goes to disk before the file is released. The
+        // normal path arrives here with the block already flushed, but there is
+        // no reason to rely on that: an empty accumulator makes the call free.
         Self::flush_block(ch, counters)?;
         let Some(seg) = ch.segment.take() else {
             return Ok(());
@@ -1143,20 +1176,21 @@ impl WriterLoop {
         let name = SegmentName::new(seg.header().boot, seg.header().base);
         let data_end = seg.data_end();
         seg.close_unsealed()?;
-        // Бюджет обязан увидеть возврат: незапечатанный сегмент числился в
-        // нём вместе с нерасписанным хвостом окна.
+        // The budget has to see the return: an unsealed segment was counted in
+        // it together with the unwritten tail of its window.
         ch.inventory.update_size_bytes(name, data_end);
         ch.parked_segment = Some(name);
         Ok(())
     }
 
-    /// Вернуть отпущенный сегмент в работу. `false` — вернуть не вышло.
+    /// Bring a released segment back into work. `false` means it could not be.
     ///
-    /// Обход файла при открытии не лишний: между отпусканием и возвратом за
-    /// файлом никто не следил, а восстановление позиции по обходу — уже
-    /// написанный и проверенный путь. Платится он ровно раз на пробуждение и
-    /// только теми каналами, которые молчали, — то есть теми, у кого сегмент
-    /// мал. Места возврат не просит: окно резерва раздвинет первая запись.
+    /// The walk over the file at open time is not superfluous: nobody watched
+    /// the file between the release and the return, and restoring the position
+    /// by walking is an already written and tested path. It is paid exactly
+    /// once per wake-up and only by the channels that were quiet — that is, by
+    /// those whose segment is small. The return asks for no space: the first
+    /// write will extend the reserve window.
     fn unpark(ch: &mut ChannelState, counters: &Counters) -> bool {
         let Some(name) = ch.parked_segment.take() else {
             return false;
@@ -1168,18 +1202,20 @@ impl WriterLoop {
             Some(ch.config.segment_bytes),
         ) {
             Ok(seg) => {
-                // Места открытие не просило: файл так и остался обрезанным до
-                // конца данных, окно восстановит первая запись. Но в бюджете
-                // сегмент числился обрезанным, и сверить его с носителем
-                // всё равно надо — восстановление могло отбросить хвост.
+                // Opening asked for no space: the file stayed truncated to the
+                // end of the data, and the first write will restore the window.
+                // But the segment was counted in the budget as truncated, and
+                // it still has to be checked against the medium — recovery may
+                // have discarded a tail.
                 ch.inventory.update_size_bytes(name, seg.capacity());
                 ch.segment = Some(seg);
                 Counters::bump(&counters.segments_opened);
                 true
             }
             Err(_) => {
-                // Файл исчез (вытеснен, убран снаружи) или не открылся.
-                // Не беда: заведём новый, а индекс прежнего больше ни к чему.
+                // The file is gone (evicted, removed from outside) or would not
+                // open. No matter: a new one will be started, and the old index
+                // is of no more use.
                 Counters::bump(&counters.io_errors);
                 ch.inventory.remove(name);
                 ch.footer.reset();
@@ -1189,7 +1225,7 @@ impl WriterLoop {
         }
     }
 
-    /// Убедиться, что в активном сегменте хватит места на целый блок.
+    /// Make sure there is room in the active segment for a whole block.
     fn ensure_room(ch: &mut ChannelState, at: Micros, counters: &Counters) -> Result<()> {
         let need = ch.config.block_max_bytes as u64 + BlockHeader::SIZE as u64 * 2;
 
@@ -1213,9 +1249,9 @@ impl WriterLoop {
             store_id,
             boot,
         } = ch.identity;
-        // Имя сегмента — (boot, время его первой записи). Совпадение имён
-        // возможно только при регрессе времени; сдвигаем на микросекунду,
-        // чтобы не затереть существующий файл.
+        // A segment's name is (boot, the time of its first record). Names can
+        // coincide only when time goes backwards; shift by a microsecond so as
+        // not to overwrite an existing file.
         let mut base = at;
         for attempt in 0..64 {
             let header = SegmentHeader {
@@ -1226,11 +1262,12 @@ impl WriterLoop {
             };
             match SegmentWriter::create(&ch.dir, header, ch.config.segment_bytes) {
                 Ok(seg) => {
-                    // В бюджете сегмент числится тем, что занял на носителе, —
-                    // первым окном резерва, а не пределом роста. Числить предел
-                    // значило бы вытеснять чужую историю ради пустоты, а на
-                    // флоте — упереть практический предел одновременно пишущих
-                    // каналов в `budget_bytes / segment_bytes`.
+                    // In the budget a segment is counted as what it took on the
+                    // medium — its first reserve window, not its growth limit.
+                    // Counting the limit would mean evicting someone else's
+                    // history for the sake of emptiness, and across a fleet it
+                    // would peg the practical number of channels writing at
+                    // once to `budget_bytes / segment_bytes`.
                     ch.inventory.push_newest(SegmentEntry {
                         name: SegmentName::new(boot, base),
                         size_bytes: seg.capacity(),
@@ -1239,12 +1276,13 @@ impl WriterLoop {
                     ch.footer.reset();
                     Counters::bump(&counters.segments_created);
                     Counters::bump(&counters.segments_opened);
-                    // Занятость выросла на первое окно резерва — бюджет
-                    // обязан пересчитаться. Возвращение отпущенного сегмента
-                    // (`unpark`), наоборот, места не просит: файл остаётся
-                    // обрезанным, и числится он тем же, чем числился.
+                    // Occupancy grew by the first reserve window — the budget
+                    // has to be recomputed. Bringing a released segment back
+                    // (`unpark`), by contrast, asks for no space: the file
+                    // stays truncated, and it is counted as what it was counted
+                    // as before.
                     Counters::bump(&counters.occupancy_raised);
-                    // Новый сегмент занял место — освобождаем старые.
+                    // The new segment took space — free the old ones.
                     Self::rotate(ch, counters)?;
                     return Ok(());
                 }
@@ -1255,9 +1293,9 @@ impl WriterLoop {
                     ch.last_time = base;
                 }
                 Err(e) if e.is_no_space() => {
-                    // Место кончилось: удаляем самый старый сегмент и пробуем
-                    // ещё раз. Без этого канал замер бы навсегда, хотя
-                    // освободить место — его собственная задача.
+                    // Out of space: delete the oldest segment and try again.
+                    // Without this the channel would freeze forever, although
+                    // freeing space is its own job.
                     if attempt > 8 {
                         return Err(e);
                     }
@@ -1271,25 +1309,26 @@ impl WriterLoop {
         }
         Err(Error::Corrupt {
             path: ch.dir.clone(),
-            reason: "не удалось подобрать имя для нового сегмента".to_owned(),
+            reason: "could not find a name for the new segment".to_owned(),
         })
     }
 
     fn flush_block(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
-        // Отметка о незакрытом блоке снимается ПЕРВЫМ делом, до любых ранних
-        // выходов и до возможной ошибки записи. Иначе просроченный дедлайн
-        // остаётся навсегда, `next_deadline` возвращает нулевой таймаут, и
-        // цикл writer'а превращается в busy-loop на целое ядро.
+        // The mark of an open block is cleared FIRST of all, before any early
+        // return and before a possible write error. Otherwise an overdue
+        // deadline stays forever, `next_deadline` returns a zero timeout, and
+        // the writer's loop turns into a busy loop on a whole core.
         ch.block_opened = None;
 
         if ch.builder.is_empty() {
             return Ok(());
         }
         let Some(seg) = ch.segment.as_mut() else {
-            // Собранный блок некуда положить: сегмент не открыт. Такого быть
-            // не должно (его открывает `ensure_room`), но потерю всё равно
-            // нужно показать, а не отдать `Ok` — и показать там же, где она
-            // образовалась, чтобы отметка попала в поток этого канала.
+            // There is nowhere to put the assembled block: no segment is open.
+            // This should not happen (`ensure_room` opens it), but the loss
+            // still has to be shown rather than answered with `Ok` — and shown
+            // where it appeared, so that the notice reaches this channel's
+            // stream.
             let lost = u64::from(ch.builder.count());
             Counters::add(&counters.dropped, lost);
             ch.drops.record_n(ch.index, lost);
@@ -1302,34 +1341,36 @@ impl WriterLoop {
         out.clear();
         let last = ch.builder.last().unwrap_or(ch.last_time);
         let seq = seg.next_seq();
-        // Число записей снимается ДО `finish`: на превышении потолка тела он
-        // сбрасывает накопитель, и посчитать потерю потом будет нечем.
+        // The record count is taken BEFORE `finish`: on exceeding the body
+        // ceiling it resets the accumulator, and there would be nothing left to
+        // count the loss with.
         let pending = ch.builder.count();
         let header = match ch.builder.finish(seq, ch.config.compression, &mut out) {
             Ok(h) => h,
             Err(e) => {
                 ch.scratch = out;
-                // Блок не собрался — его записи потеряны, и это обязано быть
-                // видно там же, где образовалась дыра. Один `io_errors`
-                // сказал бы «что-то сломалось», но не «сколько пропало», и
-                // отметка в поток без поканального счётчика не попадёт.
+                // The block did not assemble — its records are lost, and that
+                // has to be visible where the hole appeared. One `io_errors`
+                // would say "something broke" but not "how much went missing",
+                // and a notice will not reach the stream without a per-channel
+                // counter.
                 let lost = u64::from(pending);
                 Counters::add(&counters.dropped, lost);
                 ch.drops.record_n(ch.index, lost);
-                // Накопитель сбрасывается и здесь: `finish` делает это только
-                // на превышении потолка, а заряженный накопитель заклинил бы
-                // канал на той же ошибке при каждом следующем flush'е.
+                // The accumulator is reset here too: `finish` does that only on
+                // exceeding the ceiling, and a loaded accumulator would jam the
+                // channel on the same error at every following flush.
                 ch.builder.reset();
                 ch.footer.discard_pending();
                 return Err(e.into());
             }
         };
 
-        // Дальше любой исход проходит через одну точку возврата буфера:
-        // раньше четыре ранних `?` роняли `out` на пол — вместе с ёмкостью,
-        // которую следующий flush реаллоцировал бы, — а записи блока исчезали
-        // с одним лишь `io_errors`, без учёта в потерях и без отметки в
-        // потоке канала.
+        // From here on every outcome goes through one point where the buffer
+        // comes back: four early `?` used to drop `out` on the floor — along
+        // with the capacity the next flush would reallocate — while the block's
+        // records disappeared with an `io_errors` alone, unaccounted for in the
+        // losses and with no notice in the channel's stream.
         let placed = Self::place_block(ch, counters, &mut out, &header);
         let written = out.len() as u64;
         ch.scratch = out;
@@ -1342,11 +1383,12 @@ impl WriterLoop {
                 Ok(())
             }
             Ok(Placement::Dropped) => {
-                // Блока не будет ни в одном сегменте — его типы не должны
-                // осесть в множествах ни того, ни другого.
+                // The block will be in no segment at all — its types must
+                // settle in the sets of neither.
                 ch.footer.discard_pending();
-                // Негабаритный блок раздул буферы до размеров, которых канал
-                // больше не увидит, — держать их за ним незачем.
+                // An oversized block inflated the buffers to a size the channel
+                // will not see again — there is no reason to keep them behind
+                // it.
                 ch.release_buffers();
                 Ok(())
             }
@@ -1360,19 +1402,20 @@ impl WriterLoop {
         }
     }
 
-    /// Положить собранный блок в сегмент, при необходимости сменив сегмент.
+    /// Put an assembled block into a segment, changing segment if need be.
     ///
-    /// Ошибка означает, что блок потерян: учёт потерь и возврат буфера —
-    /// забота вызывающего, у которого буфер и остаётся.
+    /// An error means the block is lost: accounting for the loss and returning
+    /// the buffer are the caller's business, and the buffer stays with it.
     fn place_block(
         ch: &mut ChannelState,
         counters: &Counters,
         out: &mut [u8],
         header: &BlockHeader,
     ) -> Result<Placement> {
-        // Проверка в `ensure_room` рассчитана по `block_max_bytes`, но одна
-        // крупная запись могла перевалить порог: писать за предел роста
-        // нельзя — это граница ротации, за ней начинается следующий сегмент.
+        // The check in `ensure_room` is computed from `block_max_bytes`, but
+        // one large record may have crossed the threshold: writing past the
+        // growth limit is not allowed — it is the rotation boundary, and the
+        // next segment begins beyond it.
         let fits = ch
             .segment
             .as_ref()
@@ -1382,12 +1425,13 @@ impl WriterLoop {
             Self::open_segment(ch, header.base, counters)?;
             let next_seq = {
                 let seg = ch.segment.as_ref().ok_or(Error::WriterDead)?;
-                // Свежий сегмент тоже может не вместить блок: одна запись
-                // бывает крупнее целого сегмента (несжимаемый blob). Растить
-                // окно за предел значило бы отменить границу ротации: сегмент
-                // рос бы под одну запись сколько угодно, а бюджет класса
-                // вытесняет только целыми сегментами. Блок отбрасывается,
-                // потеря объявляется отметкой в потоке.
+                // A fresh segment may not fit the block either: one record can
+                // be larger than a whole segment (an incompressible blob).
+                // Growing the window past the limit would cancel the rotation
+                // boundary: a segment would grow for one record without end,
+                // while the class budget evicts only whole segments. The block
+                // is discarded and the loss is announced by a notice in the
+                // stream.
                 if !seg.fits(out.len() as u64) {
                     let lost = u64::from(header.count);
                     Counters::add(&counters.dropped, lost);
@@ -1396,7 +1440,7 @@ impl WriterLoop {
                 }
                 seg.next_seq()
             };
-            // Нумерация блоков в новом сегменте начинается заново.
+            // Block numbering restarts in a new segment.
             dduroc_format::restamp_seq(out, next_seq)?;
         }
         let before = ch.segment.as_ref().ok_or(Error::WriterDead)?.capacity();
@@ -1405,19 +1449,21 @@ impl WriterLoop {
             .as_mut()
             .ok_or(Error::WriterDead)?
             .append_block(out);
-        // Окно не раздвинулось — на носителе кончилось место. Сперва канал
-        // освобождает своё, как и при создании сегмента: неудача на
-        // расширении окна ничем не отличается от неудачи на создании файла,
-        // и отвечать на неё потерей блока, не попробовав отдать собственную
-        // историю, было бы непоследовательно.
+        // The window did not extend — the medium is out of space. First the
+        // channel frees its own, as when creating a segment: a failure to
+        // extend the window is no different from a failure to create a file,
+        // and answering it by losing a block without having tried to give up
+        // its own history would be inconsistent.
         //
-        // Попытка ровно одна: вытеснение отдаёт целый сегмент, а просят —
-        // одну восьмую его. Не хватило места после этого — дело не в канале,
-        // и дальше нужен взгляд на весь носитель (`enforce_limits`).
+        // Exactly one attempt: eviction gives up a whole segment while what is
+        // asked for is an eighth of one. If there is still no room after that,
+        // the channel is not the problem, and what is needed next is a view of
+        // the whole medium (`enforce_limits`).
         //
-        // Ошибка самого вытеснения проглатывается намеренно: наверх обязана
-        // уйти исходная причина — кончившееся место, — а не то, что вдобавок
-        // не удалось удалить файл. Она уже сосчитана в `io_errors`.
+        // An error from the eviction itself is swallowed deliberately: what has
+        // to go up is the original cause — running out of space — not the fact
+        // that a file could not be deleted as well. That is already counted in
+        // `io_errors`.
         if placed.as_ref().err().is_some_and(Error::is_no_space)
             && Self::rotate_one(ch, counters).unwrap_or(false)
         {
@@ -1429,24 +1475,25 @@ impl WriterLoop {
         }
         let offset = placed?;
         let seg = ch.segment.as_mut().ok_or(Error::WriterDead)?;
-        // Окно резерва могло раздвинуться под этот блок — тогда занятость
-        // носителя выросла, и бюджет обязан увидеть рост там же, где он
-        // случился. Сверка вместо безусловной записи не бережливость, а
-        // условие: `update_size_bytes` ищет сегмент по имени, а зовётся это
-        // на каждый блок.
+        // The reserve window may have been extended for this block — then
+        // occupancy of the medium grew, and the budget has to see the growth
+        // where it happened. Comparing rather than writing unconditionally is
+        // not thrift but a condition: `update_size_bytes` looks the segment up
+        // by name, and this is called on every block.
         if seg.capacity() != before {
             let name = SegmentName::new(seg.header().boot, seg.header().base);
             let grown = seg.capacity();
             ch.inventory.update_size_bytes(name, grown);
             Counters::bump(&counters.occupancy_raised);
-            // Личная квота неймспейса — предел по занятому, и проверять её
-            // надо там, где занятое растёт. Одного создания сегмента для
-            // этого мало: между двумя созданиями окно доходит от одного блока
-            // до целого сегмента, и всё это время канал был бы над квотой.
+            // A namespace's personal quota is a limit on what is occupied, and
+            // it has to be checked where what is occupied grows. Creating a
+            // segment alone is not enough for that: between two creations the
+            // window goes from one block to a whole segment, and the channel
+            // would be over its quota the whole time.
             //
-            // Ошибка ротации не означает потери блока — он уже лёг на
-            // носитель, — поэтому наверх она не идёт: вернуть её значило бы
-            // объявить потерянными записи, которые записаны.
+            // An error from the rotation does not mean the block was lost — it
+            // is already on the medium — so it does not go up: returning it
+            // would mean declaring records lost that have been written.
             if Self::rotate(ch, counters).is_err() {
                 Counters::bump(&counters.io_errors);
             }
@@ -1469,12 +1516,13 @@ impl WriterLoop {
     fn seal_segment(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
         Self::flush_block(ch, counters)?;
         let Some(seg) = ch.segment.take() else {
-            // Отпущенный сегмент так и останется незапечатанным. Открывать его
-            // ради footer'а незачем: footer — оптимизация чтения, сегмент и
-            // без него читается сканом, а при следующем запуске его запечатает
-            // `recover_orphan` тем же обходом, которым ищет конец данных.
-            // Иначе остановка стоила бы открытия и обхода каждого молчащего
-            // канала — десятков тысяч при заявленном масштабе.
+            // A released segment will stay unsealed. There is no reason to open
+            // it for a footer: the footer is a read optimization, the segment
+            // reads by scanning without one, and on the next start
+            // `recover_orphan` will seal it in the same walk it uses to find
+            // the end of the data. Otherwise stopping would cost an open and a
+            // walk for every quiet channel — tens of thousands at the scale
+            // claimed.
             return Ok(());
         };
         let name = SegmentName::new(seg.header().boot, seg.header().base);
@@ -1482,8 +1530,8 @@ impl WriterLoop {
         let footer = ch.footer.build();
         let footer_bytes = footer.len() as u64;
         seg.seal(&footer)?;
-        // Запечатанный файл обрезан до фактических данных — бюджет обязан
-        // это учесть, иначе ротация считала бы преаллокацию вечной.
+        // A sealed file is truncated to its actual data — the budget has to
+        // account for that, or rotation would treat the reserve as permanent.
         ch.inventory
             .update_size_bytes(name, data_end + footer_bytes);
         ch.footer.reset();
@@ -1492,8 +1540,8 @@ impl WriterLoop {
         Ok(())
     }
 
-    /// Сегмент, в который канал пишет прямо сейчас или продолжит писать:
-    /// вытеснять его нельзя ни ротацией, ни потолком хранилища.
+    /// The segment a channel is writing to right now or will go on writing to:
+    /// it must be evicted by neither rotation nor the store ceiling.
     fn live_segment(ch: &ChannelState) -> Option<SegmentName> {
         ch.segment
             .as_ref()
@@ -1501,13 +1549,14 @@ impl WriterLoop {
             .or(ch.parked_segment)
     }
 
-    /// Удержать канал в личной квоте неймспейса, если она задана.
+    /// Keep a channel within the namespace's personal quota, if one is set.
     ///
-    /// Без квоты поканальной ротации нет вовсе: предел держит бюджет группы,
-    /// и старейшее вытесняется по всему классу (`enforce_groups`).
+    /// Without a quota there is no per-channel rotation at all: the limit is
+    /// held by the group budget, and the oldest is evicted across the whole
+    /// class (`enforce_groups`).
     ///
-    /// Зовётся в обеих точках роста занятости: при создании сегмента и при
-    /// расширении окна резерва.
+    /// Called at both points where occupancy grows: when a segment is created
+    /// and when the reserve window is extended.
     fn rotate(ch: &mut ChannelState, counters: &Counters) -> Result<()> {
         let Some(quota_bytes) = ch.quota_bytes else {
             return Ok(());
@@ -1518,8 +1567,8 @@ impl WriterLoop {
         Ok(())
     }
 
-    /// Удалить ровно один самый старый сегмент. Используется, когда на
-    /// носителе кончилось место.
+    /// Delete exactly one oldest segment. Used when the medium has run out of
+    /// space.
     fn rotate_one(ch: &mut ChannelState, counters: &Counters) -> Result<bool> {
         let live = Self::live_segment(ch);
         let Some(oldest) = ch.inventory.oldest().cloned() else {
@@ -1534,11 +1583,11 @@ impl WriterLoop {
         Ok(true)
     }
 
-    /// Занятость каждой группы: один проход по флоту.
+    /// Each group's occupancy: one pass over the fleet.
     ///
-    /// Полный проход дорог при десятках тысяч каналов — поэтому вызывается
-    /// только когда сумма действительно могла вырасти (см. `occupancy_seen`),
-    /// а не на каждом обороте цикла.
+    /// A full pass is expensive with tens of thousands of channels — so it is
+    /// called only when the sum really could have grown (see `occupancy_seen`)
+    /// rather than on every turn of the loop.
     fn group_totals(&self) -> Vec<u64> {
         let mut totals = vec![0u64; self.groups.len()];
         for ch in self
@@ -1554,12 +1603,13 @@ impl WriterLoop {
         totals
     }
 
-    /// Самый крупный сегмент среди каналов носителя `root`.
+    /// The largest segment among the channels of medium `root`.
     ///
-    /// Мера того, сколько надо освободить, чтобы попытка записи имела шанс.
-    /// Меньше целого сегмента брать незачем: канал под давлением по месту уже
-    /// испробовал свою ротацию, и освобождать надо с запасом на его рост, а не
-    /// на один блок — иначе каждый оборот стоил бы ещё одной потери.
+    /// A measure of how much has to be freed for a write attempt to stand a
+    /// chance. There is no reason to take less than a whole segment: a channel
+    /// under space pressure has already tried its own rotation, and what is
+    /// freed has to leave room for its growth rather than for one block —
+    /// otherwise every turn would cost one more lost record.
     fn max_segment_bytes_on(&self, root: u8) -> u64 {
         self.namespaces
             .iter()
@@ -1571,7 +1621,8 @@ impl WriterLoop {
             .unwrap_or(0)
     }
 
-    /// Отметить отказ носителя по месту у канала `(ns, канал)`.
+    /// Note a refusal of the medium for want of space at channel `(ns,
+    /// channel)`.
     fn note_pressure(&mut self, ns_idx: usize, ch_idx: usize) {
         if let Some(ch) = self
             .namespaces
@@ -1583,16 +1634,16 @@ impl WriterLoop {
         }
     }
 
-    /// Удалить самый старый сегмент среди каналов, прошедших отбор `pick`.
-    /// Возвращает освободившиеся байты; `None` — вытеснять нечего.
+    /// Delete the oldest segment among the channels that pass the `pick`
+    /// filter. Returns the bytes freed; `None` means there is nothing to evict.
     ///
-    /// Порядок глобальный по построению: имя сегмента — это пара
-    /// `(номер запуска, микросекунды от его старта)`, а номер запуска один на
-    /// всё хранилище. Поэтому «самый старый» имеет смысл и через границу
-    /// канала, и через границу неймспейса.
+    /// The order is global by construction: a segment's name is the pair `(run
+    /// number, microseconds since it started)`, and the run number is one for
+    /// the whole store. So "the oldest" is meaningful across a channel boundary
+    /// and across a namespace boundary alike.
     ///
-    /// Живой сегмент неприкосновенен — и открытый, и отпущенный по
-    /// бездействию: в первый пишут, второй продолжат.
+    /// A live segment is untouchable — both the open one and one released for
+    /// idleness: the first is being written to, the second will be continued.
     fn evict_oldest_where(&mut self, pick: impl Fn(&ChannelState) -> bool) -> Option<u64> {
         let mut victim: Option<(usize, usize, SegmentEntry)> = None;
         for (ns_idx, slot) in self.namespaces.iter().enumerate() {
@@ -1616,8 +1667,8 @@ impl WriterLoop {
         let (ns_idx, ch_idx, entry) = victim?;
         let ch = &mut self.namespaces[ns_idx].as_mut()?.channels[ch_idx];
         if crate::fsutil::remove_synced(&entry.path(&ch.dir)).is_err() {
-            // Не смогли удалить — вытеснять этот сегмент бессмысленно и
-            // дальше: следующий вызов выбрал бы его снова и зациклился.
+            // It could not be deleted — evicting this segment makes no sense
+            // any more: the next call would pick it again and spin.
             Counters::bump(&self.counters.io_errors);
             return None;
         }
@@ -1626,15 +1677,16 @@ impl WriterLoop {
         Some(entry.size_bytes)
     }
 
-    /// Отпустить сегменты каналов, молчащих не меньше `quiet_for`, досрочно.
+    /// Release the segments of channels quiet for at least `quiet_for`, ahead
+    /// of time.
     ///
-    /// Возвращает нерасписанный хвост окна резерва: файл обрезается до
-    /// фактических данных. Это и есть ответ на «тихий канал держит место,
-    /// пока шумный голодает» — занятое, но неиспользованное отдаётся первым,
-    /// до того как вытеснение примется за чью-то историю.
+    /// It returns the unwritten tail of the reserve window: the file is
+    /// truncated to its actual data. This is the answer to "a quiet channel
+    /// holds space while a noisy one starves" — what is occupied but unused is
+    /// given up first, before eviction starts on anyone's history.
     ///
-    /// Полный проход по флоту, поэтому зовётся только под давлением: когда
-    /// место кончилось или бюджет группы не выдержан.
+    /// A full pass over the fleet, so it is called only under pressure: when
+    /// space has run out or a group's budget is not being met.
     fn park_idle(&mut self, quiet_for: Duration) -> usize {
         let now = Instant::now();
         let counters = Arc::clone(&self.counters);
@@ -1653,10 +1705,11 @@ impl WriterLoop {
                     continue;
                 }
                 ch.footer.shrink_to_fit();
-                // Канал, отпустивший сегмент, тем более не нуждается в буферах
-                // блока. Раньше сюда попадали только под давлением по месту, и
-                // память при этом не возвращалась вовсе: до обычного оборота
-                // цикла с его лестницей бездействия ещё надо дожить.
+                // A channel that gave up its segment needs its block buffers
+                // even less. This used to be reached only under space pressure,
+                // and the memory was not returned at all: an ordinary turn of
+                // the loop with its staircase of idleness still had to be
+                // survived first.
                 ch.release_buffers();
                 ch.buffers_released = true;
                 parked += 1;
@@ -1665,23 +1718,22 @@ impl WriterLoop {
         parked
     }
 
-    /// Удержать хранилище в объявленных пределах.
+    /// Keep the store within its declared limits.
     ///
-    /// Обе причины сюда попадать редки, и обе требуют взгляда шире одного
-    /// канала: поканальная квота по построению не видит, что место занято
-    /// соседом.
+    /// Both reasons for getting here are rare, and both call for a view wider
+    /// than one channel: a per-channel quota by construction cannot see that
+    /// the space is taken by a neighbour.
     fn enforce_limits(&mut self) {
         let pressured = std::mem::take(&mut self.pressured_roots);
         if pressured != 0 {
-            // Место на носителе кончилось. Ротация внутри канала, который в
-            // него упёрся, уже испробована и не помогла — освобождаем там, где
-            // место действительно занято, и на ТОМ ЖЕ носителе: сперва
-            // нерасписанные хвосты окон у молчащих каналов, потом старейшая
-            // история.
+            // The medium has run out of space. Rotation inside the channel that
+            // hit it has already been tried and did not help — free space where
+            // it is actually taken, and on THE SAME medium: first the unwritten
+            // tails of quiet channels' windows, then the oldest history.
             //
-            // Освобождать надо не «что-нибудь», а хотя бы целый сегмент:
-            // меньшего не хватит на следующую попытку, и каждый оборот стоил
-            // бы ещё одной потерянной записи.
+            // What has to be freed is not "something" but at least a whole
+            // segment: less will not do for the next attempt, and every turn
+            // would cost one more lost record.
             self.park_idle(RELEASE_AFTER);
             for root in 0..8u8 {
                 if pressured & (1 << root) == 0 {
@@ -1698,9 +1750,9 @@ impl WriterLoop {
             }
         }
 
-        // Сумма растёт только когда канал берёт сегмент в работу или
-        // раздвигает окно резерва; пока счётчик не сдвинулся, обходить флот
-        // незачем.
+        // The sum grows only when a channel takes a segment into work or
+        // extends its reserve window; while the counter has not moved there is
+        // no reason to walk the fleet.
         let raised = self
             .counters
             .occupancy_raised
@@ -1712,7 +1764,8 @@ impl WriterLoop {
         self.enforce_groups();
     }
 
-    /// Вернуть каждую группу под её бюджет — без сторожа, безусловно.
+    /// Bring every group back under its budget — unconditionally, with no
+    /// watchdog.
     fn enforce_groups(&mut self) {
         let mut totals = self.group_totals();
         let mut parked = false;
@@ -1720,9 +1773,9 @@ impl WriterLoop {
             let budget_bytes = self.groups[g].budget_bytes;
             totals[g] = self.evict_group_down_to(g, budget_bytes, totals[g]);
             if totals[g] > budget_bytes && !parked {
-                // Вытеснять больше нечего, но остались нерасписанные хвосты
-                // окон у молчащих каналов — отдать их дешевле, чем объявлять
-                // бюджет невыполнимым.
+                // There is nothing left to evict, but the unwritten tails of
+                // quiet channels' windows remain — giving them up is cheaper
+                // than declaring the budget unmeetable.
                 parked = true;
                 if self.park_idle(RELEASE_AFTER) > 0 {
                     totals = self.group_totals();
@@ -1730,14 +1783,15 @@ impl WriterLoop {
                 }
             }
             if totals[g] > budget_bytes {
-                // Всё, что осталось, — живые сегменты: вытеснить их нельзя, и
-                // бюджет группы в этой конфигурации попросту невыполним.
+                // Everything left is live segments: they cannot be evicted, and
+                // the group's budget in this configuration is simply
+                // unmeetable.
                 Counters::bump(&self.counters.budget_overruns);
             }
         }
     }
 
-    /// Вытеснять старейшее в группе, пока её сумма не влезет в бюджет.
+    /// Evict the oldest in a group until its sum fits the budget.
     fn evict_group_down_to(&mut self, group: usize, budget_bytes: u64, mut total: u64) -> u64 {
         while total > budget_bytes {
             let Some(freed) = self.evict_oldest_where(|ch| ch.group == group) else {
@@ -1748,13 +1802,14 @@ impl WriterLoop {
         total
     }
 
-    /// Ближайший дедлайн — только по каналам, которым есть что обслуживать.
+    /// The nearest deadline — over the channels that have something to service
+    /// only.
     ///
-    /// Обходить все каналы подряд нельзя: при заявленных двадцати четырёх
-    /// тысячах неймспейсов их десятки тысяч, а вызывается это на **каждом**
-    /// холостом обороте цикла, то есть до четырёх раз в секунду. Дедлайн
-    /// бывает только у канала с открытым блоком или несинхронизованными
-    /// данными — то есть ровно у того, кто уже лежит в `active`.
+    /// Walking every channel is not an option: with the twenty-four thousand
+    /// namespaces claimed there are tens of thousands of them, and this is
+    /// called on **every** idle turn of the loop, that is, up to four times a
+    /// second. Only a channel with an open block or unsynced data has a
+    /// deadline — that is, exactly the one already in `active`.
     fn next_deadline(&self) -> Option<Duration> {
         let now = Instant::now();
         let mut best: Option<Instant> = None;
@@ -1777,7 +1832,7 @@ impl WriterLoop {
         best.map(|d| d.saturating_duration_since(now))
     }
 
-    /// Обслужить дедлайны и отметки о потерях.
+    /// Service the deadlines and the loss notices.
     fn tick(&mut self) {
         self.emit_drop_notices();
 
@@ -1812,30 +1867,32 @@ impl WriterLoop {
                 }
             }
 
-            // Канал остаётся в списке, только пока ему есть что обслуживать:
-            // открытый блок или дедлайн синхронизации. Проверять сырой
-            // `dirty_since_sync` нельзя — у Relaxed-канала он не сбрасывается
-            // до самого seal, и канал жил бы в списке вечно, возвращая полный
-            // обход, ради устранения которого список заведён.
+            // A channel stays in the list only while it has something to
+            // service: an open block or a sync deadline. Checking the raw
+            // `dirty_since_sync` is not an option — on a Relaxed channel it is
+            // not cleared until the seal, and the channel would live in the
+            // list forever, bringing back the full walk the list exists to
+            // remove.
             if ch.block_opened.is_some() || ch.sync_deadline().is_some() {
                 ch.idle_since = None;
                 self.active.push((ns_idx, ch_idx));
             } else {
-                // Бездействие отдаётся в два приёма, по разной цене.
+                // Idleness is given up in two stages, at different prices.
                 //
-                // Сперва буферы: их ёмкость — след самого крупного блока, и
-                // держать её за молчащим каналом значит закрепить пик
-                // навсегда. Но не мгновенно: Immediate-канал попадает сюда
-                // после каждой групповой фиксации (см. `RELEASE_AFTER`), и
-                // возврат на месте стоил бы пары аллокаций на каждую
-                // аварийную запись.
+                // The buffers first: their capacity is the imprint of the
+                // largest block, and holding it behind a quiet channel means
+                // pinning a peak forever. But not instantly: an Immediate
+                // channel gets here after every group commit (see
+                // `RELEASE_AFTER`), and returning them on the spot would cost a
+                // couple of allocations per critical record.
                 //
-                // Потом сегмент: он стоит дескриптора и числится в бюджете
-                // вместе с нерасписанным хвостом окна, хотя записанного в нём
-                // может быть сто байт (см. `PARK_AFTER`). Отпускание обрезает
-                // файл до фактических данных и закрывает дескриптор; из списка
-                // обслуживаемых канал уходит только здесь — иначе отдавать
-                // сегмент стало бы некому.
+                // Then the segment: it costs a descriptor and is counted in the
+                // budget together with the unwritten tail of its window,
+                // although what is written in it may be a hundred bytes (see
+                // `PARK_AFTER`). Releasing truncates the file to its actual
+                // data and closes the descriptor; a channel leaves the serviced
+                // list only here — otherwise there would be nobody left to give
+                // the segment up.
                 let idle_since = *ch.idle_since.get_or_insert(now);
                 let idle = now.duration_since(idle_since);
                 if idle >= RELEASE_AFTER && !ch.buffers_released {
@@ -1856,21 +1913,22 @@ impl WriterLoop {
         }
 
         self.pressured_roots |= pressured;
-        // В самом конце: и обслуживание дедлайнов, и запечатывание по
-        // бездействию только что меняли занятость носителя.
+        // Right at the end: both servicing the deadlines and sealing for
+        // idleness have just changed the occupancy of the medium.
         self.enforce_limits();
-        // После лестницы бездействия: она могла всё уже освободить, и потолок
-        // не должен отбирать буферы у тех, кто и так их сейчас отдаёт.
+        // After the staircase of idleness: it may have freed everything
+        // already, and the ceiling must not take buffers from those already
+        // giving them up.
         self.enforce_memory();
     }
 
-    /// Байты, которые каналы держат в памяти под блоки.
+    /// The bytes the channels hold in memory for blocks.
     ///
-    /// Обходится только `active` — и этого достаточно: канал уходит из списка
-    /// обслуживаемых лишь при запечатывании по бездействию, а буферы к тому
-    /// моменту уже возвращены. Полный проход по флоту здесь означал бы десятки
-    /// тысяч каналов на каждом обороте цикла — ровно то, ради устранения чего
-    /// этот список и заведён.
+    /// Only `active` is walked — and that is enough: a channel leaves the
+    /// serviced list only when its segment is sealed for idleness, and by then
+    /// its buffers have already been returned. A full pass over the fleet here
+    /// would mean tens of thousands of channels on every turn of the loop —
+    /// exactly what this list exists to remove.
     fn held_bytes(&self) -> u64 {
         self.active
             .iter()
@@ -1885,20 +1943,20 @@ impl WriterLoop {
             .sum()
     }
 
-    /// Вернуть буферы блоков в объявленный потолок памяти.
+    /// Bring the block buffers back under the declared memory ceiling.
     ///
-    /// Потолок соблюдается **между оборотами цикла**, а не на каждой записи, и
-    /// это не послабление, а единственный честный вариант. Порог закрытия
-    /// блока проверяется ПОСЛЕ добавления записи, поэтому одна запись способна
-    /// раздуть буфер сверх любого потолка (несжимаемый blob крупнее сегмента —
-    /// уже известный случай), а отбросить её ради бухгалтерии по памяти
-    /// значило бы потерять данные там, где память всего лишь неудобна.
-    /// Невыполнимый потолок объявляется счётчиком — как и невыполнимый бюджет.
+    /// The ceiling is honoured **between turns of the loop** rather than on
+    /// every record, and that is not a concession but the only honest option.
+    /// The block-closing threshold is checked AFTER a record is added, so one
+    /// record can inflate a buffer past any ceiling (an incompressible blob
+    /// larger than a segment is the known case), and discarding it for the sake
+    /// of memory accounting would mean losing data where memory is merely
+    /// inconvenient. An unmeetable ceiling is announced by a counter — as an
+    /// unmeetable budget is.
     ///
-    /// Освобождение идёт от самых крупных: одна операция даёт больше всего, а
-    /// стоит каждая выталкивания блока. Порядок обязателен — `shrink_to`
-    /// отказывается сжимать заряженный накопитель, поэтому сперва flush, потом
-    /// возврат.
+    /// Freeing goes from the largest down: one operation gives the most, and
+    /// each costs a block flush. The order is mandatory — `shrink_to` refuses
+    /// to shrink a loaded accumulator, so it is flush first, then the return.
     fn enforce_memory(&mut self) {
         let Some(ceiling) = self.buffer_ceiling else {
             return;
@@ -1931,25 +1989,26 @@ impl WriterLoop {
             else {
                 continue;
             };
-            // Выталкивать некуда: сегмент отпущен или не открылся, и flush
-            // отбросил бы весь блок, посчитав его записи потерянными. Память
-            // такой цены не стоит. Пустой накопитель этим не связан: у него
-            // нечего терять, а ёмкость он держит.
+            // There is nowhere to flush to: the segment is released or never
+            // opened, and a flush would discard the whole block, counting its
+            // records as lost. Memory is not worth that price. An empty
+            // accumulator is not bound by this: it has nothing to lose, and it
+            // does hold capacity.
             if state.segment.is_none() && !state.builder.is_empty() {
                 continue;
             }
             if let Err(e) = Self::flush_block(state, &counters) {
                 Counters::bump(&counters.io_errors);
-                // Место кончилось — освобождать его надо там, где оно занято,
-                // и обход по носителям об этом должен узнать.
+                // Out of space — it has to be freed where it is taken, and the
+                // walk over the media has to learn about that.
                 if e.is_no_space() {
                     self.pressured_roots |= 1 << state.root_key.min(7);
                 }
             }
             state.release_buffers();
             state.buffers_released = true;
-            // Слак индекса блоков заодно: живых записей он не теряет, а
-            // отдаётся даром.
+            // The block index's slack along the way: it loses no live entries
+            // and is given up for free.
             state.footer.shrink_to_fit();
             held = held.saturating_sub(was.saturating_sub(state.held_bytes()));
         }
@@ -1959,26 +2018,26 @@ impl WriterLoop {
         }
     }
 
-    /// Вставить в поток отметки о потерянных записях.
+    /// Insert notices about lost records into the stream.
     ///
-    /// Дыра, о которой нигде не сказано, неотличима от тишины — ровно тот
-    /// дефект прототипа, ради которого здесь ведётся учёт.
+    /// A hole nobody mentions is indistinguishable from silence — exactly the
+    /// prototype defect this accounting exists for.
     fn emit_drop_notices(&mut self) {
-        // Обход всех каналов всех неймспейсов — это десятки тысяч атомарных
-        // обменов при заявленном масштабе, а зовётся он на каждом обороте
-        // цикла, то есть до четырёх раз в секунду даже в полном простое.
-        // Ровно тот полный проход, ради устранения которого заведён список
-        // `active`.
+        // A walk over every channel of every namespace is tens of thousands of
+        // atomic exchanges at the scale claimed, and it is called on every turn
+        // of the loop, that is, up to four times a second even when entirely
+        // idle. Precisely the full pass the `active` list exists to remove.
         //
-        // Каждая поканальная потеря сопровождается инкрементом общего
-        // счётчика — иначе она не попала бы в `Stats`, — поэтому
-        // неизменившийся общий счётчик доказывает, что обходить нечего.
-        // Одно атомарное чтение вместо прохода по флоту.
-        // Чтение с захватом: поканальные счётчики растут на прикладных
-        // потоках ДО публикации общего ([`Counters::publish`]), и увидеть
-        // новый общий счётчик значит увидеть и их. С `Relaxed` обход мог бы
-        // застать поканальный счётчик ещё нулевым, счесть отметку выданной и
-        // оставить дыру необъявленной до следующей потери.
+        // Every per-channel loss comes with an increment of the total counter —
+        // otherwise it would not reach `Stats` — so an unchanged total proves
+        // there is nothing to walk for. One atomic read instead of a pass over
+        // the fleet.
+        //
+        // The read acquires: the per-channel counters grow on application
+        // threads BEFORE the total is published ([`Counters::publish`]), and
+        // seeing the new total means seeing them too. With `Relaxed` a walk
+        // could find a per-channel counter still zero, consider the notice
+        // issued and leave the hole unannounced until the next loss.
         let total = self
             .counters
             .dropped
@@ -2052,15 +2111,16 @@ impl WriterLoop {
                 ControlOutcome::Continue
             }
             Control::Release(ns) => {
-                // Сначала записи, потом освобождение: то, что прикладной поток
-                // успел поставить в очередь до уничтожения ручки, обязано лечь
-                // на диск — `log()` на него уже ответил `Ok`.
+                // The records first, the release after: what an application
+                // thread managed to enqueue before the handle was dropped has
+                // to reach the disk — `log()` already answered `Ok` to it.
                 //
-                // Остаток очереди не трогаем. Очередь общая на процесс, и в
-                // ней лежат записи ЧУЖИХ, живых неймспейсов: отпустить один
-                // неймспейс не значит уничтожить всё, что успели написать
-                // остальные. Записи самого отпускаемого писать уже некуда —
-                // их учтёт `push` по несуществующему адресу.
+                // The rest of the queue is left alone. The queue is shared by
+                // the process, and it holds records of OTHER, living
+                // namespaces: releasing one namespace does not mean destroying
+                // everything the rest managed to write. There is nowhere left
+                // to write the released one's own records — `push` will account
+                // for them against a non-existent address.
                 self.drain_pending(normal, critical, Leftovers::Keep);
                 self.release(ns);
                 ControlOutcome::Continue
@@ -2076,25 +2136,26 @@ impl WriterLoop {
                 ControlOutcome::Continue
             }
             Control::Sync(ns, reply) => {
-                // Сначала записи, потом отчёт: иначе `sync` подтвердил бы
-                // сохранность того, что ещё стоит в очереди.
+                // The records first, the report after: otherwise `sync` would
+                // confirm the safety of what is still sitting in the queue.
                 let drained = self.drain_pending(normal, critical, Leftovers::Keep);
                 let mut outcome = self.sync_all(ns);
                 if outcome.is_ok() && !drained {
-                    // Забранное лежит на носителе, но очередь пополняется
-                    // быстрее, чем разбирается. Записи не потеряны — они
-                    // по-прежнему в очереди, — а вот обещание «всё
-                    // накопленное на носителе» в этот раз не выполнено, и
-                    // отдать `Ok` значило бы соврать.
+                    // What was taken is on the medium, but the queue is filling
+                    // faster than it drains. The records are not lost — they
+                    // are still in the queue — but the promise "everything
+                    // accumulated is on the medium" was not kept this time, and
+                    // returning `Ok` would be a lie.
                     outcome = Err(Error::SyncIncomplete);
                 }
                 let _ = reply.send(outcome);
                 ControlOutcome::Continue
             }
             Control::Shutdown(reply) => {
-                // Единственный случай, когда остаток очереди отбрасывается:
-                // после остановки записывать его будет некому, и держать
-                // процесс живым до молчания пишущих потоков нельзя.
+                // The only case in which the rest of the queue is discarded:
+                // after the stop there will be nobody to write it, and the
+                // process cannot be kept alive until the writing threads fall
+                // silent.
                 self.drain_pending(normal, critical, Leftovers::Discard);
                 self.finish();
                 let _ = reply.send(());
@@ -2103,12 +2164,13 @@ impl WriterLoop {
         }
     }
 
-    /// Выполнить фиксацию миграции сегмента на потоке writer'а.
+    /// Perform a migration's segment commit on the writer's thread.
     ///
-    /// Здесь, а не на потоке вызывающего, потому что инвентарь и ротация
-    /// живут только тут: подмена файла мимо writer'а гонялась бы с его же
-    /// `unlink` этого файла. Сама фиксация — rename и правка числа в
-    /// инвентаре, микросекунды: writer не задерживается.
+    /// Here rather than on the caller's thread because the inventory and
+    /// rotation live only here: swapping a file behind the writer's back would
+    /// race with its own `unlink` of that file. The commit itself is a rename
+    /// and an edit to a number in the inventory — microseconds: the writer is
+    /// not held up.
     fn commit_migration(
         &mut self,
         ns: NsId,
@@ -2122,19 +2184,20 @@ impl WriterLoop {
             .and_then(|n| n.as_mut())
             .and_then(|n| n.channels.get_mut(channel.0 as usize))
         else {
-            // Неймспейс уже отпущен — фиксировать не во что.
+            // The namespace is already released — there is nothing to commit
+            // into.
             return Ok(false);
         };
-        // Сегмент мог быть ротирован, пока его переписывали: тогда его
-        // история уже выброшена, и воскрешать её из временного файла нельзя —
-        // бюджет про неё забыл.
+        // The segment may have been rotated while it was being rewritten: then
+        // its history is already thrown out, and resurrecting it from a
+        // temporary file is not allowed — the budget has forgotten about it.
         if !ch.inventory.iter().any(|e| e.name == name) {
             return Ok(false);
         }
         debug_assert_ne!(
             Some(name),
             Self::live_segment(ch),
-            "мигрируют только сегменты прежних версий, живой всегда текущей"
+            "only segments of earlier versions migrate; the live one is always current"
         );
         let path = ch.dir.join(name.to_string());
         match commit {
@@ -2152,9 +2215,10 @@ impl WriterLoop {
     }
 
     fn register(&mut self, setup: NsSetup) -> Result<NsId> {
-        // Каталогов стало больше, а счётчиками сегментов это не видно: пустой
-        // канал файлов ещё не завёл. Подписке на группу неймспейсов сервис,
-        // стартовавший позже, обязан достаться без её перезапуска.
+        // There are more directories now, and the segment counters do not show
+        // it: an empty channel has not created a file yet. A service that
+        // started later has to reach a subscription over a group of namespaces
+        // without restarting it.
         self.roster_changed = true;
         let identity = SegmentIdentity {
             protocol_version: setup.protocol_version,
@@ -2183,9 +2247,9 @@ impl WriterLoop {
             channels,
             drops: setup.drops,
         };
-        // Слот отпущенного неймспейса переиспользуется: иначе повторный
-        // подъём того же имени (переподключение сервиса) растил бы таблицу
-        // до конца жизни процесса.
+        // The slot of a released namespace is reused: otherwise bringing the
+        // same name up again (a service reconnecting) would grow the table for
+        // the life of the process.
         match self.namespaces.iter().position(Option::is_none) {
             Some(i) => {
                 self.namespaces[i] = Some(state);
@@ -2198,16 +2262,17 @@ impl WriterLoop {
         }
     }
 
-    /// Отпустить неймспейс: дописать, запечатать сегменты, освободить слот.
+    /// Release a namespace: write out, seal the segments, free the slot.
     ///
-    /// Без этого состояние канала жило бы до конца процесса, и повторный
-    /// подъём того же имени дал бы **два** состояния на один каталог со своими
-    /// инвентарями. Ротация одного не знала бы об активном сегменте другого и
-    /// удалила бы его: запись продолжалась бы в файл, у которого больше нет
-    /// имени, и всё записанное после этого исчезло бы при закрытии.
+    /// Without this a channel's state would live until the end of the process,
+    /// and bringing the same name up again would give **two** states over one
+    /// directory with inventories of their own. One's rotation would not know
+    /// about the other's active segment and would delete it: writing would go
+    /// on into a file that no longer has a name, and everything written after
+    /// that would vanish when it closed.
     fn release(&mut self, ns: NsId) {
-        // Отметки о потерях выталкиваются ДО запечатывания — иначе дыра,
-        // образовавшаяся перед закрытием, не попала бы в поток вовсе.
+        // The loss notices are flushed BEFORE sealing — otherwise a hole that
+        // formed just before closing would not reach the stream at all.
         self.emit_drop_notices();
 
         let idx = ns.0 as usize;
@@ -2216,12 +2281,13 @@ impl WriterLoop {
             && let Some(state) = slot.as_mut()
         {
             for ch in &mut state.channels {
-                // Отпущенный сегмент здесь возвращается и запечатывается —
-                // в отличие от остановки процесса (см. `finish`). Разница в
-                // масштабе: отпускают один неймспейс, и имя его могут занять
-                // следующей же строкой, а останавливают весь флот сразу, где
-                // те же открытия и обходы — это десятки тысяч операций ради
-                // footer'а, который следующий запуск допишет даром.
+                // A released segment is brought back and sealed here — unlike
+                // at process stop (see `finish`). The difference is one of
+                // scale: one namespace is released, and its name may be taken
+                // on the very next line, whereas a whole fleet is stopped at
+                // once, where the same opens and walks are tens of thousands of
+                // operations for the sake of a footer the next start will
+                // append for free.
                 Self::unpark(ch, &counters);
                 if Self::seal_segment(ch, &counters).is_err() {
                     Counters::bump(&counters.io_errors);
@@ -2257,12 +2323,12 @@ impl WriterLoop {
         }
     }
 
-    /// Финальное закрытие: дописать и запечатать всё.
+    /// The final close: write out and seal everything.
     fn finish(&mut self) {
-        // Отметки о потерях выталкиваются ДО запечатывания. Иначе дыра,
-        // образовавшаяся между последним `tick` и остановкой, не попадала бы
-        // в поток вовсе — а это ровно тот момент, когда очередь переполнена
-        // чаще всего: процесс завершается под нагрузкой.
+        // The loss notices are flushed BEFORE sealing. Otherwise a hole that
+        // formed between the last `tick` and the stop would not reach the
+        // stream at all — and that is exactly the moment the queue is most
+        // often full: the process is ending under load.
         self.emit_drop_notices();
 
         let counters = Arc::clone(&self.counters);
@@ -2274,10 +2340,10 @@ impl WriterLoop {
             }
         }
 
-        // Остановка — единственный момент, когда занятость носителя точно
-        // окончательна: активных сегментов больше нет, преаллокация обрезана.
-        // Оставить группу над бюджетом именно здесь значило бы оставить её
-        // над бюджетом до следующего запуска.
+        // The stop is the only moment when the occupancy of the medium is
+        // certainly final: there are no active segments left and the reserve is
+        // trimmed. Leaving a group over its budget here would mean leaving it
+        // over budget until the next start.
         self.enforce_groups();
     }
 }
@@ -2287,20 +2353,22 @@ enum ControlOutcome {
     Stop,
 }
 
-/// Что делать с записями, оставшимися в очереди после отведённых проходов.
+/// What to do with records left in the queue after the allotted passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leftovers {
-    /// Оставить в очереди: их запишет обычный ход цикла.
+    /// Leave them in the queue: the ordinary course of the loop will write
+    /// them.
     Keep,
-    /// Отбросить и учесть как потерю: писать их больше некому.
+    /// Discard and count as a loss: there is nobody left to write them.
     Discard,
 }
 
-/// Куда лёг собранный блок.
+/// Where an assembled block landed.
 enum Placement {
-    /// Записан по смещению.
+    /// Written at an offset.
     At(u64),
-    /// Отброшен: не помещается даже в свежий сегмент. Потеря уже учтена.
+    /// Discarded: it does not fit even a fresh segment. The loss is already
+    /// counted.
     Dropped,
 }
 
@@ -2312,9 +2380,10 @@ mod tests {
 
     #[test]
     fn queue_sizes_never_degenerate_to_rendezvous() {
-        // Нулевая ёмкость превратила бы постановку в очередь в рандеву с
-        // writer'ом: обычный канал перестал бы отличаться от критического, а
-        // прикладной поток стал бы ждать диск на каждой записи.
+        // A zero capacity would turn enqueueing into a rendezvous with the
+        // writer: the ordinary channel would stop differing from the critical
+        // one, and an application thread would wait for the disk on every
+        // record.
         let q = QueueSizes {
             normal: 0,
             critical: 0,
@@ -2324,15 +2393,15 @@ mod tests {
         assert_eq!(q.critical, 1);
 
         let d = QueueSizes::default();
-        assert_eq!(d.sanitized(), d, "разумные значения не искажаются");
+        assert_eq!(d.sanitized(), d, "sensible values are not distorted");
     }
 
     #[test]
     fn idle_channel_gives_its_buffers_back() {
-        // Буферы канала растут до крупнейшего блока и без возврата остаются
-        // такими навсегда: RSS-замер показывал +16 МиБ после ОДНОГО blob'а
-        // на 8 МиБ — буфер блока плюс scratch, оба по размеру блока.
-        // При уходе канала в бездействие память обязана вернуться аллокатору.
+        // A channel's buffers grow to the largest block and without a return
+        // stay that way forever: an RSS measurement showed +16 MiB after ONE 8
+        // MiB blob — the block buffer plus scratch, both the size of the block.
+        // When a channel goes idle the memory has to go back to the allocator.
         use dduroc_format::record::Sample;
         use dduroc_format::{MetricId, Record, Value};
 
@@ -2358,7 +2427,8 @@ mod tests {
         )
         .unwrap();
 
-        // Мегабайтный несжимаемый blob — блок заведомо крупнее block_max.
+        // A megabyte incompressible blob — a block knowably larger than
+        // block_max.
         let noise: Vec<u8> = {
             let mut s: u64 = 0x2545_F491_4F6C_DD1D;
             (0..1 << 20)
@@ -2385,18 +2455,18 @@ mod tests {
         let held = ch.builder.capacity() + ch.scratch.capacity();
         assert!(
             held >= 2 << 20,
-            "после blob'а буферы обязаны быть раздуты (иначе тест пуст): {held}"
+            "after a blob the buffers must be inflated (or the test is empty): {held}"
         );
 
-        // То, что делает tick с каналом, покинувшим active.
+        // What tick does with a channel that has left active.
         ch.release_buffers();
         assert_eq!(
             ch.builder.capacity() + ch.scratch.capacity(),
             0,
-            "бездействующий канал не имеет права держать пик"
+            "an idle channel has no right to hold a peak"
         );
 
-        // Канал остаётся рабочим: следующая запись переоткрывает буферы.
+        // The channel stays usable: the next record reopens the buffers.
         ch.builder
             .push(
                 Micros(10),
@@ -2411,7 +2481,8 @@ mod tests {
         assert_eq!(counters.snapshot().blocks_written, 2);
     }
 
-    /// Цикл с единственной бюджетной группой. `None` — бюджет «без предела».
+    /// A loop with a single budget group. `None` means a budget "without a
+    /// limit".
     fn empty_loop(group_budget: Option<u64>) -> WriterLoop {
         WriterLoop {
             namespaces: Vec::new(),
@@ -2442,8 +2513,9 @@ mod tests {
         boot: u32,
     ) -> NsId {
         let drops = Arc::new(DropCounters::new(channels.len()));
-        // Имена каталогов в тестах синтетические: writer безразличен к ним.
-        // Все каналы — в группе 0, без личных квот.
+        // The directory names in the tests are synthetic: the writer is
+        // indifferent to them. Every channel is in group 0, with no personal
+        // quotas.
         let channels = channels
             .into_iter()
             .enumerate()
@@ -2486,18 +2558,18 @@ mod tests {
 
     #[test]
     fn a_declared_memory_ceiling_takes_the_buffers_back() {
-        // Память на канал — активный буфер блока и его сериализованная копия.
-        // Пишущих в любой момент единицы, и обычно этого достаточно; там, где
-        // «единицы» перестают быть правдой, потолок отбирает буферы у самых
-        // крупных держателей. Отбирает именно буферы, а не записи: запись,
-        // отброшенная ради бухгалтерии по памяти, — потеря данных.
+        // The memory per channel is the active block buffer and its serialized
+        // copy. Only a handful of channels write at any moment, and usually
+        // that is enough; where "a handful" stops being true, the ceiling takes
+        // buffers from the largest holders. Buffers, not records: a record
+        // discarded for the sake of memory accounting is data loss.
         let dir = tempfile::tempdir().unwrap();
         let config = ChannelConfig {
             block_max_bytes: 4096,
             ..ChannelConfig::new(16 * 1024 * 1024)
         };
         let (mut w, ns) = loop_with_one_channel(dir.path(), config);
-        // Потолок ниже того, что раздует один крупный blob.
+        // A ceiling below what one large blob inflates things to.
         w.buffer_ceiling = Some(16 * 1024);
 
         let noise: Vec<u8> = (0..(1 << 20)).map(|i| (i * 2654435761u64) as u8).collect();
@@ -2513,26 +2585,31 @@ mod tests {
         w.apply_batch();
         assert!(
             held_bytes(&w) > 1 << 20,
-            "мегабайтный blob обязан раздуть буферы (иначе тест пуст): {}",
+            "a megabyte blob must inflate the buffers (or the test is empty): {}",
             held_bytes(&w)
         );
 
         w.tick();
         assert!(
             (held_bytes(&w) as u64) <= 16 * 1024,
-            "потолок обязан вернуть память: держится {} Б",
+            "the ceiling must give memory back: {} B held",
             held_bytes(&w)
         );
-        // Запись при этом дошла до носителя, а не была принесена в жертву.
-        assert_eq!(w.counters.snapshot().dropped, 0, "потолок не теряет записи");
+        // The record reached the medium rather than being sacrificed.
+        assert_eq!(
+            w.counters.snapshot().dropped,
+            0,
+            "the ceiling loses no records"
+        );
         assert!(w.counters.snapshot().blocks_written >= 1);
         assert_eq!(
             w.counters.snapshot().buffer_overruns,
             0,
-            "потолок выполнен — жаловаться не на что"
+            "the ceiling is met — there is nothing to complain about"
         );
 
-        // Канал остаётся рабочим: следующая запись выделит буферы заново.
+        // The channel stays usable: the next record allocates the buffers
+        // again.
         w.batch.push(Staged {
             ns,
             channel: ChannelIdx(0),
@@ -2543,15 +2620,18 @@ mod tests {
             },
         });
         w.apply_batch();
-        assert!(held_bytes(&w) > 0, "канал жив и пишет дальше");
+        assert!(
+            held_bytes(&w) > 0,
+            "the channel is alive and goes on writing"
+        );
     }
 
     #[test]
     fn an_unmeetable_memory_ceiling_is_counted_not_paid_for_with_records() {
-        // Одна запись бывает крупнее любого разумного потолка: буфер обязан
-        // вместить хотя бы её. Отбросить такую запись значило бы потерять
-        // данные там, где память всего лишь неудобна, поэтому невыполнимость
-        // объявляется счётчиком — как и невыполнимый бюджет носителя.
+        // One record can be larger than any reasonable ceiling: the buffer has
+        // to hold at least that one. Discarding such a record would mean losing
+        // data where memory is merely inconvenient, so unmeetability is
+        // announced by a counter — as an unmeetable medium budget is.
         let dir = tempfile::tempdir().unwrap();
         let config = ChannelConfig {
             block_max_bytes: 4096,
@@ -2560,8 +2640,9 @@ mod tests {
         let (mut w, ns) = loop_with_one_channel(dir.path(), config);
         w.buffer_ceiling = Some(16 * 1024);
 
-        // Блок открыт и заряжен записью, но сегмента нет: вытолкнуть его —
-        // значит потерять её. Потолок такой цены не платит.
+        // The block is open and loaded with a record, but there is no segment:
+        // flushing it means losing that record. The ceiling does not pay that
+        // price.
         let noise: Vec<u8> = (0..(1 << 20)).map(|i| (i * 2654435761u64) as u8).collect();
         w.batch.push(Staged {
             ns,
@@ -2592,22 +2673,26 @@ mod tests {
         w.tick();
         assert!(
             held_bytes(&w) > 1 << 20,
-            "заряженный накопитель без сегмента трогать нельзя"
+            "a loaded accumulator with no segment must not be touched"
         );
-        assert_eq!(w.counters.snapshot().dropped, 0, "ни одной записи в жертву");
+        assert_eq!(
+            w.counters.snapshot().dropped,
+            0,
+            "not one record sacrificed"
+        );
         assert!(
             w.counters.snapshot().buffer_overruns >= 1,
-            "невыполнимый потолок обязан быть назван"
+            "an unmeetable ceiling must be named"
         );
     }
 
     #[test]
     fn an_immediate_channel_keeps_its_buffers_between_batches() {
-        // Канал с немедленной долговечностью после КАЖДОЙ групповой фиксации
-        // оказывается «без дела»: блок вытолкнут, синхронизировать нечего.
-        // Возврат буферов на этом основании означал бы освобождение и
-        // повторное выделение буфера блока со scratch'ем на каждой аварийной
-        // записи — ровно на том пути, ради скорости которого канал и заведён.
+        // A channel with immediate durability turns out to be "idle" after
+        // EVERY group commit: the block is flushed and there is nothing to
+        // sync. Returning the buffers on those grounds would mean freeing and
+        // reallocating the block buffer and its scratch on every critical
+        // record — on exactly the path the channel exists to make fast.
         let dir = tempfile::tempdir().unwrap();
         let (mut w, ns) =
             loop_with_one_channel(dir.path(), ChannelConfig::critical(16 * 1024 * 1024));
@@ -2624,55 +2709,59 @@ mod tests {
         w.apply_batch();
 
         let held = held_bytes(&w);
-        assert!(held > 0, "буферы выделены под записанный блок");
-        assert_eq!(
-            w.counters.snapshot().syncs,
-            1,
-            "групповая фиксация состоялась"
-        );
+        assert!(held > 0, "the buffers were allocated for the block written");
+        assert_eq!(w.counters.snapshot().syncs, 1, "the group commit happened");
 
         w.tick();
         assert_eq!(
             held_bytes(&w),
             held,
-            "буферы обязаны пережить обслуженный батч"
+            "the buffers must survive a serviced batch"
         );
         assert_eq!(
             w.active.len(),
             1,
-            "канал остаётся под наблюдением — иначе некому будет отдать буферы"
+            "the channel stays watched — otherwise there is nobody to give the buffers back"
         );
 
-        // Но настоящее бездействие их всё-таки забирает: отматываем начало
-        // простоя за отведённую паузу.
+        // But genuine idleness does take them after all: wind the start of the
+        // idle spell back by the allotted pause.
         {
             let ch = &mut w.namespaces[0].as_mut().unwrap().channels[0];
             ch.idle_since = Instant::now().checked_sub(RELEASE_AFTER * 2);
-            assert!(ch.idle_since.is_some(), "часы монотонны и уже идут");
+            assert!(
+                ch.idle_since.is_some(),
+                "the clock is monotonic and already running"
+            );
         }
         w.tick();
-        assert_eq!(held_bytes(&w), 0, "простоявший канал возвращает память");
+        assert_eq!(
+            held_bytes(&w),
+            0,
+            "a channel that sat idle gives its memory back"
+        );
         assert!(
             channel_of(&w).segment.is_some(),
-            "но сегмент держит: он стоит на порядок дороже буферов и \
-             отдаётся отдельной, куда более длинной паузой"
+            "but it holds the segment: that costs an order of magnitude more than \
+             the buffers and is given up on a separate, far longer pause"
         );
         assert_eq!(
             w.active.len(),
             1,
-            "и остаётся под наблюдением — иначе отдавать сегмент станет некому"
+            "and stays watched — otherwise there will be nobody to give the segment up"
         );
     }
 
-    /// Сколько дескрипторов процесса указывают внутрь каталога.
+    /// How many of the process's descriptors point inside a directory.
     ///
-    /// Главное следствие открытого сегмента — занятый дескриптор, и заявленный
-    /// масштаб упирается в их число задолго до всего остального; увидеть это
-    /// можно только через procfs. Считаются именно свои: тесты идут потоками
-    /// одного процесса, и общий счёт дескрипторов гулял бы от соседей.
+    /// The main consequence of an open segment is a descriptor held, and the
+    /// scale claimed runs into their number long before anything else; the only
+    /// way to see that is through procfs. Ours specifically are counted: the
+    /// tests run as threads of one process, and a global descriptor count would
+    /// drift with the neighbours.
     fn open_fds_under(dir: &Path) -> usize {
         std::fs::read_dir("/proc/self/fd")
-            .expect("procfs смонтирована")
+            .expect("procfs is mounted")
             .filter_map(|e| e.ok())
             .filter_map(|e| std::fs::read_link(e.path()).ok())
             .filter(|target| target.starts_with(dir))
@@ -2685,18 +2774,19 @@ mod tests {
 
     #[test]
     fn a_channel_that_went_quiet_hands_back_its_segment() {
-        // Открытый сегмент стоит дескриптора и числится в бюджете ЦЕЛИКОМ:
-        // файл преаллоцирован на полный размер, а записанного в нём может быть
-        // сто байт. При заявленных десятках тысяч каналов молчащие держали бы
-        // десятки тысяч дескрипторов и сотни гигабайт зарезервированного места
-        // — притом что пишущих в любой момент единицы. Простояв отведённое,
-        // канал обязан отдать и файл, и дескриптор.
+        // An open segment costs a descriptor and is counted in the budget
+        // together with the unwritten tail of its reserve window, while what is
+        // written in it may be a hundred bytes. With the tens of thousands of
+        // channels claimed, quiet ones would hold tens of thousands of
+        // descriptors — while only a handful write at any moment. Having sat
+        // out its allotted time, a channel has to give up both the file and the
+        // descriptor.
         let dir = tempfile::tempdir().unwrap();
         let (mut w, ns) = loop_with_one_channel(dir.path(), ChannelConfig::new(16 * 1024 * 1024));
         assert_eq!(
             open_fds_under(dir.path()),
             0,
-            "до первой записи канал не держит ничего"
+            "before the first record a channel holds nothing"
         );
 
         let record = |at: u64| Staged {
@@ -2714,83 +2804,94 @@ mod tests {
         let path = channel_of(&w)
             .segment
             .as_ref()
-            .expect("запись открыла сегмент")
+            .expect("the write opened a segment")
             .path()
             .to_owned();
         let full = std::fs::metadata(&path).unwrap().len();
         assert_eq!(
             full,
             64 << 10,
-            "резерв взят окном в один блок, а не на весь сегмент"
+            "the reserve was taken as a one-block window, not as the whole segment"
         );
         assert!(
             full < channel_of(&w).config.segment_bytes,
-            "иначе тест пуст: окно совпало с пределом роста"
+            "otherwise the test is empty: the window equals the growth limit"
         );
         assert_eq!(
             open_fds_under(dir.path()),
             1,
-            "иначе тесту нечего возвращать: дескриптор не занят"
+            "otherwise the test has nothing to give back: no descriptor is held"
         );
 
-        // Дедлайны позади — блок вытолкнут, синхронизация выполнена, каналу
-        // больше нечего обслуживать: с этого момента идёт отсчёт бездействия.
+        // The deadlines are behind: the block is flushed, the sync is done and
+        // the channel has nothing left to service — the idleness count starts
+        // here.
         {
             let ch = &mut w.namespaces[0].as_mut().unwrap().channels[0];
             ch.block_opened = Instant::now().checked_sub(Duration::from_secs(60));
             ch.last_sync = Instant::now()
                 .checked_sub(Duration::from_secs(60))
-                .expect("часы монотонны и уже идут");
+                .expect("the clock is monotonic and already running");
         }
         w.tick();
         assert!(
             channel_of(&w).segment.is_some(),
-            "короткая пауза сегмент не забирает: запечатывание стоит footer'а, \
-             fdatasync, ftruncate и fsync каталога — и столько же при открытии"
+            "a short pause does not take the segment: sealing costs a footer, an \
+             fdatasync, an ftruncate and a directory fsync — and as much again on opening"
         );
 
-        // А настоящее бездействие — забирает.
+        // And genuine idleness does take them.
         {
             let ch = &mut w.namespaces[0].as_mut().unwrap().channels[0];
             ch.idle_since = Instant::now().checked_sub(PARK_AFTER * 2);
         }
         w.tick();
 
-        assert!(channel_of(&w).segment.is_none(), "сегмент отдан");
-        assert!(w.active.is_empty(), "и канал ушёл из списка обслуживаемых");
-        assert_eq!(open_fds_under(dir.path()), 0, "дескриптор вернулся системе");
+        assert!(channel_of(&w).segment.is_none(), "the segment was given up");
+        assert!(
+            w.active.is_empty(),
+            "and the channel left the serviced list"
+        );
+        assert_eq!(
+            open_fds_under(dir.path()),
+            0,
+            "the descriptor went back to the system"
+        );
         let sealed = std::fs::metadata(&path).unwrap().len();
         assert!(
             sealed < full / 100,
-            "файл обрезан до фактических данных: {sealed} против {full}"
+            "the file is truncated to its actual data: {sealed} against {full}"
         );
 
-        // Но НЕ запечатан. Запечатать значило бы, что следующая запись
-        // заведёт новый файл: канал, пишущий раз в час, оставлял бы восемь
-        // тысяч крохотных сегментов в год, и байтовая ротация не убрала бы
-        // ни одного — байт в них почти нет. Файлы кончились бы раньше места.
+        // But NOT sealed. Sealing would mean the next record starts a new file:
+        // a channel writing once an hour would leave eight thousand tiny
+        // segments a year, and byte-based rotation would remove none of them —
+        // there are hardly any bytes in them. The files would run out before
+        // the space did.
         let reader = crate::segment::SegmentReader::open(&path).unwrap();
         assert!(
             !reader.is_sealed(),
-            "отпущенный сегмент обязан остаться продолжаемым"
+            "a released segment must stay continuable"
         );
 
-        // И канал продолжает ТОТ ЖЕ сегмент, а не заводит новый.
+        // And the channel continues THAT SAME segment rather than starting a
+        // new one.
         w.batch.push(record(2));
         w.apply_batch();
         assert_eq!(
             open_segment_path(&w, ns),
             path,
-            "пробуждение обязано продолжить прежний сегмент"
+            "waking must continue the earlier segment"
         );
         assert_eq!(
             std::fs::read_dir(&channel_of(&w).dir).unwrap().count(),
             1,
-            "молчание не имеет права плодить файлы"
+            "silence has no right to breed files"
         );
         assert_eq!(w.counters.snapshot().dropped, 0);
 
-        // Записи по обе стороны молчания на месте и читаются как один сегмент.
+        // The records on both sides of the silence are there and read as one
+        // segment.
         WriterLoop::flush_block(
             &mut w.namespaces[0].as_mut().unwrap().channels[0],
             &Arc::clone(&w.counters),
@@ -2803,12 +2904,19 @@ mod tests {
             let mut footer = dduroc_format::FooterBuilder::new();
             crate::segment::Scan::run_collecting(&file, len, &path, &mut footer).unwrap()
         };
-        assert_eq!(scan.block_count, 2, "два блока: до молчания и после");
-        assert_eq!(reader.header().base, Micros(1), "и это один и тот же файл");
+        assert_eq!(
+            scan.block_count, 2,
+            "two blocks: before the silence and after"
+        );
+        assert_eq!(
+            reader.header().base,
+            Micros(1),
+            "and it is one and the same file"
+        );
     }
 
-    /// Канал с мелкими сегментами и без сжатия: тесту нужно, чтобы сегменты
-    /// действительно кончались, а не сжимались до нуля.
+    /// A channel with small segments and no compression: the test needs the
+    /// segments really to run out rather than compress to nothing.
     fn dense_channel(channel_budget: u64) -> ChannelConfig {
         ChannelConfig {
             segment_bytes: 1 << 20,
@@ -2834,25 +2942,25 @@ mod tests {
         w.namespaces[ns.0 as usize].as_ref().unwrap().channels[0]
             .segment
             .as_ref()
-            .expect("сегмент открыт")
+            .expect("the segment is open")
             .path()
             .to_owned()
     }
 
     #[test]
     fn the_store_ceiling_reaches_across_namespaces() {
-        // Поканальный бюджет отвечает на вопрос «сколько истории хранить у
-        // этого класса», а не «сколько занять на носителе»: каналов на приборе
-        // тысячи, и сумма их бюджетов кратно больше любого носителя. Потолок
-        // хранилища обязан вытеснять самое старое ГДЕ УГОДНО — иначе молчащий
-        // канал держит место, которого не хватает шумному, а собственный его
-        // бюджет при этом не превышен и ротация в нём не срабатывает никогда.
+        // A per-channel budget answers "how much history to keep for this
+        // class", not "how much to take on the medium": a device has thousands
+        // of channels, and the sum of their budgets is many times any medium.
+        // The store ceiling has to evict the oldest ANYWHERE — otherwise a
+        // quiet channel holds space a noisy one lacks, while its own budget is
+        // not exceeded and its rotation never fires at all.
         const CAP: u64 = 3 << 20;
         let quiet_dir = tempfile::tempdir().unwrap();
         let noisy_dir = tempfile::tempdir().unwrap();
 
-        // Бюджет каждого канала заведомо больше потолка всего хранилища:
-        // поканальная ротация в этом тесте не срабатывает ни разу.
+        // Every channel's budget is knowably larger than the whole store
+        // ceiling: per-channel rotation never fires once in this test.
         let mut w = empty_loop(Some(CAP));
         let quiet = add_namespace(
             &mut w,
@@ -2867,8 +2975,8 @@ mod tests {
             vec![dense_channel(64 << 20)],
         );
 
-        // Молчащий пишет первым и замолкает: его сегмент — самый старый в
-        // хранилище, и запечатанный, то есть вытеснить его можно.
+        // The quiet one writes first and falls silent: its segment is the
+        // oldest in the store and sealed, that is, it can be evicted.
         w.batch.push(blob(quiet, 1, 8));
         w.apply_batch();
         let quiet_path = open_segment_path(&w, quiet);
@@ -2878,19 +2986,19 @@ mod tests {
             WriterLoop::seal_segment(ch, &counters).unwrap();
             assert!(
                 ch.inventory.total_bytes() < ch.config.budget_bytes / 1000,
-                "молчащий канал и близко не подходит к своему бюджету"
+                "the quiet channel comes nowhere near its own budget"
             );
         }
         assert!(quiet_path.exists());
 
-        // Шумный набивает несколько сегментов подряд.
+        // The noisy one fills several segments in a row.
         for i in 0..80 {
             w.batch.push(blob(noisy, 1_000 + i, 64 << 10));
         }
         w.apply_batch();
         assert!(
             w.group_totals().iter().sum::<u64>() > CAP,
-            "иначе вытеснять нечего и тест пуст: {}",
+            "otherwise there is nothing to evict and the test is empty: {}",
             w.group_totals().iter().sum::<u64>()
         );
 
@@ -2898,32 +3006,32 @@ mod tests {
 
         assert!(
             !quiet_path.exists(),
-            "вытесняется самое старое по ХРАНИЛИЩУ, а не по каналу: место \
-             понадобилось соседу"
+            "the oldest across the STORE is evicted, not across the channel: a \
+             neighbour needed the space"
         );
         assert!(
             w.group_totals().iter().sum::<u64>() <= CAP,
-            "хранилище обязано влезть в объявленный потолок: {} против {CAP}",
+            "the store must fit the declared ceiling: {} against {CAP}",
             w.group_totals().iter().sum::<u64>()
         );
         assert!(
             open_segment_path(&w, noisy).exists(),
-            "активный сегмент неприкосновенен: в него пишут"
+            "the active segment is untouchable: it is being written to"
         );
         assert_eq!(
             w.counters.snapshot().budget_overruns,
             0,
-            "потолок выдержан — жаловаться не на что"
+            "the ceiling is met — there is nothing to complain about"
         );
     }
 
     #[test]
     fn a_segment_left_parked_is_sealed_by_the_next_run() {
-        // Отпущенный сегмент остаётся незапечатанным, и при остановке процесса
-        // так и остаётся. Открывать его ради footer'а на остановке нельзя —
-        // это открытие и обход каждого молчащего канала, десятков тысяч при
-        // заявленном масштабе. Обещание в том, что footer допишет следующий
-        // запуск: восстановление и так обходит файл, чтобы найти конец данных.
+        // A released segment stays unsealed, and so it remains when the process
+        // stops. Opening it for a footer at the stop is not an option — that is
+        // an open and a walk for every quiet channel, tens of thousands at the
+        // scale claimed. The promise is that the next start appends the footer:
+        // recovery walks the file anyway to find the end of the data.
         let dir = tempfile::tempdir().unwrap();
         let mut w = empty_loop(None);
         let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
@@ -2931,13 +3039,13 @@ mod tests {
         w.apply_batch();
         let path = open_segment_path(&w, ns);
 
-        // Дедлайны позади: блок вытолкнут, синхронизация выполнена.
+        // The deadlines are behind: the block is flushed and the sync is done.
         {
             let ch = &mut w.namespaces[0].as_mut().unwrap().channels[0];
             ch.block_opened = Instant::now().checked_sub(Duration::from_secs(60));
             ch.last_sync = Instant::now()
                 .checked_sub(Duration::from_secs(60))
-                .expect("часы монотонны и уже идут");
+                .expect("the clock is monotonic and already running");
         }
         w.tick();
         {
@@ -2945,16 +3053,19 @@ mod tests {
             ch.idle_since = Instant::now().checked_sub(PARK_AFTER * 2);
         }
         w.tick();
-        assert!(channel_of(&w).parked_segment.is_some(), "сегмент отпущен");
+        assert!(
+            channel_of(&w).parked_segment.is_some(),
+            "the segment was released"
+        );
         assert!(
             !crate::segment::SegmentReader::open(&path)
                 .unwrap()
                 .is_sealed(),
-            "и не запечатан"
+            "and not sealed"
         );
-        drop(w); // процесс кончился, ничего больше не дописав
+        drop(w); // the process ended without writing anything more
 
-        // Следующий запуск: тот же каталог, новый номер запуска.
+        // The next start: the same directory, a new run number.
         let mut next = empty_loop(None);
         add_namespace_at(
             &mut next,
@@ -2965,28 +3076,30 @@ mod tests {
         );
 
         let reader = crate::segment::SegmentReader::open(&path).unwrap();
-        assert!(reader.is_sealed(), "следующий запуск обязан его запечатать");
-        let footer = reader.footer().expect("footer читается");
+        assert!(reader.is_sealed(), "the next start must seal it");
+        let footer = reader.footer().expect("the footer reads");
         assert_eq!(
             footer.metrics,
             vec![MetricId(1)],
-            "и назвать типы: по ним миграция решает, затронут ли сегмент"
+            "and name the types: a migration decides from them whether the segment is affected"
         );
-        assert_eq!(footer.blocks.len(), 1, "индекс блоков на месте");
+        assert_eq!(footer.blocks.len(), 1, "the block index is there");
     }
 
     #[test]
     fn no_space_is_freed_where_it_is_taken_not_where_it_is_needed() {
-        // Преаллокация делается ради одного: чтобы ENOSPC пришёл при создании
-        // сегмента, а не посреди записи аварийного события. Сам этот путь до
-        // сих пор не исполнялся ни одним тестом — воспроизвести отказ по месту
-        // на настоящей ФС без прав root нельзя, — поэтому отказ подставляется
-        // ровно там, где он приходит на самом деле.
+        // Space is reserved for one thing: so that ENOSPC arrives when a
+        // segment is created rather than in the middle of writing a critical
+        // event. That path itself was until now exercised by no test — a
+        // refusal for want of space cannot be reproduced on a real filesystem
+        // without root — so the refusal is injected exactly where it really
+        // arrives.
         //
-        // Проверяется то, чего прежний движок не делал: канал, упёршийся в
-        // ENOSPC, ротирует ТОЛЬКО СЕБЯ. Своей истории у новичка нет, всё место
-        // держит сосед — и без взгляда на хранилище целиком канал замирал бы
-        // навсегда, хотя освободить место есть где.
+        // What is checked is what the former engine did not do: a channel that
+        // hit ENOSPC rotates ONLY ITSELF. A newcomer has no history of its own,
+        // all the space is held by a neighbour — and without a view of the
+        // whole store the channel would freeze forever although there is
+        // somewhere to free space.
         let hoard_dir = tempfile::tempdir().unwrap();
         let new_dir = tempfile::tempdir().unwrap();
         let mut w = empty_loop(None);
@@ -3003,8 +3116,8 @@ mod tests {
             vec![dense_channel(64 << 20)],
         );
 
-        // Сосед набил несколько сегментов и в свой бюджет прекрасно влезает:
-        // его собственная ротация не сработает никогда.
+        // The neighbour has filled several segments and fits its own budget
+        // perfectly well: its own rotation will never fire.
         for i in 0..64 {
             w.batch.push(blob(hoarder, 1_000 + i, 64 << 10));
         }
@@ -3013,10 +3126,13 @@ mod tests {
             let ch = &w.namespaces[hoarder.0 as usize].as_ref().unwrap().channels[0];
             ch.inventory.iter().map(|e| e.path(&ch.dir)).collect()
         };
-        assert!(hoarded.len() >= 2, "иначе вытеснять нечего: {hoarded:?}");
+        assert!(
+            hoarded.len() >= 2,
+            "otherwise there is nothing to evict: {hoarded:?}"
+        );
         let oldest = hoarded[0].clone();
 
-        // Носитель отказывает новичку в его первом же сегменте.
+        // The medium refuses the newcomer its very first segment.
         crate::segment::fault::no_space_for(1);
         w.batch.push(blob(newcomer, 9_000, 8));
         w.apply_batch();
@@ -3025,42 +3141,47 @@ mod tests {
             w.namespaces[newcomer.0 as usize].as_ref().unwrap().channels[0]
                 .segment
                 .is_none(),
-            "сегмент не создался — место кончилось"
+            "the segment was not created — the space ran out"
         );
-        assert_eq!(w.counters.snapshot().dropped, 1, "запись потеряна и учтена");
-        assert!(oldest.exists(), "пока никто ничего не освобождал");
+        assert_eq!(
+            w.counters.snapshot().dropped,
+            1,
+            "the record was lost and accounted for"
+        );
+        assert!(oldest.exists(), "nobody has freed anything yet");
 
         w.tick();
 
         assert!(
             !oldest.exists(),
-            "место освобождается ТАМ, ГДЕ ОНО ЗАНЯТО: у соседа, а не у того, \
-             кто в него упёрся"
+            "space is freed WHERE IT IS TAKEN: at the neighbour, not at the one \
+             that ran into it"
         );
 
-        // И запись продолжается: канал не заклинило.
+        // And writing goes on: the channel is not jammed.
         w.batch.push(blob(newcomer, 9_001, 8));
         w.apply_batch();
         assert!(
             w.namespaces[newcomer.0 as usize].as_ref().unwrap().channels[0]
                 .segment
                 .is_some(),
-            "после освобождения места запись обязана пойти"
+            "once space is freed the write must go through"
         );
-        assert_eq!(w.counters.snapshot().dropped, 1, "второй потери не было");
+        assert_eq!(w.counters.snapshot().dropped, 1, "there was no second loss");
     }
 
     #[test]
     fn the_budget_counts_what_a_segment_occupies_not_what_it_may_grow_into() {
-        // Живой сегмент числится в бюджете класса своим окном резерва, а не
-        // пределом роста. Разница — не бухгалтерская: числить предел значит
-        // объявить занятыми мегабайты, которых на носителе нет, и вытеснять
-        // за них чужую историю. На флоте это упирает практический предел
-        // одновременно пишущих каналов в `budget_bytes / segment_bytes` —
-        // тридцать два канала на бюджет в четверть гигабайта.
+        // A live segment is counted in the class budget as its reserve window,
+        // not as its growth limit. The difference is not bookkeeping: counting
+        // the limit means declaring megabytes occupied that are not on the
+        // medium, and evicting someone else's history for them. Across a fleet
+        // that pegs the practical number of channels writing at once to
+        // `budget_bytes / segment_bytes` — thirty-two channels on a
+        // quarter-gigabyte budget.
         let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
-        // Бюджет с запасом покрывает четыре окна и вчетверо меньше того, что
-        // заняли бы четыре предела роста.
+        // The budget covers four windows with room to spare and is a quarter of
+        // what four growth limits would take.
         let budget = 4 * ChannelConfig::new(0).segment_bytes / 2;
         let mut w = empty_loop(Some(budget));
         let counters = Arc::clone(&w.counters);
@@ -3083,11 +3204,11 @@ mod tests {
         let occupied = w.group_totals().iter().sum::<u64>();
         assert!(
             occupied < budget,
-            "четыре канала заняли {occupied} при бюджете {budget}"
+            "four channels took {occupied} on a budget of {budget}"
         );
         assert!(
             4 * ChannelConfig::new(0).segment_bytes > budget,
-            "иначе тест пуст: пределы роста и так влезли бы в бюджет"
+            "otherwise the test is empty: the growth limits would have fitted the budget anyway"
         );
 
         let paths: Vec<_> = (0..4).map(|i| open_segment_path(&w, NsId(i))).collect();
@@ -3095,31 +3216,32 @@ mod tests {
         assert_eq!(
             w.counters.snapshot().budget_overruns,
             0,
-            "бюджет выдержан: занято {occupied} из {budget}"
+            "the budget is met: {occupied} of {budget} taken"
         );
         assert_eq!(
             w.counters.snapshot().segments_rotated,
             0,
-            "вытеснять нечего"
+            "there is nothing to evict"
         );
         for path in &paths {
-            assert!(path.exists(), "живой сегмент не тронут: {path:?}");
+            assert!(path.exists(), "the live segment is untouched: {path:?}");
         }
     }
 
     #[test]
     fn a_window_that_cannot_grow_costs_the_oldest_segment_not_the_block() {
-        // Резерв берётся окном, поэтому ENOSPC приходит и посреди сегмента —
-        // на расширении окна, а не только при создании файла. Это новый род
-        // отказа, и отвечать на него надо тем же, чем на отказ при создании:
-        // канал сперва отдаёт СВОЁ старейшее и пробует ещё раз. Иначе
-        // мгновенная нехватка места стоила бы целого блока записей при живой,
-        // никому не нужной истории рядом.
+        // Space is reserved as a window, so ENOSPC arrives in the middle of a
+        // segment too — when the window is extended, not only when the file is
+        // created. That is a new kind of refusal, and it has to be answered the
+        // same way as a refusal at creation: the channel gives up ITS OWN
+        // oldest first and tries again. Otherwise a momentary shortage would
+        // cost a whole block of records while live history nobody needs sat
+        // right beside it.
         let dir = tempfile::tempdir().unwrap();
         let mut w = empty_loop(Some(u64::MAX));
         let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
 
-        // Несколько сегментов истории — есть чем расплатиться.
+        // Several segments of history — there is something to pay with.
         for i in 0..48 {
             w.batch.push(blob(ns, 1_000 + i, 64 << 10));
         }
@@ -3128,14 +3250,18 @@ mod tests {
             let ch = &w.namespaces[ns.0 as usize].as_ref().unwrap().channels[0];
             ch.inventory.iter().map(|e| e.path(&ch.dir)).collect()
         };
-        assert!(history.len() >= 2, "иначе платить нечем: {history:?}");
+        assert!(
+            history.len() >= 2,
+            "otherwise there is nothing to pay with: {history:?}"
+        );
         let before = w.counters.snapshot();
 
-        // Носитель отказывает ровно один раз — на ближайшем расширении окна.
-        // Три блока: окно растёт не под каждый (шаг — восьмая доля предела),
-        // но за три раза расширение случается наверняка, а до конца сегмента
-        // их ещё больше десятка — значит отказ придётся именно на рост окна,
-        // и это доказывает неизменившийся счётчик созданий.
+        // The medium refuses exactly once — at the next extension of the
+        // window. Three blocks: the window does not grow for every one (the
+        // step is an eighth of the limit), but over three an extension is
+        // certain, while more than a dozen remain before the end of the segment
+        // — so the refusal falls on the window's growth, and the unchanged
+        // creation counter proves it.
         crate::segment::fault::no_space_for(1);
         for i in 0..3 {
             w.batch.push(blob(ns, 9_000 + i, 64 << 10));
@@ -3146,27 +3272,29 @@ mod tests {
         let after = w.counters.snapshot();
         assert_eq!(
             after.segments_created, before.segments_created,
-            "отказ пришёлся на рост окна, а не на создание сегмента"
+            "the refusal fell on the window growing, not on a segment being created"
         );
-        assert_eq!(after.dropped, before.dropped, "блок не потерян");
+        assert_eq!(after.dropped, before.dropped, "the block is not lost");
         assert!(
             after.segments_rotated > before.segments_rotated,
-            "старейшее обязано быть отдано: {before:?} → {after:?}"
+            "the oldest must be given up: {before:?} → {after:?}"
         );
-        assert!(!history[0].exists(), "отдано именно старейшее");
+        assert!(!history[0].exists(), "it is the oldest that was given up");
     }
 
     #[test]
     fn a_window_that_cannot_grow_with_nothing_to_give_counts_the_loss() {
-        // Тот же отказ, но отдать нечего: единственный сегмент — тот, в
-        // который пишут. Тогда блок теряется, и это обязано быть видно и в
-        // общем счётчике, и поканально — иначе дыра в потоке осталась бы
-        // необъявленной, а хранилище отчиталось бы о благополучии.
+        // The same refusal, but with nothing to give up: the only segment is
+        // the one being written to. Then the block is lost, and that has to be
+        // visible both in the total counter and per channel — otherwise the
+        // hole in the stream would stay unannounced while the store reported
+        // all was well.
         let dir = tempfile::tempdir().unwrap();
         let mut w = empty_loop(Some(u64::MAX));
         let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
 
-        // Один блок помещается в первое окно — сегмент заводится без роста.
+        // One block fits the first window — the segment is created without
+        // growing.
         w.batch.push(blob(ns, 1, 8));
         w.apply_batch();
         let path = open_segment_path(&w, ns);
@@ -3182,10 +3310,10 @@ mod tests {
                 .inventory
                 .len(),
             1,
-            "иначе тест не про «отдать нечего»"
+            "otherwise the test is not about having nothing to give up"
         );
 
-        // Дальше носитель не даёт ни байта.
+        // From here on the medium gives not a byte.
         crate::segment::fault::free_space(0);
         w.batch.push(blob(ns, 9_000, 64 << 10));
         w.apply_batch();
@@ -3194,26 +3322,29 @@ mod tests {
         let after = w.counters.snapshot();
         assert!(
             after.dropped > before.dropped,
-            "потеря обязана быть сосчитана: {before:?} → {after:?}"
+            "the loss must be counted: {before:?} → {after:?}"
         );
         assert!(
             after.io_errors > before.io_errors,
-            "и отказ носителя — тоже"
+            "and so must the medium's refusal"
         );
-        assert!(path.exists(), "сегмент, в который писали, цел");
-        assert_ne!(w.pressured_roots, 0, "носитель отмечен как переполненный");
+        assert!(
+            path.exists(),
+            "the segment that was being written to is intact"
+        );
+        assert_ne!(w.pressured_roots, 0, "the medium is marked as full");
     }
 
     #[test]
     fn writing_after_a_park_counts_against_the_ceiling_again() {
-        // Проснувшийся канал занимает место не пробуждением, а записью: файл
-        // остаётся обрезанным, пока в него не лёг блок, и вот тогда окно
-        // резерва раздвигается заново.
+        // A channel that wakes takes space not by waking but by writing: the
+        // file stays truncated until a block lands in it, and only then is the
+        // reserve window extended again.
         //
-        // Сторож пересчёта бюджета считает именно «занятость выросла», а не
-        // «создан файл»: со счётом созданий этот рост прошёл бы мимо, и
-        // хранилище сидело бы над потолком до чьей-нибудь следующей ротации —
-        // то есть неопределённо долго.
+        // The budget-recount watchdog counts "occupancy grew" rather than "a
+        // file was created": counting creations would let this growth slip
+        // past, and the store would sit over its ceiling until somebody's next
+        // rotation — that is, indefinitely.
         let quiet_dir = tempfile::tempdir().unwrap();
         let noisy_dir = tempfile::tempdir().unwrap();
         let mut w = empty_loop(Some(u64::MAX));
@@ -3236,41 +3367,42 @@ mod tests {
         }
         w.apply_batch();
 
-        // Тихий канал отпускает сегмент: файл сжимается до сотни байт.
+        // The quiet channel gives up its segment: the file shrinks to a hundred
+        // bytes.
         {
             let ch = &mut w.namespaces[quiet.0 as usize].as_mut().unwrap().channels[0];
             ch.block_opened = None;
             ch.idle_since = Instant::now().checked_sub(RELEASE_AFTER * 2);
         }
-        assert_eq!(w.park_idle(RELEASE_AFTER), 1, "сегмент отпущен");
+        assert_eq!(w.park_idle(RELEASE_AFTER), 1, "the segment was released");
 
-        // Потолок — ровно по текущей занятости.
+        // The ceiling set to exactly the current occupancy.
         let cap = w.group_totals().iter().sum::<u64>();
         w.groups[0].budget_bytes = cap;
         w.tick();
         assert_eq!(
             w.group_totals().iter().sum::<u64>(),
             cap,
-            "пока всё на своих местах"
+            "so far everything is where it was"
         );
 
-        // Тихий просыпается. Само пробуждение места не просит — файл как был
-        // обрезан, так и остался.
+        // The quiet one wakes. Waking itself asks for no space — the file is
+        // truncated as it was and stays that way.
         w.batch.push(blob(quiet, 2, 8));
         w.apply_batch();
         assert!(
             w.namespaces[quiet.0 as usize].as_ref().unwrap().channels[0]
                 .segment
                 .is_some(),
-            "сегмент вернулся в работу"
+            "the segment came back into work"
         );
         assert_eq!(
             w.group_totals().iter().sum::<u64>(),
             cap,
-            "пробуждение без записи места не занимает"
+            "waking without writing takes no space"
         );
 
-        // А вот лёгший блок раздвигает окно — и потолок пробит.
+        // But a block landing extends the window — and the ceiling is broken.
         {
             let ch = &mut w.namespaces[quiet.0 as usize].as_mut().unwrap().channels[0];
             ch.block_opened = Instant::now().checked_sub(Duration::from_secs(60));
@@ -3283,26 +3415,27 @@ mod tests {
         .unwrap();
         assert!(
             w.group_totals().iter().sum::<u64>() > cap,
-            "иначе тест пуст: запись обязана занять место"
+            "otherwise the test is empty: the write must take space"
         );
 
         w.tick();
         assert!(
             w.group_totals().iter().sum::<u64>() <= cap,
-            "потолок обязан быть восстановлен: {} против {cap}",
+            "the ceiling must be restored: {} against {cap}",
             w.group_totals().iter().sum::<u64>()
         );
     }
 
     #[test]
     fn an_unreachable_ceiling_is_reported_rather_than_pretended() {
-        // Вытеснить можно только запечатанный сегмент: в активный пишут.
-        // Потолок ниже того, что занял один активный сегмент, невыполним по
-        // построению, и единственный честный исход — сказать об этом, а не
-        // удалить файл из-под записи и не сделать вид, что всё в порядке.
+        // Only a sealed segment can be evicted: the active one is being written
+        // to. A ceiling below what one active segment has taken is unmeetable
+        // by construction, and the only honest outcome is to say so rather than
+        // delete a file out from under a write and pretend all is well.
         let dir = tempfile::tempdir().unwrap();
-        // Потолок ниже одного окна резерва: канал занял 64 КиБ первым же
-        // блоком, и отдать их можно только вместе с сегментом, в который пишут.
+        // A ceiling below one reserve window: the channel took 64 KiB with its
+        // very first block, and they can only be given up along with the
+        // segment being written to.
         let mut w = empty_loop(Some(8 << 10));
         let ns = add_namespace(&mut w, "ns", dir.path(), vec![dense_channel(64 << 20)]);
 
@@ -3312,30 +3445,34 @@ mod tests {
 
         w.tick();
 
-        assert!(path.exists(), "сегмент, в который пишут, не удаляют");
+        assert!(path.exists(), "a segment being written to is not deleted");
         assert_eq!(
             w.counters.snapshot().budget_overruns,
             1,
-            "невыполнимый потолок обязан быть виден снаружи"
+            "an unmeetable ceiling must be visible from outside"
         );
-        assert_eq!(w.counters.snapshot().dropped, 0, "и это не потеря записей");
+        assert_eq!(
+            w.counters.snapshot().dropped,
+            0,
+            "and this is not a loss of records"
+        );
     }
 
     #[test]
     fn sync_never_throws_away_what_it_could_not_keep_up_with() {
-        // Вычерпывание очереди ограничено числом проходов: иначе `sync` не
-        // вернулся бы, пока пишущие потоки не замолчат. Но остаток при этом
-        // НЕ выбрасывается — писать его по-прежнему есть кому, обычным ходом
-        // цикла. Отбросить принятое ради операции, которая от этого ничего не
-        // выигрывает, значит уничтожить данные, на которые `log()` ответил
-        // `Ok`. Отбрасывает только `shutdown`, и только потому, что после
-        // него записывать некому.
+        // Draining the queue is bounded by a number of passes: otherwise `sync`
+        // would not return until the writing threads fell silent. But the
+        // remainder is NOT thrown away — there is still someone to write it, in
+        // the ordinary course of the loop. Discarding what was accepted for the
+        // sake of an operation that gains nothing by it means destroying data
+        // `log()` answered `Ok` to. Only `shutdown` discards, and only because
+        // after it there is nobody to write.
         let dir = tempfile::tempdir().unwrap();
         let (mut w, ns) = loop_with_one_channel(dir.path(), ChannelConfig::new(16 * 1024 * 1024));
 
-        // Один проход забирает не больше DRAIN_LIMIT записей, поэтому очередь
-        // на одну запись длиннее заведомо не разбирается за отведённый
-        // единственный проход — без всякой зависимости от планировщика.
+        // One pass takes no more than DRAIN_LIMIT records, so a queue one
+        // record longer is knowably not drained in the single allotted pass —
+        // with no dependence on the scheduler at all.
         let n = DRAIN_LIMIT + 1;
         let (tx, rx) = crossbeam_channel::bounded::<Staged>(n);
         let (_ctx, crx) = crossbeam_channel::bounded::<Staged>(1);
@@ -3353,44 +3490,49 @@ mod tests {
         }
 
         let drained = w.drain_pending_rounds(&rx, &crx, Leftovers::Keep, 1);
-        assert!(!drained, "проход отведён один, записей больше");
-        assert_eq!(rx.len(), 1, "остаток остался в очереди, а не выброшен");
+        assert!(!drained, "one pass is allotted and there are more records");
+        assert_eq!(
+            rx.len(),
+            1,
+            "the remainder stayed in the queue rather than being thrown away"
+        );
         assert_eq!(
             w.counters.snapshot().dropped,
             0,
-            "ничего не потеряно: писать остаток по-прежнему есть кому"
+            "nothing is lost: there is still someone to write the remainder"
         );
         assert_eq!(
             w.counters.snapshot().records_written,
             DRAIN_LIMIT as u64,
-            "забранное записано"
+            "what was taken is written"
         );
 
-        // Для остановки — наоборот: писать остаток будет некому, поэтому он
-        // отбрасывается, но не молча, а с учётом потери. Проходов снова
-        // ровно один, чтобы отказ вычерпывания был настоящим, а не следствием
-        // нулевого числа попыток.
+        // For the stop it is the other way round: there will be nobody to write
+        // the remainder, so it is discarded — but not silently: the loss is
+        // accounted for. Again exactly one pass, so that the drain's failure is
+        // real rather than a consequence of zero attempts.
         for _ in 0..DRAIN_LIMIT {
             tx.send(item.clone()).unwrap();
         }
         let before = w.counters.snapshot().dropped;
         let drained = w.drain_pending_rounds(&rx, &crx, Leftovers::Discard, 1);
-        assert!(!drained, "проход отведён один, записей больше");
-        assert_eq!(rx.len(), 0, "очередь опустошена");
+        assert!(!drained, "one pass is allotted and there are more records");
+        assert_eq!(rx.len(), 0, "the queue is emptied");
         assert_eq!(
             w.counters.snapshot().dropped - before,
             1,
-            "отброшенная запись обязана быть учтена"
+            "a discarded record must be accounted for"
         );
     }
 
     #[test]
     fn a_stopping_store_refuses_instead_of_swallowing() {
-        // Между вычерпыванием очереди в `shutdown` и выходом потока очередь
-        // остаётся живой. Без признака остановки `try_send` отвечал бы `Ok`
-        // записям, которые тут же гибнут в деструкторе канала: ни счётчика,
-        // ни отметки, ни ответа вызывающему — то есть ровно та неотличимая от
-        // тишины дыра, против которой заведён весь учёт потерь.
+        // Between draining the queue in `shutdown` and the thread exiting, the
+        // queue stays alive. Without a sign of the stop, `try_send` would
+        // answer `Ok` to records that die at once in the channel's destructor:
+        // no counter, no notice, no answer to the caller — that is, exactly the
+        // hole indistinguishable from silence all this loss accounting exists
+        // against.
         let counters = Arc::new(Counters::default());
         let writer = Writer::spawn(
             Arc::clone(&counters),
@@ -3415,24 +3557,31 @@ mod tests {
 
         let e = writer
             .write(item, false, &drops)
-            .expect_err("после остановки записывать некуда");
+            .expect_err("after the stop there is nowhere to write");
         assert!(
             matches!(e, Error::ShuttingDown),
-            "причина названа своим именем: {e}"
+            "the cause is named for what it is: {e}"
         );
-        assert!(e.loses_record(), "и это потеря, а не дефект вызова");
+        assert!(
+            e.loses_record(),
+            "and this is a loss, not a defect in the call"
+        );
         assert_eq!(
             counters.snapshot().dropped,
             1,
-            "потеря учтена, а не проглочена"
+            "the loss is accounted for rather than swallowed"
         );
-        assert_eq!(drops.take(ChannelIdx(0)), 1, "и отмечена в своём канале");
+        assert_eq!(
+            drops.take(ChannelIdx(0)),
+            1,
+            "and marked in its own channel"
+        );
     }
 
     #[test]
     fn footer_ids_split_events_from_metrics() {
-        // Множества типов в footer'е ведутся раздельно: миграция спрашивает
-        // про события и метрики по отдельности.
+        // The type sets in the footer are kept separately: a migration asks
+        // about events and metrics one at a time.
         let sample = Staged {
             ns: NsId(0),
             channel: ChannelIdx(0),
@@ -3450,6 +3599,6 @@ mod tests {
             },
             ..sample
         };
-        assert_eq!(span.footer_ids(), (None, None), "спан не тип данных");
+        assert_eq!(span.footer_ids(), (None, None), "a span is not a data type");
     }
 }
