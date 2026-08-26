@@ -1,10 +1,10 @@
-//! Неймспейс: рабочая ручка микросервиса.
+//! The namespace: a microservice's working handle.
 //!
-//! Неймспейс — runtime-сущность: каталог со своими сегментами, привязанный к
-//! compile-time схеме. Четыре экземпляра сервиса усилителя поднимают
-//! `orc-radio-0`…`orc-radio-3` с одной схемой, и принадлежность записи
-//! определяется её местоположением — в самих записях никакого «кто это
-//! написал» не хранится.
+//! A namespace is a runtime entity: a directory with its own segments, bound
+//! to a compile-time schema. Four instances of an amplifier service bring up
+//! `orc-radio-0`…`orc-radio-3` with one schema, and a record's ownership is
+//! determined by where it lies — nothing about "who wrote this" is stored in
+//! the records themselves.
 
 use crate::Clock;
 use crate::error::{Error, Result};
@@ -24,21 +24,21 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-/// Имя файла метаданных неймспейса.
+/// The name of a namespace's metadata file.
 pub const NS_META: &str = "ns-meta";
 
-/// Метаданные неймспейса.
+/// A namespace's metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NsMeta {
-    /// Имя схемы. Открыть неймспейс чужой схемой нельзя: одни и те же
-    /// идентификаторы событий в разных схемах означают разное.
+    /// The schema name. A namespace cannot be opened under a foreign schema:
+    /// the same event identifiers mean different things in different schemas.
     pub schema_name: String,
-    /// Версия протокола, к которой приведены все сегменты каталога.
+    /// The protocol version every segment in the directory has been brought to.
     pub protocol_version: u16,
 }
 
 impl NsMeta {
-    /// Прочитать или создать метаданные, проверив совместимость схемы.
+    /// Read or create the metadata, checking schema compatibility.
     pub fn open(dir: &Path, ns_name: &str, schema: &Schema) -> Result<Self> {
         let path = dir.join(NS_META);
         match fsutil::read_optional(&path)? {
@@ -53,7 +53,7 @@ impl NsMeta {
             Some(bytes) => {
                 let meta: Self = postcard::from_bytes(&bytes).map_err(|_| Error::Corrupt {
                     path: path.clone(),
-                    reason: "метаданные неймспейса не разбираются".to_owned(),
+                    reason: "the namespace metadata does not parse".to_owned(),
                 })?;
                 if meta.schema_name != schema.name {
                     return Err(Error::SchemaMismatch {
@@ -62,8 +62,9 @@ impl NsMeta {
                         opening: schema.name.to_owned(),
                     });
                 }
-                // Данные, записанные более новой прошивкой, эта понять не
-                // может: у неё нет ни новых типов, ни шагов миграции вперёд.
+                // Data written by newer firmware is beyond this one's
+                // understanding: it has neither the new types nor steps that
+                // migrate forward.
                 if meta.protocol_version > schema.version.0 {
                     return Err(Error::ProtocolFromFuture {
                         namespace: ns_name.to_owned(),
@@ -71,9 +72,9 @@ impl NsMeta {
                         current: schema.version.0,
                     });
                 }
-                // Цепочка шагов проверена при валидации схемы; отсутствующий
-                // шаг здесь означал бы, что старые сегменты нечем привести
-                // к текущему виду.
+                // The chain of steps was checked when the schema was validated;
+                // a missing step here would mean there is nothing to bring the
+                // old segments up to the current shape with.
                 for from in meta.protocol_version..schema.version.0 {
                     if schema.migration(from).is_none() {
                         return Err(Error::MissingMigration {
@@ -83,27 +84,26 @@ impl NsMeta {
                         });
                     }
                 }
-                // `protocol_version` в мете — версия последней **завершённой**
-                // миграции, и переписывать её здесь нельзя: подъём — не
-                // прогон, сегменты остались в прежней раскладке. Проштамповав
-                // мету, этот билд объявил бы неймспейс мигрированным, и
-                // будущий `Namespace::migrate` обошёл бы старые сегменты
-                // стороной — их разобрали бы декодерами новой версии, молча и
-                // неверно. Смешанное состояние легально: версию несёт
-                // заголовок каждого сегмента, и она у них своя. Штампует мету
-                // только успешный прогон.
+                // `protocol_version` in the metadata is the version of the last
+                // **completed** migration, and it must not be rewritten here: coming up is
+                // not a run, and the segments are still in the earlier layout. By stamping
+                // the metadata, this build would declare the namespace migrated, and a
+                // future `Namespace::migrate` would walk past the old segments — they
+                // would be parsed with the new version's decoders, silently and wrongly. A
+                // mixed state is legitimate: every segment header carries its own version.
+                // Only a successful run stamps the metadata.
                 Ok(meta)
             }
         }
     }
 }
 
-/// Диапазон из range-выражения над значениями метрики.
+/// A range from a range expression over a metric's values.
 ///
-/// Границы приводятся к `f64` — в нём движок их и хранит, — но записываются
-/// тем же типом, что и отсчёты: `..=60.0` у `Metric<f32>`, `..=10` у
-/// `Metric<u64>`. Исключающая граница трактуется как включающая по той же
-/// причине, что и в [`crate::schema::Range`].
+/// The bounds are converted to `f64` — that is what the engine stores them in —
+/// but they are written with the same type as the samples: `..=60.0` for a
+/// `Metric<f32>`, `..=10` for a `Metric<u64>`. An exclusive bound is treated as
+/// inclusive for the same reason as in [`crate::schema::Range`].
 fn numeric_range<T: NumericValue>(r: impl std::ops::RangeBounds<T>) -> crate::schema::Range {
     use std::ops::Bound;
     let bound = |b: Bound<&T>| match b {
@@ -116,10 +116,10 @@ fn numeric_range<T: NumericValue>(r: impl std::ops::RangeBounds<T>) -> crate::sc
     }
 }
 
-/// Ручка неймспейса.
+/// A namespace handle.
 ///
-/// Копируется дёшево (`Clone`) и рассылается по задачам сервиса: записи
-/// адресуются явно, без неявного контекста потока.
+/// Cheap to clone and to hand around a service's tasks: records are addressed
+/// explicitly, with no implicit thread context.
 #[derive(Debug, Clone)]
 pub struct Namespace {
     inner: Arc<NamespaceInner>,
@@ -127,44 +127,46 @@ pub struct Namespace {
 
 #[derive(Debug)]
 struct NamespaceInner {
-    /// Хранилище, которому принадлежит неймспейс.
+    /// The store the namespace belongs to.
     ///
-    /// Держится живым, пока жива ручка: `Store` при уничтожении
-    /// останавливает writer, и переживший его `Namespace` писал бы в
-    /// никуда, возвращая `Ok` на каждый вызов.
+    /// Kept alive for as long as the handle lives: a `Store` being dropped
+    /// stops the writer, and a `Namespace` that outlived it would write into
+    /// nothing while returning `Ok` on every call.
     _store: Arc<dyn std::any::Any + Send + Sync>,
     id: NsId,
     name: String,
-    /// Каталог неймспейса — здесь живёт `ns-meta`.
+    /// The namespace's directory — this is where `ns-meta` lives.
     dir: std::path::PathBuf,
-    /// Каталоги каналов в порядке `classes`: классы могут жить на разных
-    /// носителях, и прогону миграции пути нужны готовыми.
+    /// The channel directories in `classes` order: classes may live on
+    /// different media, and a migration run needs the paths ready.
     channel_dirs: Vec<std::path::PathBuf>,
-    /// Идентичность хранилища: прогон не трогает сегменты чужих приборов.
+    /// The store's identity: a run does not touch another device's segments.
     store_id: u64,
     schema: Schema,
-    /// Классы хранения в том же порядке, в каком зарегистрированы каналы.
+    /// The storage classes in the same order the channels were registered in.
     classes: Vec<StorageClass>,
     writer: Arc<Writer>,
     clock: Clock,
     drops: Arc<DropCounters>,
     next_span: Arc<AtomicU32>,
     meta: NsMeta,
-    /// Версия последней завершённой миграции — живое значение.
+    /// The version of the last completed migration — the live value.
     ///
-    /// В `meta` лежит то, что было прочитано при открытии; успешный
-    /// `Namespace::migrate` двигает версию, не переоткрывая неймспейс.
+    /// `meta` holds what was read at open time; a successful
+    /// `Namespace::migrate` moves the version without reopening the namespace.
     migrated_to: std::sync::atomic::AtomicU16,
-    /// Прогон единоличен: два одновременных переписывали бы одни файлы.
+    /// A run is exclusive: two at once would rewrite the same files.
     migrate_lock: std::sync::Mutex<()>,
-    /// Пределы значений: дефолты схемы плюс то, что выставила установка.
-    /// Живут в памяти и **не пишутся на диск** — см. [`crate::limits`].
+    /// The value limits: the schema's defaults plus whatever the installation
+    /// set. They live in memory and are **never written to disk** — see
+    /// [`crate::limits`].
     limits: LimitsRegistry,
-    /// Какие нарушения контракта уже объявлены в потоке — по биту на вид.
+    /// Which contract violations have already been announced in the stream —
+    /// one bit per kind.
     ///
-    /// Объявлять каждое значило бы залить журнал: нарушение контракта не
-    /// случайность, оно повторяется на каждом витке цикла. Одного раза
-    /// достаточно, чтобы дефект нашли; дальше растёт только счётчик.
+    /// Announcing every one would flood the journal: a contract violation is no
+    /// accident, it repeats on every turn of a loop. Once is enough for the
+    /// defect to be found; after that only the counter grows.
     announced: std::sync::atomic::AtomicU8,
 }
 
@@ -222,10 +224,10 @@ impl Namespace {
         &self.inner.schema
     }
 
-    /// Метаданные неймспейса — с живой версией протокола.
+    /// The namespace's metadata — with the live protocol version.
     ///
-    /// По значению, а не ссылкой: успешный [`Namespace::migrate`] двигает
-    /// версию, и снимок обязан это отражать.
+    /// By value rather than by reference: a successful [`Namespace::migrate`]
+    /// moves the version, and a snapshot has to reflect that.
     pub fn meta(&self) -> NsMeta {
         NsMeta {
             schema_name: self.inner.meta.schema_name.clone(),
@@ -236,27 +238,29 @@ impl Namespace {
         }
     }
 
-    /// Версия схемы ЭТОГО билда — та, которой пишутся новые сегменты.
+    /// The schema version of THIS build — the one new segments are written
+    /// with.
     ///
-    /// Не путать с версией последней завершённой миграции
-    /// ([`NsMeta::protocol_version`]): их расхождение и есть непогашенный долг,
-    /// который называет [`Namespace::pending_migration`].
+    /// Not to be confused with the version of the last completed migration
+    /// ([`NsMeta::protocol_version`]): the gap between them is the outstanding
+    /// debt [`Namespace::pending_migration`] names.
     pub fn schema_version(&self) -> ProtocolVersion {
         self.inner.schema.version
     }
 
-    /// Незавершённая миграция: `(с какой версии, до какой)`.
+    /// An unfinished migration: `(from which version, to which)`.
     ///
-    /// `Some` означает, что в каталоге лежат сегменты прежней раскладки:
-    /// схема этого билда новее, чем версия последней завершённой миграции.
-    /// Читаются они правильно — сегмент прежней версии проходит через шаги
-    /// прямо при чтении, — но каждое чтение платит за преобразование, а
-    /// история лежит в раскладке, которой больше ни один билд не пишет.
-    /// Привести её физически — [`Namespace::migrate`]; когда его звать,
-    /// решает приложение: прогон жжёт ресурс флеша и занимает носитель.
+    /// `Some` means the directory holds segments in an earlier layout: this
+    /// build's schema is newer than the version of the last completed
+    /// migration. They read correctly — a segment of an earlier version goes
+    /// through the steps as it is read — but every read pays for the
+    /// transformation, and the history lies in a layout no build writes any
+    /// more. To bring it up physically there is [`Namespace::migrate`]; when to
+    /// call it is the application's decision: a run burns flash wear and takes
+    /// up the medium.
     ///
-    /// Новые сегменты пишутся текущей версией схемы; смешанное состояние
-    /// каталога легально и ожидаемо.
+    /// New segments are written at the current schema version; a mixed state of
+    /// the directory is legitimate and expected.
     pub fn pending_migration(&self) -> Option<(u16, u16)> {
         let stored = self
             .inner
@@ -266,35 +270,36 @@ impl Namespace {
         (stored < current).then_some((stored, current))
     }
 
-    /// Привести сегменты неймспейса к текущей версии схемы.
+    /// Bring the namespace's segments up to the current schema version.
     ///
-    /// Явный вызов, а не автоматика при открытии: прогон читает и переписывает
-    /// историю целиком — минуты на гигабайтах — и жжёт ресурс флеша. Когда
-    /// прибору это позволительно, знает только приложение (после старта, в
-    /// тихий час); долг тем временем виден в [`Namespace::pending_migration`],
-    /// а читается всё правильно и без прогона — шаги применяются при чтении.
+    /// An explicit call rather than something automatic at open time: a run
+    /// reads and rewrites the whole history — minutes on gigabytes — and burns
+    /// flash wear. Only the application knows when a device can afford that
+    /// (after a start, in a quiet hour); meanwhile the debt is visible in
+    /// [`Namespace::pending_migration`], and everything reads correctly without
+    /// a run — the steps are applied at read time.
     ///
-    /// Тяжёлая работа идёт на потоке вызывающего; writer участвует только в
-    /// фиксации каждого сегмента (rename поверх старого имени), поэтому запись
-    /// не останавливается. Прогон идемпотентен и возобновляем: обрыв на любом
-    /// месте оставляет каждый сегмент либо прежним, либо уже переписанным, и
-    /// следующий вызов продолжит с оставшихся.
+    /// The heavy work happens on the calling thread; the writer takes part only
+    /// in committing each segment (a rename over the old name), so writing does
+    /// not stop. A run is idempotent and resumable: an interruption anywhere
+    /// leaves every segment either as it was or already rewritten, and the next
+    /// call carries on with the rest.
     ///
-    /// Сегменты, которые ни один шаг не затрагивает, не переписываются и
-    /// сохраняют прежнюю версию в заголовке — это легально: незатронутость и
-    /// означает, что текущие декодеры читают их верно.
+    /// Segments no step touches are not rewritten and keep the earlier version
+    /// in their header — which is legitimate: being untouched is precisely what
+    /// makes the current decoders read them correctly.
     ///
-    /// # Место на носителе
+    /// # Space on the medium
     ///
-    /// Прогон переписывает сегмент во временный файл рядом и подменяет им
-    /// оригинал: пока идёт переписывание, на носителе лежат оба. Значит,
-    /// свободным должен быть примерно **один сегмент** сверх занятого
-    /// (`ChannelConfig::segment_bytes`) — и не больше: ёмкость временного файла
-    /// берётся по фактическим данным оригинала и растёт, только если шаг
-    /// действительно раздул записи. В бюджет класса этот файл не входит, и
-    /// вытеснением место под него движок не освобождает: `Err` с
-    /// [`Error::is_no_space`] означает, что прогон отложен до тех пор, пока
-    /// место не появится. Оригинал при этом не тронут.
+    /// A run rewrites a segment into a temporary file next to it and swaps it for
+    /// the original: while the rewrite goes on, both lie on the medium. So roughly
+    /// **one segment** (`ChannelConfig::segment_bytes`) has to be free on top of
+    /// what is occupied — and no more: the temporary file's capacity is taken from
+    /// the original's actual data and grows only if a step really did swell the
+    /// records. That file does not count towards the class budget, and the engine
+    /// does not evict anything to make room for it: an `Err` with
+    /// [`Error::is_no_space`] means the run is deferred until the space appears.
+    /// The original is untouched.
     pub fn migrate(&self) -> Result<crate::migrate::MigrationReport> {
         let Some((_, to)) = self.pending_migration() else {
             return Ok(crate::migrate::MigrationReport::default());
@@ -311,10 +316,10 @@ impl Namespace {
             &self.inner.channel_dirs,
         )?;
 
-        // Штамп — только после того, как КАЖДЫЙ сегмент оказался либо
-        // текущим, либо переписанным, либо доказуемо незатронутым: мета
-        // означает «завершено», и объявить это раньше значило бы, что
-        // будущие прогоны обойдут недоделанное стороной.
+        // The stamp comes only after EVERY segment turned out to be either
+        // current, or rewritten, or provably untouched: the metadata means
+        // "completed", and declaring that earlier would mean future runs walk
+        // past what was left undone.
         let meta = NsMeta {
             schema_name: self.inner.meta.schema_name.clone(),
             protocol_version: to,
@@ -329,30 +334,30 @@ impl Namespace {
         Ok(report)
     }
 
-    /// Текущий момент — в тех же координатах, в каких его вернёт читатель.
+    /// The current moment — in the same coordinates a reader will return it in.
     ///
-    /// Именно момент, а не только микросекунды: сравнивать `Micros` разных
-    /// запусков между собой бессмысленно, и тип это запрещает.
+    /// The moment specifically, not just the microseconds: comparing `Micros`
+    /// from different runs is meaningless, and the type forbids it.
     pub fn now(&self) -> BootTime {
         self.inner.clock.now_at()
     }
 
-    /// Метка для записи: только микросекунды.
+    /// The stamp for a record: microseconds only.
     ///
-    /// Запуск в запись не идёт — он имплицитен из заголовка сегмента, и
-    /// повторять его в каждой записи значило бы платить четыре байта за то,
-    /// что и так известно из имени файла.
+    /// The run does not go into the record — it is implicit from the segment
+    /// header, and repeating it in every record would mean paying four bytes
+    /// for something already known from the file name.
     #[inline]
     fn stamp(&self) -> Micros {
         self.inner.clock.now()
     }
 
-    /// Канал, соответствующий классу хранения.
+    /// The channel corresponding to a storage class.
     ///
-    /// Список каналов построен по самой схеме, поэтому класс обязан
-    /// найтись. Тихий возврат нулевого канала при промахе означал бы, что
-    /// критическая запись без предупреждения уходит в обычный канал — с
-    /// другой политикой долговечности и другим бюджетом.
+    /// The channel list is built from the schema itself, so the class has to be
+    /// there. Silently returning channel zero on a miss would mean a critical
+    /// record going to the ordinary channel without warning — with a different
+    /// durability policy and a different budget.
     fn channel_of(&self, class: StorageClass) -> Result<ChannelIdx> {
         self.inner
             .classes
@@ -365,16 +370,17 @@ impl Namespace {
             })
     }
 
-    /// Учесть исход записи, о котором вызывающему не сообщают.
+    /// Account for a write outcome the caller is not told about.
     ///
-    /// Путь записи ничего не возвращает — прикладной код всё равно не может
-    /// сделать с отказом ничего осмысленного, — но исход не исчезает:
+    /// The write path returns nothing — application code can do nothing
+    /// sensible with a failure anyway — but the outcome does not disappear:
     ///
-    /// - **потеря** (очередь не успевает, writer мёртв) уже учтена счётчиком
-    ///   writer'а и объявляется отметкой в самом потоке;
-    /// - **нарушение контракта** (id из чужой схемы) — дефект сборки: он
-    ///   считается отдельно и один раз объявляется записью в журнал, чтобы его
-    ///   нашли, а не искали причину тишины.
+    /// - a **loss** (the queue is falling behind, the writer is dead) is already
+    ///   counted by the writer's counter and announced by a notice in the stream
+    ///   itself;
+    /// - a **contract violation** (an id from a foreign schema) is a build defect:
+    ///   it is counted separately and announced once by a record in the journal, so
+    ///   that it gets found rather than searched for as the cause of silence.
     fn report(&self, outcome: Result<()>) {
         let Err(e) = outcome else { return };
         if e.loses_record() {
@@ -384,55 +390,58 @@ impl Namespace {
         Counters::bump(&self.inner.writer.counters().rejected);
         let bit = contract_bit(&e);
         if self.inner.announced.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-            // Само объявление идёт обычным путём и может быть потеряно под
-            // нагрузкой; повторять его незачем — счётчик остаётся.
+            // The announcement itself goes by the ordinary path and may be lost
+            // under load; there is no reason to repeat it — the counter
+            // remains.
             let _ = self.try_log_text(Level::Error, "dduroc", e.to_string(), None);
         }
     }
 
-    /// Учесть отказ, случившийся слоем выше — при сериализации полей события
-    /// или в мосте из `tracing`.
+    /// Account for a failure that happened a layer above — while serializing an
+    /// event's fields, or in the bridge from `tracing`.
     ///
-    /// Нужно, чтобы такой отказ попал в те же счётчики и то же однократное
-    /// объявление, что и отказы самого движка: иначе типизированный слой поверх
-    /// ручки терял бы записи тише, чем она сама.
+    /// Needed so that such a failure reaches the same counters and the same
+    /// one-off announcement as the engine's own: otherwise a typed layer over
+    /// the handle would lose records more quietly than the handle itself.
     pub fn note_failure(&self, e: Error) {
         self.report(Err(e));
     }
 
-    /// Записать событие с уже сериализованным payload'ом.
+    /// Write an event with an already serialized payload.
     pub fn log_raw(&self, event: EventId, payload: &[u8], span: Option<SpanId>) {
         self.report(self.try_log_raw(event, payload, span));
     }
 
-    /// То же с ответом об исходе — см. [`Namespace::try_log_payload`].
+    /// The same with an answer about the outcome — see
+    /// [`Namespace::try_log_payload`].
     pub fn try_log_raw(&self, event: EventId, payload: &[u8], span: Option<SpanId>) -> Result<()> {
         self.try_log_payload(event, Payload::from_slice(payload), span)
     }
 
-    /// Записать событие; payload уже собран в буфере записи.
+    /// Write an event; the payload is already assembled in the write buffer.
     ///
-    /// Ничего не возвращает намеренно: логирование не должно влиять на
-    /// управление в прикладном коде, а сделать с отказом на месте вызова
-    /// нечего — повтор при отстающем диске только усугубляет. Что именно
-    /// случилось, видно в [`crate::stats::Stats`] и в самом потоке записей;
-    /// кому нужен ответ на месте — [`Namespace::try_log_payload`].
+    /// It deliberately returns nothing: logging must not influence control flow
+    /// in application code, and there is nothing to do with a failure at the
+    /// call site — retrying against a lagging disk only makes it worse. What
+    /// happened is visible in [`crate::stats::Stats`] and in the record stream
+    /// itself; whoever needs an answer on the spot has
+    /// [`Namespace::try_log_payload`].
     pub fn log_payload(&self, event: EventId, payload: Payload, span: Option<SpanId>) {
         self.report(self.try_log_payload(event, payload, span));
     }
 
-    /// Записать событие и сказать, чем это кончилось.
+    /// Write an event and say how it ended.
     ///
-    /// `Err` бывает двух родов, и различать их важнее, чем текст:
-    /// [`Error::loses_record`] — запись не дошла до носителя (диск отстаёт),
-    /// [`Error::breaks_contract`] — событие не из этой схемы, то есть дефект
-    /// сборки.
+    /// There are two kinds of `Err`, and telling them apart matters more than
+    /// the text: [`Error::loses_record`] means the record did not reach the
+    /// medium (the disk is lagging), [`Error::breaks_contract`] that the event
+    /// is not from this schema, that is, a build defect.
     ///
-    /// Вердикт — вызывающему целиком: нарушение контракта здесь **не**
-    /// попадает в счётчики и не объявляется в журнале (это делают «тихие»
-    /// методы). Обработали отказ — он ваш; отдать его движку —
-    /// [`Namespace::note_failure`]. Потери диска учтены в любом случае:
-    /// их считает сам writer.
+    /// The verdict belongs to the caller entirely: a contract violation here does
+    /// **not** reach the counters and is not announced in the journal (the "quiet"
+    /// methods do that). Once the failure is handled it belongs to whoever handled
+    /// it; to hand it to the engine there is [`Namespace::note_failure`]. Disk
+    /// losses are counted in any case: the writer counts them itself.
     pub fn try_log_payload(
         &self,
         event: EventId,
@@ -462,11 +471,12 @@ impl Namespace {
         )
     }
 
-    /// Записать свободный текст без схемы: мост из `tracing`, panic-handler.
+    /// Write free text without a schema: the bridge from `tracing`, a panic
+    /// handler.
     ///
-    /// `target` — источник строки (`"app"`, имя модуля); он интернируется
-    /// (`Arc<str>`), потому что у моста один и тот же target повторяется
-    /// тысячами, но на месте вызова достаточно строкового литерала.
+    /// `target` is the string's source (`"app"`, a module name); it is interned
+    /// (`Arc<str>`) because the bridge repeats one and the same target
+    /// thousands of times, while a string literal is enough at the call site.
     pub fn log_text(
         &self,
         level: Level,
@@ -477,7 +487,7 @@ impl Namespace {
         self.report(self.try_log_text(level, target, text, span));
     }
 
-    /// То же с ответом об исходе.
+    /// The same with an answer about the outcome.
     pub fn try_log_text(
         &self,
         level: Level,
@@ -486,16 +496,17 @@ impl Namespace {
         span: Option<SpanId>,
     ) -> Result<()> {
         let target = target.into();
-        // Свободный текст не объявлен в схеме, поэтому и класса хранения у
-        // него нет. Ошибочный уровень просится в критический канал, но схема
-        // не обязана его объявлять: отказать значило бы промолчать ровно там,
-        // где текст и пишется ради того, чтобы не молчать (объявление дефекта
-        // сборки, сообщение моста, паника). Берём критический, если он есть,
-        // иначе обычный — он есть всегда (`Schema::classes`).
+        // Free text is not declared in the schema, so it has no storage class
+        // either. Text at an error level asks for the critical channel, but the
+        // schema is not obliged to declare one: refusing would mean staying
+        // silent exactly where text is written in order not to be silent (the
+        // announcement of a build defect, a bridge message, a panic). The
+        // critical one is taken if it exists, otherwise the ordinary one, which
+        // always does (`Schema::classes`).
         //
-        // Очередь выбирается по каналу, который достался на самом деле:
-        // ожидание места ради доставки в канал с отложенной синхронизацией
-        // было бы платой без гарантии.
+        // The queue is chosen by the channel that was actually obtained:
+        // waiting for room in order to deliver into a channel with deferred
+        // syncing would be a price paid without a guarantee.
         let (channel, critical) = match level >= Level::Error {
             true => match self.channel_of(StorageClass::Critical) {
                 Ok(idx) => (idx, true),
@@ -517,17 +528,18 @@ impl Namespace {
         self.inner.writer.write(item, critical, &self.inner.drops)
     }
 
-    /// Открыть ряд телеметрии.
+    /// Open a telemetry series.
     ///
-    /// Ряд — это метрика, и ничего кроме: рантайм-размерностей нет. Ручка
-    /// разрешает дескриптор один раз, дальше отсчёт стоит один вызов без
-    /// всякого поиска. Четыре датчика температуры — четыре метрики схемы:
-    /// иначе различающий их признак пришлось бы писать в каждый отсчёт.
+    /// A series is a metric and nothing else: there are no runtime dimensions.
+    /// The handle resolves the descriptor once, after which a sample costs one
+    /// call with no lookup at all. Four temperature sensors are four schema
+    /// metrics: otherwise whatever told them apart would have to be written
+    /// into every sample.
     ///
-    /// Тип значения приходит из константы метрики, поэтому `sample` принимает
-    /// только объявленное — см. [`crate::metric`]. Открытие возвращает
-    /// `Result`, потому что метрика может быть из чужой схемы; это один вызов
-    /// на ряд, а не на отсчёт.
+    /// The value type comes from the metric constant, so `sample` accepts only
+    /// what was declared — see [`crate::metric`]. Opening returns a `Result`
+    /// because the metric may be from a foreign schema; that is one call per
+    /// series, not per sample.
     pub fn series<M>(&self, metric: Metric<M>) -> Result<Series<M>> {
         let id: MetricId = metric.into();
         let desc = self.metric_desc(id)?;
@@ -542,11 +554,12 @@ impl Namespace {
         })
     }
 
-    /// Открыть ряд по идентификатору, известному только в рантайме.
+    /// Open a series by an identifier known only at runtime.
     ///
-    /// Тип значения на этапе компиляции неизвестен, поэтому такой ряд
-    /// принимает лишь [`Series::sample_raw`], который сверяет тип со схемой.
-    /// Нужно веб-слою и миграциям — прикладному коду нужен [`Namespace::series`].
+    /// The value type is unknown at compile time, so such a series accepts only
+    /// [`Series::sample_raw`], which checks the type against the schema. Needed
+    /// by the web layer and by migrations — application code wants
+    /// [`Namespace::series`].
     pub fn series_untyped(&self, metric: MetricId) -> Result<Series<Untyped>> {
         let desc = self.metric_desc(metric)?;
         Ok(Series {
@@ -569,24 +582,26 @@ impl Namespace {
             })
     }
 
-    /// Выставить границы значений поверх схемных.
+    /// Set value bounds over the schema's.
     ///
-    /// Для случая, когда они известны только в рантайме: внешняя система
-    /// определила модель железа и знает, что для этого усилителя нормально.
-    /// Диапазоны записываются так же, как в схеме, — обычными range-выражениями:
+    /// For the case where they are known only at runtime: the external system
+    /// has determined the hardware model and knows what is normal for this
+    /// amplifier. The ranges are written just as in the schema, as ordinary
+    /// range expressions:
     ///
     /// ```text
-    /// ns.set_thresholds(metrics::TempPa, ..=60.0, ..=75.0)?;   // сверху
-    /// ns.set_thresholds(metrics::Vswr, 1.0..=1.5, 1.0..=2.0)?; // с двух сторон
+    /// ns.set_thresholds(metrics::TempPa, ..=60.0, ..=75.0)?;   // from above
+    /// ns.set_thresholds(metrics::Vswr, 1.0..=1.5, 1.0..=2.0)?; // from both sides
     /// ```
     ///
-    /// Границы — того же типа, что и отсчёты метрики ([`NumericValue`]):
-    /// метрике-перечислению или `type: blob` их не задать, и говорит об этом
-    /// компилятор, а не отказ на устройстве. Метрику, известную только в
-    /// рантайме, обслуживает [`Namespace::set_thresholds_raw`].
+    /// The bounds have the same type as the metric's samples
+    /// ([`NumericValue`]): they cannot be set on an enum metric or on `type:
+    /// blob`, and it is the compiler that says so rather than a refusal on the
+    /// device. A metric known only at runtime is served by
+    /// [`Namespace::set_thresholds_raw`].
     ///
-    /// **На диск не пишется.** Границы — свойство установки, а не измерения;
-    /// подробнее в [`crate::limits`].
+    /// **Never written to disk.** Bounds are a property of the installation, not of
+    /// the measurement; more in [`crate::limits`].
     pub fn set_thresholds<T: NumericValue>(
         &self,
         metric: Metric<T>,
@@ -602,11 +617,12 @@ impl Namespace {
         )
     }
 
-    /// То же для метрики, известной только в рантайме.
+    /// The same for a metric known only at runtime.
     ///
-    /// Путь веб-слоя: метрика пришла строкой из запроса, границы — числами из
-    /// конфигурации. Несовместимость с объявленным типом здесь по-прежнему
-    /// ловит только рантайм — компилятору тут не на что опереться.
+    /// The web layer's path: the metric arrived as a string in a request, the
+    /// bounds as numbers from a configuration. Incompatibility with the
+    /// declared type is still caught only at runtime here — the compiler has
+    /// nothing to lean on.
     pub fn set_thresholds_raw(
         &self,
         metric: impl Into<MetricId>,
@@ -616,28 +632,28 @@ impl Namespace {
         self.set_limits(metric, MetricLimits::numeric(Thresholds::new(warn, alarm)))
     }
 
-    /// Выставить переопределение целиком: границы, важность состояний или и то
-    /// и другое.
+    /// Set the whole override: the bounds, the state severities, or both.
     pub fn set_limits(&self, metric: impl Into<MetricId>, limits: MetricLimits) -> Result<()> {
         self.inner
             .limits
             .set(&self.inner.schema, metric.into(), Some(limits))
     }
 
-    /// Снять переопределение: снова действует объявленное в схеме.
+    /// Remove the override: what the schema declared applies again.
     pub fn clear_limits(&self, metric: impl Into<MetricId>) -> Result<()> {
         self.inner
             .limits
             .set(&self.inner.schema, metric.into(), None)
     }
 
-    /// Взять диагноз метрики целиком на себя: замыкание вместо диапазонов.
+    /// Take a metric's diagnosis over entirely: a closure instead of ranges.
     ///
-    /// Для правил, которые данными не выразить, — гистерезис, зависимость от
-    /// захваченного контекста (модель железа, режим работы). Побеждает и
-    /// схему, и [`Namespace::set_limits`]; значение приходит числом (код
-    /// состояния — как число), blob-метрике замыкание не поставить. Как и
-    /// остальные пределы, на диск не пишется — читатель дампа его не увидит.
+    /// For rules the data cannot express — hysteresis, a dependence on captured
+    /// context (the hardware model, the operating mode). It beats both the
+    /// schema and [`Namespace::set_limits`]; the value arrives as a number (a
+    /// state code as a number too), and a blob metric cannot be given a
+    /// closure. Like the other limits it is never written to disk — a reader of
+    /// a dump will not see it.
     pub fn set_severity_fn(
         &self,
         metric: impl Into<MetricId>,
@@ -648,69 +664,74 @@ impl Namespace {
             .set_fn(&self.inner.schema, metric.into(), Some(Box::new(check)))
     }
 
-    /// Снять замыкание диагноза: снова действуют данные — переопределения и
-    /// схема.
+    /// Remove the diagnosis closure: the data — the overrides and the schema —
+    /// applies again.
     pub fn clear_severity_fn(&self, metric: impl Into<MetricId>) -> Result<()> {
         self.inner
             .limits
             .set_fn(&self.inner.schema, metric.into(), None)
     }
 
-    /// Действующие пределы метрики: схема плюс переопределения.
+    /// A metric's effective limits: the schema plus the overrides.
     pub fn limits(&self, metric: impl Into<MetricId>) -> Result<EffectiveLimits> {
         self.inner
             .limits
             .effective(&self.inner.schema, metric.into())
     }
 
-    /// Насколько значение требует внимания по действующим пределам.
+    /// How much a value calls for attention by the effective limits.
     ///
-    /// Сама запись пределов не касается: движок не решает за приложение, что
-    /// делать с выходом за границы, и не порождает событий сам. Метод — для
-    /// того, кто хочет проверить значение (и, например, записать событие).
+    /// Writing itself does not touch the limits: the engine does not decide for
+    /// the application what to do about a bound being crossed, and it raises no
+    /// events of its own. This method is for whoever wants to check a value
+    /// (and, say, write an event).
     ///
-    /// Значение принимается ровно то же, что принял бы отсчёт: `65.0` у
-    /// метрики, объявленной `type: f32`, состояние — у перечисления. Тип
-    /// сверяет компилятор — по той же константе метрики, что открывает ряд:
+    /// It accepts exactly what a sample would: `65.0` for a metric declared
+    /// `type: f32`, a state for an enum. The compiler checks the type — from
+    /// the same metric constant that opens a series:
     ///
     /// ```ignore
     /// ns.severity_of(radio::metrics::TempPa, 65.0);
     /// ns.severity_of(radio::metrics::LinkState, radio::metrics::LinkState::Los);
     /// ```
     ///
-    /// Метрику, известную только в рантайме, обслуживает
+    /// A metric known only at runtime is served by
     /// [`Namespace::severity_of_raw`].
     #[inline]
     pub fn severity_of<T, V: MetricValue<T>>(&self, metric: Metric<T>, value: V) -> Severity {
         self.severity_of_raw(metric, &value.into_owned())
     }
 
-    /// То же для метрики и значения, собранных в рантайме.
+    /// The same for a metric and a value assembled at runtime.
     ///
-    /// Путь веб-слоя и вьюера: метрика пришла строкой из запроса, типа на
-    /// этапе компиляции нет. Прикладному коду нужен [`Namespace::severity_of`].
+    /// The path of the web layer and the viewer: the metric arrived as a string
+    /// in a request and there is no compile-time type. Application code wants
+    /// [`Namespace::severity_of`].
     pub fn severity_of_raw(&self, metric: impl Into<MetricId>, value: &OwnedValue) -> Severity {
         self.inner
             .limits
             .severity_of(&self.inner.schema, metric.into(), &value.as_value())
     }
 
-    /// Начать спан. Возвращает страж: конец записывается при его уничтожении,
-    /// в том числе при развёртке стека — незакрытый спан неотличим от краха.
+    /// Begin a span. Returns a guard: the end is written when it is dropped,
+    /// stack unwinding included — an unclosed span is indistinguishable from a
+    /// crash.
     ///
-    /// Страж выдаётся всегда, даже если начало спана не удалось записать:
-    /// иначе прикладной код получал бы `?` на месте, где вложенность важнее
-    /// самой записи, а читатель и так обязан уметь показать спан без начала —
-    /// именно так выглядит спан, оборванный крахом процесса.
+    /// The guard is handed out always, even if the span's start could not be
+    /// written: otherwise application code would get a `?` in a place where
+    /// nesting matters more than the record, and a reader has to be able to
+    /// show a span without a start anyway — that is exactly what a span cut
+    /// short by a process crash looks like.
     pub fn span(&self, kind: SpanKindId) -> SpanGuard {
         self.span_with_parent(kind, None)
     }
 
-    /// Начать спан с явным родителем.
+    /// Begin a span with an explicit parent.
     pub fn span_with_parent(&self, kind: SpanKindId, parent: Option<SpanId>) -> SpanGuard {
         let span = next_span_id(&self.inner.next_span);
-        // Вид спана не из этой схемы — не повод не открывать спан: класс
-        // хранения берём обычный, о нарушении контракта сообщаем как обычно.
+        // A span kind not from this schema is no reason not to open the span:
+        // the ordinary storage class is taken, and the contract violation is
+        // reported as usual.
         let class = self
             .inner
             .schema
@@ -752,27 +773,28 @@ impl Namespace {
         }
     }
 
-    /// Дождаться, пока накопленное окажется на носителе.
+    /// Wait until what has accumulated is on the medium.
     pub fn sync(&self) -> Result<()> {
         self.inner.writer.sync(Some(self.inner.id))
     }
 }
 
-/// Открытый ряд телеметрии.
+/// An open telemetry series.
 ///
-/// Идентичность ряда — метрика. Дескриптор разрешён при открытии, поэтому
-/// отсчёт не делает ни поиска по схеме, ни обращения к какому-либо реестру.
+/// A series is identified by its metric. The descriptor is resolved at open
+/// time, so a sample does no schema lookup and consults no registry.
 ///
-/// Параметр `M` — маркер типа значения из константы метрики; он и определяет,
-/// что примет [`Series::sample`].
+/// The parameter `M` is the value type marker from the metric constant, and it
+/// is what determines what [`Series::sample`] will accept.
 #[derive(Debug, Clone)]
 pub struct Series<M> {
     ns: Namespace,
     metric: MetricId,
     channel: ChannelIdx,
     critical: bool,
-    /// Копия объявленного типа значения. Дескриптор весит полторы сотни байт
-    /// и лежит в `.rodata`; сверка на каждом отсчёте не должна за ним ходить.
+    /// A copy of the declared value type. The descriptor weighs a hundred and
+    /// fifty-odd bytes and lies in `.rodata`; the check on every sample must
+    /// not go to it.
     value_type: dduroc_format::ValueType,
     desc: &'static crate::schema::MetricDesc,
     _value: std::marker::PhantomData<fn() -> M>,
@@ -787,25 +809,25 @@ impl<M> Series<M> {
         self.value_type
     }
 
-    /// Как величина ведёт себя между отсчётами.
+    /// How the quantity behaves between samples.
     pub fn kind(&self) -> MetricKind {
         self.desc.kind
     }
 
-    /// Имя метрики из схемы.
+    /// The metric's name from the schema.
     pub fn name(&self) -> &'static str {
         self.desc.name
     }
 
-    /// Записать отсчёт с уже собранным значением.
+    /// Write a sample with an already assembled value.
     ///
-    /// Путь для случая, когда тип известен лишь в рантайме. Прикладному коду
-    /// нужен [`Series::sample`]: там тип сверяет компилятор.
+    /// The path for when the type is known only at runtime. Application code
+    /// wants [`Series::sample`]: there the compiler checks the type.
     pub fn sample_raw(&self, value: OwnedValue) {
         self.ns.report(self.try_sample_raw(value));
     }
 
-    /// То же с ответом об исходе.
+    /// The same with an answer about the outcome.
     pub fn try_sample_raw(&self, value: OwnedValue) -> Result<()> {
         if value.value_type() != self.value_type {
             return Err(Error::ValueTypeMismatch {
@@ -829,9 +851,9 @@ impl<M> Series<M> {
             .write(item, self.critical, &self.ns.inner.drops)
     }
 
-    /// Важность значения, собранного в рантайме.
+    /// The severity of a value assembled at runtime.
     ///
-    /// Единственная форма для [`Series<Untyped>`]; типизированному ряду нужен
+    /// The only form for a [`Series<Untyped>`]; a typed series wants
     /// [`Series::severity_of`].
     pub fn severity_of_raw(&self, value: &OwnedValue) -> Severity {
         self.ns.severity_of_raw(self.metric, value)
@@ -839,39 +861,41 @@ impl<M> Series<M> {
 }
 
 impl<M> Series<M> {
-    /// Записать отсчёт.
+    /// Write a sample.
     ///
-    /// Принимает только то, что объявлено у метрики: `Series<f32>` — `f32`,
-    /// `Series<LinkState>` — состояния этой метрики и ничьи другие. Ничего не
-    /// возвращает по той же причине, что и запись событий (см.
-    /// [`Namespace::log_payload`]); кому нужен ответ — [`Series::try_sample`].
+    /// It accepts only what the metric declared: a `Series<f32>` takes an
+    /// `f32`, a `Series<LinkState>` the states of that metric and nobody
+    /// else's. It returns nothing for the same reason event writing does (see
+    /// [`Namespace::log_payload`]); whoever needs an answer has
+    /// [`Series::try_sample`].
     #[inline]
     pub fn sample<V: MetricValue<M>>(&self, value: V) {
         self.ns.report(self.try_sample(value));
     }
 
-    /// То же с ответом об исходе.
+    /// The same with an answer about the outcome.
     #[inline]
     pub fn try_sample<V: MetricValue<M>>(&self, value: V) -> Result<()> {
         self.try_sample_raw(self.coerce(value.into_owned()))
     }
 
-    /// Важность значения по действующим пределам.
+    /// A value's severity by the effective limits.
     ///
-    /// Принимает то же, что и [`Series::sample`], — метрика уже известна ряду,
-    /// а её тип известен компилятору: `link.severity_of(LinkState::Los)`.
-    /// Проверить значение перед отсчётом можно, не собирая его вручную.
+    /// It accepts the same as [`Series::sample`] — the series already knows its
+    /// metric and the compiler knows its type:
+    /// `link.severity_of(LinkState::Los)`. A value can be checked before
+    /// sampling without assembling it by hand.
     #[inline]
     pub fn severity_of<V: MetricValue<M>>(&self, value: V) -> Severity {
         self.ns
             .severity_of_raw(self.metric, &self.coerce(value.into_owned()))
     }
 
-    /// Привести значение к объявленному представлению.
+    /// Bring a value to the declared representation.
     ///
-    /// Нужно ровно для перечислений: код состояния приходит целым, а метрика
-    /// может быть объявлена как `bool` (два состояния) или `i64`. Остальные
-    /// значения проходят как есть — их тип уже совпадает по построению.
+    /// Needed for enums exactly: a state code arrives as an integer while the
+    /// metric may be declared as `bool` (two states) or `i64`. The other values
+    /// pass through as they are — their type already matches by construction.
     #[inline]
     fn coerce(&self, value: OwnedValue) -> OwnedValue {
         match (self.value_type, &value) {
@@ -882,15 +906,15 @@ impl<M> Series<M> {
     }
 }
 
-/// Страж спана: конец записывается при уничтожении.
+/// A span guard: the end is written when it is dropped.
 ///
-/// Значение обязано быть куда-то положено: `ns.span(kind);` без привязки
-/// уничтожает стража тем же выражением, которое его создало, и спан
-/// схлопывается в нулевую длительность — две записи подряд вместо отрезка
-/// работы. Внешне это выглядит как «спан есть, но пустой», и разбирать такое
-/// в журнале не по чему.
+/// The value has to be put somewhere: `ns.span(kind);` with no binding drops
+/// the guard in the same expression that created it, and the span collapses to
+/// zero duration — two records in a row instead of a stretch of work. From
+/// outside it looks like "there is a span, but it is empty", and there is
+/// nothing in the journal to make sense of that with.
 #[derive(Debug)]
-#[must_use = "спан живёт, пока жив страж: `ns.span(kind);` закрывает его сразу же"]
+#[must_use = "a span lives while its guard lives: `ns.span(kind);` closes it at once"]
 pub struct SpanGuard {
     ns: Namespace,
     span: SpanId,
@@ -904,37 +928,37 @@ impl SpanGuard {
         self.span
     }
 
-    /// Неймспейс, которому принадлежит спан — нужен слою поверх ручки.
+    /// The namespace the span belongs to — needed by a layer over the handle.
     pub fn namespace(&self) -> &Namespace {
         &self.ns
     }
 
-    /// Вложенный спан: родителем становится этот.
+    /// A nested span: this one becomes its parent.
     pub fn child(&self, kind: SpanKindId) -> SpanGuard {
         self.ns.span_with_parent(kind, Some(self.span))
     }
 
-    /// Записать событие, привязанное к этому спану.
+    /// Write an event attached to this span.
     pub fn log_raw(&self, event: EventId, payload: &[u8]) {
         self.ns.log_raw(event, payload, Some(self.span));
     }
 
-    /// То же, но payload уже собран в буфере записи.
+    /// The same, but with the payload already assembled in the write buffer.
     pub fn log_payload(&self, event: EventId, payload: Payload) {
         self.ns.log_payload(event, payload, Some(self.span));
     }
 
-    /// То же с ответом об исходе.
+    /// The same with an answer about the outcome.
     pub fn try_log_payload(&self, event: EventId, payload: Payload) -> Result<()> {
         self.ns.try_log_payload(event, payload, Some(self.span))
     }
 
-    /// Закрыть явно, увидев ошибку записи. Обычно не нужно: закрытие
-    /// происходит при уничтожении.
+    /// Close explicitly on seeing a write error. Usually unnecessary: closing
+    /// happens when the guard is dropped.
     ///
-    /// В отличие от уничтожения, здесь действует обычная политика канала:
-    /// у критического спана вызывающий подождёт места в очереди, зато конец
-    /// спана гарантированно не потеряется.
+    /// Unlike dropping, the channel's ordinary policy applies here: on a
+    /// critical span the caller will wait for room in the queue, but the span's
+    /// end is guaranteed not to be lost.
     pub fn close(mut self) -> Result<()> {
         self.closed = true;
         self.write_end(true)
@@ -959,22 +983,22 @@ impl SpanGuard {
 impl Drop for SpanGuard {
     fn drop(&mut self) {
         if !self.closed {
-            // Без ожидания места — намеренно. `Drop` вызывается в том числе
-            // при развёртке стека после паники, и у критического спана
-            // обычный путь ждал бы место в очереди до пяти секунд: аварийное
-            // завершение превратилось бы в зависание, а вложенные стражи
-            // сложили бы свои таймауты друг к другу.
+            // Without waiting for room — deliberately. `Drop` is called during
+            // stack unwinding after a panic too, and on a critical span the
+            // ordinary path would wait up to five seconds for room in the
+            // queue: an emergency shutdown would turn into a hang, and nested
+            // guards would stack their timeouts on top of one another.
             //
-            // Цена — конец спана может быть потерян под давлением. Он учтён
-            // счётчиком потерь и отметкой в потоке, а незакрытый спан читатель
-            // и так обязан уметь показать: спан, оборванный крахом процесса,
-            // выглядит точно так же.
+            // The price is that a span's end may be lost under pressure. It is
+            // counted by the loss counter and by a notice in the stream, and a
+            // reader has to be able to show an unclosed span anyway: a span cut
+            // short by a process crash looks exactly the same.
             let _ = self.write_end(false);
         }
     }
 }
 
-/// Бит вида нарушения контракта: объявляется по одному разу на вид.
+/// A bit per kind of contract violation: each is announced once.
 fn contract_bit(e: &Error) -> u8 {
     match e {
         Error::UnknownEvent { .. } => 1 << 0,
@@ -983,8 +1007,8 @@ fn contract_bit(e: &Error) -> u8 {
         Error::ValueTypeMismatch { .. } => 1 << 3,
         Error::ClassNotDeclared { .. } => 1 << 4,
         Error::EncodeFailed { .. } => 1 << 5,
-        // Прочее (например, отказ носителя) — тоже один раз, но своим битом:
-        // залить журнал повторами оно способно ровно так же.
+        // The rest (a failure of the medium, say) once too, but under its own
+        // bit: it can flood the journal with repeats just as easily.
         _ => 1 << 7,
     }
 }
@@ -1076,12 +1100,12 @@ mod tests {
 
     use crate::metric::{Metric, MetricState, MetricValue};
 
-    /// Типизированные константы метрик — то, что для настоящей схемы порождает
-    /// макрос: тип значения приходит вместе с идентификатором.
+    /// Typed metric constants — what the macro produces for a real schema: the
+    /// value type arrives together with the identifier.
     const TEMP: Metric<f32> = Metric::new(MetricId(1));
     const LINK: Metric<LinkState> = Metric::new(MetricId(2));
 
-    /// Состояние канала — то, что для настоящей схемы породил бы макрос.
+    /// The channel state — what the macro would produce for a real schema.
     #[derive(Debug, Clone, Copy)]
     enum LinkState {
         Los = 0,
@@ -1142,16 +1166,16 @@ mod tests {
         let stats = store.stats();
         assert_eq!(stats.records_written, 100);
         assert!(stats.blocks_written >= 1);
-        assert!(stats.is_clean(), "потерь быть не должно: {stats:?}");
+        assert!(stats.is_clean(), "there must be no losses: {stats:?}");
 
-        // Сегмент появился в канале «default».
+        // A segment appeared in the "default" channel.
         let seg_dir = dir.path().join("orc-radio-0").join("default");
         let files: Vec<_> = std::fs::read_dir(&seg_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
             .collect();
-        assert_eq!(files.len(), 1, "создан ровно один сегмент");
+        assert_eq!(files.len(), 1, "exactly one segment was created");
     }
 
     #[test]
@@ -1161,25 +1185,26 @@ mod tests {
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         ns.log_raw(EventId(2), &[1, 2, 3], None);
-        // Ждём, пока writer обработает: sync — барьер по той же очереди.
+        // Wait for the writer to get to it: sync is a barrier over the same
+        // queue.
         ns.sync().unwrap();
-        assert!(
-            store.stats().syncs >= 1,
-            "критическое событие обязано быть синхронизировано"
-        );
+        assert!(store.stats().syncs >= 1, "a critical event must be synced");
 
         let crit_dir = dir.path().join("orc-radio-0").join("critical");
-        assert!(crit_dir.is_dir(), "критический канал создан отдельно");
+        assert!(
+            crit_dir.is_dir(),
+            "the critical channel is created separately"
+        );
     }
 
     #[test]
     fn overload_loses_only_what_it_reports() {
-        // Под давлением обычный канал вправе терять записи — но ровно
-        // столько, сколько признал потерянными. Расхождение между «принято»
-        // и «записано» означало бы тихую дыру.
+        // Under pressure the ordinary channel may lose records — but exactly as
+        // many as it admitted to losing. A discrepancy between "accepted" and
+        // "written" would mean a silent hole.
         //
-        // Пропускная способность как таковая здесь не проверяется: она
-        // зависит от загрузки машины и меряется бенчмарками.
+        // Throughput as such is not checked here: it depends on how loaded the
+        // machine is and is measured by benchmarks.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1197,23 +1222,26 @@ mod tests {
 
         let stats = store.stats();
         assert_eq!(accepted + refused, N);
-        assert!(accepted > 0, "хоть что-то обязано пройти");
+        assert!(accepted > 0, "at least something must get through");
         assert!(
             stats.records_written >= accepted,
-            "записано {} при принятых {accepted} — тихая потеря",
+            "{} written against {accepted} accepted — a silent loss",
             stats.records_written
         );
-        assert_eq!(stats.dropped, refused, "потери учтены ровно те, что были");
-        assert_eq!(stats.io_errors, 0, "ошибок ввода-вывода быть не должно");
+        assert_eq!(
+            stats.dropped, refused,
+            "exactly the losses that happened are accounted for"
+        );
+        assert_eq!(stats.io_errors, 0, "there must be no I/O errors");
     }
 
     #[test]
     fn critical_burst_is_one_group_commit() {
-        // Смысл политики Immediate — не «fdatasync на запись», а «синхронизация
-        // при первой возможности». Всплеск аварийных сообщений должен стоить
-        // единиц обращений к носителю: на eMMC каждый fdatasync это 1–10 мс,
-        // и пятьсот таких обращений превратили бы аварию в секунды записи и
-        // лишний износ флеша.
+        // The point of the Immediate policy is not "an fdatasync per record"
+        // but "a sync at the first opportunity". A burst of critical messages
+        // should cost a handful of trips to the medium: on eMMC every fdatasync
+        // is 1–10 ms, and five hundred of them would turn an incident into
+        // seconds of writing and needless flash wear.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1230,13 +1258,13 @@ mod tests {
         assert!(stats.records_written >= BURST as u64);
         assert!(
             stats.syncs < BURST as u64 / 4,
-            "всплеск из {BURST} записей стоил {} обращений к носителю — \
-             это не групповая фиксация",
+            "a burst of {BURST} records cost {} trips to the medium — \
+             that is not a group commit",
             stats.syncs
         );
         assert!(
             stats.blocks_written < BURST as u64 / 4,
-            "{BURST} записей уложены в {} блоков — заголовок на запись",
+            "{BURST} records fit into {} blocks — a header per record",
             stats.blocks_written
         );
     }
@@ -1247,14 +1275,14 @@ mod tests {
         let store = open_store(dir.path());
         let a = store.namespace("orc-radio-0", schema()).unwrap();
         let err = store.namespace("orc-radio-0", schema()).unwrap_err();
-        assert!(matches!(err, Error::NamespaceBusy(_)), "получено {err}");
+        assert!(matches!(err, Error::NamespaceBusy(_)), "got {err}");
 
-        // Отпущенное имя обязано освободиться: иначе сервис не смог бы
-        // переоткрыть свой неймспейс после перенастройки.
+        // A released name must become free: otherwise a service could not
+        // reopen its namespace after being reconfigured.
         drop(a);
         store
             .namespace("orc-radio-0", schema())
-            .expect("имя свободно после уничтожения ручки");
+            .expect("the name is free once the handle is dropped");
     }
 
     #[test]
@@ -1267,14 +1295,11 @@ mod tests {
 
         let store2 = open_store(dir.path());
         let other = Schema {
-            name: "другая-схема",
+            name: "another-schema",
             ..schema()
         };
         let err = store2.namespace("orc-radio-0", other).unwrap_err();
-        assert!(
-            matches!(err, Error::SchemaMismatch { .. }),
-            "получено {err}"
-        );
+        assert!(matches!(err, Error::SchemaMismatch { .. }), "got {err}");
     }
 
     #[test]
@@ -1292,17 +1317,18 @@ mod tests {
         let err = store.namespace("orc-radio-0", schema()).unwrap_err();
         assert!(
             matches!(err, Error::ProtocolFromFuture { stored: 99, .. }),
-            "получено {err}"
+            "got {err}"
         );
     }
 
     #[test]
     fn pending_migration_is_reported_and_meta_is_not_stamped() {
-        // `protocol_version` в мете — версия последней ЗАВЕРШЁННОЙ миграции.
-        // Проштамповав её при подъёме, этот билд объявил бы неймспейс
-        // мигрированным, хотя физического прогона ещё нет. Будущая миграция
-        // обошла бы старые сегменты стороной, и их разобрали бы декодерами
-        // новой версии — молча и неверно. Регрессия была бы совершенно тихой.
+        // `protocol_version` in the metadata is the version of the last
+        // COMPLETED migration. By stamping it when coming up, this build would
+        // declare the namespace migrated although there has been no physical
+        // run. A future migration would walk past the old segments, and they
+        // would be parsed with the new version's decoders — silently and
+        // wrongly. The regression would have been entirely quiet.
         use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome};
 
         fn noop(
@@ -1323,7 +1349,7 @@ mod tests {
         {
             let store = open_store(dir.path());
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
-            assert_eq!(ns.pending_migration(), None, "версии совпадают");
+            assert_eq!(ns.pending_migration(), None, "the versions match");
             ns.log_raw(EventId(1), &[1], None);
             ns.sync().unwrap();
             store.shutdown();
@@ -1339,23 +1365,23 @@ mod tests {
         assert_eq!(
             ns.pending_migration(),
             Some((1, 2)),
-            "незавершённая миграция обязана быть названа"
+            "an unfinished migration must be named"
         );
         assert_eq!(
             ns.meta().protocol_version,
             1,
-            "мета остаётся на версии последней завершённой миграции"
+            "the metadata stays at the version of the last completed migration"
         );
         ns.log_raw(EventId(1), &[2], None);
         ns.sync().unwrap();
         store.shutdown();
 
-        // На диске мета по-прежнему объявляет версию 1.
+        // On disk the metadata still declares version 1.
         let raw = std::fs::read(dir.path().join("orc-radio-0").join(NS_META)).unwrap();
         let meta: NsMeta = postcard::from_bytes(&raw).unwrap();
         assert_eq!(meta.protocol_version, 1);
 
-        // А сегменты несут каждый свою версию — смешанное состояние легально.
+        // And the segments carry a version each — a mixed state is legitimate.
         let seg_dir = dir.path().join("orc-radio-0").join("default");
         let mut versions: Vec<u16> = std::fs::read_dir(&seg_dir)
             .unwrap()
@@ -1374,16 +1400,17 @@ mod tests {
         assert_eq!(
             versions,
             vec![1, 2],
-            "старый сегмент сохранил свою версию, новый получил текущую"
+            "the old segment kept its version and the new one got the current"
         );
     }
 
     #[test]
     fn migrate_rewrites_history_and_stamps_the_meta() {
-        // Полный цикл физического прогона: запись v1 → подъём v2 →
-        // `Namespace::migrate` — старый сегмент переписан по шагу, активный
-        // не тронут, мета заштампована, повтор пуст. Всё это на живом
-        // хранилище с работающим writer'ом: фиксация идёт через него.
+        // The full cycle of a physical run: write v1 → come up at v2 →
+        // `Namespace::migrate` — the old segment is rewritten by the step, the
+        // active one is untouched, the metadata is stamped, a repeat is empty.
+        // All of it on a live store with a running writer: the commit goes
+        // through it.
         use crate::migrate::MigrationReport;
         use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome};
 
@@ -1391,12 +1418,12 @@ mod tests {
             r: MigrationInput<'_>,
         ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
             match (r.event_id(), r.metric_id()) {
-                // PowerSet перекодируется в фиксированный новый payload.
+                // PowerSet is re-encoded into a fixed new payload.
                 (Some(EventId(1)), _) => Ok(Some(MigrationOutcome::Message {
                     event: EventId(1),
                     payload: vec![0xAA, 0xBB],
                 })),
-                // Отсчёты temp удаляются целиком.
+                // The temp samples are deleted entirely.
                 (_, Some(MetricId(1))) => Ok(None),
                 _ => Ok(Some(MigrationOutcome::AsIs)),
             }
@@ -1411,7 +1438,7 @@ mod tests {
         }];
 
         let dir = tempfile::tempdir().unwrap();
-        // Запуск 1: история версии 1 — событие, отсчёт и спан.
+        // Run 1: a version 1 history — an event, a sample and a span.
         {
             let store = open_store(dir.path());
             let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1431,25 +1458,33 @@ mod tests {
         let ns = store.namespace("orc-radio-0", v2).unwrap();
         assert_eq!(ns.pending_migration(), Some((1, 2)));
 
-        // Живой сегмент версии 2 — прогон обязан пройти мимо него.
+        // A live version 2 segment — the run has to walk past it.
         ns.log_raw(EventId(1), &[9], None);
         ns.sync().unwrap();
 
-        let report = ns.migrate().expect("прогон проходит");
+        let report = ns.migrate().expect("the run goes through");
         assert_eq!(report.rewritten, 1, "{report:?}");
-        assert_eq!(report.already_current, 1, "активный сегмент не тронут");
-        assert_eq!(report.records_rewritten, 2, "два PowerSet пережили шаг");
-        assert_eq!(report.records_dropped, 1, "отсчёт temp удалён");
+        assert_eq!(report.already_current, 1, "the active segment is untouched");
+        assert_eq!(
+            report.records_rewritten, 2,
+            "two PowerSet records survived the step"
+        );
+        assert_eq!(report.records_dropped, 1, "the temp sample was deleted");
         assert_eq!(report.skipped_untouched + report.emptied, 0, "{report:?}");
 
-        assert_eq!(ns.pending_migration(), None, "долга больше нет");
-        assert_eq!(ns.meta().protocol_version, 2, "мета заштампована в памяти");
+        assert_eq!(ns.pending_migration(), None, "there is no debt left");
+        assert_eq!(
+            ns.meta().protocol_version,
+            2,
+            "the metadata is stamped in memory"
+        );
         let raw = std::fs::read(dir.path().join("orc-radio-0").join(NS_META)).unwrap();
         let meta: NsMeta = postcard::from_bytes(&raw).unwrap();
-        assert_eq!(meta.protocol_version, 2, "и на диске");
+        assert_eq!(meta.protocol_version, 2, "and on disk");
 
-        // Переписанный сегмент: версия текущая, footer есть, содержимое — по
-        // шагу: payload'ы заменены, отсчётов не осталось.
+        // The rewritten segment: the version is current, there is a footer, and
+        // the content follows the step — the payloads are replaced and no
+        // samples are left.
         let seg_dir = dir.path().join("orc-radio-0").join("default");
         let mut rewritten_payloads = Vec::new();
         let mut samples = 0;
@@ -1462,7 +1497,7 @@ mod tests {
             assert_eq!(
                 reader.header().protocol_version.0,
                 2,
-                "прежних версий на диске не осталось: {path:?}"
+                "no earlier versions are left on disk: {path:?}"
             );
             let mut buf = Vec::new();
             for offset in reader.scan_block_offsets().0 {
@@ -1483,21 +1518,21 @@ mod tests {
         assert_eq!(
             rewritten_payloads,
             vec![vec![9], vec![0xAA, 0xBB], vec![0xAA, 0xBB]],
-            "старые payload'ы переписаны шагом, новый — как был"
+            "the old payloads were rewritten by the step, the new one is as it was"
         );
-        assert_eq!(samples, 0, "удалённые шагом отсчёты не воскресают");
+        assert_eq!(samples, 0, "samples deleted by a step do not come back");
 
-        // Повторный прогон — честный no-op.
+        // A second run is an honest no-op.
         assert_eq!(ns.migrate().unwrap(), MigrationReport::default());
         store.shutdown();
     }
 
     #[test]
     fn an_untouched_segment_is_skipped_and_keeps_its_version() {
-        // Сегмент, в котором нет ни одного затронутого типа, не тратит цикла
-        // записи флеша: он не переписывается и сохраняет прежнюю версию в
-        // заголовке — при заштампованной мете. Это легально: незатронутость
-        // и означает, что текущие декодеры читают его верно.
+        // A segment holding not one affected type spends no flash write cycle:
+        // it is not rewritten and keeps the earlier version in its header —
+        // with the metadata stamped. That is legitimate: being untouched is
+        // precisely what makes the current decoders read it correctly.
         use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome};
 
         fn nope(
@@ -1511,7 +1546,7 @@ mod tests {
         static STEPS: &[Migration] = &[Migration {
             from: 1,
             touches_all: false,
-            // Шаг затрагивает только Alarm — его в истории не будет.
+            // The step touches only Alarm, which will not be in the history.
             events: &[EventId(2)],
             metrics: &[],
             spans: &[],
@@ -1536,8 +1571,8 @@ mod tests {
         let ns = store.namespace("orc-radio-0", v2).unwrap();
         let report = ns.migrate().unwrap();
         assert_eq!(report.skipped_untouched, 1, "{report:?}");
-        assert_eq!(report.rewritten, 0, "флеш не тронут");
-        assert_eq!(ns.pending_migration(), None, "мета заштампована");
+        assert_eq!(report.rewritten, 0, "the flash is untouched");
+        assert_eq!(ns.pending_migration(), None, "the metadata is stamped");
 
         let seg_dir = dir.path().join("orc-radio-0").join("default");
         let old = std::fs::read_dir(&seg_dir)
@@ -1550,7 +1585,7 @@ mod tests {
         assert_eq!(
             reader.header().protocol_version.0,
             1,
-            "незатронутый сегмент остаётся при своей версии — и это легально"
+            "an untouched segment keeps its version, and that is legitimate"
         );
         store.shutdown();
     }
@@ -1562,7 +1597,7 @@ mod tests {
         for bad in ["../escape", "a/b", "", ".hidden"] {
             assert!(
                 store.namespace(bad, schema()).is_err(),
-                "{bad:?} обязано отвергаться"
+                "{bad:?} must be rejected"
             );
         }
     }
@@ -1577,34 +1612,37 @@ mod tests {
         for i in 0..50 {
             temp.sample(20.0 + i as f32);
         }
-        // Динамический путь сверяет тип со схемой сам: у типизированного
-        // `sample` такое значение просто не собралось бы.
+        // The dynamic path checks the type against the schema itself: with a
+        // typed `sample` such a value simply would not have been assembled.
         let dyn_temp = ns.series_untyped(MetricId(1)).unwrap();
         let e = dyn_temp
             .try_sample_raw(OwnedValue::U64(1))
-            .expect_err("тип значения обязан совпасть с объявленным");
-        assert!(e.breaks_contract(), "это дефект вызова, а не потеря: {e}");
+            .expect_err("the value type must match what was declared");
+        assert!(
+            e.breaks_contract(),
+            "this is a defect in the call, not a loss: {e}"
+        );
 
         {
             let cal = ns.span(SpanKindId(1));
             cal.log_raw(EventId(1), &[7]);
             let _child = cal.child(SpanKindId(1));
-        } // оба спана закрываются здесь
+        } // both spans close here
 
         ns.sync().unwrap();
         let stats = store.stats();
-        // 50 сэмплов + 1 SeriesDef + 2 SpanStart + 1 событие + 2 SpanEnd
-        assert!(stats.records_written >= 55, "получено {stats:?}");
+        // 50 samples + 2 SpanStart + 1 event + 2 SpanEnd
+        assert!(stats.records_written >= 55, "got {stats:?}");
         assert!(stats.is_clean());
     }
 
     #[test]
     fn sync_waits_for_everything_already_enqueued() {
-        // Управляющие команды идут отдельной очередью и без явного
-        // вычерпывания обгоняли бы записи в полёте: sync отчитывался бы
-        // об успехе, не записав их, а shutdown запечатывал бы сегменты
-        // поверх недописанного. Проверяем на потоке, заведомо обгоняющем
-        // writer.
+        // Control commands travel on a separate queue and without an explicit
+        // drain would overtake records in flight: sync would report success
+        // without having written them, and shutdown would seal segments over
+        // what was not written yet. Checked on a thread that knowably outruns
+        // the writer.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1612,8 +1650,8 @@ mod tests {
         const N: usize = 20_000;
         let mut accepted = 0u64;
         for i in 0..N {
-            // Ретраи, чтобы отделить потери очереди (штатное поведение
-            // обычного канала) от потерь при синхронизации.
+            // Retries, to separate queue losses (the ordinary channel's normal
+            // behaviour) from losses during syncing.
             while ns.try_log_raw(EventId(1), &[i as u8; 4], None).is_err() {
                 std::thread::yield_now();
             }
@@ -1622,12 +1660,12 @@ mod tests {
         ns.sync().unwrap();
 
         let stats = store.stats();
-        // Записей может оказаться БОЛЬШЕ принятых: неудачные попытки
-        // try_send оставляют в потоке отметку о потере. Меньше — нельзя.
+        // There may be MORE records than were accepted: failed try_send
+        // attempts leave a loss notice in the stream. Fewer is not allowed.
         assert!(
             stats.records_written >= accepted,
-            "sync обязан дождаться всех принятых записей, а не только успевших: \
-             записано {}, принято {accepted}",
+            "sync must wait for every accepted record, not only those that made it: \
+             {} written, {accepted} accepted",
             stats.records_written
         );
     }
@@ -1651,23 +1689,23 @@ mod tests {
         let written = store.stats().records_written;
         assert!(
             written >= accepted,
-            "shutdown обязан дописать очередь, а не запечатать поверх неё: \
-             записано {written}, принято {accepted}"
+            "shutdown must drain the queue rather than seal over it: \
+             {written} written, {accepted} accepted"
         );
     }
 
     #[test]
     fn segment_name_matches_time_of_its_first_record() {
-        // Имя и база сегмента обязаны совпадать со временем ПЕРВОЙ его
-        // записи: на этом стоит отбор сегментов по диапазону при чтении.
-        // Брать время предыдущей записи (у нового канала — ноль) значило бы
-        // молча отдавать читателю сегменты, которых он не просил, и
-        // пропускать те, что нужны.
+        // A segment's name and base have to match the time of its FIRST record:
+        // selecting segments by range at read time rests on that. Taking the
+        // time of the previous record (zero for a new channel) would mean
+        // silently handing a reader segments it did not ask for and skipping
+        // the ones it needs.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        // Небольшая занятая пауза, чтобы время старта заведомо было > 0.
+        // A short busy pause so that the start time is knowably above 0.
         let mut spin = 0u64;
         while ns.now().at.0 < 1_000 && spin < 200_000_000 {
             spin += 1;
@@ -1683,21 +1721,21 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .find(|n| n.ends_with(".seg"))
-            .expect("сегмент создан");
-        let parsed = dduroc_format::segment::SegmentName::parse(&name).expect("имя разбирается");
+            .expect("a segment was created");
+        let parsed = dduroc_format::segment::SegmentName::parse(&name).expect("the name parses");
 
         assert!(
             parsed.start() >= before && parsed.start() <= after,
-            "имя сегмента {name} должно нести время первой записи ({before}..{after})"
+            "segment name {name} must carry the time of the first record ({before}..{after})"
         );
-        assert_ne!(parsed.base.0, 0, "нулевая база — признак старой ошибки");
+        assert_ne!(parsed.base.0, 0, "a zero base is the sign of the old bug");
     }
 
     #[test]
     fn namespace_keeps_store_alive() {
-        // Store при уничтожении останавливает writer. Переживший его
-        // Namespace писал бы в никуда, возвращая Ok на каждый вызов —
-        // худший вид потери данных: без единого признака.
+        // A Store being dropped stops the writer. A Namespace that outlived it
+        // would write into nothing while returning Ok on every call — the worst
+        // kind of data loss: without a single sign.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1705,9 +1743,9 @@ mod tests {
 
         for i in 0..100 {
             ns.try_log_raw(EventId(1), &[i as u8], None)
-                .expect("запись обязана продолжать работать");
+                .expect("writing must go on working");
         }
-        ns.sync().expect("синхронизация обязана работать");
+        ns.sync().expect("syncing must work");
 
         let seg_dir = dir.path().join("orc-radio-0").join("default");
         let total: u64 = std::fs::read_dir(&seg_dir)
@@ -1715,31 +1753,33 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
             .count() as u64;
-        assert!(total >= 1, "данные записаны на диск");
+        assert!(total >= 1, "the data was written to disk");
     }
 
     #[test]
     fn failed_namespace_open_releases_the_name() {
-        // Пометка «занято» ставится до подъёма; ранний выход обязан её снять,
-        // иначе имя останется недоступным до конца жизни процесса.
+        // The "taken" mark is set before the namespace comes up; an early
+        // return has to clear it, or the name stays unavailable for the life of
+        // the process.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
 
         let broken = Schema {
-            version: ProtocolVersion(0), // недопустима
+            version: ProtocolVersion(0), // not allowed
             ..schema()
         };
         assert!(store.namespace("orc-radio-0", broken).is_err());
-        // Имя снова свободно.
+        // The name is free again.
         store
             .namespace("orc-radio-0", schema())
-            .expect("имя обязано освободиться после неудачи");
+            .expect("the name must be freed after a failure");
     }
 
     #[test]
     fn enum_states_are_written_as_plain_integers() {
-        // Смысл модели: состояние на диске — обычное целое, всё остальное
-        // (имя, важность) живёт в схеме и места не занимает.
+        // The point of the model: a state on disk is an ordinary integer, and
+        // everything else (the name, the severity) lives in the schema and
+        // takes no room.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1752,24 +1792,24 @@ mod tests {
         ns.sync().unwrap();
 
         let stats = store.stats();
-        assert_eq!(stats.records_written, 3, "ни одной служебной записи");
+        assert_eq!(stats.records_written, 3, "not one bookkeeping record");
         assert!(stats.is_clean(), "{stats:?}");
 
-        // Три отсчёта: каждый — заголовок, дельта времени, метрика, код.
+        // Three samples: each a header, a time delta, a metric and a code.
         assert!(
             stats.bytes_written < 32 + 3 * 8,
-            "три состояния заняли {} байт вместе с заголовком блока",
+            "three states took {} bytes including the block header",
             stats.bytes_written
         );
     }
 
     #[test]
     fn sealed_segment_lists_its_metrics_in_the_footer() {
-        // По этому множеству миграция решает, переписывать ли сегмент, а
-        // читатель — есть ли смысл его открывать. Пустое множество означало бы,
-        // что миграция молча пропустит всю историю телеметрии, а поиск
-        // состояния перед окном отбросит сегмент, в котором оно есть.
-        // Регрессия была бы совершенно тихой — отсюда тест.
+        // A migration decides from this set whether to rewrite a segment, and a
+        // reader whether it is worth opening. An empty set would mean a
+        // migration silently skips the whole telemetry history, and a search
+        // for a state before a window throws away the segment that holds it.
+        // The regression would have been entirely quiet — hence this test.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1785,32 +1825,33 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .find(|p| p.extension().is_some_and(|x| x == "seg"))
-            .expect("сегмент создан");
+            .expect("a segment was created");
 
         let reader = crate::segment::SegmentReader::open(&path).unwrap();
-        assert!(reader.is_sealed(), "shutdown запечатывает сегмент");
-        let footer = reader.footer().expect("footer читается");
+        assert!(reader.is_sealed(), "shutdown seals the segment");
+        let footer = reader.footer().expect("the footer reads");
         assert_eq!(
             footer.metrics,
             vec![MetricId(1), MetricId(2)],
-            "обе метрики обязаны быть перечислены"
+            "both metrics must be listed"
         );
         assert_eq!(footer.events, vec![EventId(1)]);
         assert!(
             footer.touches(&[], &[MetricId(2)]),
-            "миграция обязана увидеть, что сегмент затронут"
+            "a migration must see that the segment is affected"
         );
         assert!(!footer.touches(&[], &[MetricId(9)]));
     }
 
     #[test]
     fn state_of_a_foreign_metric_is_refused() {
-        // Коды состояний у разных метрик свои. Записать чужой код значило бы
-        // получить график, подписанный чужими именами.
+        // State codes belong to their own metrics. Writing a foreign code would
+        // give a chart labelled with someone else's names.
         //
-        // На типизированном пути это **ошибка компиляции**: `Series<f32>` не
-        // примет `LinkState`, и проверять тут нечего. Проверяется динамический
-        // путь — единственный оставшийся способ подсунуть чужое значение.
+        // On the typed path this is a **compile error**: a `Series<f32>` will
+        // not accept a `LinkState`, and there is nothing to check. What is
+        // checked is the dynamic path — the only remaining way to slip a
+        // foreign value in.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1819,10 +1860,7 @@ mod tests {
         let err = temp
             .try_sample_raw(OwnedValue::U64(LinkState::Lock as u64))
             .unwrap_err();
-        assert!(
-            matches!(err, Error::ValueTypeMismatch { .. }),
-            "получено {err}"
-        );
+        assert!(matches!(err, Error::ValueTypeMismatch { .. }), "got {err}");
         assert!(err.breaks_contract());
     }
 
@@ -1832,22 +1870,26 @@ mod tests {
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        // Дефолты схемы.
+        // The schema's defaults.
         let sev = |v: f32| ns.severity_of(TEMP, v);
         assert_eq!(sev(36.6), Severity::Normal);
         assert_eq!(sev(75.0), Severity::Warn);
         assert_eq!(sev(90.0), Severity::Alarm);
 
-        // Внешняя система определила модель усилителя и сузила пределы —
-        // теми же range-выражениями, что и в схеме.
+        // The external system determined the amplifier model and narrowed the
+        // limits — with the same range expressions as in the schema.
         ns.set_thresholds(TEMP, ..=40.0, ..=50.0).unwrap();
-        assert_eq!(sev(45.0), Severity::Warn, "схема сказала бы Normal");
+        assert_eq!(
+            sev(45.0),
+            Severity::Warn,
+            "the schema would have said Normal"
+        );
         let eff = ns.limits(MetricId(1)).unwrap();
         assert!(eff.overridden);
         assert_eq!(eff.unit, "°C");
         assert_eq!(eff.kind, MetricKind::Gauge);
 
-        // Состояния: важность приходит из состояния, а не из диапазонов.
+        // States: the severity comes from the state, not from ranges.
         let link = ns.limits(MetricId(2)).unwrap();
         assert_eq!(link.kind, MetricKind::State);
         assert_eq!(link.states.len(), 3);
@@ -1855,8 +1897,9 @@ mod tests {
         assert_eq!(link.states[0].severity, Severity::Alarm);
         assert_eq!(ns.severity_of(LINK, LinkState::Los), Severity::Alarm);
 
-        // Ряд знает метрику: важность спрашивается тем же значением, что и
-        // отсчёт, — без сборки OwnedValue руками и без повторения метрики.
+        // A series knows its metric: severity is asked with the same value as a
+        // sample — without assembling an OwnedValue by hand and without
+        // repeating the metric.
         let link_series = ns.series(LINK).unwrap();
         assert_eq!(link_series.severity_of(LinkState::Los), Severity::Alarm);
         assert_eq!(link_series.severity_of(LinkState::Sync), Severity::Warn);
@@ -1864,32 +1907,32 @@ mod tests {
         assert_eq!(
             link_series.severity_of(LinkState::Los),
             link_series.severity_of_raw(&OwnedValue::U64(0)),
-            "типизированный путь обязан отвечать то же, что рантаймовый"
+            "the typed path must answer the same as the runtime one"
         );
 
-        // Пределы не попадают в поток записей.
+        // The limits do not reach the record stream.
         ns.sync().unwrap();
         assert_eq!(
             store.stats().records_written,
             0,
-            "пределы — настройка, а не данные: писать их некуда"
+            "limits are a setting, not data: there is nowhere to write them"
         );
-        // Снятие переопределения возвращает объявленное в схеме.
+        // Removing the override brings back what the schema declared.
         ns.clear_limits(TEMP).unwrap();
         assert_eq!(sev(45.0), Severity::Normal);
         assert!(!ns.limits(TEMP).unwrap().overridden);
 
-        // Метрика не из этой схемы — дефект вызова, а не потеря.
+        // A metric not from this schema is a defect in the call, not a loss.
         let e = ns.clear_limits(MetricId(99)).unwrap_err();
         assert!(e.breaks_contract(), "{e}");
     }
 
     #[test]
     fn numeric_bounds_on_a_state_metric_are_refused_at_runtime_too() {
-        // Типизация `set_thresholds` сняла эту ошибку с типизированного
-        // вызова — `set_thresholds(LINK, ..)` теперь не компилируется, — но
-        // рантайм-путь остался и обязан отвечать так же: через него ходят
-        // веб-слой и `set_limits`, где типа метрики нет.
+        // Typing `set_thresholds` removed this error from the typed call —
+        // `set_thresholds(LINK, ..)` no longer compiles — but the runtime path
+        // remains and has to answer the same way: the web layer and
+        // `set_limits` go through it, and there the metric has no type.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1899,7 +1942,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(e, Error::BadLimits { .. }), "{e}");
 
-        // А числовой метрике те же границы через люк ставятся.
+        // And on a numeric metric the same bounds go in through the hatch.
         ns.set_thresholds_raw(MetricId(1), ..=40.0, ..=50.0)
             .unwrap();
         assert_eq!(ns.severity_of(TEMP, 45.0), Severity::Warn);
@@ -1907,8 +1950,8 @@ mod tests {
 
     #[test]
     fn limits_are_per_namespace_not_per_process() {
-        // У каждого экземпляра своё железо: общие на процесс пределы были бы
-        // неверны для всех сразу.
+        // Every instance has hardware of its own: process-wide limits would be
+        // wrong for all of them at once.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let a = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1920,17 +1963,17 @@ mod tests {
         assert_eq!(
             b.severity_of(TEMP, 20.0),
             Severity::Normal,
-            "сосед сохранил свои пределы"
+            "the neighbour kept its limits"
         );
     }
 
     #[test]
     fn unknown_ids_are_counted_and_announced_once() {
-        // Id из чужой схемы — дефект сборки. Путь записи ничего не
-        // возвращает, поэтому такой вызов не должен пропадать бесследно: он
-        // учитывается отдельным счётчиком и **один раз** объявляется записью в
-        // журнал. Объявлять каждый значило бы залить журнал — нарушение
-        // контракта повторяется на каждом витке цикла.
+        // An id from a foreign schema is a build defect. The write path returns
+        // nothing, so such a call must not vanish without trace: it is counted
+        // by a separate counter and announced **once** by a record in the
+        // journal. Announcing every one would flood the journal — a contract
+        // violation repeats on every turn of a loop.
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
@@ -1945,17 +1988,17 @@ mod tests {
         ns.sync().unwrap();
 
         let stats = store.stats();
-        assert_eq!(stats.rejected, 100, "каждый отказ учтён");
-        assert_eq!(stats.dropped, 0, "это не потеря из-за диска");
-        assert!(!stats.is_clean(), "дефект обязан быть виден");
+        assert_eq!(stats.rejected, 100, "every refusal is accounted for");
+        assert_eq!(stats.dropped, 0, "this is not a loss caused by the disk");
+        assert!(!stats.is_clean(), "the defect must be visible");
         assert_eq!(
             stats.records_written, 1,
-            "объявление одно на все сто вызовов: получено {}",
+            "one announcement for all hundred calls: got {}",
             stats.records_written
         );
 
-        // Вид спана из чужой схемы: страж выдаётся всё равно, иначе
-        // вложенность прикладного кода зависела бы от схемы.
+        // A span kind from a foreign schema: the guard is handed out all the
+        // same, or application code's nesting would depend on the schema.
         let span = ns.span(SpanKindId(99));
         assert!(span.id().0 > 0);
     }
