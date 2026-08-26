@@ -1,51 +1,54 @@
-//! Описание схемы неймспейса.
+//! The description of a namespace schema.
 //!
-//! Схема — **compile-time** сущность: она принадлежит коду микросервиса и
-//! описывает, какие события, метрики и спаны он умеет писать. На диск из неё
-//! не попадает ничего, кроме номера версии в заголовке сегмента: уровни,
-//! шаблоны текста, тэги и имена резолвятся при чтении по идентификаторам.
+//! A schema is a **compile-time** entity: it belongs to a microservice's code
+//! and describes which events, metrics and spans it can write. Nothing of it
+//! reaches the disk except the version number in the segment header: levels,
+//! text templates, tags and names are resolved at read time from identifiers.
 //!
-//! Дескрипторы статические (`&'static`), поэтому схема ничего не стоит в
-//! рантайме и целиком лежит в `.rodata` прошивки.
+//! The descriptors are static (`&'static`), so a schema costs nothing at
+//! runtime and lies wholly in the firmware's `.rodata`.
 //!
-//! Идентификаторы задаются **явно**. Позиционная авто-нумерация прототипа
-//! молча перемапливала исторические записи на чужие декодеры при вставке
-//! события в середину списка; здесь такой ошибки допустить нельзя, а
-//! переименования и перенумерация делаются миграциями.
+//! Identifiers are assigned **explicitly**. The prototype's positional
+//! auto-numbering silently remapped historical records onto the wrong decoders
+//! when an event was inserted into the middle of a list; that mistake must not
+//! be possible here, and renaming and renumbering are done by migrations.
 
 use dduroc_format::{EventId, Level, MetricId, ProtocolVersion, SpanKindId, ValueType};
 
-/// Класс хранения: канал, в который попадают записи этого типа.
+/// The storage class: the channel records of this type land in.
 ///
-/// Канал определяет политику долговечности и бюджет. Значимые данные
-/// объявляют [`StorageClass::Critical`], остальные — [`StorageClass::Default`].
+/// The channel determines the durability policy and the budget. Data that
+/// matters declares [`StorageClass::Critical`], the rest
+/// [`StorageClass::Default`].
 ///
-/// Перечисление, а не имя строкой: множество классов закрыто (его знает и
-/// макрос схемы, и настройка хранилища), и класс, которого не существует,
-/// не должен быть представим — со строкой опечатка в конфигурации молча
-/// заводила бы канал-сироту со своей политикой. Имя каталога канала — это
-/// [`StorageClass::as_str`], производная от класса, а не второй источник.
+/// An enum rather than a name in a string: the set of classes is closed (both
+/// the schema macro and the store configuration know it), and a class that
+/// does not exist must not be representable — with a string, a typo in the
+/// configuration would silently create an orphan channel with its own policy.
+/// A channel's directory name is [`StorageClass::as_str`], derived from the
+/// class rather than a second source of it.
 ///
-/// Закрытое и в смысле `#[non_exhaustive]` тоже: новый класс — не добавление
-/// варианта, а согласованная правка ключевого слова `store:` у макроса,
-/// [`StorageClass::ALL`], квот и раскладки каталогов. Такое ломает сборку в
-/// любом случае, и заставлять ради него каждый разбор класса заводить ветку
-/// `_` значило бы платить за то, что всё равно не пройдёт молча.
+/// Closed in the `#[non_exhaustive]` sense too: a new class is not the
+/// addition of a variant but a coordinated edit to the macro's `store:`
+/// keyword, to [`StorageClass::ALL`], to the quotas and to the directory
+/// layout. That breaks the build in any case, and forcing every match on a
+/// class to carry a `_` arm for its sake would mean paying for something that
+/// will not pass silently anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StorageClass {
-    /// Батчи с отложенной синхронизацией.
+    /// Batches with deferred syncing.
     Default,
-    /// Синхронизация сразу (group commit) — устойчивость к потере питания.
+    /// Syncing at once (group commit) — resilience to a power loss.
     Critical,
-    /// Отдельный канал под телеметрию: обычно самый большой бюджет.
+    /// A separate channel for telemetry: usually the largest budget.
     Telemetry,
 }
 
 impl StorageClass {
-    /// Все классы — для настройки и проверки каждого.
+    /// Every class — for configuring and validating each of them.
     pub const ALL: [StorageClass; 3] = [Self::Default, Self::Critical, Self::Telemetry];
 
-    /// Имя каталога канала.
+    /// The channel's directory name.
     pub const fn as_str(self) -> &'static str {
         match self {
             StorageClass::Default => "default",
@@ -54,8 +57,8 @@ impl StorageClass {
         }
     }
 
-    /// Позиция в [`StorageClass::ALL`] — стабильный индекс для таблиц
-    /// по классам (группы бюджетов, квоты).
+    /// The position in [`StorageClass::ALL`] — a stable index for per-class
+    /// tables (budget groups, quotas).
     pub const fn index(self) -> usize {
         match self {
             StorageClass::Default => 0,
@@ -64,11 +67,13 @@ impl StorageClass {
         }
     }
 
-    /// Класс по имени его каталога — обратное к [`StorageClass::as_str`].
+    /// The class by its directory name — the inverse of
+    /// [`StorageClass::as_str`].
     ///
-    /// `None` — каталог не является каналом ни одного класса этой сборки:
-    /// либо чужая директория, либо дамп из будущей версии с новым классом.
-    /// Читатель обязан различить это и сказать, а не разбирать неизвестное.
+    /// `None` means the directory is not the channel of any class this build
+    /// knows: either a foreign directory or a dump from a future version with a
+    /// new class. A reader has to tell them apart and say so rather than parse
+    /// the unknown.
     pub fn from_dir_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.as_str() == name)
     }
@@ -80,10 +85,11 @@ impl std::fmt::Display for StorageClass {
     }
 }
 
-/// Код языка шаблонов (`"en"`, `"ru"`, `"ja"`…).
+/// A template language code (`"en"`, `"ru"`, `"ja"`…).
 ///
-/// Набор языков задаёт приложение: `en`/`ru` — частный случай одного проекта,
-/// другому нужен `en`+`ja`+`zh`. Библиотека к набору агностична.
+/// The set of languages is chosen by the application: `en`/`ru` is one
+/// project's particular case, another needs `en`+`ja`+`zh`. The library is
+/// agnostic to the set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Language(pub &'static str);
 
@@ -93,29 +99,29 @@ impl Language {
     }
 }
 
-/// Поле payload события — для показа структурированных данных при чтении.
+/// A field of an event payload — for showing structured data at read time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldDesc {
     pub name: &'static str,
-    /// Имя типа как в исходнике (`"f32"`, `"String"`) — для UI.
+    /// The type name as in the source (`"f32"`, `"String"`) — for the UI.
     pub type_name: &'static str,
 }
 
-/// Ошибка декодирования payload'а.
+/// A payload decoding error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("payload не соответствует схеме события")]
+#[error("the payload does not match the event schema")]
 pub struct DecodeError;
 
-/// Функции декодирования, сгенерированные макросом схемы.
+/// The decoding functions generated by the schema macro.
 ///
-/// Сигнатуры намеренно свободны от `serde_json` и прочих типов: движок не
-/// должен тянуть зависимости слоя представления, а генерируемый код вправе
-/// использовать что угодно.
+/// The signatures are deliberately free of `serde_json` and other such types:
+/// the engine must not drag in the presentation layer's dependencies, and
+/// generated code is free to use whatever it likes.
 #[derive(Clone, Copy)]
 pub struct EventDecoders {
-    /// Отрендерить сообщение на языке с индексом из [`Schema::languages`].
+    /// Render a message in the language at this index in [`Schema::languages`].
     pub render: fn(&[u8], usize) -> Result<String, DecodeError>,
-    /// Поля payload'а как JSON-объект.
+    /// The payload fields as a JSON object.
     pub json: fn(&[u8]) -> Result<String, DecodeError>,
 }
 
@@ -125,20 +131,20 @@ impl std::fmt::Debug for EventDecoders {
     }
 }
 
-/// Тип сообщения.
+/// A message type.
 #[derive(Debug, Clone, Copy)]
 pub struct EventDesc {
     pub id: EventId,
     pub name: &'static str,
-    /// Уровень — статическое свойство типа, на диск не пишется.
+    /// The level is a static property of the type and is never written to disk.
     pub level: Level,
     pub class: StorageClass,
-    /// Статические тэги-категории. Живут в схеме, места на диске не занимают,
-    /// поэтому фильтрация по ним бесплатна: она сводится к выбору множества
-    /// идентификаторов ещё до сканирования.
+    /// Static category tags. They live in the schema and take no room on disk,
+    /// so filtering by them is free: it reduces to picking a set of identifiers
+    /// before any scanning.
     pub tags: &'static [&'static str],
-    /// Шаблоны — по одному на каждый язык из [`Schema::languages`], в том же
-    /// порядке.
+    /// The templates — one per language of [`Schema::languages`], in the same
+    /// order.
     pub templates: &'static [&'static str],
     pub fields: &'static [FieldDesc],
     pub decoders: Option<EventDecoders>,
@@ -150,24 +156,26 @@ impl EventDesc {
     }
 }
 
-/// Насколько значение метрики требует внимания.
+/// How much a metric value calls for attention.
 ///
-/// Вычисляется при чтении по пределам, на диск не пишется: пределы —
-/// настраиваемое свойство установки, а не свойство измерения. Одна и та же
-/// температура нормальна для одного усилителя и аварийна для другого.
+/// Computed at read time from the limits and never written to disk: limits are
+/// a configurable property of the installation, not a property of the
+/// measurement. One and the same temperature is normal for one amplifier and
+/// critical for another.
 ///
-/// Слово `critical` здесь намеренно **не** используется: оно занято классом
-/// хранения ([`StorageClass::Critical`] — устойчивость к потере питания). Это
-/// разные оси: класс хранения говорит, *как записать*, важность — *что
-/// значение означает*, а в объявлении метрики они стоят рядом. Пара
-/// `warn` → `alarm` привычна в промышленной телеметрии и не путается.
+/// The word `critical` is deliberately **not** used here: it is taken by the
+/// storage class ([`StorageClass::Critical`] — resilience to a power loss).
+/// Those are different axes: the storage class says *how to write*, the
+/// severity *what the value means*, and in a metric declaration they stand
+/// side by side. The pair `warn` → `alarm` is familiar in industrial telemetry
+/// and is not confused with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash)]
 pub enum Severity {
     #[default]
     Normal,
-    /// Величина вышла из нормы.
+    /// The quantity has left what is normal.
     Warn,
-    /// Величина вышла за допустимое — авария.
+    /// The quantity has left what is permissible — a fault.
     Alarm,
 }
 
@@ -185,38 +193,40 @@ impl Severity {
     }
 }
 
-/// Как величина ведёт себя между отсчётами — подсказка тому, кто её рисует.
+/// How a quantity behaves between samples — a hint for whoever draws it.
 ///
-/// Соединять точки прямой можно только у непрерывной величины. Состояние
-/// между отсчётами **не меняется**: линия через промежуточные значения
-/// показала бы состояния, которых не было. Разница не косметическая, поэтому
-/// вид объявляется в схеме, а не угадывается по типу значения.
+/// Points may be joined by a straight line only for a continuous quantity. A
+/// state does **not** change between samples: a line through intermediate
+/// values would show states that never were. The difference is not cosmetic, so
+/// the kind is declared in the schema rather than guessed from the value type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum MetricKind {
-    /// Непрерывная величина: температура, мощность. Интерполируется.
+    /// A continuous quantity: temperature, power. Interpolated.
     #[default]
     Gauge,
-    /// Дискретное состояние: держится ступенькой до следующего отсчёта.
+    /// A discrete state: held as a step until the next sample.
     State,
-    /// Монотонно растущий счётчик: осмысленна производная, не значение.
+    /// A monotonically growing counter: the derivative is meaningful, the value
+    /// is not.
     Counter,
 }
 
-/// Одно состояние метрики-перечисления.
+/// One state of an enum metric.
 ///
-/// Код пишется на диск как обычное целое, имя и важность остаются в схеме —
-/// ровно как уровень и шаблон у сообщения. Коды задаются **явно**: позиционная
-/// нумерация сдвинулась бы при вставке состояния в середину списка, и старые
-/// сегменты стали бы читаться неверно без единого признака ошибки.
+/// The code is written to disk as an ordinary integer while the name and the
+/// severity stay in the schema — exactly as a message's level and template do.
+/// The codes are assigned **explicitly**: positional numbering would shift
+/// when a state was inserted into the middle of a list, and old segments would
+/// start reading wrongly without a single sign of an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateDesc {
     pub code: u64,
     pub name: &'static str,
-    /// Важность самого факта нахождения в этом состоянии.
+    /// The severity of merely being in this state.
     pub severity: Severity,
 }
 
-/// Диапазон допустимых значений; `None` — граница не задана.
+/// A range of permissible values; `None` means the bound is not set.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Range {
     pub min: Option<f64>,
@@ -233,10 +243,10 @@ impl Range {
         self.min.is_none() && self.max.is_none()
     }
 
-    /// Лежит ли значение внутри (границы включительно).
+    /// Whether a value lies inside (the bounds are inclusive).
     ///
-    /// NaN не внутри никакого диапазона: сравнения с ним ложны, и это
-    /// правильный ответ — неизвестное значение не «нормально».
+    /// NaN is inside no range: comparisons with it are false, and that is the
+    /// right answer — an unknown value is not "normal".
     pub fn contains(&self, v: f64) -> bool {
         if v.is_nan() {
             return false;
@@ -246,12 +256,14 @@ impl Range {
 }
 
 impl<R: std::ops::RangeBounds<f64>> From<R> for Range {
-    /// Диапазон из обычного range-выражения: `..=70.0`, `1.0..=1.5`, `10.0..`.
+    /// A range from an ordinary range expression: `..=70.0`, `1.0..=1.5`,
+    /// `10.0..`.
     ///
-    /// Границы диапазона метрики включительные — за ними уже не норма, — а
-    /// `Excluded` у `f64` не выразить без произвольного эпсилона, поэтому
-    /// исключающая граница трактуется как включающая. В схеме макрос требует
-    /// `..=` явно; здесь этого не потребовать, зато можно не соврать молча.
+    /// A metric range's bounds are inclusive — beyond them it is no longer
+    /// normal — and `Excluded` cannot be expressed for an `f64` without an
+    /// arbitrary epsilon, so an exclusive bound is treated as inclusive. In a
+    /// schema the macro demands an explicit `..=`; here that cannot be
+    /// demanded, but at least nothing is silently misrepresented.
     fn from(r: R) -> Self {
         use std::ops::Bound;
         let bound = |b: Bound<&f64>| match b {
@@ -265,17 +277,17 @@ impl<R: std::ops::RangeBounds<f64>> From<R> for Range {
     }
 }
 
-/// Пределы числовой метрики: диапазоны, **вне** которых значение требует
-/// внимания.
+/// The limits of a numeric metric: the ranges **outside** which a value calls
+/// for attention.
 ///
-/// `alarm` обязан включать `warn`: сначала величина выходит из нормы, потом
-/// из допустимого. Обратное означало бы, что значение аварийно, не будучи
-/// тревожным. Проверяется в [`Schema::validate`].
+/// `alarm` has to contain `warn`: a quantity first leaves what is normal, then
+/// what is permissible. The reverse would mean a value is a fault without
+/// being a warning. Checked in [`Schema::validate`].
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Thresholds {
-    /// Вне этого диапазона — [`Severity::Warn`].
+    /// Outside this range — [`Severity::Warn`].
     pub warn: Range,
-    /// Вне этого — [`Severity::Alarm`].
+    /// Outside this one — [`Severity::Alarm`].
     pub alarm: Range,
 }
 
@@ -285,11 +297,11 @@ impl Thresholds {
         alarm: Range::NONE,
     };
 
-    /// Пределы из двух range-выражений — так же, как в объявлении схемы:
+    /// Limits from two range expressions — just as in a schema declaration:
     ///
     /// ```text
-    /// Thresholds::new(..=70.0, ..=85.0)        // только сверху
-    /// Thresholds::new(1.0..=1.5, 1.0..=2.0)    // с двух сторон
+    /// Thresholds::new(..=70.0, ..=85.0)        // from above only
+    /// Thresholds::new(1.0..=1.5, 1.0..=2.0)    // from both sides
     /// ```
     pub fn new(
         warn: impl std::ops::RangeBounds<f64>,
@@ -305,7 +317,7 @@ impl Thresholds {
         self.warn.is_unset() && self.alarm.is_unset()
     }
 
-    /// Важность числового значения. Более тяжёлый диагноз побеждает.
+    /// The severity of a numeric value. The heavier diagnosis wins.
     pub fn severity_of(&self, v: f64) -> Severity {
         if !self.alarm.is_unset() && !self.alarm.contains(v) {
             return Severity::Alarm;
@@ -317,54 +329,54 @@ impl Thresholds {
     }
 }
 
-/// Тип метрики телеметрии.
+/// A telemetry metric type.
 #[derive(Debug, Clone, Copy)]
 pub struct MetricDesc {
     pub id: MetricId,
     pub name: &'static str,
     pub value_type: ValueType,
     pub class: StorageClass,
-    /// Единица измерения для UI (`"°C"`, `"dBm"`).
+    /// The unit for the UI (`"°C"`, `"dBm"`).
     pub unit: &'static str,
-    /// Статические тэги-категории — как у [`EventDesc::tags`]. Живут в схеме,
-    /// места на диске не занимают.
+    /// Static category tags — as on [`EventDesc::tags`]. They live in the
+    /// schema and take no room on disk.
     ///
-    /// Рантайм-размерностей у метрики нет: идентичность ряда равна метрике.
-    /// Четыре датчика температуры — это четыре метрики схемы, а не одна с
-    /// тэгом, иначе тэг пришлось бы писать в каждый отсчёт.
+    /// A metric has no runtime dimensions: a series is identified by its
+    /// metric. Four temperature sensors are four schema metrics rather than one
+    /// with a tag, or the tag would have to be written into every sample.
     pub tags: &'static [&'static str],
-    /// Как величина ведёт себя между отсчётами.
+    /// How the quantity behaves between samples.
     pub kind: MetricKind,
-    /// Подписи кодов состояний. Пусто — метрика не перечисление.
+    /// The labels of the state codes. Empty means the metric is not an enum.
     pub states: &'static [StateDesc],
-    /// Пределы по умолчанию. Установка вправе переопределить их в рантайме
-    /// (см. `Namespace::set_limits`) — например узнав модель железа.
+    /// The default limits. An installation may override them at runtime (see
+    /// `Namespace::set_limits`) — on learning the hardware model, for instance.
     pub thresholds: Thresholds,
-    /// Предикат срабатывания тревоги: истина — значение тревожно.
+    /// The warning trigger predicate: true means the value is a warning.
     ///
-    /// Для форм, которые диапазоном нормы не выразить. Полярность обратна
-    /// [`MetricDesc::thresholds`] — поэтому в схеме это отдельные ключи
-    /// `warn_if:`/`alarm_if:`. С диапазонами предикат складывается по правилу
-    /// «тяжелейший диагноз побеждает»; интроспекции у него нет, полосы на
-    /// графике рисуются только по диапазонам.
+    /// For shapes a normal range cannot express. The polarity is the opposite
+    /// of [`MetricDesc::thresholds`] — hence the separate
+    /// `warn_if:`/`alarm_if:` keys in a schema. It composes with ranges by the
+    /// rule "the heaviest diagnosis wins"; it offers no introspection, and
+    /// chart bands are drawn from ranges alone.
     pub warn_if: Option<fn(f64) -> bool>,
-    /// Предикат срабатывания аварии — см. [`MetricDesc::warn_if`].
+    /// The fault trigger predicate — see [`MetricDesc::warn_if`].
     pub alarm_if: Option<fn(f64) -> bool>,
 }
 
 impl MetricDesc {
-    /// Подпись состояния по коду. `None` — код не объявлен либо метрика не
-    /// перечисление.
+    /// The label of a state by its code. `None` means the code is not declared
+    /// or the metric is not an enum.
     pub fn state(&self, code: u64) -> Option<&'static StateDesc> {
         self.states.iter().find(|s| s.code == code)
     }
 
-    /// Важность значения по пределам **из схемы**.
+    /// A value's severity by the limits **from the schema**.
     ///
-    /// Для перечислений и `bool` берётся важность состояния: их значения не
-    /// упорядочены, и «выше порога» к ним неприменимо. Незнакомый код — не
-    /// повод для тревоги сам по себе, но и не норма: у него нет подписи, и
-    /// решать, что он значит, читателю нечем.
+    /// For enums and `bool` the state's severity is taken: their values are not
+    /// ordered, and "above the threshold" does not apply. An unfamiliar code is
+    /// no cause for alarm in itself, but it is not normal either: it has no
+    /// label, and a reader has nothing to decide its meaning with.
     pub fn severity_of(&self, value: &dduroc_format::Value<'_>) -> Severity {
         use dduroc_format::Value;
         if !self.states.is_empty() {
@@ -383,8 +395,8 @@ impl MetricDesc {
         })
     }
 
-    /// Важность числа по диапазонам и предикатам; диапазоны могут быть
-    /// рантайм-переопределением, предикаты всегда схемные.
+    /// A number's severity by ranges and predicates; the ranges may be a
+    /// runtime override, the predicates are always the schema's.
     pub(crate) fn numeric_severity(&self, thresholds: &Thresholds, v: f64) -> Severity {
         let by_predicate = if self.alarm_if.is_some_and(|hit| hit(v)) {
             Severity::Alarm
@@ -397,7 +409,7 @@ impl MetricDesc {
     }
 }
 
-/// Вид спана.
+/// A span kind.
 #[derive(Debug, Clone, Copy)]
 pub struct SpanDesc {
     pub id: SpanKindId,
@@ -405,46 +417,47 @@ pub struct SpanDesc {
     pub class: StorageClass,
 }
 
-/// Шаг миграции `from → from + 1`.
+/// The migration step `from → from + 1`.
 #[derive(Clone, Copy)]
 pub struct Migration {
-    /// Версия, из которой мигрируем.
+    /// The version being migrated from.
     pub from: u16,
-    /// Шаг затрагивает любой сегмент, что бы в нём ни лежало.
+    /// The step touches any segment whatever it holds.
     ///
-    /// `true` — затронутые типы не объявлены, и решать по ним нельзя.
-    /// Это **безопасное умолчание**: переписать лишний сегмент дорого ровно
-    /// на один цикл записи флеша, а пропустить нужный — значит навсегда
-    /// оставить его в прежней раскладке, притом молча.
+    /// `true` means the affected types are not declared and cannot be decided
+    /// from. This is a **safe default**: rewriting a segment needlessly costs
+    /// exactly one flash write cycle, while skipping one that mattered leaves
+    /// it in the earlier layout forever, and silently at that.
     pub touches_all: bool,
-    /// Типы, затронутые шагом. Сегменты, не содержащие ни одного из них,
-    /// переписывать не нужно — прямая экономия ресурса флеша.
+    /// The types the step affects. Segments holding none of them need not be
+    /// rewritten — a direct saving of flash wear.
     pub events: &'static [EventId],
     pub metrics: &'static [MetricId],
-    /// Виды спанов, затронутые шагом.
+    /// The span kinds the step affects.
     ///
-    /// В отличие от событий и метрик, экономии на сегментах они не дают:
-    /// множества видов спанов в footer'е нет, и ответить «в этом сегменте
-    /// таких спанов не бывает» не по чему. Шаг со спанами переписывает
-    /// сегмент всегда — см. [`Migration::touches`].
+    /// Unlike events and metrics, they save no segments: there is no set of
+    /// span kinds in the footer, and there is nothing to answer "this segment
+    /// holds no such spans" from. A step with spans always rewrites the segment
+    /// — see [`Migration::touches`].
     pub spans: &'static [SpanKindId],
-    /// Преобразование одной записи. `Ok(None)` — запись удаляется.
+    /// The transformation of one record. `Ok(None)` deletes the record.
     pub migrate: fn(MigrationInput<'_>) -> Result<Option<MigrationOutcome>, DecodeError>,
 }
 
 impl Migration {
-    /// Нужно ли переписывать сегмент с таким footer'ом.
+    /// Whether a segment with this footer needs rewriting.
     ///
-    /// Единственное место, где решается этот вопрос: множества типов в
-    /// footer'е отвечают на него без чтения блоков, а `touches_all` —
-    /// без чтения вовсе.
+    /// The only place this question is decided: the type sets in the footer
+    /// answer it without reading any blocks, and `touches_all` without reading
+    /// at all.
     pub fn touches(&self, footer: &dduroc_format::Footer) -> bool {
-        // Шаг, трогающий виды спанов, переписывает сегмент безусловно.
-        // Footer знает множества событий и метрик, но не спанов: спросить
-        // «есть ли здесь такой спан» не у кого, а решить «нет» наугад значило
-        // бы навсегда оставить эти записи в прежней раскладке — притом молча,
-        // потому что прогон отчитается об успехе и заштампует мету. Лишняя
-        // перезапись стоит одного цикла флеша, пропуск — необратим.
+        // A step that touches span kinds rewrites the segment unconditionally.
+        // The footer knows the sets of events and metrics but not of spans:
+        // there is nobody to ask "is there such a span here", and deciding "no"
+        // on a guess would leave those records in the earlier layout forever —
+        // silently at that, because the run reports success and stamps the
+        // metadata. A needless rewrite costs one flash cycle; a skip is
+        // irreversible.
         self.touches_all || !self.spans.is_empty() || footer.touches(self.events, self.metrics)
     }
 }
@@ -461,18 +474,20 @@ impl std::fmt::Debug for Migration {
     }
 }
 
-/// Вход шага миграции: запись **в прежней раскладке**, как она лежит на диске.
+/// The input to a migration step: a record **in the earlier layout**, as it
+/// lies on disk.
 ///
-/// Парна [`MigrationOutcome`] — тому, что шаг возвращает. Разведены именами
-/// намеренно: причастие («мигрированная запись») переворачивало бы стороны
-/// сигнатуры, а шаг получает именно то, что ещё не приведено.
+/// It pairs with [`MigrationOutcome`], which is what the step returns. The
+/// names are kept apart deliberately: a participle ("a migrated record") would
+/// flip the sides of the signature, whereas a step receives exactly what has
+/// not been brought up to date.
 #[derive(Debug, Clone, Copy)]
 pub struct MigrationInput<'a> {
     pub record: dduroc_format::Record<'a>,
 }
 
 impl MigrationInput<'_> {
-    /// Тип сообщения. `None` — запись не сообщение.
+    /// The message type. `None` means the record is not a message.
     pub fn event_id(&self) -> Option<EventId> {
         match &self.record {
             dduroc_format::Record::Message(m) => Some(m.event),
@@ -480,7 +495,7 @@ impl MigrationInput<'_> {
         }
     }
 
-    /// Метрика отсчёта. `None` — запись не отсчёт.
+    /// The sample's metric. `None` means the record is not a sample.
     pub fn metric_id(&self) -> Option<MetricId> {
         match &self.record {
             dduroc_format::Record::Sample(s) => Some(s.metric),
@@ -488,10 +503,10 @@ impl MigrationInput<'_> {
         }
     }
 
-    /// Вид спана. `None` — запись не начало спана.
+    /// The span kind. `None` means the record is not the start of a span.
     ///
-    /// У конца спана вида нет: он ссылается на уже начатый по номеру, и
-    /// переименование вида его не касается.
+    /// A span's end has no kind: it refers by number to one already started,
+    /// and renaming a kind does not concern it.
     pub fn span_kind(&self) -> Option<SpanKindId> {
         match &self.record {
             dduroc_format::Record::SpanStart(s) => Some(s.kind),
@@ -499,11 +514,11 @@ impl MigrationInput<'_> {
         }
     }
 
-    /// Значение отсчёта. `None` — запись не отсчёт.
+    /// The sample's value. `None` means the record is not a sample.
     ///
-    /// Значение самоописуемо: тип лежит в самой записи, а не берётся из
-    /// схемы. Поэтому шаг видит то, что писали, — даже если с тех пор в схеме
-    /// у метрики объявлен другой тип.
+    /// The value is self-describing: the type lies in the record itself rather
+    /// than being taken from the schema. So a step sees what was written — even
+    /// if the schema has since declared a different type for the metric.
     pub fn value(&self) -> Option<dduroc_format::Value<'_>> {
         match &self.record {
             dduroc_format::Record::Sample(s) => Some(s.value),
@@ -511,9 +526,10 @@ impl MigrationInput<'_> {
         }
     }
 
-    /// Сырой payload сообщения. `None` — запись не сообщение.
+    /// The message's raw payload. `None` means the record is not a message.
     ///
-    /// Нужен ремапу id: тип меняет номер, байты полей едут как есть.
+    /// An id remap needs it: the type changes its number while the field bytes
+    /// travel as they are.
     pub fn payload(&self) -> Option<&[u8]> {
         match &self.record {
             dduroc_format::Record::Message(m) => Some(m.payload),
@@ -521,11 +537,12 @@ impl MigrationInput<'_> {
         }
     }
 
-    /// Разобрать payload сообщения в старую раскладку.
+    /// Parse a message payload into the old layout.
     ///
-    /// `T` — структура с полями той версии, из которой мигрирует шаг (при
-    /// объявленной `history` её генерирует макрос). Ошибка и для записи,
-    /// которая не сообщение: у остальных видов payload'а в этом смысле нет.
+    /// `T` is a struct with the fields of the version the step migrates from
+    /// (with a declared `history` the macro generates it). It is an error for a
+    /// record that is not a message too: the other kinds have no payload in
+    /// this sense.
     pub fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, DecodeError> {
         match &self.record {
             dduroc_format::Record::Message(m) => {
@@ -536,45 +553,46 @@ impl MigrationInput<'_> {
     }
 }
 
-/// Исход шага миграции — то, чем запись станет. Владеющая форма: шаг обычно
-/// перекодирует payload.
+/// The outcome of a migration step — what the record is to become. An owning
+/// form: a step usually re-encodes the payload.
 ///
-/// Парен [`MigrationInput`]. Прежнее имя `OwnedRecord` сталкивалось с
-/// одноимённым типом читателя (владеющая копия wire-записи) — при импорте
-/// обоих крейтов они были неразличимы.
+/// It pairs with [`MigrationInput`]. The former name `OwnedRecord` collided
+/// with the reader's type of the same name (an owning copy of a wire record) —
+/// importing both crates made them indistinguishable.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum MigrationOutcome {
-    /// Оставить как есть.
+    /// Leave it as it is.
     AsIs,
-    /// Заменить тип и/или payload сообщения.
+    /// Replace a message's type and/or payload.
     Message { event: EventId, payload: Vec<u8> },
-    /// Заменить метрику сэмпла, не трогая значение.
+    /// Replace a sample's metric without touching the value.
     ///
-    /// Остаётся отдельным исходом ради значения: ремап не копирует его вовсе,
-    /// а мегабайтный спектр стоил бы копии на каждой записи.
+    /// It stays a separate outcome for the value's sake: a remap does not copy
+    /// it at all, and a megabyte spectrum would cost a copy on every record.
     SampleMetric(MetricId),
-    /// Заменить значение отсчёта (и, если нужно, метрику).
+    /// Replace a sample's value (and its metric if need be).
     ///
-    /// Значение владеющее: у исхода шага нет времени жизни, связывающего его
-    /// с входной записью, — заимствовать байты блока ему не из чего.
+    /// The value owns its bytes: a step's outcome has no lifetime tying it to
+    /// the input record, so it has nothing to borrow the block's bytes from.
     Sample {
         metric: MetricId,
         value: crate::staged::OwnedValue,
     },
-    /// Переименовать вид спана.
+    /// Rename a span kind.
     ///
-    /// Только вид: номер спана и его родитель — личность записи, на которую
-    /// ссылаются её сообщения и дочерние спаны, и переписать эти ссылки
-    /// цепочке нечем.
+    /// The kind only: a span's number and its parent are the record's identity,
+    /// referred to by its messages and its child spans, and a chain has no way
+    /// to rewrite those references.
     SpanKind(SpanKindId),
 }
 
-/// Схема неймспейса.
+/// A namespace schema.
 #[derive(Debug, Clone, Copy)]
 pub struct Schema {
-    /// Идентичность схемы. Неймспейс запоминает её и отказывается открываться
-    /// чужой схемой: одинаковые id событий в разных схемах означают разное.
+    /// The schema's identity. A namespace remembers it and refuses to open
+    /// under a foreign one: equal event ids in different schemas mean different
+    /// things.
     pub name: &'static str,
     pub version: ProtocolVersion,
     pub languages: &'static [Language],
@@ -584,11 +602,11 @@ pub struct Schema {
     pub migrations: &'static [Migration],
 }
 
-/// Вид дескриптора схемы — чьё пространство идентификаторов имеется в виду.
+/// The kind of schema descriptor — whose identifier space is meant.
 ///
-/// Перечисление, а не строка: у события, метрики и спана id-пространства
-/// раздельные, и диагностика, называющая вид строкой, позволяла бы назвать
-/// несуществующий.
+/// An enum rather than a string: events, metrics and spans have separate id
+/// spaces, and diagnostics that named the kind with a string would let one
+/// name a kind that does not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescriptorKind {
     Event,
@@ -612,11 +630,11 @@ impl std::fmt::Display for DescriptorKind {
     }
 }
 
-/// Ошибка валидации схемы: ловится при подъёме неймспейса, то есть на старте
-/// процесса, а не через месяц работы на нечитаемых логах.
+/// A schema validation error: caught when a namespace comes up, that is, at
+/// process start rather than a month later over unreadable logs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SchemaError {
-    #[error("схема {schema:?}: {kind} id {id} объявлен дважды ({first:?} и {second:?})")]
+    #[error("schema {schema:?}: {kind} id {id} is declared twice ({first:?} and {second:?})")]
     DuplicateId {
         schema: &'static str,
         kind: DescriptorKind,
@@ -625,7 +643,9 @@ pub enum SchemaError {
         second: &'static str,
     },
 
-    #[error("схема {schema:?}: событие {event:?} имеет {got} шаблонов, а языков объявлено {want}")]
+    #[error(
+        "schema {schema:?}: event {event:?} has {got} templates but {want} languages are declared"
+    )]
     TemplateCount {
         schema: &'static str,
         event: &'static str,
@@ -633,21 +653,23 @@ pub enum SchemaError {
         want: usize,
     },
 
-    #[error("схема {schema:?}: языки не объявлены — рендерить сообщения будет нечем")]
+    #[error(
+        "schema {schema:?}: no languages declared — there would be nothing to render messages with"
+    )]
     NoLanguages { schema: &'static str },
 
-    #[error("схема {schema:?}: язык {lang:?} объявлен дважды")]
+    #[error("schema {schema:?}: language {lang:?} is declared twice")]
     DuplicateLanguage {
         schema: &'static str,
         lang: &'static str,
     },
 
-    #[error("схема {schema:?}: версия 0 недопустима — нумерация версий начинается с 1")]
+    #[error("schema {schema:?}: version 0 is not allowed — version numbering starts at 1")]
     ZeroVersion { schema: &'static str },
 
     #[error(
-        "схема {schema:?}: нет шага миграции с версии {from} (цепочка обязана быть \
-         непрерывной до текущей версии {version})"
+        "schema {schema:?}: no migration step from version {from} (the chain has to be \
+         unbroken up to the current version {version})"
     )]
     MigrationGap {
         schema: &'static str,
@@ -655,15 +677,15 @@ pub enum SchemaError {
         version: u16,
     },
 
-    #[error("схема {schema:?}: шаг миграции с версии {from} объявлен дважды")]
+    #[error("schema {schema:?}: the migration step from version {from} is declared twice")]
     DuplicateMigration { schema: &'static str, from: u16 },
 
-    #[error("схема {schema:?}: имя пустое")]
+    #[error("schema {schema:?}: the name is empty")]
     EmptyName { schema: &'static str },
 
     #[error(
-        "схема {schema:?}: {kind} {name:?} нарушает порядок идентификаторов — \
-         поиск дескриптора идёт бинарно и требует возрастания"
+        "schema {schema:?}: {kind} {name:?} breaks the identifier ordering — the \
+         descriptor search is binary and requires ascending order"
     )]
     Unsorted {
         schema: &'static str,
@@ -671,14 +693,14 @@ pub enum SchemaError {
         name: &'static str,
     },
 
-    #[error("схема {schema:?}: метрика {metric:?} объявляет код состояния {code} дважды")]
+    #[error("schema {schema:?}: metric {metric:?} declares state code {code} twice")]
     DuplicateStateCode {
         schema: &'static str,
         metric: &'static str,
         code: u64,
     },
 
-    #[error("схема {schema:?}: метрика {metric:?}: {reason}")]
+    #[error("schema {schema:?}: metric {metric:?}: {reason}")]
     BadMetric {
         schema: &'static str,
         metric: &'static str,
@@ -687,7 +709,7 @@ pub enum SchemaError {
 }
 
 impl Schema {
-    /// Проверить внутреннюю согласованность.
+    /// Check the schema's internal consistency.
     pub fn validate(&self) -> Result<(), SchemaError> {
         if self.name.is_empty() {
             return Err(SchemaError::EmptyName { schema: self.name });
@@ -723,9 +745,10 @@ impl Schema {
             self.spans.iter().map(|s| (s.id.0, s.name)),
         )?;
 
-        // Дескрипторы обязаны идти по возрастанию идентификаторов: поиск по
-        // ним бинарный и выполняется на каждую запись. Макрос `schema!`
-        // раскладывает их сам, но схему можно объявить и вручную.
+        // The descriptors have to run in ascending order of identifier: the
+        // search over them is binary and happens on every record. The `schema!`
+        // macro lays them out itself, but a schema can also be declared by
+        // hand.
         check_sorted(
             self.name,
             DescriptorKind::Event,
@@ -757,9 +780,8 @@ impl Schema {
             self.check_metric(m)?;
         }
 
-        // Цепочка миграций обязана быть непрерывной: 1→2→…→version. Пропуск
-        // означает, что данные старой версии молча остались бы неверно
-        // истолкованными.
+        // The migration chain has to be unbroken: 1→2→…→version. A gap means
+        // data of an old version would silently remain misinterpreted.
         for (i, m) in self.migrations.iter().enumerate() {
             if self.migrations[..i].iter().any(|p| p.from == m.from) {
                 return Err(SchemaError::DuplicateMigration {
@@ -780,11 +802,10 @@ impl Schema {
         Ok(())
     }
 
-    /// Проверить осмысленность метрики.
+    /// Check that a metric makes sense.
     ///
-    /// Бессмысленную метрику нельзя объявить: ошибка ловится на старте
-    /// процесса, а не через месяц работы на графике, который никто не может
-    /// прочесть.
+    /// A meaningless metric cannot be declared: the error is caught at process
+    /// start rather than a month later over a chart nobody can read.
     fn check_metric(&self, m: &MetricDesc) -> Result<(), SchemaError> {
         let bad = |reason| SchemaError::BadMetric {
             schema: self.name,
@@ -792,46 +813,46 @@ impl Schema {
             reason,
         };
 
-        // Перечисление и вид State — одно и то же свойство, объявленное
-        // дважды. Расхождение означает, что одно из двух написано по ошибке,
-        // а какое — знает только автор схемы.
+        // Being an enum and being of kind State are one and the same property
+        // declared twice. A discrepancy means one of the two was written by
+        // mistake, and only the schema's author knows which.
         match (m.states.is_empty(), m.kind) {
             (true, MetricKind::State) => {
                 return Err(bad(
-                    "вид State без объявленных состояний: подписывать нечем",
+                    "kind State with no declared states: there is nothing to label with",
                 ));
             }
             (false, k) if k != MetricKind::State => {
                 return Err(bad(
-                    "состояния объявлены, но вид не State — график нарисовали бы \
-                     прямой через значения, которых не было",
+                    "states are declared but the kind is not State — a chart would be \
+                     drawn as a straight line through values that never were",
                 ));
             }
             _ => {}
         }
 
         if !m.states.is_empty() {
-            // Код состояния — целое на диске, поэтому дробный или блобовый
-            // тип значения к перечислению неприменим.
+            // A state code is an integer on disk, so a fractional or blob value
+            // type does not apply to an enum.
             if !matches!(
                 m.value_type,
                 ValueType::U64 | ValueType::I64 | ValueType::Bool
             ) {
                 return Err(bad(
-                    "состояния допустимы только у целочисленной или булевой \
-                     метрики: код состояния хранится целым",
+                    "states are allowed only on an integer or boolean metric: a \
+                     state code is stored as an integer",
                 ));
             }
             if !m.thresholds.is_unset() {
                 return Err(bad(
-                    "числовые пределы у перечисления: его значения не упорядочены, \
-                     важность задаётся на состояние",
+                    "numeric limits on an enum: its values are not ordered, and \
+                     severity is set per state",
                 ));
             }
             if m.warn_if.is_some() || m.alarm_if.is_some() {
                 return Err(bad(
-                    "предикаты у перечисления: его значения не упорядочены, \
-                     важность задаётся на состояние",
+                    "predicates on an enum: its values are not ordered, and severity \
+                     is set per state",
                 ));
             }
             for (i, s) in m.states.iter().enumerate() {
@@ -843,53 +864,56 @@ impl Schema {
                     });
                 }
                 if s.name.is_empty() {
-                    return Err(bad("состояние без имени"));
+                    return Err(bad("a state with no name"));
                 }
                 if m.value_type == ValueType::Bool && s.code > 1 {
-                    return Err(bad("у булевой метрики допустимы только коды 0 и 1"));
+                    return Err(bad("a boolean metric allows only the codes 0 and 1"));
                 }
             }
         }
 
         for (r, what) in [
-            (m.thresholds.warn, "тревожный"),
-            (m.thresholds.alarm, "аварийный"),
+            (m.thresholds.warn, "warning"),
+            (m.thresholds.alarm, "alarm"),
         ] {
             if matches!((r.min, r.max), (Some(lo), Some(hi)) if lo > hi) {
                 let _ = what;
-                return Err(bad("диапазон задан вывернутым: min больше max"));
+                return Err(bad("the range is inverted: min exceeds max"));
             }
             if r.min.is_some_and(f64::is_nan) || r.max.is_some_and(f64::is_nan) {
-                return Err(bad("граница диапазона — NaN: сравнения с ним всегда ложны"));
+                return Err(bad(
+                    "a range bound is NaN: comparisons with it are always false",
+                ));
             }
         }
         crate::limits::check_nesting(m.name, &m.thresholds).map_err(|_| {
             bad(
-                "критический диапазон обязан включать тревожный: иначе значение \
-                 оказалось бы критическим, не будучи тревожным",
+                "the alarm range has to contain the warning one: otherwise a value \
+                 would be a fault without being a warning",
             )
         })?;
 
         if m.value_type == ValueType::Blob && (m.warn_if.is_some() || m.alarm_if.is_some()) {
             return Err(bad(
-                "предикат у blob-метрики: значение не приводится к числу, и \
-                 проверять ему нечего",
+                "a predicate on a blob metric: the value cannot be reduced to a \
+                 number, so there is nothing for it to check",
             ));
         }
 
         Ok(())
     }
 
-    /// Найти тип сообщения по идентификатору.
+    /// Find a message type by its identifier.
     ///
-    /// Вызывается на **каждую** записываемую и читаемую запись, поэтому
-    /// поиск бинарный: линейный обход двухсот с лишним дескрипторов на
-    /// событие заметен уже на x86 и тем более на armv7. Упорядоченность
-    /// проверяется в [`Schema::validate`], а не предполагается.
+    /// Called on **every** record written and read, so the search is binary: a
+    /// linear walk over two hundred-odd descriptors per event is noticeable
+    /// already on x86, let alone on armv7. The ordering is checked in
+    /// [`Schema::validate`] rather than assumed.
     pub fn event(&self, id: EventId) -> Option<&'static EventDesc> {
         match self.events.binary_search_by_key(&id.0, |e| e.id.0) {
             Ok(i) => Some(&self.events[i]),
-            // Схема не отсортирована (не прошла validate) — честно ищем.
+            // The schema is not sorted (it never passed validate) — search
+            // honestly.
             Err(_) => self.events.iter().find(|e| e.id == id),
         }
     }
@@ -898,14 +922,15 @@ impl Schema {
         self.metric_index(id).map(|(_, d)| d)
     }
 
-    /// Метрика вместе с её позицией в [`Schema::metrics`].
+    /// A metric together with its position in [`Schema::metrics`].
     ///
-    /// Позиция — устойчивый ключ для того, что хранится параллельно схеме и
-    /// не пишется на диск: рантайм-пределов (см. [`crate::limits`]).
+    /// The position is a stable key for what is stored alongside the schema and
+    /// never written to disk: the runtime limits (see [`crate::limits`]).
     pub fn metric_index(&self, id: MetricId) -> Option<(usize, &'static MetricDesc)> {
         match self.metrics.binary_search_by_key(&id.0, |m| m.id.0) {
             Ok(i) => Some((i, &self.metrics[i])),
-            // Схема не отсортирована (не прошла validate) — честно ищем.
+            // The schema is not sorted (it never passed validate) — search
+            // honestly.
             Err(_) => self
                 .metrics
                 .iter()
@@ -925,17 +950,18 @@ impl Schema {
         self.languages.iter().position(|l| l.0 == code)
     }
 
-    /// Все каналы, которые может использовать схема.
+    /// Every channel the schema may use.
     pub fn classes(&self) -> Vec<StorageClass> {
-        // Обычный канал есть всегда, даже если его не объявил ни один тип.
-        // Свободному тексту своего класса взять неоткуда — у него нет типа в
-        // схеме, — а писать его надо: это мост из чужих логов, обработчик
-        // паники и однократное объявление дефекта сборки. Схема из одной
-        // телеметрии оставляла бы всё это без канала, и объявление, ради
-        // которого механизм заведён, молча отказывало бы.
+        // The ordinary channel always exists, even if no type declared it. Free
+        // text has nowhere to get a class of its own — it has no type in the
+        // schema — and it has to be written: it is the bridge from foreign
+        // logs, the panic handler and the one-off announcement of a build
+        // defect. A schema of pure telemetry would leave all of that without a
+        // channel, and the very announcement the mechanism exists for would
+        // fail silently.
         //
-        // Пустой канал не стоит почти ничего: каталог создаётся при подъёме,
-        // а сегмент — только первой записью.
+        // An empty channel costs almost nothing: the directory is created when
+        // the namespace comes up, and a segment only by the first record.
         let mut out: Vec<StorageClass> = vec![StorageClass::Default];
         let all = self
             .events
@@ -952,13 +978,13 @@ impl Schema {
         out
     }
 
-    /// Шаг миграции с версии `from`.
+    /// The migration step from version `from`.
     pub fn migration(&self, from: u16) -> Option<&'static Migration> {
         self.migrations.iter().find(|m| m.from == from)
     }
 }
 
-/// Проверить возрастание идентификаторов: по ним идёт бинарный поиск.
+/// Check that identifiers ascend: the search over them is binary.
 fn check_sorted(
     schema: &'static str,
     kind: DescriptorKind,
@@ -995,14 +1021,14 @@ fn check_unique(
     Ok(())
 }
 
-/// Конструкторы схем для тестов соседних модулей.
+/// Schema constructors for the tests of neighbouring modules.
 ///
-/// Не `mod tests`: тем нужен готовый экземпляр, а не проверки этого модуля.
+/// Not `mod tests`: those need a ready instance, not checks of this module.
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::*;
 
-    /// Минимальная валидная схема с шагами миграции.
+    /// The minimal valid schema with migration steps.
     pub(crate) fn minimal_schema_with_migrations(
         version: u16,
         migrations: &'static [Migration],
@@ -1063,13 +1089,13 @@ mod tests {
             },
         ];
         let s = schema(EVENTS, 1);
-        s.validate().expect("схема корректна");
+        s.validate().expect("the schema is valid");
         assert_eq!(s.event(EventId(1)).unwrap().name, "PowerSet");
         assert!(s.event(EventId(99)).is_none());
         assert_eq!(s.language_index("ru"), Some(1));
         assert_eq!(s.language_index("ja"), None);
-        // Порядок — как в объявлении перечисления: он определяет индексы
-        // каналов в рантайме, на диске каналы живут под именами.
+        // The order is as in the enum declaration: it determines the channel
+        // indices at runtime, while on disk channels live under names.
         assert_eq!(
             s.classes(),
             vec![StorageClass::Default, StorageClass::Critical]
@@ -1082,12 +1108,12 @@ mod tests {
 
     #[test]
     fn the_default_channel_exists_even_if_no_type_asks_for_it() {
-        // Схема из одной телеметрии не объявляет обычного канала, а
-        // свободному тексту деться больше некуда: у него нет типа в схеме, а
-        // значит и класса хранения. Без безусловного `default` объявление
-        // дефекта сборки, сообщение моста и обработчик паники молча
-        // отказывали бы — то есть механизм, заведённый против тишины, сам бы
-        // и молчал.
+        // A schema of pure telemetry declares no ordinary channel, and free
+        // text has nowhere else to go: it has no type in the schema and
+        // therefore no storage class. Without an unconditional `default`, the
+        // announcement of a build defect, a bridge message and the panic
+        // handler would fail silently — that is, the mechanism set up against
+        // silence would itself go quiet.
         static METRICS: &[MetricDesc] = &[MetricDesc {
             warn_if: None,
             alarm_if: None,
@@ -1110,11 +1136,11 @@ mod tests {
             spans: &[],
             migrations: &[],
         };
-        s.validate().expect("схема корректна");
+        s.validate().expect("the schema is valid");
         assert_eq!(
             s.classes(),
             vec![StorageClass::Default, StorageClass::Telemetry],
-            "обычный канал есть всегда"
+            "the ordinary channel always exists"
         );
     }
 
@@ -1153,7 +1179,7 @@ mod tests {
                     ..
                 }
             ),
-            "получено {err}"
+            "got {err}"
         );
     }
 
@@ -1179,7 +1205,7 @@ mod tests {
                     ..
                 }
             ),
-            "получено {err}"
+            "got {err}"
         );
     }
 
@@ -1198,7 +1224,7 @@ mod tests {
             migrate: noop,
         }];
 
-        // Версия 3, а шаг есть только 1→2: разрыв 2→3.
+        // Version 3, with only a 1→2 step: the gap is 2→3.
         let s = Schema {
             migrations: STEPS,
             ..schema(EVENTS, 3)
@@ -1213,10 +1239,10 @@ mod tests {
                     ..
                 }
             ),
-            "получено {err}"
+            "got {err}"
         );
 
-        // Полная цепочка проходит.
+        // A complete chain passes.
         static FULL: &[Migration] = &[
             Migration {
                 from: 1,
@@ -1240,10 +1266,10 @@ mod tests {
             ..schema(EVENTS, 3)
         }
         .validate()
-        .expect("непрерывная цепочка");
+        .expect("an unbroken chain");
     }
 
-    /// Схема с одной метрикой — для проверок осмысленности метрик.
+    /// A schema with one metric — for checking that metrics make sense.
     fn with_metric(metrics: &'static [MetricDesc]) -> Schema {
         static EVENTS: &[EventDesc] = &[];
         Schema {
@@ -1297,13 +1323,17 @@ mod tests {
             STATES,
             Thresholds::NONE,
         )];
-        with_metric(M).validate().expect("перечисление корректно");
+        with_metric(M).validate().expect("the enum is valid");
 
         let desc = with_metric(M).metric(MetricId(1)).unwrap();
         assert_eq!(desc.state(0).unwrap().name, "Los");
         assert_eq!(desc.state(2).unwrap().severity, Severity::Normal);
-        assert!(desc.state(1).is_none(), "код 1 не объявлен — и подписи нет");
-        // Пропуски в нумерации законны: коды явные, а не позиционные.
+        assert!(
+            desc.state(1).is_none(),
+            "code 1 is not declared, and there is no label"
+        );
+        // Gaps in the numbering are legitimate: the codes are explicit, not
+        // positional.
         assert_eq!(
             desc.severity_of(&dduroc_format::Value::U64(2)),
             Severity::Normal
@@ -1318,7 +1348,7 @@ mod tests {
             severity: Severity::Normal,
         }];
 
-        // Вид State без состояний: подписывать нечем.
+        // Kind State with no states: there is nothing to label with.
         static NO_STATES: &[MetricDesc] = &[metric(
             ValueType::U64,
             MetricKind::State,
@@ -1330,8 +1360,8 @@ mod tests {
             Err(SchemaError::BadMetric { .. })
         ));
 
-        // Состояния при виде Gauge: график нарисовали бы прямой через
-        // значения, которых не было.
+        // States with kind Gauge: a chart would be drawn as a straight line
+        // through values that never were.
         static WRONG_KIND: &[MetricDesc] = &[metric(
             ValueType::U64,
             MetricKind::Gauge,
@@ -1363,7 +1393,7 @@ mod tests {
                     with_metric(leaked).validate(),
                     Err(SchemaError::BadMetric { .. })
                 ),
-                "тип {vt:?} не может нести код состояния"
+                "type {vt:?} cannot carry a state code"
             );
         }
     }
@@ -1446,8 +1476,8 @@ mod tests {
             OK,
             Thresholds::NONE,
         )];
-        with_metric(G).validate().expect("bool как два состояния");
-        // Важность булева значения берётся из состояния.
+        with_metric(G).validate().expect("a bool as two states");
+        // A boolean's severity comes from the state.
         let d = with_metric(G).metric(MetricId(1)).unwrap();
         assert_eq!(
             d.severity_of(&dduroc_format::Value::Bool(false)),
@@ -1461,7 +1491,7 @@ mod tests {
 
     #[test]
     fn thresholds_must_be_sane() {
-        // Вывернутый диапазон.
+        // An inverted range.
         static INVERTED: &[MetricDesc] = &[metric(
             ValueType::F32,
             MetricKind::Gauge,
@@ -1476,7 +1506,7 @@ mod tests {
             Err(SchemaError::BadMetric { .. })
         ));
 
-        // Критический не включает тревожный.
+        // The critical one does not contain the warning one.
         static NOT_NESTED: &[MetricDesc] = &[metric(
             ValueType::F32,
             MetricKind::Gauge,
@@ -1491,8 +1521,8 @@ mod tests {
             Err(SchemaError::BadMetric { .. })
         ));
 
-        // NaN как граница: сравнения с ним всегда ложны, значит предел
-        // молча не работал бы.
+        // NaN as a bound: comparisons with it are always false, so the limit
+        // would silently do nothing.
         static NAN: &[MetricDesc] = &[metric(
             ValueType::F32,
             MetricKind::Gauge,
@@ -1507,7 +1537,7 @@ mod tests {
             Err(SchemaError::BadMetric { .. })
         ));
 
-        // Пределы у перечисления.
+        // Limits on an enum.
         static STATES: &[StateDesc] = &[StateDesc {
             code: 0,
             name: "A",
@@ -1527,7 +1557,7 @@ mod tests {
             Err(SchemaError::BadMetric { .. })
         ));
 
-        // Односторонние границы и полностью открытый диапазон законны.
+        // One-sided bounds and a fully open range are legitimate.
         static OPEN: &[MetricDesc] = &[metric(
             ValueType::F32,
             MetricKind::Gauge,
@@ -1537,14 +1567,14 @@ mod tests {
                 alarm: range(Some(-273.15), None),
             },
         )];
-        with_metric(OPEN).validate().expect("открытые границы");
+        with_metric(OPEN).validate().expect("open bounds");
     }
 
     #[test]
     fn metric_index_is_stable_key_for_runtime_state() {
-        // Позиция метрики — ключ для того, что хранится параллельно схеме и
-        // на диск не идёт (пределы). Она обязана совпадать с порядком в
-        // массиве, иначе пределы применились бы к чужой метрике.
+        // A metric's position is the key for what is stored alongside the
+        // schema and never reaches disk (the limits). It has to match the order
+        // in the array, or the limits would apply to the wrong metric.
         static M: &[MetricDesc] = &[
             MetricDesc {
                 warn_if: None,
