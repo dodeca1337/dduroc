@@ -11,66 +11,43 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// and superfluous barriers are noticeable on armv7.
 #[derive(Debug, Default)]
 pub struct Counters {
+    /// Records appended to the block journal; ordinary writes need a later barrier.
     pub records_written: AtomicU64,
     pub blocks_written: AtomicU64,
+    /// Encoded dduroc block bytes, excluding raft metadata, rewrites and file overhead.
     pub bytes_written: AtomicU64,
+    /// Successful writer sync/barrier operations, not a count of physical syscalls.
     pub syncs: AtomicU64,
+    /// Legacy segment counter, retained for API compatibility; zero in the raft writer.
     pub segments_created: AtomicU64,
+    /// Legacy segment counter, retained for API compatibility; zero in the raft writer.
     pub segments_sealed: AtomicU64,
+    /// Legacy segment counter, retained for API compatibility; zero in the raft writer.
     pub segments_rotated: AtomicU64,
-    /// Records dropped because the normal channel's queue overflowed.
+    /// Records lost to bounded admission or writer/storage failure.
     pub dropped: AtomicU64,
-    /// Records refused as breaking the schema contract: an id from a foreign
-    /// schema, a value of the wrong type. A build defect rather than a
-    /// consequence of load, hence a separate counter — mixing it with losses
-    /// would hide a bug behind "the disk cannot keep up".
+    /// Refusals reported by the quiet API for schema/type/size validation.
+    /// Explicit try_* callers handle such refusals themselves. They differ
+    /// from a storage failure after a write was accepted.
     pub rejected: AtomicU64,
     /// How many times a write to the critical channel waited for room in the
     /// queue.
     pub backpressure_waits: AtomicU64,
-    /// I/O errors in the writer.
+    /// Terminal writer/backend failures, including I/O errors.
     pub io_errors: AtomicU64,
-    /// Damaged tails discarded during recovery.
+    /// Legacy recovery counter. Strict raft recovery refuses damaged tails;
+    /// it never truncates them, so this remains zero for raft stores.
     pub truncated_tails: AtomicU64,
-    /// How many times a channel took a segment into work: created a new one
-    /// **or** brought back one released for idleness.
+    /// Legacy internal segment counter; not used by the raft writer.
     pub segments_opened: AtomicU64,
-    /// How many times occupancy of the medium grew.
-    ///
-    /// Not handed out: this is the watchdog for recomputing the total budget.
-    /// It grows in three cases — a segment was created, a released one was
-    /// brought back, the reserve window was extended (see
-    /// `SegmentWriter::reserve`); everything else only reduces occupancy. While
-    /// the counter has not moved, there is no reason to walk the whole fleet
-    /// for the sum.
-    ///
-    /// It is separate from `segments_opened` because that counter is what
-    /// announces a change of the store's shape to readers: extending a window
-    /// changes no shape — not one segment appeared or vanished — and waking
-    /// subscriptions with it would mean calling them for every megabyte
-    /// written.
+    /// Legacy reserve-window counter; not used for raft occupancy accounting.
+    /// Current physical/logical usage is ReadBackend::usage().
     pub occupancy_raised: AtomicU64,
-    /// How many times the store could not be brought back under its declared
-    /// total ceiling.
-    ///
-    /// Only sealed segments can be evicted: the active one is being written to,
-    /// and its reserve is not extravagance but the guarantee that ENOSPC
-    /// arrives when the window is extended rather than in the middle of a
-    /// critical event. So the ceiling has to exceed what the live segments have
-    /// taken — and they take not `segment_bytes` but their actual reserve
-    /// window, which grows along with what has been written. An unmeetable
-    /// ceiling is better learned from a counter than from the medium running
-    /// out.
+    /// Legacy soft-ceiling counter, retained for API compatibility. The raft
+    /// backend returns explicit retention/headroom errors instead of raising it.
     pub budget_overruns: AtomicU64,
-    /// How many times the block buffers could not be brought back under the
-    /// declared memory ceiling.
-    ///
-    /// The ceiling cannot be made hard without losing data: one record can be
-    /// larger than any reasonable ceiling (an incompressible blob), and a block
-    /// buffer has to hold at least that one. So the ceiling is honoured by
-    /// freeing what can be freed, and its unmeetability is announced by a
-    /// counter — which is more honest than discarding a record for the sake of
-    /// memory accounting.
+    /// Legacy soft-buffer-ceiling counter, retained for API compatibility.
+    /// Current producer payload and queue memory limits reject before admission.
     pub buffer_overruns: AtomicU64,
 }
 
@@ -137,8 +114,11 @@ pub struct Stats {
     pub blocks_written: u64,
     pub bytes_written: u64,
     pub syncs: u64,
+    /// Legacy segment counter; zero for raft-backed stores.
     pub segments_created: u64,
+    /// Legacy segment counter; zero for raft-backed stores.
     pub segments_sealed: u64,
+    /// Legacy segment counter; zero for raft-backed stores.
     pub segments_rotated: u64,
     pub dropped: u64,
     /// Refused as breaking the schema contract — see the field of the same name
@@ -146,12 +126,11 @@ pub struct Stats {
     pub rejected: u64,
     pub backpressure_waits: u64,
     pub io_errors: u64,
+    /// Legacy recovery counter; strict raft recovery never truncates a tail.
     pub truncated_tails: u64,
-    /// The store did not fit its declared total ceiling — see the field of the
-    /// same name on [`Counters`].
+    /// Legacy soft-ceiling counter; see [`Counters::budget_overruns`].
     pub budget_overruns: u64,
-    /// The block buffers did not fit the declared memory ceiling — see the
-    /// field of the same name on [`Counters`].
+    /// Legacy soft-buffer counter; see [`Counters::buffer_overruns`].
     pub buffer_overruns: u64,
 }
 

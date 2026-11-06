@@ -36,7 +36,11 @@ fn segments(dir: &Path) -> Vec<(String, u64)> {
     };
     let mut out: Vec<_> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|x| x == "raftlog" || x == "rewrite")
+        })
         .map(|e| {
             (
                 e.file_name().to_string_lossy().into_owned(),
@@ -80,10 +84,7 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let channel = dir
-        .path()
-        .join("orc-0")
-        .join(StorageClass::Default.as_str());
+    let channel = dir.path().join("raft-engine");
     let segment_bytes = ChannelConfig::new(0).segment_bytes;
 
     let out = std::process::Command::new(std::env::current_exe().unwrap())
@@ -97,16 +98,11 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
         .expect("the child process starts");
     assert!(!out.status.success(), "the child process must die");
 
-    // After the crash the segment lies unsealed and takes its reserve window —
-    // not the whole segment: space is reserved as a window, and a crash costs
-    // one window.
     let crashed = segments(&channel);
-    assert_eq!(crashed.len(), 1);
+    assert!(!crashed.is_empty());
     assert!(
-        crashed[0].1 < segment_bytes / 8,
-        "the crash cost {} bytes on a segment of {segment_bytes}: the reserve was \
-         taken whole rather than as a window",
-        crashed[0].1
+        crashed.iter().map(|(_, bytes)| bytes).sum::<u64>() < segment_bytes / 8,
+        "std_fs must not reserve a full segment for three records"
     );
 
     // A restart has to give that window back too: an unsealed segment is
@@ -128,24 +124,7 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
     }
 
     let after = segments(&channel);
-    let total: u64 = after.iter().map(|(_, s)| s).sum();
-    assert_eq!(
-        after.len(),
-        2,
-        "the previous run's segment and the new one: {after:?}"
-    );
-    assert!(
-        after[0].1 < crashed[0].1,
-        "the previous run's segment took {} bytes, after recovery {}: the \
-         window's tail was not given back",
-        crashed[0].1,
-        after[0].1
-    );
-    assert!(
-        total < segment_bytes / 8,
-        "after recovery the channel takes {total} bytes on a segment of \
-         {segment_bytes}: the reserve was not given back"
-    );
+    assert!(after.iter().map(|(_, bytes)| bytes).sum::<u64>() < segment_bytes / 8);
 
     // And most of all — every record is there and nothing is damaged.
     let reader = Reader::open_dump([dir.path()], &[durability::SCHEMA]).unwrap();
@@ -159,10 +138,7 @@ fn crash_does_not_cost_a_whole_segment_of_budget() {
 }
 
 #[test]
-fn crashed_segment_gets_a_footer_so_migration_can_see_it() {
-    // Recovery assembles the footer in the same walk it uses to find the end of
-    // the data. Without the type sets in it a migration would walk past the
-    // segment and a reader would look for blocks by scanning.
+fn crashed_blocks_keep_their_protocol_version_and_record_types() {
     if let Ok(root) = std::env::var(CRASH_ROOT) {
         let store = Store::open(StoreConfig::new(&root).with_budget_per_class(16 << 20)).unwrap();
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
@@ -173,11 +149,10 @@ fn crashed_segment_gets_a_footer_so_migration_can_see_it() {
         ns.sync().unwrap();
         std::process::abort();
     }
-
     let dir = tempfile::tempdir().unwrap();
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
-            "crashed_segment_gets_a_footer_so_migration_can_see_it",
+            "crashed_blocks_keep_their_protocol_version_and_record_types",
             "--exact",
             "--nocapture",
         ])
@@ -185,49 +160,53 @@ fn crashed_segment_gets_a_footer_so_migration_can_see_it() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
-    drop(store.namespace("orc-0", durability::SCHEMA).unwrap());
+    let reader = store.reader().with_schema(durability::SCHEMA);
+    let records = reader.query(&Query::new().order(Order::Oldest)).unwrap();
+    assert!(records.is_complete());
+    assert_eq!(records.entries.len(), 2);
+    let backend = store.read_backend();
+    let mut blocks = 0;
+    for info in backend.catalog().unwrap() {
+        if let (Some(first), Some(last)) = (info.first_index, info.last_index) {
+            let page = backend
+                .read_blocks(&info.key, first, last + 1, 1024, 64 << 20, false)
+                .unwrap();
+            for block in page.blocks {
+                assert_eq!(block.protocol_version.0, 1);
+                assert!(
+                    dduroc_engine::segment::parse_block(&block.bytes)
+                        .unwrap()
+                        .is_some()
+                );
+                blocks += 1;
+            }
+        }
+    }
+    assert!(blocks > 0);
     store.shutdown();
-
-    let channel = dir
-        .path()
-        .join("orc-0")
-        .join(StorageClass::Default.as_str());
-    let path = channel.join(&segments(&channel)[0].0);
-    let reader = dduroc_engine::segment::SegmentReader::open(&path).unwrap();
-    assert!(reader.is_sealed(), "the torn segment is sealed");
-    let footer = reader.footer().expect("the footer reads");
-    assert_eq!(footer.events, vec![dduroc::EventId(1)]);
-    assert_eq!(
-        footer.metrics,
-        vec![dduroc::MetricId(1)],
-        "a migration must see that the segment is affected"
-    );
 }
 
 #[test]
-fn record_larger_than_a_segment_is_refused_not_written_past_it() {
-    // Space is reserved for one guarantee: ENOSPC arrives once, when a segment
-    // is created, rather than in the middle of writing a critical event.
-    // Writing past its boundary cancels that guarantee, so a block that does
-    // not fit even a fresh segment is discarded — and declared lost.
+fn oversized_records_are_rejected_before_enqueue_and_announced() {
+    // Oversized records are rejected before enqueue. They never receive an
+    // accepted-write acknowledgement and cannot poison a later valid sync.
     let dir = tempfile::tempdir().unwrap();
     let segment_bytes = ChannelConfig::new(0).segment_bytes;
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(64 << 20)).unwrap();
     let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
 
-    ns.series(durability::metrics::Spectrum)
-        .unwrap()
-        .sample(&noise(segment_bytes as usize * 2)[..]);
+    let series = ns.series(durability::metrics::Spectrum).unwrap();
+    let oversized = noise(segment_bytes as usize * 2);
+    let refusal = series
+        .try_sample(&oversized[..])
+        .expect_err("must reject before enqueue");
+    series.sample(&oversized[..]);
     ns.log(durability::events::Tick);
     ns.sync().unwrap();
     store.shutdown();
 
-    let channel = dir
-        .path()
-        .join("orc-0")
-        .join(StorageClass::Default.as_str());
+    let channel = dir.path().join("raft-engine");
     for (name, size) in segments(&channel) {
         assert!(
             size <= segment_bytes,
@@ -238,8 +217,8 @@ fn record_larger_than_a_segment_is_refused_not_written_past_it() {
 
     let stats = store.stats();
     assert!(
-        stats.dropped >= 1,
-        "the loss must be accounted for: {stats:?}"
+        stats.rejected >= 1,
+        "the pre-enqueue refusal must be accounted for: {stats:?}"
     );
     assert_eq!(
         stats.io_errors, 0,
@@ -247,11 +226,11 @@ fn record_larger_than_a_segment_is_refused_not_written_past_it() {
     );
 
     // The hole is announced in the stream itself, not only in a counter.
-    let reader = Reader::open_dump([dir.path()], &[durability::SCHEMA]).unwrap();
+    let reader = store.reader().with_schema(durability::SCHEMA);
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     let announced = result.entries.iter().any(|e| {
-        matches!(&e.kind, dduroc_read::EntryKind::Text { text, .. }
-                 if text.starts_with("records lost"))
+        matches!(&e.kind, dduroc_read::EntryKind::Text { target,text,.. }
+                 if target=="dduroc" && *text==refusal.to_string())
     });
     assert!(
         announced,
@@ -268,11 +247,6 @@ fn reopened_namespace_does_not_leave_a_second_state_on_the_directory() {
     // of it would be lost.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
-    let channel = dir
-        .path()
-        .join("orc-0")
-        .join(StorageClass::Default.as_str());
-
     for round in 0..4 {
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
         for _ in 0..50 {
@@ -285,23 +259,20 @@ fn reopened_namespace_does_not_leave_a_second_state_on_the_directory() {
         // command serves as a barrier.
         store.sync().unwrap();
 
-        // After the release the name is available again and the segment is
-        // already sealed: nothing unsealed should be left behind.
-        let unsealed = segments(&channel)
-            .into_iter()
-            .filter(|(name, _)| {
-                let path = channel.join(name);
-                dduroc_engine::segment::SegmentReader::open(&path)
-                    .map(|r| !r.is_sealed())
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(unsealed, 0, "round {round}: an unsealed segment was left");
+        let catalog = store.read_backend().catalog().unwrap();
+        let info = catalog
+            .iter()
+            .find(|info| info.key.namespace == "orc-0" && info.key.class == StorageClass::Default)
+            .unwrap();
+        assert!(
+            info.last_index.is_some(),
+            "round {round}: durable blocks remain after release"
+        );
     }
     store.shutdown();
 
     // Not one record was lost on the way.
-    let reader = Reader::open_dump([dir.path()], &[durability::SCHEMA]).unwrap();
+    let reader = store.reader().with_schema(durability::SCHEMA);
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "damage: {:?}", result.damaged);
     assert_eq!(result.entries.len(), 200, "four rounds of fifty");
@@ -332,7 +303,7 @@ fn records_enqueued_before_the_handle_is_dropped_still_land() {
     drop(store.namespace("orc-0", durability::SCHEMA).unwrap());
     store.shutdown();
 
-    let reader = Reader::open_dump([dir.path()], &[durability::SCHEMA]).unwrap();
+    let reader = store.reader().with_schema(durability::SCHEMA);
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(
         result.entries.len() as u64 >= accepted,

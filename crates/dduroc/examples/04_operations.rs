@@ -97,7 +97,7 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     store.shutdown();
 
     // What survived: the oldest available snapshot is no longer number zero.
-    let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
+    let reader = store.reader();
     let oldest = reader.query(
         &Query::new()
             .kinds(KindFilter::TELEMETRY)
@@ -187,7 +187,7 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let stats = store.stats();
     store.shutdown();
 
-    let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
+    let reader = store.reader();
     let listing = reader.namespaces()?;
     for ns in &listing.namespaces {
         println!("  {}: {} KiB taken", ns.name, ns.total_bytes >> 10);
@@ -262,7 +262,7 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     // counter. A notice is parsed by `Entry::dropped_records` — the format of
     // its text belongs to the engine, and application code need not parse the
     // prose.
-    let reader = Reader::open_dump([root], &[probe::SCHEMA])?;
+    let reader = store.reader();
     let mut announced = 0u64;
     let mut marks = 0usize;
     for e in reader.stream(&Query::new().kinds(KindFilter {
@@ -284,8 +284,7 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 // 4. A class with a medium of its own. Critical data is written to a protected
 // partition (jffs2 and the like): the class is given its own root, and the
-// layout inside it is the same — `<root>/<namespace>/<class>/`. A dump of such
-// a store is two trees, and the viewer is told both.
+// each root contains its own shared raft log. A dump of such a store names both roots.
 // ---------------------------------------------------------------------------
 fn vault(
     root: &std::path::Path,
@@ -307,19 +306,8 @@ fn vault(
     ns.log(probe::events::Ping { seq: 1 });
     ns.log(probe::events::Fault { code: 3 });
     ns.sync()?;
-    println!(
-        "  the main root:          {:?}\n  the critical partition: {:?}",
-        std::fs::read_dir(root.join("orc-probe-0"))?
-            .filter_map(|e| e
-                .ok()
-                .map(|e| e.file_name().into_string().unwrap_or_default()))
-            .collect::<Vec<_>>(),
-        std::fs::read_dir(vault.join("orc-probe-0"))?
-            .filter_map(|e| e
-                .ok()
-                .map(|e| e.file_name().into_string().unwrap_or_default()))
-            .collect::<Vec<_>>(),
-    );
+    println!("  engine roots: {:?}", store.roots());
+    println!("  channels: {:?}", store.read_backend().catalog()?);
 
     // One's own store is read by itself: it already has the roots (both!) and
     // the schemas of the namespaces that came up. Naming the critical partition
@@ -339,6 +327,9 @@ fn vault(
     // takes a lock on the root and sweeps temporary files), so the roots and
     // schemas are named by hand.
     store.shutdown();
+    drop(reader);
+    drop(ns);
+    drop(store);
     let offline = Reader::open_dump([root, vault], &[probe::SCHEMA])?;
     println!(
         "  the same dump through a viewer: {} records",

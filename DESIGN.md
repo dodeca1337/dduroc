@@ -4,35 +4,30 @@ A design document. The implementation: the crates `dduroc-format`,
 `dduroc-engine`, `dduroc-read`, `dduroc-macros`, `dduroc`. The byte format is
 in [SPEC.md](SPEC.md), the measurements in [BENCHMARKS.md](BENCHMARKS.md).
 
-Not implemented (deliberately deferred):
+The writer uses the pinned Raft Engine backend described below. The compact
+record/block codec is independent of that backend. Legacy segment readers are
+retained for explicit offline inspection; an old segment store is not opened
+for writing or silently converted.
 
-- **the web layer** (`dduroc-graphql`, `dduroc-web`, `dduroc-viewer`) and the
-  frontend;
-- **the bridge from tracing/log** — the `Text` record kind exists in the
-  format, the bridge does not;
-- **continuing to write into a segment of a previous run**:
-  `SegmentWriter::reopen` is implemented and tested but unused — by the format
-  a segment does not cross a run boundary, and at start `boot_counter` is
-  always new. A torn segment is sealed instead (see below), and `reopen`
-  remains a groundwork for recovery within one run.
+The web layer and a tracing/log bridge remain separate work.
 
 ## Goals and constraints
 
 - Rust, embedded Linux (no RTC), the media are eMMC and SD cards.
 - A relative time system; conversion to UTC is a best-effort layer on top.
 - The minimum volume of stored data and the minimum flash wear.
-- The storage budget is custom: the design reference point is ~20 GB, scaling
-  from 2–8 GB to hundreds of GB. The library is reused across projects.
+- Storage budgets are configurable per class and namespace. The current backend
+  imposes explicit capacity limits for its 32-bit indexes; the former 20 GB
+  design target is not a claim of support for this backend on ARMv7.
 - Durability within one engine: critical messages are synced at once — that is
   the definition of their class — while the rest only have their `fdatasync`
   interval configured. The storage class is stated per message.
-- Scale: up to ~200 microservice types × up to 64 instances (up to ~12.8k
-  namespaces); up to ~150 message types and ~100 metrics per unit.
-- The target architecture is **armv7** (32-bit), cross-compiled with
-  **cargo-zigbuild**. The consequences: file sizes and offsets are always
-  `u64`, never `usize`; large segments are not mmapped (pread — already
-  decided); CRC32C on armv7 has no hardware instruction (it appeared in
-  ARMv8) — the `crc32c` crate's software fallback is enough at our speeds.
+- Historical sizing target: ~200 service types × 64 instances. This is not a
+  measured capacity claim; current scenarios and limits are in BENCHMARKS.md.
+- The target architecture is **armv7** (32-bit). Application file sizes and
+  offsets use `u64`; the dependency still has internal `usize` accounting,
+  so capacity and file-sequence spans are checked explicitly. Target CPU and
+  storage performance require measurement on the device.
 
 ## Decisions (settled)
 
@@ -44,37 +39,56 @@ monotonic and LSM's sorting is not needed; a write amplification of ≥2×
 workers are superfluous. fjall's FIFO compaction is the same deletion of old
 files, but with overhead on top.
 
-### A segmented append-only log
+### Raft Engine block storage
 
-- **A segment** is a file `<boot>-<µs of the first record>.log` in a channel's
-  directory. Append only. It is sealed on reaching the size limit or on a
-  change of boot. Rotation is an `unlink` of the oldest segment when a
-  channel's budget is exceeded.
-- **A block** is the unit of writing and of a flush (= a writer batch):
-  `header{base_time, count, uncompressed_len, compressed_len, crc32c}` plus
-  the records, optionally LZ4/zstd per block. A block may hold a single record
-  (the critical channel).
-- **A record inside a block**: `varint Δµs from base_time` plus an event
-  header plus a postcard payload. Delta-encoded time: 1–3 bytes instead of
-  LSM's 10-byte key.
-- **Recovery**: no WAL is needed — the log is the WAL. A scan of the last
-  segment by block CRCs, stopping at the first broken or zero header, and a
-  truncation of the tail. It is done when a channel comes up: a torn segment
-  of a previous run is truncated to the end of the intact data and **sealed** —
-  the footer is assembled in the same walk that looks for that end, so no
-  second pass is needed. The point is not the convenience of reading: while a
-  segment is unsealed, the unwritten tail of its reserve window is counted
-  against it, and several crash stops in a row eat the channel's budget with
-  emptiness, after which rotation starts on live history. Only a segment of a
-  foreign run is touched — the live state of this same process may be writing
-  into one of the current run.
-- **Reading**: a binary search over the segment names → the footer's block
-  index for a sealed segment (or a scan of the headers for an active one) →
-  decompressing a block.
-- **Spans** — with no keyspace of their own and no update semantics: ordinary
-  `SpanStart`/`SpanEnd` events in the shared stream, and the tree is assembled
-  at read time. Spans rotate along with the events — there are no dangling
-  span ids.
+The storage dependency is pinned to `raft-engine = 0.4.2`, with default features
+disabled and `std_fs` enabled. `std_fs` is also used on the host so tests exercise
+the backend used on ARMv7. The default Unix backend of this release fails to
+compile for ARMv7 because of its `off_t` assumptions.
+
+Each distinct configured root has one Engine, shared with live readers.
+Distinct roots must not overlap or nest. Payload reads and purge execute on a
+bounded worker dedicated to that engine
+lifetime. This is required because the pinned upstream thread-local block
+cache identifies file positions without identifying the engine. Reusing a
+caller thread across roots can otherwise return another root's payload. The
+worker is closed and joined rather than reused when its engine is dropped. Each
+(namespace, storage class) has a persistent Raft group. Entries contain compact
+dduroc blocks; metadata values contain identities, indexes and retention
+accounting, not event payloads. Keeping multiple events in a block amortizes
+the engine's per-entry memory index. Raft batch compression is disabled because
+dduroc already compresses blocks.
+
+The backend's files are opaque: dduroc does not implement a second WAL or
+truncate them itself. Prefix removal is logged in an error-returning batch,
+followed by explicit garbage collection. Bounded page reads exclude concurrent
+prefix compaction and schema group replacement so normal retention cannot
+appear as a missing/corrupt block halfway through a page. Logical retained bytes and allocated
+filesystem bytes are different measurements. Released namespaces remain in
+retention accounting, including after reopening the store.
+
+**Durability:** a critical `try_log*` result succeeds only after a nonempty
+synchronous engine write. Ordinary success means acceptance into a bounded
+queue; its eventual persistence follows the configured flush/sync intervals
+while the writer and storage are making progress. These intervals do not
+guarantee a deadline under stalled I/O.
+Public synchronization uses a nonempty metadata barrier on every root: the
+published dependency's `Engine::sync()` is a no-op for an empty batch. An
+unconfirmed write can nevertheless appear after restart; errors are not a
+promise that retrying cannot duplicate an event.
+
+**Recovery:** the backend selects `AbsoluteConsistency`. The dependency's
+default tolerant recovery can classify a body-read EIO as a corrupt tail and
+truncate acknowledged data. Strict recovery preserves files and returns an
+error instead, including for a genuinely torn tail. Automatic repair is not
+provided. Upstream I/O panics can terminate an aborting application; no critical
+success is emitted after such a failure. The dependency tests in
+`crates/dduroc-engine/tests/raft_faults.rs` pin these limitations.
+
+**Compatibility:** the root marker is `dduroc-raft-v1`. Existing segment stores
+are rejected before modification; moving their history needs an explicit
+export/import into a different root. Changing a storage backend is distinct
+from migrating an event schema.
 
 ### The data model
 
@@ -86,12 +100,11 @@ writer task, with the span context in a task_local.
   (`register_events!`), the protocol version, the migration chain. It belongs
   to the microservice's code.
 - **A namespace** is runtime: a named storage area a microservice brings up at
-  start, binding it to a schema. Physically a subdirectory
-  `<root>/<namespace>/<channel>/…` with its own segments and metadata (the
-  schema name, the protocol version).
+  start, binding it to a schema. It is bound to persistent backend groups with schema and protocol metadata;
+  records do not repeat the namespace name.
 
-Records **do not store an origin at all** — belonging is implicit from where
-they lie. Every microservice has a unique name and id: four instances of an
+Records **do not store an origin at all** — belonging is implicit from the
+backend channel that contains them. Every microservice has a unique name and id: four instances of an
 amplifier service are four namespaces `orc-radio-0` … `orc-radio-3` sharing a
 schema. There is no separate notion of an instance anywhere.
 
@@ -100,16 +113,15 @@ adapters. A group is used for queries ("all the orchestrators' logs") and as a
 level of default configuration (channels and budgets are inherited group →
 namespace).
 
-**Rotation budgets** are per storage class, shared across the whole store:
-"all telemetry gets this much". The class's oldest segment is evicted across
+**Retention budgets** are per storage class, shared across the whole store:
+"all telemetry gets this much". The class's oldest blocks are evicted across
 namespace boundaries; a namespace's personal quota is an optional limit inside
 the shared one (`NsQuota` at open time). A class may have a root of its own
 (`custom_root:`) — critical data on a protected partition.
 
 Reading "everything over a period" is a k-way merge of streams (namespaces ×
-channels) by time. The price of the model: an active block buffer per
-(namespace, channel); the group commit of Immediate channels works per
-namespace.
+channels) by time. The price of the model includes an active block buffer per writing channel
+and an in-memory backend index per retained block.
 
 **A message**:
 - the event type — an id within the namespace's schema (`register_events!`);
@@ -130,9 +142,9 @@ the binary's registry and takes not a byte on disk:
 - **tags** — static only, in the event type's declaration; there are no
   dynamic (runtime) tags.
 
-Old records stay readable not through self-description but through
-**migrations** (see below): the store is always brought up to the schema of
-the current build.
+Old records stay readable through declared **migrations** (see below), applied
+by the reader or explicitly persisted by a namespace migration. Opening a
+store does not silently rewrite all historical payloads.
 
 **A span** marks a stretch of the system's work (an example: an amplifier
 calibration → a child span "power ramp" → messages attached to it). Two
@@ -229,103 +241,47 @@ no point to them. So a query's window may hold not one sample of a series that
 held one value the whole time. On request the reader carries the last sample
 of every state series through to **before** the window's start — as a separate
 field of the answer, so as not to break the promise that everything is inside
-the range. The search is bounded to two segments back and discards segments
-without the metrics wanted by the set of identifiers in the footer; a series
-unchanged for a very long time will be left without a seed — which is more
-honest than reading the whole history for one value.
+the range. The Raft reader searches at most 256 blocks with records in the seed window
+per selected channel. Blocks newer than that window may also need scanning;
+there is no time index, so this is not a constant-I/O promise. The legacy reader
+uses two eligible segments and footer filtering. A state older than the search
+horizon can be absent; neither mode claims a complete snapshot of all states.
 
 ### The protocol version and migrations
 
-A message schema can change between firmware versions. The answer is a system
-of **migrations** (rather than self-describing segments):
+Event schemas keep independent monotonically increasing protocol versions.
+Each block carries its original version; readers apply the declared migration
+chain on demand. Missing steps are errors, never guessed conversions. Typed
+rules still use the old layouts declared in `history {}`; raw migration
+functions retain their binding event/metric filters. Event text and severity
+remain properties of the current decoder rather than duplicated log payloads.
 
-- **The protocol version is per schema and applied per namespace**: a
-  monotonic number in the schema declaration; every namespace migrates
-  independently (updating one service migrates only its namespaces). The
-  library provides the mechanism, while the number and the steps belong to the
-  microservice's code.
-- Every **segment** carries a version (as of write time) in its header, while
-  a namespace's metadata carries the version of the last completed migration.
-  A mixed state is legitimate, and a migration is idempotent ("rewrite the
-  segments whose version is below the current one").
-- **Migration steps** `vN → vN+1` are written by the developer along with the
-  schema change: renaming or removing an event, adding a field with a default,
-  remapping an id. A step is declared by its **source key**: `1 =>
-  migrate_v1` is the step from version 1 to version 2, and the chain has to be
-  unbroken from 1 to the current version. A chain of steps covers a jump
-  across several versions. Remapping an id by a migration takes the edge off
-  the prototype's positional auto-id problem.
-- **Crash safety**: a migration goes segment by segment — rewrite into a
-  temporary file → fdatasync → an atomic rename → unlink the old one. A power
-  loss means continuing at the next start.
-- **Saving wear**: a segment's footer holds the sets of event and metric type
-  ids occurring in the segment. A migration rewrites only the segments with
-  affected types; the rest are not touched (the version is held by the
-  namespace's metadata, and an in-place stamp on a segment is not needed). For
-  a raw fn the affected types are declared **explicitly** — `1 => migrate_v1 {
-  events: [PowerSet] }` — and their absence means "it affects everything": a
-  forgotten list must not silently turn into "we touch nothing". The sets are
-  **binding** at the same time: a step sees only records of the declared
-  types, so what is declared and what is done do not diverge.
-- **Typed rules** are a step's main form. The old layout is declared in
-  `history {}` (the macro generates `v1::PowerSet` with `Deserialize` and the
-  old id), and a step is written as rules keyed by it:
-  `v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) }` (the
-  decoding, the transformation and the encoding are generated),
-  `event(0x05): drop` (a removed type, by its bare id), `metric(0x07):
-  metrics::TempPa` (a remap). The affected types are **inferred** from the
-  keys, and an unused history entry is a compile error. The raw fn remains as
-  a hatch.
-- **Sample values and span kinds** migrate by the same rules:
-  `metrics::Level: |v: u64| v as f32 / 10.0` (a quantity is now written in its
-  own units), `span(0x01): spans::Calibration` (a kind was renamed). A value
-  needs no `history`: it is self-describing — the type lies in the record
-  itself — and the type is named by the closure's parameter; the check is
-  strict and no conversion happens silently. The return, meanwhile, is held by
-  the schema: a rule that yields a type the metric does not declare will not
-  compile — otherwise a migration would become a gap in the very check `sample`
-  is typed for. For the same reason a value is transformed only on a metric
-  named by name: a bare id has no declared type. Only a span's **kind**
-  changes: its number and parent are the record's identity, referred to by its
-  end, its messages and its children. For the same reason a rule does not
-  delete a span's start at all. Spans save no segments: there is no set of
-  kinds in the footer and nothing to answer "there are no such spans here"
-  with — a step with spans rewrites every segment. Deciding "no" on a guess
-  would leave those records in the earlier layout forever: the run would report
-  success and stamp the metadata.
-- **Reading applies the chain on the fly**: a segment of an old version reads
-  correctly even before a physical run — a run changes the medium, not the
-  answer. When to call it is the application's decision
-  (`Namespace::migrate`); the debt is visible in
-  `Namespace::pending_migration()`.
+`Namespace::migrate` physically transforms a channel in one streaming pass.
+It copies into a staging Raft group and publishes the replacement through an
+atomic metadata switch after successful transformation. It does not overwrite
+an old Raft index in place, which could truncate the remaining suffix. Failed
+transformation leaves the published history unchanged; tracked staging groups
+are cleaned up on retry/startup. Dropped blocks become explicit tombstones so
+index positions remain meaningful. Reading skips tombstones while advancing
+its bounded cursor.
+
+Schema migration is distinct from converting a legacy segment store. No
+in-place legacy backend conversion is performed by opening a Store.
 
 ### Channels (storage classes)
 
-The engine is a set of named **channels**. A channel is a directory of
-segments plus a configuration:
+There are three storage classes: `default`, `critical`, and `telemetry`.
+Class budgets are shared across namespaces; optional namespace quotas are
+additional limits inside them. Channel policy controls block batching,
+compression, flush intervals, sync intervals and the destination root.
 
-```
-ChannelConfig {
-    budget_bytes,        // the budget of the CLASS across the whole store
-    segment_bytes,       // the growth LIMIT, which is also the rotation
-                         // boundary (8 MiB; 4 MiB for critical). Not the
-                         // file's size: space is taken as a window from
-                         // 64 KiB, by eighths of the limit
-    root,                // the class's own medium (critical data on jffs)
-    block_max_bytes,     // the block buffer's size (64 KiB, say)
-    flush_interval,      // the longest delay before flushing a block
-    sync_interval,       // see below
-    compression,         // None | Lz4 | Zstd(level)
-}
-```
-
-Syncing is per channel with one interval (`sync_interval`): an `fdatasync` no
-more often than that, plus always on sealing a segment and at shutdown. Zero
-means right after every group commit (a group commit takes everything that has
-piled up); that is how the critical channel works, and for it this is not a
-setting but a **definition** — `Store::open` refuses a critical channel with a
-non-zero interval. There are no separate "Immediate"/"Relaxed" states:
-immediacy is a zero interval, and "on sealing only" is a large one.
+The critical class requires a zero sync interval. A successful critical
+`try_log*` call waits for its synchronous batch. Concurrent calls may share a
+group commit; sequential calls that each wait for durability necessarily pay
+separate barriers. Ordinary calls return after enqueueing, and explicit
+`Store::sync`/namespace synchronization waits for persistence. A void logging
+wrapper still invokes the fallible path and reports failures through counters;
+it does not turn a failed write into a durable acknowledgement.
 
 A class's settings are shared by the whole store, and that holds exactly as
 long as the namespaces are uniform. Twenty-four thousand never are, and the
@@ -336,25 +292,27 @@ and the same for reading and for writing (`in_group`).
 
 ```rust
 StoreConfig::new("/data/logs").group("orc-", GroupPolicy::new()
-    .channel(StorageClass::Telemetry, ChannelOverride::new().segment_bytes(2 << 20))
-    .limit_bytes(StorageClass::Telemetry, 1 << 30))
+    .channel(StorageClass::Telemetry, ChannelOverride::new().block_max_bytes(16 << 10))
+    .limit_bytes(StorageClass::Telemetry, 1 << 20))
 ```
 
 When several prefixes match they **lay over** one another from the general to
 the specific: `orc-radio-` refines `orc-` rather than replacing it, and a
 setting the refining group did not mention comes from the general one.
-Otherwise refining one segment size would silently remove the quota, the
+Otherwise refining one block size would silently remove the quota, the
 compression and the intervals set for every orchestrator. Settings named when
 a namespace is opened beat the group's. A group sets only what belongs to
-**each writing channel separately**: the segment and block sizes, the
-intervals, the compression, the personal quota. The class budget and its
+**each writing channel separately**: block size, intervals, compression and
+personal quota. A per-group segment-size override is rejected because the
+physical Raft log files are shared. The smallest class-level `segment_bytes`
+on a root determines that root's file target size. The class budget and its
 medium are not available to it, and not as an oversight: the budget is shared
 by the class and is the occupancy ceiling ("all telemetry gets this much"),
 and a group with a budget of its own would either raise that ceiling above
 what was declared or spread one class across two media, where a shared budget
 would stop meaning anything. A group's quota is a limit **inside** the class
 budget and is assigned to every namespace of the group separately: "no
-orchestrator takes more than a gigabyte", not "all of them together". A group
+orchestrator takes more than a megabyte", not "all of them together". A group
 is validated by the same rules as a class: a setting unfit for a class does
 not become fit by being given to a group.
 
@@ -382,9 +340,14 @@ when a store is opened. The capacities are configurable
 (`StoreConfig::with_queues`): the defaults (8192 / 1024) cost about three
 quarters of a megabyte per process, which is not always appropriate on armv7.
 A smaller queue saves memory but starts losing records sooner on bursts.
+Payload bytes have separate bounds: 16 MiB for the ordinary queue and 4 MiB
+reserved for the critical queue; permits are released on dequeue or rejection.
+Dynamic record data is limited to 1 MiB before enqueueing. The default active
+builder ceiling is 16 MiB, with one bounded record of transient headroom; a
+configured buffer ceiling can tighten it.
 
-Waiting for room in the critical queue is the only place where writing blocks
-the caller, and there is an exception to it: **`SpanGuard::drop` never
+Critical calls can wait both for queue capacity and for durable completion.
+There is an exception to waiting: **`SpanGuard::drop` never
 waits**. A guard is dropped during stack unwinding after a panic too, and
 there a five-second wait would turn an emergency shutdown into a hang, with
 nested guards stacking their timeouts on top of one another. The price is a
@@ -393,54 +356,41 @@ reader has to be able to show an unclosed span in any case: a span cut short
 by a process crash looks the same. Whoever needs the guarantee calls
 `SpanGuard::close()` explicitly, where the channel's ordinary policy applies.
 
-### Flash specifics (eMMC/SD)
+### Flash and resource limits
 
-- The appends are sequential; the block size is roughly a multiple of the
-  FTL's page (4–64 KiB).
-- Reserving a segment's space up front plus `fdatasync` instead of `fsync`: an
-  append does not touch the filesystem's metadata, so the sync is cheaper. The
-  tail of zeros in a reserved file naturally terminates a recovery scan.
-- "Permanent" durability is implemented as a group commit — one fdatasync per
-  burst of critical records (~1–10 ms on eMMC), not per record.
+Appends are sequential. The portable backend uses `sync_all()` and does not
+preallocate filesystem space. A configured reserve is an admission budget, not
+a physical reservation against other processes filling the same filesystem.
+Host throughput and sync timings do not predict eMMC wear or power-loss safety.
 
-### Scaling
+Memory includes queued payloads, active block buffers, the engine's retained
+entry index, catalog metadata and reader pages. Count limits alone do not bound
+queued payload bytes. Readers bound both entry counts and returned bytes;
+reading a single entry can still load its upstream log batch, so the writer
+also bounds batch size. A merged query retains a decoded head block per
+selected channel: RAM grows with selected channels and block size. A result
+count limit alone does not bound the merge-head memory. Select namespaces and
+time windows appropriately for the target memory budget. Local, correctly checksummed store files are the input
+model; adversarial files with forged valid checksums are not claimed safe.
 
-- RAM per channel: the active block buffer plus the segment inventory (a name
-  → the first key), hundreds of bytes per segment. 200 GB at 256 MiB segments
-  is about 800 inventory entries.
-- A segment's block index is loaded only when that segment is read.
-- **Descriptors and space are counted by the writers rather than by the
-  channels that exist.** An open segment is a descriptor and a reserve window;
-  both come back once a channel goes quiet (SPEC §5). So both quantities are
-  bounded by the number of channels that wrote in the last few minutes rather
-  than by their total number: at ~24k namespaces × 2–3 channels, the
-  difference between "tens of thousands" and "a handful" is the difference
-  between a working device and one that hit its `ulimit`. A released segment
-  is **continued** rather than closed: otherwise a rarely writing channel
-  would pay for the saving with a file per wake-up, and the inodes would run
-  out before the space did.
-- **The buffer memory ceiling** (`StoreConfig::buffer_ceiling_bytes`) is
-  optional and absent by default: only a handful write at any moment. It is
-  for where that stops being true, and it bounds **RAM** rather than space:
-  the budget belongs to a class and a medium, the ceiling to the process. An
-  excess is removed by giving buffers back rather than by discarding records;
-  an unmeetable ceiling is visible in `Stats::buffer_overruns`.
-- **The scale limit is set by what was written, not by what was
-  configured.** An active segment cannot be evicted, so a class budget has to
-  cover the sum of the live segments — but they are counted by their reserve
-  window rather than by `segment_bytes` (SPEC §2). A channel that wrote a
-  hundred bytes costs 64 KiB rather than 8 MiB: the same 8-gigabyte budget
-  holds not ~1000 channels writing at once but the whole 24k fleet claimed, as
-  long as they write a little at a time. An excess is still visible in
-  `Stats::budget_overruns` rather than in the medium running out.
-
-  A fleet measurement (one record per namespace, then closing):
-
-  | Namespaces | Bring-up | Taken under load | Would be with a whole-segment reserve |
-  |---|---|---|---|
-  | 1,000 | 0.19 s | 66 MB | 8 GiB |
-  | 4,000 | 0.51 s | 266 MB | 32 GiB |
-  | 24,000 | 2.80 s | 1.1 GB | 192 GiB |
+Configured class/namespace budgets bound retained payloads; root accounting
+includes allocated log, rewrite and metadata files. An open store exclusively
+owns its directory trees: callers must not write unrelated files there.
+Managed control-file allocations are tracked on mutation; journal allocations
+are measured from the filesystem before admission. A failed late namespace
+registration can leave small control metadata, which remains counted against
+physical and catalog limits; it is not an automatic rollback. The current per-root
+class-budget sum is limited to 1 GiB. Its allocated-space admission ceiling is
+the budget plus the larger of half the budget or 8 MiB, capped at 1.5 GiB.
+These conservative limits avoid the pinned engine's internal 32-bit size
+arithmetic overflowing; they are restrictions of this backend, not record
+format limits. Garbage collection needs
+working space and must propagate failures. Limits are checked rather than
+silently wrapped on 32-bit machines. This is an admission ceiling with rewrite
+headroom, not a proven hard bound on every upstream GC allocation. The channel
+catalog and retained block index also have explicit count limits. See current
+configuration validation and
+`BENCHMARKS.md` for measured scenarios and their limits.
 
 ## Inherited from the prototype (proven decisions)
 
@@ -481,9 +431,9 @@ Svelte** (charts with uPlot/ECharts). The project name and crate prefix are
 
 **The writer's queue**: the ordinary channel drops plus counts an overflow (as
 the prototype did); the critical channel applies **back pressure**:
-`ns.log()` of a critical event blocks (with a timeout) until room frees up —
-critical events are rare, so blocking is all but unreachable, but the
-guarantee is honest.
+`ns.try_log()` of a critical event waits for queue capacity and then durable
+completion. Failure must be handled by callers that require acknowledgement;
+critical retention still expires old records according to its configured quota.
 
 **The tracing/log bridge** (intercepting third-party crates' logs and panics)
 comes second; the Text record kind (0x5) is reserved in the format from the
@@ -493,16 +443,16 @@ start.
 CRC), lz4_flex, zstd (optional), rustix (syscalls), crossbeam-channel (the
 writer's queue), globset, chrono (the read layer), thiserror, syn/quote,
 axum plus async-graphql plus tokio (the web), proptest (the format's tests).
-What is our own is only the engine (there is no alternative in the ecosystem
-without LSM or B-tree overhead), the format and the schema macro (tracing does
-not do as a frontend: no stable ids, no schema, no i18n, no migrations).
+Raft Engine owns journal storage. Our code supplies the compact format,
+schema macro, retention policy, durability acknowledgements and query layer.
+The GraphQL/web/viewer crates below remain proposed integration layers.
 
 ### The workspace
 
 | Crate | Contents | Dependencies |
 |---|---|---|
 | `dduroc-format` | the byte format: segments, blocks, records, varint, CRC | minimal, sync, no tokio |
-| `dduroc-engine` | the engine: Store, namespaces, channels, the writer thread, rotation, recovery, migrations, epochs | format; **no tokio** — the writer is a dedicated OS thread |
+| `dduroc-engine` | the engine: Store, namespaces, channels, the writer thread, Raft storage integration, retention, migrations, epochs | format; **no tokio** — the writer is a dedicated OS thread |
 | `dduroc-macros` | the proc-macro for the schema declaration | syn/quote |
 | `dduroc` | the facade: re-exports, the Namespace/Span/Series handles, the LogEvent trait | engine, macros |
 | `dduroc-read` | the reader: the k-way merge, filters, schema resolution, UTC | format, engine (or a standalone open of a directory) |
@@ -521,7 +471,10 @@ universal viewer — every project builds its own viewer binary: it links its
 schema crates plus `dduroc-viewer` (about 10 lines of main). Records of
 unknown types are shown as "unknown" (skipped by payload_len).
 
-### A sketch of the API
+### A historical API sketch
+
+The examples below illustrate the model; the compiled examples under
+`crates/dduroc/examples/` define the current callable API.
 
 ```rust
 // A service's crate — the schema declaration:
@@ -557,8 +510,8 @@ let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
 // segments of an earlier layout, and that is worth writing to the journal.
 if let Some((from, to)) = ns.pending_migration() { /* … */ }
 
-// messages return nothing: logging does not influence control flow, and
-// losses are counted in store.stats() and announced in the stream itself:
+// This convenience wrapper reports errors via counters. Critical calls still
+// wait for storage; use try_log when the caller requires a durable verdict:
 ns.log(radio::events::PowerSet { dbm: 27.5 });
 
 // telemetry: a sample's type comes from the metric constant (Metric<f32>), so
@@ -605,8 +558,8 @@ Reading (the same API on a device and in a viewer):
 // A live reader: parallel to writing by construction. Created once; the roots
 // (the media of classes moved out included), the schemas of the namespaces
 // that came up and the time anchors are asked of the store on every query —
-// there is nothing for them to go stale from. Rotation underfoot and a
-// segment's growing tail are ordinary events rather than damage.
+// there is nothing for them to go stale from. New blocks and retention
+// are ordinary events rather than damage.
 let reader = store.reader();
 // A foreign dump goes by hand, with EVERY root at once: a `Store` must not be
 // opened there — it takes a lock on the root and sweeps temporary files. A
@@ -633,11 +586,9 @@ println!("{:?}", reader.render(&result.entries[0], "en"));  // the text from the
 for entry in reader.stream(&q)? {
     if done() { break; }                        // the walk can be broken off
 }
-// No descriptors are held meanwhile: a cursor is created per (namespace,
-// channel) pair and the merge needs a head from each of them, so a permanently
-// open file for each would mean tens of thousands of descriptors per query.
-// What has been parsed (the header, the footer, the block bounds) lives in
-// memory, and the file is opened for the duration of reading a batch.
+// Raft cursors share the live backend; they do not open a file per namespace.
+// A merged stream keeps one decoded head block per selected channel. Narrow
+// the query to control this memory cost; a result limit alone does not do so.
 
 // a subscription: the same window, but the stream does not end at the end of
 // the data — it waits for more. The reader sleeps while there is nothing to
@@ -670,27 +621,11 @@ ordinary channel's record may become visible later than a critical one that
 happened after it. Within one channel the order is exact — it is the order on
 disk.
 
-There are three seams a subscription must not lose anything at, and all three
-set it apart from a one-off query: an **unfinished tail** of a block is
-deferred rather than skipped (a query has a next query, a subscription does
-not); **a change of segment** — the directory is listed anew, but only when
-the store has announced that the segments changed, or a subscription does not
-do a single `readdir`; **a namespace brought up later** than the subscription
-is picked up — a viewer that started before a service is the ordinary order on
-a device.
-
-That is why there are three marks, and they differ in the cost of the answer:
-"a block landed" means reading on through the tail of an open segment; "the
-segment changed" means listing the directory of **that** channel; "a namespace
-came up" means walking the root, reading `ns-meta` in every matching directory
-and opening cursors for the newcomers. The last is the only work proportional
-to the whole store, and only a namespace coming up triggers it: fused with
-rotation it would mean walking twenty-four thousand directories every half
-second for the sake of a segment that changed in one channel. The rest of the
-reading-on is one cursor per channel per wake-up, and that is the price of a
-mark shared by the store: it does not say which channel wrote. Whoever
-narrowed the query pays the least — a subscription to a group pays for its
-group.
+A subscription follows committed blocks, retention changes and newly registered
+namespaces. Raft cursors retain bounded block pages and advance persistent
+indexes; fully drained channels with no retained history are pruned. Dormant
+channels with history retain their watermark so a wake-up cannot replay old
+records. Namespace schema presentation caching is bounded separately.
 
 A subscription hands out damage as a difference (`take_damage`) rather than as
 an accumulated list: it lives a long time, and a list that only grows would
@@ -718,8 +653,6 @@ series / namespaces / storageStats`, cursor pagination (base64 positions) and
   redb.
 - Composite telemetry values (a spectrum): the payload's format, and whether a
   separate block type for high-frequency series is worth it.
-- The behaviour on a writer queue overflow for the critical channel (back
-  pressure against dropping).
 - **A pagination cursor for the web layer.** `stream` makes it possible to
   read lazily and break the walk off, but there is nothing to continue it with
   in the next HTTP request: resuming "from the last record" is imprecise,

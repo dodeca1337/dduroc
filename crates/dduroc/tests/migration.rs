@@ -9,7 +9,7 @@
 //! "today's" builds.
 
 use dduroc::prelude::*;
-use dduroc::{EventId, MetricId, StorageClass, StoreConfig};
+use dduroc::{EventId, MetricId, StoreConfig};
 use dduroc_read::{EntryKind, Order, OwnedSampleValue, Query, Reader};
 
 /// Yesterday's firmware schema.
@@ -71,8 +71,7 @@ enum Seen {
     Other(EventId),
 }
 
-fn read_all(root: &std::path::Path) -> Vec<Seen> {
-    let reader = Reader::open_dump([root], &[now::probe::SCHEMA]).unwrap();
+fn read_all(reader: &Reader) -> Vec<Seen> {
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "damage: {:?}", result.damaged);
     result
@@ -134,12 +133,12 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
     // byte -3i8 in the f32 layout would otherwise parse silently and wrongly,
     // Legacy would show as an "unknown type", and Temp would stay under its old
     // number.
-    let before = read_all(dir.path());
+    let before = read_all(&store.reader());
     assert_eq!(before, expected, "reading through the steps");
 
     // And rendering works from the current template over the migrated payload.
     {
-        let reader = Reader::open_dump([dir.path()], &[now::probe::SCHEMA]).unwrap();
+        let reader = store.reader();
         let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
         let power = result
             .entries
@@ -165,18 +164,25 @@ fn yesterdays_history_reads_the_same_before_and_after_the_physical_run() {
 
     // Reading AFTER the run answers exactly the same — which is the whole
     // point: a run changes the medium, not the answer.
-    assert_eq!(read_all(dir.path()), expected, "the answer did not change");
+    assert_eq!(
+        read_all(&store.reader()),
+        expected,
+        "the answer did not change"
+    );
 
-    // The segment headers are at the current version only.
-    let channel = dir
-        .path()
-        .join("orc-0")
-        .join(StorageClass::Default.as_str());
-    for entry in std::fs::read_dir(&channel).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|x| x == "seg") {
-            let r = dduroc_engine::segment::SegmentReader::open(&path).unwrap();
-            assert_eq!(r.header().protocol_version.0, 2, "{path:?}");
+    // Every retained block was physically rewritten in the current layout.
+    let backend = store.read_backend();
+    for channel in backend.catalog().unwrap() {
+        if let (Some(first), Some(last)) = (channel.first_index, channel.last_index) {
+            let page = backend
+                .read_blocks(&channel.key, first, last + 1, 1024, 64 << 20, false)
+                .unwrap();
+            assert!(!page.blocks.is_empty());
+            assert!(
+                page.blocks
+                    .iter()
+                    .all(|block| block.protocol_version.0 == 2)
+            );
         }
     }
 
@@ -240,8 +246,7 @@ mod units {
 }
 
 /// The samples and span kinds in read order.
-fn levels_and_spans(root: &std::path::Path) -> (Vec<f32>, Vec<Option<&'static str>>) {
-    let reader = Reader::open_dump([root], &[units::gauge::SCHEMA]).unwrap();
+fn levels_and_spans(reader: &Reader) -> (Vec<f32>, Vec<Option<&'static str>>) {
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "damage: {:?}", result.damaged);
     let mut levels = Vec::new();
@@ -287,7 +292,7 @@ fn a_span_kind_and_a_sample_value_migrate_like_everything_else() {
     // Reading through the steps — before any run.
     let expected = (vec![36.5f32, 70.0], vec![Some("Calibration")]);
     assert_eq!(
-        levels_and_spans(dir.path()),
+        levels_and_spans(&store.reader()),
         expected,
         "reading through the steps"
     );
@@ -306,7 +311,7 @@ fn a_span_kind_and_a_sample_value_migrate_like_everything_else() {
     // And the same answer after the run: a run changes the medium, not the
     // answer.
     assert_eq!(
-        levels_and_spans(dir.path()),
+        levels_and_spans(&store.reader()),
         expected,
         "the answer did not change"
     );

@@ -1,13 +1,13 @@
 //! A channel — a storage class within a namespace.
 //!
-//! Physically it is a subdirectory of segments; logically it is a set of
-//! policies: segment and block size, compression and, above all, durability.
+//! A channel is a logical stream with policies for its class budget, blocks,
+//! compression and durability. Channels on one root share raft log files.
 //! The record format is the same in every channel — only the policies differ,
 //! which is why "critical" and "not critical" live in one engine.
 //!
 //! A budget is declared for a **whole class**: "all telemetry gets this much,
 //! all logs get that much". The channels of every namespace of one class draw
-//! on a shared budget, and the oldest segment of the class is evicted
+//! on a shared budget, and the oldest block of the class is evicted
 //! regardless of whose namespace it lies in.
 
 use crate::error::{Error, Result};
@@ -17,58 +17,41 @@ use std::time::Duration;
 
 /// The settings of a storage class — the policy of all its channels.
 ///
-/// There is deliberately no name here: a channel lives in the directory of its
-/// storage class ([`crate::schema::StorageClass::as_str`]), and a second source
-/// of the same name in the configuration could only drift away from the first.
+/// The typed storage class identifies the logical stream. Channels on one
+/// physical root share the raft log; there is no per-channel file name here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelConfig {
     /// The budget of a **class across the whole store**: the total size of that
-    /// class's segments in every namespace. When it is exceeded, the class's
-    /// oldest segment is evicted whoever it belongs to: a quiet service does
+    /// class's encoded blocks in every namespace. When it is exceeded, the class's
+    /// oldest block is evicted whoever it belongs to: a quiet service does
     /// not hold space a noisy one lacks. A quota for an individual namespace is
     /// a separate, optional setting ([`crate::store::NsQuota`]).
     pub budget_bytes: u64,
-    /// The growth limit of one segment — the rotation boundary.
-    ///
-    /// This is **not** the file's size at creation: space is reserved as a
-    /// window starting at one block and grows by eighths of the limit as
-    /// writing goes on (see the `segment` module). A channel that wrote a
-    /// hundred bytes takes one extent on the medium rather than a whole
-    /// segment, and is counted as that in the class budget. So the number of
-    /// channels that can write at once is set not by `budget_bytes /
-    /// segment_bytes` but by how much they actually wrote.
-    ///
-    /// Fixed rather than derived from the budget: the budget is shared by the
-    /// class, and a segment that grew along with it would give one noisy
-    /// channel the right to take the whole thing before the first rotation.
+    /// Target size for shared raft log files on this class's root. When
+    /// classes share a root, their minimum configured target is used. A
+    /// namespace-group override is rejected because it cannot control an
+    /// individual channel's physical files.
     pub segment_bytes: u64,
     /// The threshold at which a block is closed.
     pub block_max_bytes: usize,
     /// The longest an incomplete block may wait before being flushed.
     pub flush_interval: Duration,
-    /// `fdatasync` no more often than this interval. The window of loss on a
-    /// power cut equals the interval; syncing on sealing a segment and on
-    /// shutdown happens in any case.
+    /// Sync no more often than this interval. Normal events can be lost in a
+    /// power cut before the next successful sync; shutdown also syncs.
     ///
-    /// `ZERO` means syncing right after every group commit. That is a group
-    /// commit, not a sync per record: the writer takes everything that has
-    /// piled up in the queue, writes it as one block and syncs once — a burst
-    /// of a hundred events costs one `fdatasync` (~1–10 ms on eMMC). This is
-    /// how the critical channel works, and for it this is not a setting but a
-    /// definition: a non-zero interval on the critical class is refused when
-    /// the store is opened.
+    /// `ZERO` requires a successful synchronous journal write before each
+    /// critical try_* call returns. Concurrent pending critical writes can
+    /// share a group commit; sequential calls each await their own completion.
+    /// There is no fixed burst-to-sync ratio. A nonzero interval is refused for
+    /// the critical class. The std_fs backend uses File::sync_all().
     pub sync_interval: Duration,
     pub compression: Compression,
     /// The class's own root. `None` means the store's shared root.
     ///
-    /// Needed when a class belongs on a different medium: critical data on a
-    /// protected partition (jffs2), heavy telemetry on a large one. The layout
-    /// inside the root is the same: `<root>/<namespace>/<class>/`. A live
-    /// reader (`store.reader()`) learns every root from the store itself; a
-    /// dump is told them all at once (`Reader::open_dump`). Changing the root
-    /// does not move the history: new segments are written to the new place,
-    /// the old one stays readable as one more dump root but no longer counts
-    /// towards the class budget.
+    /// Each configured root contains its own shared `raft-engine` directory.
+    /// A live reader shares those engines; an offline dump names every root
+    /// and opens them exclusively. Changing this setting does not migrate old
+    /// history: moving an existing class requires an explicit storage migration.
     pub custom_root: Option<PathBuf>,
 }
 
@@ -88,10 +71,8 @@ impl ChannelConfig {
 
     /// The class of critical data: sync immediately, compression off.
     ///
-    /// Compression on a critical channel is harmful: it makes the system hoard
-    /// data for the sake of efficiency, and hoarding is exactly what a critical
-    /// channel avoids. The segment is half the usual size: critical partitions
-    /// are small.
+    /// Defaults avoid compression work and use a smaller block and log-file
+    /// target. Immediate acknowledgement comes from sync, not from these sizes.
     pub fn critical(budget_bytes: u64) -> Self {
         Self {
             sync_interval: Duration::ZERO,
@@ -120,9 +101,9 @@ impl ChannelConfig {
     /// cause they share, and there must not be a second copy of it — once the
     /// copies drifted apart they would declare different things invalid.
     pub(crate) fn check(&self) -> std::result::Result<(), &'static str> {
-        // A budget smaller than two segments means that on sealing the only
-        // segment rotation would delete it at once — the channel would hold
-        // nothing.
+        // Conservatively require two shared log targets of logical budget.
+        // This preserves rotation/rewrite headroom; it is not a per-channel
+        // active-segment reservation.
         //
         // The multiplication saturates: `segment_bytes` comes from the
         // application's configuration, and an ordinary one would overflow a u64
@@ -130,7 +111,7 @@ impl ChannelConfig {
         // knowably too small.
         if self.budget_bytes < self.segment_bytes.saturating_mul(2) {
             return Err(
-                "the budget is smaller than two segments: rotation would eat the data at once",
+                "the class budget is below two shared log targets required for rotation/rewrite headroom",
             );
         }
         if self.block_max_bytes < 512 {
@@ -144,7 +125,8 @@ impl ChannelConfig {
         Ok(())
     }
 
-    /// How many segments fit in the budget.
+    /// Ratio of the logical budget to the shared log target; not a physical
+    /// file count, because raft files interleave namespaces and classes.
     pub fn max_segments(&self) -> u64 {
         (self.budget_bytes / self.segment_bytes).max(1)
     }
@@ -161,9 +143,9 @@ impl ChannelConfig {
 /// would stop meaning anything. A group does have a limit of its own — a quota
 /// ([`GroupPolicy::limit_bytes`]), a limit INSIDE the class budget.
 ///
-/// The rest are properties of each writing channel separately, and belong to a
-/// group by right: heavy orchestrator telemetry deserves its own segment size,
-/// a rarely used diagnostic service its own flush delay.
+/// Block size, compression and intervals can vary by group. The legacy
+/// segment_bytes field remains representable for API compatibility, but a
+/// group override is rejected: shared physical files have one root-wide target.
 ///
 /// What is not set is inherited from the class; it is built as a chain, like
 /// everything else.
@@ -184,7 +166,8 @@ impl ChannelOverride {
         Self::default()
     }
 
-    /// Its own segment growth limit.
+    /// Legacy compatibility setter. Store::open rejects group-specific log
+    /// targets; configure ChannelConfig::segment_bytes on the class instead.
     pub fn segment_bytes(mut self, bytes: u64) -> Self {
         self.segment_bytes = Some(bytes);
         self

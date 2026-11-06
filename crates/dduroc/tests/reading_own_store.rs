@@ -62,26 +62,24 @@ fn a_reader_of_the_store_sees_the_class_that_lives_on_another_medium() {
     let reader = store.reader();
     assert_eq!(lines(&reader), ["ping 1", "fault 3"]);
 
-    // A dump that was not told every root is not a "short answer" but a
-    // refusal: completeness is checked against the schema at open time. Such a
-    // reader used to show the history without the critical part, giving nothing
-    // away.
-    let e = Reader::open_dump([&root], &[split::SCHEMA]).unwrap_err();
-    assert!(
-        matches!(
-            &e,
-            dduroc_read::ReadError::IncompleteDump { namespace, class }
-                if namespace == "orc-probe-0" && *class == StorageClass::Critical
-        ),
-        "{e}"
-    );
-    // With every root the dump reads whole.
+    // Offline opening is exclusive; live readers share the existing engine.
+    assert!(Reader::open_dump([&root, &vault], &[split::SCHEMA]).is_err());
+    store.shutdown();
+    drop(ns);
+    drop(reader);
+    drop(store);
+    let error = Reader::open_dump([&root], &[split::SCHEMA]).unwrap_err();
+    assert!(matches!(
+        error,
+        dduroc_read::ReadError::IncompleteDump {
+            class: StorageClass::Critical,
+            ..
+        }
+    ));
     assert_eq!(
         lines(&Reader::open_dump([&root, &vault], &[split::SCHEMA]).unwrap()),
         ["ping 1", "fault 3"]
     );
-
-    store.shutdown();
 }
 
 mod other {
@@ -149,31 +147,20 @@ fn an_entry_decodes_back_into_the_type_it_was_written_as() {
 }
 
 #[test]
-fn an_unknown_directory_under_a_namespace_is_reported_not_hidden() {
-    // A channel is a storage class, and the listing of channels is typed. A
-    // directory that is the channel of no class this build knows (a foreign
-    // directory, a dump from a future version with a new class) is not parsed —
-    // but neither does it drop out silently: it is declared damage.
+fn foreign_directories_cannot_invent_backend_channels() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
     let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
     ns.log(split::events::Ping { seq: 1 });
     ns.sync().unwrap();
-    std::fs::create_dir(dir.path().join("orc-probe-0").join("scratch")).unwrap();
-
+    std::fs::create_dir_all(dir.path().join("orc-probe-0/scratch")).unwrap();
     let listing = store.reader().namespaces().unwrap();
     assert_eq!(
         listing.namespaces[0].channels,
-        [StorageClass::Default, StorageClass::Critical],
-        "the known channels are there and typed"
+        [StorageClass::Default, StorageClass::Critical]
     );
-    assert_eq!(
-        listing.damaged.len(),
-        1,
-        "an unknown directory must be announced: {:?}",
-        listing.damaged
-    );
-    assert!(listing.damaged[0].path.ends_with("scratch"));
+    assert!(listing.damaged.is_empty());
+    assert!(listing.namespaces[0].total_bytes > 0);
     store.shutdown();
 }
 
@@ -235,73 +222,34 @@ fn a_live_reader_stays_current_without_being_rebuilt() {
 }
 
 #[test]
-fn a_torn_active_tail_is_data_not_yet_for_live_and_damage_for_dump() {
-    // The writer lays a block down with one write, but a reader sees the pages
-    // with no guarantee of being whole: an active segment may have a tail that
-    // has not arrived yet. For a live reader that is "the data is not ready
-    // yet", for a dump honest corruption: nobody appends to a dump.
-    use dduroc_engine::segment::SegmentReader;
-    use std::os::unix::fs::FileExt;
-
+fn a_torn_raft_tail_is_refused_without_changing_the_dump() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
-    let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
-    ns.log(split::events::Ping { seq: 1 });
-    ns.sync().unwrap();
-
-    // The channel's only segment is the active one. We append garbage to it
-    // where the writer would have gone on writing: that is what a block whose
-    // write has not become visible whole looks like.
-    let ch_dir = dir
-        .path()
-        .join("orc-probe-0")
-        .join(StorageClass::Default.as_str());
-    let seg_path = std::fs::read_dir(&ch_dir)
+    {
+        let store =
+            Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
+        let ns = store.namespace("orc-probe-0", split::SCHEMA).unwrap();
+        ns.log(split::events::Ping { seq: 1 });
+        ns.sync().unwrap();
+        store.shutdown();
+    }
+    let mut files: Vec<_> = std::fs::read_dir(dir.path().join("raft-engine"))
         .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x == "seg"))
-        .expect("the active segment");
-    let mut seg = SegmentReader::open(&seg_path).unwrap();
-    let (offsets, stopped) = seg.scan_block_offsets();
-    assert!(
-        stopped.is_none(),
-        "before the interference the segment is intact"
-    );
-    let mut buf = Vec::new();
-    let end = seg
-        .read_block_at(*offsets.last().unwrap(), &mut buf)
-        .unwrap()
-        .expect("the last block is intact");
-    drop(seg);
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&seg_path)
-        .unwrap()
-        .write_all_at(&[0xEE; 16], end)
-        .unwrap();
-
-    let live = store
-        .reader()
-        .query(&Query::new().kinds(KindFilter::LOGS))
-        .unwrap();
-    assert_eq!(live.entries.len(), 1, "the intact blocks are read");
-    assert!(
-        live.damaged.is_empty(),
-        "an unfinished tail is not corruption: {:?}",
-        live.damaged
-    );
-
-    let dump = Reader::open_dump([dir.path()], &[split::SCHEMA])
-        .unwrap()
-        .query(&Query::new().kinds(KindFilter::LOGS))
-        .unwrap();
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "raftlog"))
+        .collect();
+    files.sort();
+    let path = files.last().unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let length = file.metadata().unwrap().len();
+    file.set_len(length - 1).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert!(Reader::open_dump([dir.path()], &[split::SCHEMA]).is_err());
     assert_eq!(
-        dump.damaged.len(),
-        1,
-        "in a dump the same tail is damage, and silence about it is not allowed"
+        std::fs::metadata(path).unwrap().len(),
+        length - 1,
+        "strict recovery must preserve damaged evidence"
     );
-    store.shutdown();
 }
 
 #[test]

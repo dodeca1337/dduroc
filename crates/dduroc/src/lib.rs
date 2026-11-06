@@ -63,10 +63,10 @@
 //!     dduroc::StoreConfig::new("/data/logs")
 //!         // The budget of a CLASS across the whole store: "all telemetry gets
 //!         // this much, all logs get that much". The channels of every namespace
-//!         // of a class draw on the shared budget, and the class's oldest segment
+//!         // of a class draw on the shared budget, and the class's oldest block
 //!         // is evicted whoever's namespace it lies in. with_budget_per_class
 //!         // gives that budget to every class not named explicitly in .channel().
-//!         .with_budget_per_class(4 << 30),
+//!         .with_budget_per_class(64 << 20),
 //! )?;
 //!
 //! // An instance of a microservice brings up its own namespace.
@@ -155,6 +155,10 @@ pub use serde;
 pub use serde_json;
 
 pub use dduroc_engine::MigrationReport;
+/// Bounded block access through the store's shared read backend.
+pub use dduroc_engine::backend::{
+    BlockPage, ChannelInfo, ChannelKey, ReadBackend, RootUsage, StoredBlock,
+};
 pub use dduroc_engine::channel::{ChannelConfig, ChannelOverride};
 pub use dduroc_engine::epochs::SyncSource;
 pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, SeverityFn, StateStatus};
@@ -459,8 +463,8 @@ impl SpanExt for SpanGuard {
 /// An extension of [`Store`] with reading one's own store.
 ///
 /// The reader is a separate type for a reason: reading is a different set of
-/// guarantees (change nothing, survive corruption, show a foreign dump), and a
-/// viewer must not open a `Store` at all — that takes a lock on the root. But
+/// guarantees (selection, corruption reports, offline dumps). An offline raft
+/// view takes an exclusive engine lock; a live reader shares the Store engine. But
 /// there is no reason to name **one's own** store a second time: it already has
 /// its roots and schemas.
 #[cfg(feature = "read")]
@@ -469,8 +473,8 @@ pub trait StoreExt {
     ///
     /// Created once and kept for as long as needed — it asks the store for the
     /// truth (the roots, the schemas, the time anchors) on every query, and
-    /// rotation and a segment's growing tail are ordinary events for it rather
-    /// than damage. What is visible is what is on the medium; fresh records
+    /// compaction and new committed blocks are ordinary events rather than
+    /// damage. What is visible is the committed block journal; fresh records
     /// have to be flushed first with [`Store::sync`]. The details are in
     /// [`read::Reader::of_store`].
     fn reader(&self) -> read::Reader;
@@ -761,15 +765,14 @@ mod tests {
             store.shutdown();
         }
 
-        let channels: Vec<String> = std::fs::read_dir(dir.path().join("orc-radio-0"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .collect();
+        let reader = read::Reader::open_dump([dir.path()], &[testing::SCHEMA]).unwrap();
+        let listing = reader.namespaces().unwrap();
         assert!(
-            channels.iter().any(|c| c == "telemetry"),
-            "the directory is named after the class: {channels:?}"
+            listing.namespaces[0]
+                .channels
+                .contains(&StorageClass::Telemetry)
         );
+        assert!(listing.namespaces[0].total_bytes > 0);
     }
 
     #[test]

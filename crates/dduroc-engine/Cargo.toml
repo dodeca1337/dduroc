@@ -1,14 +1,21 @@
 [package]
 name = "dduroc-engine"
-description = "The dduroc storage engine: namespaces, channels, the writer, rotation, migrations"
+description = "Compact event storage on Raft Engine: durability, namespace quotas, retention and migrations"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
+include = ["src/**", "examples/**", "tests/**", "benches/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [dependencies]
 dduroc-format.workspace = true
+raft-engine.workspace = true
+protobuf.workspace = true
 chrono.workspace = true
 crossbeam-channel.workspace = true
 postcard.workspace = true
@@ -19,4 +26,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

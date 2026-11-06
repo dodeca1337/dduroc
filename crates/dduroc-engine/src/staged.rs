@@ -100,6 +100,19 @@ pub struct Staged {
 }
 
 impl Staged {
+    /// Dynamic payload bytes held by the queued record.
+    pub(crate) fn dynamic_bytes(&self) -> usize {
+        match &self.record {
+            StagedRecord::Message { payload, .. } => payload.len(),
+            StagedRecord::Sample {
+                value: OwnedValue::Blob(b),
+                ..
+            } => b.len(),
+            StagedRecord::Text { target, text, .. } => target.len().saturating_add(text.len()),
+            _ => 0,
+        }
+    }
+
     /// The type identifier, for accounting in the footer.
     ///
     /// The sets of types seen are what migrations need (a segment holding none

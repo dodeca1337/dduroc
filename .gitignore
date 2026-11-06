@@ -2,10 +2,12 @@
 **/*.rs.bk
 *.pdb
 
-# артефакты фронтенда (dduroc-web)
+# Frontend artifacts (dduroc-web)
 node_modules/
 dist/
 
-# локальные данные / дампы хранилища
+# Local store data and dumps
 *.seg
+*.raftlog
+*.rewrite
 /tmp-store/

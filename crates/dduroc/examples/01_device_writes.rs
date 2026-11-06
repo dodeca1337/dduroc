@@ -290,7 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     store.shutdown();
 
     // What landed on disk: a directory per namespace, inside it a directory per
-    // channel (the storage classes from the schema), and `.seg` segments in
+    // channel metadata and the shared `raft-engine` log rather than `.seg` files in
     // those.
     println!("\nthe store in {}:", root.display());
     print_tree(&root, 0)?;

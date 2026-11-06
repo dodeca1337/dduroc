@@ -19,13 +19,20 @@
 
 use crate::error::{Error, Result};
 use crate::schema::{DecodeError, Migration, MigrationInput, MigrationOutcome, Schema};
+#[cfg(test)]
 use crate::segment::{SegmentReader, SegmentWriter};
 use crate::staged::{ChannelIdx, NsId};
-use crate::writer::{MigrationCommit, Writer};
-use dduroc_format::block::{BlockBuilder, BlockHeader};
+use crate::writer::Writer;
+use dduroc_format::block::BlockBuilder;
+#[cfg(test)]
+use dduroc_format::block::BlockHeader;
 use dduroc_format::record::{Message, Sample};
+#[cfg(test)]
 use dduroc_format::segment::SegmentHeader;
-use dduroc_format::{EventId, FooterBuilder, MetricId, ProtocolVersion, Record, SpanId};
+use dduroc_format::{EventId, MetricId, Record, SpanId};
+#[cfg(test)]
+use dduroc_format::{FooterBuilder, ProtocolVersion};
+#[cfg(test)]
 use std::path::Path;
 
 /// The chain of steps that brings records of version `seg_version` up to the
@@ -289,13 +296,13 @@ pub fn apply<'a>(
 
 /// The outcome of a physical migration run.
 ///
-/// Segments: every one encountered during the run fell into exactly one column.
+/// Blocks: every retained block encountered belongs to exactly one column.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MigrationReport {
     /// Rewritten into the current layout.
     pub rewritten: usize,
-    /// Skipped by their footer: no step touches them. Their header keeps the
+    /// Skipped by their record identifiers: no step touches them. They keep the
     /// earlier version — which is legal, and the current decoders read them
     /// correctly precisely because none of the affected types are in them.
     pub skipped_untouched: usize,
@@ -312,7 +319,7 @@ pub struct MigrationReport {
     /// anyway — they do not stand in the way of stamping the metadata, because
     /// no schema version would have read them.
     pub corrupt_or_foreign: usize,
-    /// Records that landed in the rewritten segments.
+    /// Records that landed in the rewritten blocks.
     pub records_rewritten: u64,
     /// Records deleted by the steps.
     pub records_dropped: u64,
@@ -328,107 +335,121 @@ pub(crate) fn run_namespace(
     ns: NsId,
     channel_dirs: &[std::path::PathBuf],
 ) -> Result<MigrationReport> {
+    let _ = store_id;
+    writer.sync(Some(ns))?;
+    let backend = writer.backend();
     let mut report = MigrationReport::default();
-    for (idx, channel_dir) in channel_dirs.iter().enumerate() {
-        run_channel(
-            channel_dir,
-            schema,
-            store_id,
-            writer,
-            ns,
-            ChannelIdx(idx as u16),
-            &mut report,
-        )?;
+    for (idx, _) in channel_dirs.iter().enumerate() {
+        let key = writer.channel_key(ns, ChannelIdx(idx as u16))?;
+        // Avoid writing a shadow copy when every retained block is current or
+        // provably unaffected. The preflight is bounded to one block at a time;
+        // a mixed channel still publishes exactly one atomic replacement.
+        let info = backend
+            .catalog()?
+            .into_iter()
+            .find(|info| info.key == key)
+            .ok_or_else(|| Error::Backend("migration channel disappeared".into()))?;
+        let mut untouched = 0;
+        let mut current = 0;
+        let mut any_touched = false;
+        if let Some(last) = info.last_index {
+            let mut next = info.first_index.unwrap_or(0);
+            while next <= last {
+                let page = backend.read_blocks(
+                    &key,
+                    next,
+                    last.checked_add(1)
+                        .ok_or_else(|| Error::Backend("migration index exhausted".into()))?,
+                    1,
+                    4 << 20,
+                    false,
+                )?;
+                for block in page.blocks {
+                    if block.protocol_version.0 >= schema.version.0 {
+                        current += 1;
+                        continue;
+                    }
+                    let steps = chain(schema, block.protocol_version.0)
+                        .map_err(|e| Error::Backend(e.to_string()))?;
+                    let parsed = dduroc_format::block::Block::parse(&block.bytes)?
+                        .ok_or_else(|| Error::Backend("empty migration block".into()))?;
+                    for record in parsed.records() {
+                        let (_, record) = record?;
+                        any_touched |= steps.iter().any(|step| step_applies(step, &record));
+                    }
+                    untouched += 1;
+                }
+                if any_touched {
+                    break;
+                }
+                match page.next_index {
+                    Some(index) if index > next => next = index,
+                    _ => break,
+                }
+            }
+        }
+        if !any_touched {
+            report.skipped_untouched += untouched;
+            report.already_current += current;
+            continue;
+        }
+        backend.rewrite_channel(&key, |mut block| {
+            if block.protocol_version.0 >= schema.version.0 {
+                report.already_current += 1;
+                return Ok(Some(block));
+            }
+            let steps = chain(schema, block.protocol_version.0)
+                .map_err(|e| Error::Backend(e.to_string()))?;
+            let parsed = dduroc_format::block::Block::parse(&block.bytes)?
+                .ok_or_else(|| Error::Backend("empty migration block".into()))?;
+            let mut builder = BlockBuilder::new();
+            let mut rewritten = 0;
+            let mut dropped = 0;
+            let mut touched = false;
+            for rec in parsed.records() {
+                let (at, record) = rec?;
+                touched |= steps.iter().any(|step| step_applies(step, &record));
+                let transformed =
+                    apply(&steps, record).map_err(|e| Error::Backend(e.to_string()))?;
+                if let Some(record) = transformed.record() {
+                    builder.push(at, &record)?;
+                    rewritten += 1;
+                } else {
+                    dropped += 1;
+                }
+            }
+            if !touched {
+                report.skipped_untouched += 1;
+                return Ok(Some(block));
+            }
+            let mut bytes = Vec::new();
+            if !builder.is_empty() {
+                builder.finish(0, dduroc_format::Compression::Lz4, &mut bytes)?;
+            }
+            report.records_rewritten += rewritten;
+            report.records_dropped += dropped;
+            if bytes.is_empty() {
+                report.emptied += 1;
+                Ok(None)
+            } else {
+                report.rewritten += 1;
+                block.bytes = bytes;
+                block.protocol_version = schema.version;
+                Ok(Some(block))
+            }
+        })?;
     }
     Ok(report)
 }
 
-fn run_channel(
-    dir: &Path,
-    schema: &Schema,
-    store_id: u64,
-    writer: &Writer,
-    ns: NsId,
-    channel: ChannelIdx,
-    report: &mut MigrationReport,
-) -> Result<()> {
-    // The trace of an earlier interrupted run: nothing addresses the contents
-    // of a `*.tmp`, and the name it occupies would get in the way of a new
-    // attempt.
-    crate::fsutil::sweep_tmp(dir)?;
-
-    for name in crate::rotation::Inventory::scan_names(dir)? {
-        let path = dir.join(name.to_string());
-        let mut reader = match SegmentReader::open(&path) {
-            Ok(r) => r,
-            // The file vanished underfoot — rotation runs in parallel.
-            Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                report.rotated_away += 1;
-                continue;
-            }
-            // No schema version will read a broken header: there is nothing to
-            // rewrite, and leaving the metadata unstamped because of it would
-            // make migration impossible forever.
-            Err(Error::Corrupt { .. }) => {
-                report.corrupt_or_foreign += 1;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        if reader.header().store_id != store_id {
-            // A foreign dump planted in the directory: not ours, so not
-            // touched.
-            report.corrupt_or_foreign += 1;
-            continue;
-        }
-        let seg_version = reader.header().protocol_version.0;
-        if seg_version >= schema.version.0 {
-            report.already_current += 1;
-            continue;
-        }
-        let steps = chain(schema, seg_version).map_err(|e| Error::Corrupt {
-            path: path.clone(),
-            reason: e.to_string(),
-        })?;
-        if reader.is_sealed()
-            && let Some(footer) = reader.footer()
-            && !chain_touches(&steps, &footer)
-        {
-            report.skipped_untouched += 1;
-            continue;
-        }
-
-        let rewrite = match rewrite_segment(&mut reader, &path, schema.version, &steps) {
-            Ok(r) => r,
-            Err(e) => {
-                // The original is untouched; the next attempt will sweep up the
-                // unfinished tmp. The run breaks off: carrying on after a
-                // failure would mean stamping the metadata over a segment that
-                // was never rewritten.
-                let _ = std::fs::remove_file(tmp_path(&path));
-                return Err(e);
-            }
-        };
-        let emptied = matches!(rewrite.commit, MigrationCommit::Remove);
-        if writer.commit_migration(ns, channel, name, rewrite.commit)? {
-            if emptied {
-                report.emptied += 1;
-            } else {
-                report.rewritten += 1;
-            }
-            report.records_rewritten += rewrite.records_rewritten;
-            report.records_dropped += rewrite.records_dropped;
-        } else {
-            // Rotation got there first: nobody needs the result, and it is not
-            // in the report either — those records were thrown out, not
-            // rewritten.
-            let _ = std::fs::remove_file(tmp_path(&path));
-            report.rotated_away += 1;
-        }
-    }
-    Ok(())
+// Legacy codec fixture support: the live writer never creates these files.
+#[cfg(test)]
+#[derive(Debug)]
+enum MigrationCommit {
+    Replace { tmp: std::path::PathBuf, size: u64 },
+    Remove,
 }
-
+#[cfg(test)]
 fn tmp_path(path: &Path) -> std::path::PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
@@ -436,6 +457,7 @@ fn tmp_path(path: &Path) -> std::path::PathBuf {
 }
 
 /// The outcome of rewriting one segment — before the commit.
+#[cfg(test)]
 struct Rewrite {
     commit: MigrationCommit,
     records_rewritten: u64,
@@ -449,6 +471,7 @@ struct Rewrite {
 /// drops out). So are the name and the `base`: even if the leading records are
 /// deleted, selecting segments by name only becomes more conservative — see
 /// SPEC.
+#[cfg(test)]
 fn rewrite_segment(
     reader: &mut SegmentReader,
     path: &Path,
@@ -1032,6 +1055,7 @@ mod tests {
             panic!("the segment was rewritten, not deleted");
         };
         assert_eq!(rewrite.records_rewritten, 400);
+        assert_eq!(rewrite.records_dropped, 0);
         assert!(
             out <= size + size / 8,
             "the rewritten segment is {out} against the original {size}"

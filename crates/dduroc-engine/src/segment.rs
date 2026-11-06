@@ -383,13 +383,7 @@ pub(crate) mod fault {
     use std::cell::Cell;
 
     thread_local! {
-        static NO_SPACE: Cell<u32> = const { Cell::new(0) };
         static CEILING: Cell<u64> = const { Cell::new(u64::MAX) };
-    }
-
-    /// The next `n` attempts to reserve space are refused.
-    pub(crate) fn no_space_for(n: u32) {
-        NO_SPACE.with(|c| c.set(n));
     }
 
     /// A medium with exactly `bytes` free: an attempt to reserve more is
@@ -409,13 +403,7 @@ pub(crate) mod fault {
     }
 
     pub(crate) fn refuses(want: u64) -> bool {
-        let over = CEILING.with(|c| want > c.get());
-        let counted = NO_SPACE.with(|c| {
-            let left = c.get();
-            c.set(left.saturating_sub(1));
-            left > 0
-        });
-        over || counted
+        CEILING.with(|c| want > c.get())
     }
 }
 

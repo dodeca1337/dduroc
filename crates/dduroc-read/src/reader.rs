@@ -4,6 +4,7 @@ use crate::cursor::{ChannelCursor, Damage, OwnedRecord, OwnedSampleValue};
 use crate::error::{ReadError, Result};
 use crate::query::{Bounds, Filter, KindFilter, Order, Query};
 use chrono::{DateTime, Utc};
+use dduroc_engine::backend::ReadBackend;
 use dduroc_engine::epochs::{EpochStore, Epochs};
 use dduroc_engine::namespace::{NS_META, NsMeta};
 use dduroc_engine::schema::{MetricKind, Schema, Severity, StorageClass};
@@ -20,7 +21,8 @@ use std::time::{Duration, Instant};
 /// The bound is there so the search does not walk back through the whole
 /// retention depth: a series unchanged for a month would cost reading a month
 /// of data for one value. Two segments are tens of megabytes of history at a
-/// typical size, which is enough for a state written on every change.
+/// typical size. The raft backend instead bounds this probe to 256 eligible
+/// committed blocks; a state older than that horizon may have no seed.
 const SEED_SEGMENTS: usize = 2;
 
 /// Borrow an owning value as a format value — for computing severity.
@@ -646,12 +648,17 @@ impl Follow<'_> {
 
     /// Take everything that has appeared since the last wake-up.
     fn refresh(&mut self, shape_changed: bool, roster_changed: bool) {
+        if shape_changed || roster_changed {
+            self.prune_backend_channels();
+        }
         self.epochs = self.reader.epochs_now().into_owned();
         // A root walk is triggered only by the store's roster — that is, by a
         // namespace coming up. While rotation triggered it too, a subscription
         // listed the whole store every half second on end: segments change
         // constantly, while services start once in their life.
-        if roster_changed {
+        if roster_changed || self.reader.backend.is_some() {
+            // Fully drained compacted channels are pruned. A later append to
+            // an existing channel changes data, not necessarily the roster.
             self.adopt_due = true;
         }
         self.rearm(shape_changed);
@@ -696,6 +703,7 @@ impl Follow<'_> {
         }
         self.adopt_due = false;
         self.last_adopt = Some(Instant::now());
+        self.prune_backend_channels();
         self.adopt_new_channels();
         self.rearm(true);
         true
@@ -715,6 +723,9 @@ impl Follow<'_> {
 
     /// Announce damage from the walk, if it has not been mentioned yet.
     fn note_once(&mut self, damage: Damage) {
+        if self.reported.len() >= 512 {
+            self.reported.clear();
+        }
         if self
             .reported
             .insert((damage.path.clone(), damage.reason.clone()))
@@ -730,6 +741,59 @@ impl Follow<'_> {
     /// than after: otherwise every walk would list the directory anew and open
     /// a segment for each channel already being read, only to throw the result
     /// away.
+    /// Retain a delivery watermark only while its channel has retained data.
+    /// Empty channels can later start at their new monotonic index; reopening
+    /// them cannot replay history that the backend has already purged.
+    fn prune_backend_channels(&mut self) {
+        let Some(backend) = &self.reader.backend else {
+            return;
+        };
+        let catalog = match backend.catalog() {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.note_once(Damage {
+                    path: self.reader.root().to_owned(),
+                    offset: 0,
+                    reason: error.to_string(),
+                });
+                return;
+            }
+        };
+        let retained: HashSet<_> = catalog
+            .iter()
+            .filter(|info| info.retained_bytes > 0)
+            .map(|info| (info.key.namespace.as_str(), info.key.class))
+            .collect();
+        let mut cursors = Vec::new();
+        let mut schemas = Vec::new();
+        for (cursor, schema) in self.cursors.drain(..).zip(self.schemas.drain(..)) {
+            if cursor.drained() && !retained.contains(&(cursor.namespace.as_ref(), cursor.channel))
+            {
+                continue;
+            }
+            cursors.push(cursor);
+            schemas.push(schema);
+        }
+        self.cursors = cursors;
+        self.schemas = schemas;
+        self.known.clear();
+        self.heads.clear();
+        self.queued = vec![false; self.cursors.len()];
+        for idx in 0..self.cursors.len() {
+            let cursor = &self.cursors[idx];
+            *self.known.entry(cursor.namespace.to_string()).or_default() |=
+                1 << cursor.channel.index();
+            self.requeue(idx);
+        }
+        if let Ok(mut cache) = self.reader.schema_cache.write() {
+            cache.retain(|namespace, _| {
+                catalog
+                    .iter()
+                    .any(|info| info.key.namespace == *namespace && info.retained_bytes > 0)
+            });
+        }
+    }
+
     fn adopt_new_channels(&mut self) {
         let opened = self.reader.open_cursors_beyond(
             &self.query,
@@ -808,7 +872,8 @@ pub struct NamespaceInfo {
     /// The storage classes the namespace has channels for, in
     /// [`StorageClass::index`] order.
     pub channels: Vec<StorageClass>,
-    /// The total size of the segments, in bytes.
+    /// Retained encoded block bytes for raft stores; segment file bytes for legacy dumps.
+    /// Shared physical raft log overhead is not attributable to one namespace.
     pub total_bytes: u64,
 }
 
@@ -861,6 +926,7 @@ enum Source {
 #[derive(Debug)]
 pub struct Reader {
     source: Source,
+    backend: Option<Arc<ReadBackend>>,
     /// The schemas named by hand (at open time and by [`Reader::with_schema`]).
     /// A live reader sees the schemas of namespaces that came up on top of
     /// them.
@@ -890,10 +956,13 @@ impl Reader {
     /// declares has to be found in one of the roots — otherwise
     /// [`ReadError::IncompleteDump`] rather than a silently short answer.
     ///
-    /// Reading only: no recovery, no cleanup of temporary files. A viewer has
-    /// no right to change a dump it was given to look at. A `Store` is not
-    /// opened for a dump at all — that takes a lock on the root and sweeps
-    /// temporary files, which is why the roots and schemas are named by hand.
+    /// Raft dumps require an exclusive engine lock. Opening validates the
+    /// complete journal with AbsoluteConsistency: a torn tail or I/O error
+    /// refuses the dump instead of truncating it. Engine bookkeeping may create
+    /// or rotate its own active files; take a copy first when byte-for-byte
+    /// preservation is required. A live process must use Reader::of_store,
+    /// which shares the already open engine. Legacy segment dumps use the
+    /// read-only segment path and perform no recovery.
     ///
     /// A store this same process writes needs [`Reader::of_store`]: a snapshot
     /// of the epochs and schemas taken here goes stale with the first time
@@ -925,10 +994,22 @@ impl Reader {
                 ),
             });
         }
-        let epochs = EpochStore::open_read_only(main_root).unwrap_or_default();
+        let backend = if main_root.join("dduroc-raft-v1").exists()
+            || main_root.join("raft-engine").exists()
+        {
+            Some(ReadBackend::open_dump(&roots)?)
+        } else {
+            None
+        };
+        let epochs = if let Some(backend) = &backend {
+            backend.epochs()?
+        } else {
+            EpochStore::open_read_only(main_root)?
+        };
         let store_id = read_store_id(main_root);
         let reader = Self {
             source: Source::Dump { roots, epochs },
+            backend,
             schemas: schemas.iter().map(|s| (s.name.to_owned(), *s)).collect(),
             store_id,
             schema_cache: RwLock::new(HashMap::new()),
@@ -997,6 +1078,7 @@ impl Reader {
         let store_id = store.meta().store_id;
         Self {
             source: Source::Store(Arc::clone(store)),
+            backend: Some(store.read_backend()),
             schemas: HashMap::new(),
             store_id: Some(store_id),
             schema_cache: RwLock::new(HashMap::new()),
@@ -1061,10 +1143,9 @@ impl Reader {
         self
     }
 
-    /// Do not check that the segments belong to this store.
-    ///
-    /// Needed for examining a foreign dump assembled from several devices; the
-    /// absolute time of such records cannot be trusted.
+    /// Permit foreign legacy segments. This applies only to the legacy segment
+    /// reader; raft dump roots must always have matching durable store identities.
+    /// Absolute time of foreign legacy records cannot be trusted.
     pub fn allow_foreign_segments(mut self) -> Self {
         self.store_id = None;
         self
@@ -1124,8 +1205,20 @@ impl Reader {
         {
             return *found;
         }
-        let resolved = read_ns_meta(&self.root().join(namespace))
-            .and_then(|meta| self.schema_by_name(&meta.schema_name));
+        let resolved = if let Some(backend) = &self.backend {
+            backend
+                .catalog()
+                .ok()
+                .and_then(|catalog| {
+                    catalog
+                        .into_iter()
+                        .find(|info| info.key.namespace == namespace)
+                })
+                .and_then(|info| self.schema_by_name(&info.schema_name))
+        } else {
+            read_ns_meta(&self.root().join(namespace))
+                .and_then(|meta| self.schema_by_name(&meta.schema_name))
+        };
         // A live reader must not remember "there is no schema": the namespace
         // may not have come up yet, and a cached `None` would hide its texts
         // for the reader's whole life. A schema once found is immutable in both
@@ -1133,6 +1226,11 @@ impl Reader {
         if (resolved.is_some() || !self.live())
             && let Ok(mut cache) = self.schema_cache.write()
         {
+            // Bound presentation caching under namespace churn. Schema copies
+            // are cheap; clearing this cache changes no cursor or delivery mark.
+            if cache.len() >= 512 {
+                cache.clear();
+            }
             cache.insert(namespace.to_owned(), resolved);
         }
         resolved
@@ -1152,12 +1250,20 @@ impl Reader {
         let mut damaged = Vec::new();
         let found = self.scan_namespaces(&mut damaged)?;
         let mut namespaces = Vec::with_capacity(found.len());
+        let retained = self.backend.as_ref().map(|b| b.catalog()).transpose()?;
         for ns in found {
             let mut total_bytes = 0;
             for (_, dir) in &ns.channels {
                 if let Ok(inv) = dduroc_engine::rotation::Inventory::scan(dir) {
                     total_bytes += inv.total_bytes();
                 }
+            }
+            if let Some(catalog) = &retained {
+                total_bytes = catalog
+                    .iter()
+                    .filter(|info| info.key.namespace == ns.name)
+                    .map(|info| info.retained_bytes)
+                    .sum();
             }
             namespaces.push(NamespaceInfo {
                 name: ns.name,
@@ -1195,6 +1301,30 @@ impl Reader {
         wanted: impl Fn(&str) -> bool,
     ) -> Result<Vec<NsScan>> {
         let mut out = Vec::new();
+        if let Some(backend) = &self.backend {
+            let mut grouped: std::collections::BTreeMap<String, NsScan> =
+                std::collections::BTreeMap::new();
+            for info in backend.catalog()? {
+                if !wanted(&info.key.namespace) {
+                    continue;
+                }
+                let namespace = info.key.namespace.clone();
+                let ns = grouped.entry(namespace.clone()).or_insert_with(|| NsScan {
+                    name: namespace.clone(),
+                    schema_name: info.schema_name.clone(),
+                    protocol_version: info.protocol_version,
+                    channels: Vec::new(),
+                });
+                ns.channels.push((
+                    info.key.class,
+                    PathBuf::from(namespace).join(info.key.class.as_str()),
+                ));
+            }
+            for ns in grouped.values_mut() {
+                ns.channels.sort_by_key(|(class, _)| class.index());
+            }
+            return Ok(grouped.into_values().collect());
+        }
         let roots = self.all_roots();
         let main_root = &roots[0];
         let entries = match std::fs::read_dir(main_root) {
@@ -1492,15 +1622,13 @@ impl Reader {
 
     /// Find the last sample of every state series before the window begins.
     ///
-    /// It is searched for by walking back from `from`, and the walk is
-    /// **bounded** by [`SEED_SEGMENTS`] segments: a series unchanged for a very
-    /// long time will be left without a seed, and that is more honest than
-    /// reading the whole history for one value. An application that needs the
-    /// full picture should write the state at start as well — then the seed is
-    /// always close by.
-    ///
-    /// Segments holding none of the metrics wanted are discarded by the set of
-    /// identifiers in the footer, without reading any blocks.
+    /// Legacy dumps inspect at most two eligible segments using their footer
+    /// metric sets. Raft stores inspect at most 256 blocks containing records
+    /// inside the seed window per channel, with one block buffered at a time.
+    /// Raft has no per-channel time index: blocks newer than `from` may be
+    /// scanned before reaching that window and do not consume this horizon.
+    /// An older state can remain unseeded; seeds are not a complete state
+    /// reconstruction. State capture at startup keeps the needed value close.
     fn collect_state_seeds(
         &self,
         q: &Query,
@@ -1650,6 +1778,15 @@ impl Reader {
         let mut cursors = Vec::new();
         let mut schemas = Vec::new();
         let mut damaged = Vec::new();
+        let backend_channels: HashMap<_, _> = if let Some(backend) = &self.backend {
+            backend
+                .catalog()?
+                .into_iter()
+                .map(|info| (info.key.clone(), info))
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         for ns in self.scan_namespaces_matching(&mut damaged, |name| q.namespaces.matches(name))? {
             let schema = self.schema_by_name(&ns.schema_name);
@@ -1682,12 +1819,31 @@ impl Reader {
                 if seen & (1 << channel.index()) != 0 {
                     continue;
                 }
-                cursors.push(ChannelCursor::open(
-                    dir,
-                    std::sync::Arc::clone(&ns_name),
-                    channel,
-                    &scope,
-                )?);
+                if let Some(backend) = &self.backend {
+                    let key = dduroc_engine::backend::ChannelKey {
+                        namespace: ns.name.clone(),
+                        class: channel,
+                    };
+                    if let Some(info) = backend_channels.get(&key) {
+                        if info.first_index.is_none() {
+                            continue;
+                        }
+                        cursors.push(ChannelCursor::open_backend(
+                            backend.clone(),
+                            info.clone(),
+                            &scope,
+                        ));
+                    } else {
+                        continue;
+                    }
+                } else {
+                    cursors.push(ChannelCursor::open(
+                        dir,
+                        std::sync::Arc::clone(&ns_name),
+                        channel,
+                        &scope,
+                    )?);
+                }
                 schemas.push(schema);
             }
         }
@@ -2035,7 +2191,7 @@ mod tests {
     use crate::query::KindFilter;
     use dduroc_engine::schema::{EventDesc, Language, MetricDesc, SpanDesc, StorageClass};
     use dduroc_engine::store::{Store, StoreConfig};
-    use dduroc_format::{MetricId, Micros, ProtocolVersion, SpanKindId, ValueType};
+    use dduroc_format::{MetricId, Micros, ProtocolVersion, Record, SpanKindId, ValueType};
 
     static LANGS: &[Language] = &[Language("en"), Language("ru")];
     static EVENTS: &[EventDesc] = &[
@@ -2124,6 +2280,79 @@ mod tests {
             metrics: METRICS,
             spans: SPANS,
             migrations: &[],
+        }
+    }
+
+    /// Explicit v1 segment fixtures remain readable without opening a new Store.
+    fn populate_legacy(root: &Path) {
+        use dduroc_engine::segment::SegmentWriter;
+        use dduroc_format::{
+            Compression, FooterBuilder, block::BlockBuilder, record::Message,
+            segment::SegmentHeader,
+        };
+        #[derive(serde::Serialize)]
+        struct Meta {
+            container_version: u8,
+            store_id: u64,
+        }
+        std::fs::write(
+            root.join("store-meta"),
+            postcard::to_allocvec(&Meta {
+                container_version: 1,
+                store_id: 17,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for namespace in ["orc-radio-0", "orc-radio-1"] {
+            let dir = root.join(namespace);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(NS_META),
+                postcard::to_allocvec(&NsMeta {
+                    schema_name: schema().name.into(),
+                    protocol_version: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            for class in StorageClass::ALL {
+                std::fs::create_dir_all(dir.join(class.as_str())).unwrap();
+            }
+            let mut segment = SegmentWriter::create(
+                &dir.join("default"),
+                SegmentHeader {
+                    protocol_version: ProtocolVersion(1),
+                    boot: BootCounter(0),
+                    base: Micros(100),
+                    store_id: 17,
+                },
+                1 << 20,
+            )
+            .unwrap();
+            let mut footer = FooterBuilder::new();
+            for index in 0..8 {
+                let at = Micros(100 + index);
+                let mut builder = BlockBuilder::new();
+                builder
+                    .push(
+                        at,
+                        &Record::Message(Message {
+                            event: EventId(1),
+                            span: None,
+                            payload: &[1],
+                        }),
+                    )
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let header = builder
+                    .finish(segment.next_seq(), Compression::None, &mut bytes)
+                    .unwrap();
+                let offset = segment.append_block(&bytes).unwrap();
+                footer.add_event(EventId(1));
+                footer.add_block(offset, &header, at);
+            }
+            segment.seal(&footer.build()).unwrap();
         }
     }
 
@@ -2434,6 +2663,9 @@ mod tests {
         }
         ns.sync().unwrap();
         store.shutdown();
+        drop(temp);
+        drop(link);
+        drop(ns);
         drop(store);
 
         let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
@@ -2615,7 +2847,7 @@ mod tests {
         }
         ns.sync().unwrap(); // the data is on disk but the segment is not sealed
 
-        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
+        let reader = Reader::of_store(&store);
         for order in [Order::Oldest, Order::Newest] {
             let result = reader
                 .query(&Query::new().kinds(KindFilter::TELEMETRY).order(order))
@@ -2837,7 +3069,7 @@ mod tests {
     #[test]
     fn foreign_store_segments_are_reported_not_silently_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        populate(dir.path());
+        populate_legacy(dir.path());
 
         // Substitute the store metadata: the segments become "foreign".
         let meta_path = dir.path().join("store-meta");
@@ -2875,7 +3107,7 @@ mod tests {
     #[test]
     fn corrupt_block_does_not_hide_the_rest() {
         let dir = tempfile::tempdir().unwrap();
-        populate(dir.path());
+        populate_legacy(dir.path());
 
         // Damage the middle of one segment.
         let ch = dir.path().join("orc-radio-0").join("default");
@@ -2911,21 +3143,7 @@ mod tests {
         // block had dropped out of declared itself complete — that is, lied in
         // exactly the field that exists for it.
         let dir = tempfile::tempdir().unwrap();
-        {
-            let store =
-                Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024))
-                    .unwrap();
-            let ns = store.namespace("orc-radio-0", schema()).unwrap();
-            // Eight blocks in one segment: `sync` closes a block, so the
-            // segment is knowably not read to the end under the limit.
-            for round in 0..8u8 {
-                for i in 0..5u8 {
-                    ns.log_raw(EventId(1), &[round, i], None);
-                }
-                ns.sync().unwrap();
-            }
-            store.shutdown();
-        }
+        populate_legacy(dir.path());
 
         let ch = dir.path().join("orc-radio-0").join("default");
         let seg = std::fs::read_dir(&ch)
@@ -3147,6 +3365,8 @@ mod tests {
         // An unknown language falls back to the first declared, not to a refusal.
         assert_eq!(reader.render(msg, "de").as_deref(), Some("power set"));
 
+        // Offline readers own an exclusive backend lock; release it before reopening.
+        drop(reader);
         // A reader without schemas has nothing to render with, and will not invent.
         let blind = Reader::open_dump([dir.path()], &[]).unwrap();
         assert_eq!(blind.render(msg, "ru"), None);
@@ -3181,5 +3401,115 @@ mod tests {
         assert!(!r.entries.is_empty());
         assert!(r.entries.iter().all(|e| e.utc.is_none()));
         assert!(r.unanchored.is_empty());
+    }
+    #[test]
+    fn repeated_offline_open_releases_the_lock_and_does_not_accumulate_files() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let mut samples = Vec::new();
+        for _ in 0..24 {
+            let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
+            let result = reader.query(&Query::new().limit(1)).unwrap();
+            assert_eq!(result.entries.len(), 1);
+            drop(reader);
+            let files: Vec<_> = std::fs::read_dir(dir.path().join("raft-engine"))
+                .unwrap()
+                .map(|e| e.unwrap().metadata().unwrap())
+                .collect();
+            samples.push((
+                files.len(),
+                files.iter().map(|m| m.blocks() * 512).sum::<u64>(),
+            ));
+        }
+        let min_files = samples.iter().map(|s| s.0).min().unwrap();
+        let max_files = samples.iter().map(|s| s.0).max().unwrap();
+        let min_bytes = samples.iter().map(|s| s.1).min().unwrap();
+        let max_bytes = samples.iter().map(|s| s.1).max().unwrap();
+        assert!(
+            max_files <= min_files + 1,
+            "offline open leaked files: {samples:?}"
+        );
+        assert!(
+            max_bytes <= min_bytes + 65536,
+            "offline open leaked allocated blocks: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn follow_prunes_compacted_namespace_cursors_without_replaying_old_records() {
+        use dduroc_engine::channel::ChannelConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            StoreConfig::new(dir.path())
+                .with_budget_per_class(16 << 20)
+                .channel(
+                    StorageClass::Default,
+                    ChannelConfig {
+                        segment_bytes: 64 << 10,
+                        block_max_bytes: 8 << 10,
+                        compression: dduroc_format::Compression::None,
+                        ..ChannelConfig::new(128 << 10)
+                    },
+                ),
+        )
+        .unwrap();
+        let reader = Reader::of_store(&store);
+        let mut follow = reader.follow(&Query::new().order(Order::Oldest)).unwrap();
+        let text = "x".repeat(40 << 10);
+        for n in 0..12 {
+            let namespace = store.namespace(&format!("churn-{n:03}"), schema()).unwrap();
+            namespace.log_text(Level::Info, "churn", text.as_str(), None);
+            namespace.sync().unwrap();
+            // Remove rate throttling from this focused lifecycle regression.
+            follow.last_adopt = None;
+            let entry = match follow.next(Duration::from_secs(2)) {
+                Tail::Entry(entry) => entry,
+                other => panic!("missing namespace {n}: {other:?}"),
+            };
+            assert_eq!(entry.namespace.as_ref(), format!("churn-{n:03}"));
+            assert!(matches!(follow.next(Duration::ZERO), Tail::Idle));
+        }
+        follow.prune_backend_channels();
+        let retained = store
+            .read_backend()
+            .catalog()
+            .unwrap()
+            .iter()
+            .filter(|info| info.retained_bytes > 0)
+            .count();
+        assert!(
+            retained < 12,
+            "the fixture must really evict old namespaces"
+        );
+        assert!(
+            follow.cursors.len() <= retained,
+            "drained cursors outlived retained data"
+        );
+        assert!(
+            follow.known.len() <= retained,
+            "known namespace roster outlived retained data"
+        );
+        assert!(
+            matches!(follow.next(Duration::ZERO), Tail::Idle),
+            "pruning must not replay retained history"
+        );
+        store.shutdown();
+    }
+    #[test]
+    fn presentation_schema_cache_is_bounded_under_namespace_churn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
+        let reader = Reader::of_store(&store);
+        for index in 0..530 {
+            let name = format!("cache-{index:04}");
+            let namespace = store.namespace(&name, schema()).unwrap();
+            namespace.log_raw(EventId(1), &[1], None);
+            namespace.sync().unwrap();
+            assert!(reader.schema_of(&name).is_some());
+        }
+        assert!(reader.schema_cache.read().unwrap().len() <= 512);
+        store.shutdown();
     }
 }

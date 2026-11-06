@@ -31,15 +31,28 @@ jobs:
   # buffer sizes, offset arithmetic) never show up on the host. A compilation
   # check catches them sooner than a device does.
   #
-  # `check` rather than `build`: linking would need a cross toolchain, and what
-  # has to be checked is the type check, not the linker. Tests are not run on
+  # `check` rather than `build`: the final Rust binary is not linked, but
+  # lz4-sys still compiles C and needs a target C compiler. Tests are not run on
   # the target — that needs an emulator, which is a task of its own.
   armv7:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add armv7-unknown-linux-gnueabihf
+      - run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf
       - uses: Swatinem/rust-cache@v2
         with:
           key: armv7
       - run: cargo check --workspace --all-targets --target armv7-unknown-linux-gnueabihf
+        env:
+          CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.88.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.88
+      - run: cargo +1.88.0 check --workspace --all-targets --locked

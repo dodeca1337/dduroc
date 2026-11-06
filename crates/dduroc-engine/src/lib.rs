@@ -7,16 +7,21 @@
 //!
 //! ```text
 //! <root>/
+//!   dduroc-raft-v1             format marker
+//!   store-meta                 store identity
 //!   epochs.bin                 relative time tied to UTC
+//!   raft-engine/               shared log files and channel catalog
 //!   <namespace>/
 //!     ns-meta                  the namespace's schema and protocol version
-//!     <channel>/
-//!       <boot>-<micros>.seg    segments
 //! ```
+//!
+//! [`segment`] and [`rotation`] expose the earlier segment format utilities
+//! for compatibility and testing; [`Store`] writes through [`backend`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod backend;
 pub mod channel;
 pub mod clock;
 pub mod diag;

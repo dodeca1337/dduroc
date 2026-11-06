@@ -146,7 +146,7 @@ fn a_namespace_raised_later_joins_the_subscription() {
 }
 
 #[test]
-fn rotation_under_a_subscription_loses_nothing_and_looks_like_nothing() {
+fn block_boundaries_under_a_subscription_lose_nothing_and_look_like_nothing() {
     // The segment under a subscription changes silently: it is reading a file
     // the writer is sealing at that moment, and it has to move to the next one
     // at once. The budget is knowably larger than what is written — there is
@@ -207,21 +207,14 @@ fn rotation_under_a_subscription_loses_nothing_and_looks_like_nothing() {
         tail.take_damage()
     );
 
-    // The test has to prove it checked the seam between segments: fitting into
-    // one file it would have checked something else entirely and still been
-    // green.
-    let segments = std::fs::read_dir(dir.path().join("dev-0").join("default"))
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .is_ok_and(|e| e.file_name().to_string_lossy().ends_with(".seg"))
-        })
-        .count();
-    assert!(segments > 2, "there was no rotation: {segments} segments");
+    assert!(
+        store.stats().blocks_written > 2,
+        "the stream crossed multiple committed blocks"
+    );
 }
 
 #[test]
-fn a_lasting_damage_is_named_once_not_at_every_rotation() {
+fn a_foreign_directory_cannot_invent_a_backend_channel() {
     // A subscription walks the roots anew on every change of the store's shape,
     // and an unreadable directory does not go anywhere. Without a memory of
     // what it has said, it would announce one and the same damage on every
@@ -240,7 +233,10 @@ fn a_lasting_damage_is_named_once_not_at_every_rotation() {
     take(&mut tail, 1);
 
     let first = tail.take_damage();
-    assert_eq!(first.len(), 1, "the foreign directory is named: {first:?}");
+    assert!(
+        first.is_empty(),
+        "the backend catalog defines channels: {first:?}"
+    );
 
     // Any number of further turns — we stay silent about the same thing.
     for n in 1..4 {
@@ -306,7 +302,7 @@ fn a_stopped_store_ends_the_subscription_instead_of_leaving_it_waiting() {
 }
 
 #[test]
-fn a_newborn_segment_is_waited_for_not_walked_past() {
+fn a_new_committed_block_is_waited_for_not_walked_past() {
     // A segment caught at birth (the file created, the header not yet written)
     // is passed over by a one-off query: the next query will show it. A
     // subscription has no next query — passing it by, it would lose the whole
@@ -446,14 +442,18 @@ fn a_subscription_refuses_what_it_cannot_promise() {
         .unwrap_err();
     assert!(matches!(e, dduroc_read::ReadError::NotFollowable(_)), "{e}");
 
-    // Nobody appends to a dump.
+    // Nobody appends to a dump; close live owners before exclusive offline open.
+    store.shutdown();
+    drop(ns);
+    drop(reader);
+    drop(store);
     let dump = Reader::open_dump([dir.path()], &[probe::SCHEMA]).unwrap();
     let e = dump.follow(&Query::new().order(Order::Oldest)).unwrap_err();
     assert!(matches!(e, dduroc_read::ReadError::NotFollowable(_)), "{e}");
 }
 
 #[test]
-fn a_rotation_is_not_announced_as_a_new_namespace() {
+fn committed_data_is_not_announced_as_a_new_namespace() {
     // Answering "the segment changed" and "a namespace came up" cost different
     // things: the first is listing one channel's directory, the second walking
     // the root, reading `ns-meta` in every matching directory and opening
@@ -482,7 +482,7 @@ fn a_rotation_is_not_announced_as_a_new_namespace() {
     ns.sync().unwrap();
 
     let base = store.pulse().wait(Default::default(), PATIENCE);
-    assert!(base.shape > 0, "the first segment is already created");
+    assert!(base.data > 0, "the first block is committed");
 
     // Many rotations and not one new namespace.
     for n in 1..2000u32 {
@@ -490,7 +490,7 @@ fn a_rotation_is_not_announced_as_a_new_namespace() {
     }
     ns.sync().unwrap();
     let rotated = store.pulse().wait(base, PATIENCE);
-    assert_ne!(rotated.shape, base.shape, "the segments changed");
+    assert_ne!(rotated.data, base.data, "new blocks committed");
     assert_eq!(
         rotated.roster, base.roster,
         "the store roster did not change — a subscription has no reason to walk the root"

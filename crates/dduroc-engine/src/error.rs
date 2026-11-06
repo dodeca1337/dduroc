@@ -12,6 +12,10 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("backend: {0}")]
+    Backend(String),
+    #[error("storage unavailable; record durability is unconfirmed: {0}")]
+    StorageUnavailable(String),
     #[error("{context}: {source}")]
     Io {
         context: String,
@@ -233,7 +237,10 @@ impl Error {
     pub fn loses_record(&self) -> bool {
         matches!(
             self,
-            Error::QueueFull | Error::WriterDead | Error::ShuttingDown
+            Error::QueueFull
+                | Error::WriterDead
+                | Error::ShuttingDown
+                | Error::StorageUnavailable(_)
         )
     }
 

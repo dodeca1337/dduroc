@@ -1,11 +1,101 @@
 # Measurements
 
+## Pinned Raft Engine characterization
+
+These are synthetic host tests of raft-engine 0.4.2 with `std_fs`, on a
+verified disk-backed temporary filesystem. They are not ARM/eMMC acceptance,
+and SIGKILL does not remove the kernel page cache. The reusable harness is:
+
+```sh
+cargo run -p dduroc-engine --example raft_probe -- suite "$FIXTURE_ROOT"
+cargo test -p dduroc-engine --test raft_faults
+```
+
+`FIXTURE_ROOT` must be a new disposable directory on the intended filesystem.
+The example intentionally tests unsafe upstream defaults as controls; the
+production backend uses strict recovery.
+
+| Scenario | Observation | Limit |
+|---|---|---|
+| 5 child-process kills/reopens, 32 synchronous records each | 160/160 exact acknowledged payloads recovered | Process crash, not physical power loss |
+| 100 retention cycles, two active groups and one dormant group | 15,532,032 payload bytes written; steady allocated range 688,128–897,024 bytes | Group retention 16/96/96 blocks; explicit compaction and purge |
+| 8 MiB payload in 128 B / 4 KiB / 64 KiB entries | RSS increase 3256 / 204 / 280 KiB | Independent process baselines; allocator retention affects RSS |
+| Default recovery, one injected body-read EIO | Previously acknowledged value lost; file truncated | Reproduced upstream defect; forbidden production policy |
+| Strict recovery, read EIO or truncated tail | Open fails; files unchanged | Requires explicit intervention for a genuinely torn tail |
+| Empty sync vs nonempty synchronous barrier | 0 vs 1 filesystem sync calls | Pinned-version defect; use nonempty barriers |
+
+An independent release-build sample with 16 groups and 512 synchronous 4 KiB
+blocks measured p50/p95/p99 at 1.265/1.446/1.686 ms. A separate 128 MiB run with
+64 KiB blocks, four per batch and a barrier every 8 MiB measured 319 MiB/s,
+including payload generation. RSS rose from 3352 to 4428 KiB; allocated storage
+ended at 136,990,720 bytes. That throughput run performed no retention and did
+not test the application's time-based synchronization scheduler. These are
+raw-engine figures, not migrated dduroc end-to-end throughput promises.
+
+## Migrated public Store acceptance
+
+Run `cargo test -p dduroc-engine --test migration_acceptance -- --nocapture`.
+Set `DDUROC_TEST_DISK_ROOT` to a disposable disk-backed parent directory for
+resource characterization; other unit fixtures use the system temporary area.
+These samples use the default unoptimized test profile and `std_fs` on the host.
+They are neither release throughput claims nor target flash measurements.
+
+| Scenario | Observation |
+|---|---|
+| Critical ACK, explicit ordinary sync, periodic ordinary sync | Each mode preserved 48 exact payloads through three SIGKILL/reopen cycles |
+| Different personal quotas, 128 / 256 KiB | 3 / 6 payloads retained after handle release and Store reopen |
+| 160 closed namespaces, 40 KiB payload each, 256 KiB class budget | Logical retention remained within budget; allocated bytes below 4 MiB |
+| 600 repeated open/write/drop cycles of one namespace | All 600 records recovered; sampled warmed RSS 8964 → 9020 KiB |
+| Equal-geometry independent roots and fresh offline reopen cycles | Correct root-specific payloads; raw upstream negative control reproduces aliasing |
+
+The periodic test uses 10 ms flush / 60 ms sync intervals to exercise the real
+scheduler quickly. It is not a 10-second wall-clock soak or a power-cut test.
+Repeated offline opens and a 530-namespace follower separately exercise reader
+resource bounds. A broad merge still retains one decoded block per selected
+channel; the number of returned records does not cap that memory.
+
+End-to-end characterization writes 256 critical records of 2 KiB, then 512
+ordinary records with 128 explicit barriers, after registering the indicated
+number of namespaces. Both cases finish with 252,930 retained payload bytes.
+
+| Registered namespaces | Critical total | Critical p50 / p95 / p99 | Ordinary total | RSS baseline → end | Allocated baseline → end |
+|---|---|---|---|---|---|
+| 100 | 399 ms | 1497 / 2067 / 2889 us | 259 ms | 9512 → 9584 KiB | 1,032,192 → 2,789,376 B |
+| 1000 | 397 ms | 1482 / 1987 / 2834 us | 262 ms | 14768 → 14848 KiB | 8,617,984 → 10,350,592 B |
+
+An earlier version recursively measured all namespace files on every commit:
+its critical p50 rose from 2565 to 13235 us between 100 and 1000 namespaces.
+The current implementation tracks managed metadata allocation on mutation and
+measures the shared journal files before admission. The repeat sample removes
+that observed namespace-count penalty. Metadata/catalog memory and disk space
+still grow with distinct namespaces; this is bounded by explicit admission
+and count limits, not evidence of zero cost or unlimited namespace churn.
+
+## Verification environment
+
+The final workspace gate passed 423 tests, with two existing ignored doctests.
+Formatting, Clippy on all targets with warnings denied, and Rustdoc with
+warnings denied passed. `cargo check --workspace --all-targets --target
+armv7-unknown-linux-gnueabihf` passed using `arm-linux-gnueabihf-gcc` for C code.
+These checks used rustc/Cargo 1.97.1. Release preparation also passed
+`cargo +1.88.0 check --workspace --all-targets --locked` on the declared minimum
+Rust 1.88; the previous 1.85 declaration did not support the code's let-chains.
+
+The concurrent-page/retention regression reproduced a missing-block error
+before page/append locking and passed after the fix. No physical board,
+filesystem power-cut campaign or target throughput measurement was performed.
+
+## Scope of the historical tables
+
+The tables below describe the former custom segment backend. They are not
+performance evidence for the Raft Engine backend. Codec-only measurements
+remain useful for the unchanged record encoding; end-to-end and retention
+figures must be measured again for the new storage path.
+
 `cargo bench -p dduroc --bench hot_path`
 
-The numbers were taken on x86-64 (Linux, `/dev/shm`, a release build). On
-armv7 they will be several times worse in absolute terms, but **the ratios
-between the variants carry over** — and those are what the measurements exist
-for.
+The numbers were taken on x86-64 (Linux, `/dev/shm`, a release build). Neither absolute timings nor ratios have been validated on ARMv7. CPU,
+filesystem and synchronization costs must be measured on the target device.
 
 The absolute numbers in the tables below are tied to the machine they were
 taken on and are not comparable with numbers from another: the same

@@ -47,6 +47,18 @@ fn noise(n: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Logical retention is independent from physical shared-log GC overhead.
+fn retained_bytes(store: &Store, namespace: Option<&str>) -> u64 {
+    store
+        .read_backend()
+        .catalog()
+        .unwrap()
+        .iter()
+        .filter(|info| namespace.is_none_or(|name| info.key.namespace == name))
+        .map(|info| info.retained_bytes)
+        .sum()
+}
+
 /// The total size of the segments in a directory tree.
 fn bytes_under(root: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -58,7 +70,10 @@ fn bytes_under(root: &Path) -> u64 {
             let path = e.path();
             if path.is_dir() {
                 bytes_under(&path)
-            } else if path.extension().is_some_and(|x| x == "seg") {
+            } else if path
+                .extension()
+                .is_some_and(|x| x == "raftlog" || x == "rewrite")
+            {
                 e.metadata().map(|m| m.len()).unwrap_or(0)
             } else {
                 0
@@ -68,8 +83,7 @@ fn bytes_under(root: &Path) -> u64 {
 }
 
 /// The numbers that reached the disk, in read order.
-fn sequence(root: &Path) -> Vec<u64> {
-    let reader = Reader::open_dump([root], &[pressure::SCHEMA]).unwrap();
+fn sequence(reader: &Reader) -> Vec<u64> {
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "damage: {:?}", result.damaged);
     result
@@ -114,11 +128,16 @@ fn rotation_drops_the_oldest_and_keeps_the_class_inside_its_budget() {
     let stats = store.stats();
     assert_eq!(stats.dropped, 0, "the queue kept up: {stats:?}");
     assert!(
-        stats.segments_rotated > 0,
-        "otherwise the test is not about rotation: {stats:?}"
+        store
+            .read_backend()
+            .catalog()
+            .unwrap()
+            .iter()
+            .any(|info| info.first_index.is_some_and(|first| first > 1)),
+        "the test must compact a real prefix"
     );
 
-    let occupied = bytes_under(dir.path());
+    let occupied = retained_bytes(&store, None);
     assert!(
         occupied <= BUDGET,
         "the channel takes {occupied} on a budget of {BUDGET}"
@@ -127,7 +146,7 @@ fn rotation_drops_the_oldest_and_keeps_the_class_inside_its_budget() {
     // And most of all — rotation ate the BEGINNING of the history, not its end.
     // The reverse would mean the device throws away fresh data and keeps
     // ancient.
-    let seen = sequence(dir.path());
+    let seen = sequence(&store.reader());
     assert!(!seen.is_empty(), "something had to survive");
     assert_eq!(
         *seen.last().unwrap(),
@@ -177,7 +196,7 @@ fn the_class_budget_is_shared_across_namespaces() {
     store.sync().unwrap();
     store.shutdown();
 
-    let occupied = bytes_under(dir.path());
+    let occupied = retained_bytes(&store, None);
     assert!(
         occupied > 0 && occupied <= CEILING,
         "the class takes {occupied} on a budget of {CEILING}"
@@ -191,7 +210,7 @@ fn the_class_budget_is_shared_across_namespaces() {
     // wrote last".
     for name in ["orc-0", "orc-1"] {
         assert!(
-            bytes_under(&dir.path().join(name)) > 0,
+            retained_bytes(&store, Some(name)) > 0,
             "{name} was evicted entirely: eviction has to go by age"
         );
     }
@@ -208,14 +227,20 @@ fn a_group_hands_its_namespaces_their_own_segments_and_quota() {
     let store = Store::open(
         StoreConfig::new(dir.path())
             .with_budget_per_class(64 << 20)
+            .channel(
+                StorageClass::Default,
+                ChannelConfig {
+                    segment_bytes: 64 << 10,
+                    block_max_bytes: 8 << 10,
+                    ..ChannelConfig::new(64 << 20)
+                },
+            )
             .group(
                 "orc-",
                 GroupPolicy::new()
                     .channel(
                         StorageClass::Default,
-                        ChannelOverride::new()
-                            .segment_bytes(64 << 10)
-                            .block_max_bytes(4 << 10),
+                        ChannelOverride::new().block_max_bytes(4 << 10),
                     )
                     .limit_bytes(StorageClass::Default, 256 << 10),
             ),
@@ -232,39 +257,27 @@ fn a_group_hands_its_namespaces_their_own_segments_and_quota() {
         ns.sync().unwrap();
     }
 
-    let channel = |name: &str| dir.path().join(name).join("default");
-    let occupied = bytes_under(&channel("orc-radio-0"));
-    let outside = bytes_under(&channel("diag-0"));
-
-    // A group's quota holds its own: the limit plus the active segment, which
-    // cannot be evicted.
+    let occupied = retained_bytes(&store, Some("orc-radio-0"));
+    let outside = retained_bytes(&store, Some("diag-0"));
     assert!(
-        occupied <= (256 << 10) + (64 << 10),
-        "the group quota did not hold: {occupied} B"
+        occupied > 0 && occupied <= 256 << 10,
+        "group quota: {occupied}"
     );
-    // An outsider inherited no quota and draws on the class's shared budget.
     assert!(
         outside > occupied,
-        "a namespace outside the group must not obey its quota: {outside} B against {occupied} B"
+        "group policy must not constrain outsiders"
     );
-
-    // The segment size is the group's too: an outsider gets the shared
-    // eight-megabyte one, and all of its volume fitted one file.
-    let files = |name: &str| {
-        std::fs::read_dir(channel(name))
+    assert!(
+        store
+            .read_backend()
+            .catalog()
             .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "seg"))
-            })
-            .count()
-    };
-    assert!(files("orc-radio-0") > 1, "the group's small segments");
-    assert_eq!(
-        files("diag-0"),
-        1,
-        "the shared segment holds everything at once"
+            .iter()
+            .any(|info| info.key.namespace == "orc-radio-0"
+                && info.first_index.is_some_and(|first| first > 1)),
+        "group quota must compact a real prefix"
     );
+    store.shutdown();
 }
 
 #[test]
@@ -287,10 +300,17 @@ fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
     .unwrap();
     let ns = store.namespace("orc-0", pressure::SCHEMA).unwrap();
 
-    for _ in 0..N {
-        ns.try_log(pressure::events::Alarm)
-            .expect("a critical write has no right to be refused");
-    }
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let ns = &ns;
+            scope.spawn(move || {
+                for _ in 0..N / 4 {
+                    ns.try_log(pressure::events::Alarm)
+                        .expect("critical completion");
+                }
+            });
+        }
+    });
     ns.sync().unwrap();
     store.shutdown();
 
@@ -301,7 +321,7 @@ fn a_full_critical_queue_makes_the_caller_wait_and_loses_nothing() {
     );
     assert_eq!(stats.dropped, 0, "a critical write is not lost: {stats:?}");
 
-    let reader = Reader::open_dump([dir.path()], &[pressure::SCHEMA]).unwrap();
+    let reader = store.reader();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "damage: {:?}", result.damaged);
     let alarms = result
@@ -353,7 +373,7 @@ fn many_threads_write_one_namespace_without_losing_or_duplicating() {
     store.shutdown();
     assert_eq!(store.stats().dropped, 0, "nothing was discarded");
 
-    let mut seen = sequence(dir.path());
+    let mut seen = sequence(&store.reader());
     assert_eq!(
         seen.len() as u64,
         THREADS * PER_THREAD,
@@ -401,7 +421,7 @@ fn reading_a_live_store_never_takes_back_what_it_already_showed() {
         let mut queries = 0u32;
         let mut floor = 0usize;
         while !done.load(Ordering::Acquire) {
-            let reader = Reader::open_dump([dir.path()], &[pressure::SCHEMA]).unwrap();
+            let reader = store.reader();
             let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
             let count = result
                 .entries
@@ -424,7 +444,7 @@ fn reading_a_live_store_never_takes_back_what_it_already_showed() {
     store.shutdown();
 
     // And after the stop, completeness: everything accepted has to be there.
-    let seen = sequence(dir.path());
+    let seen = sequence(&store.reader());
     assert_eq!(
         seen.len() as u64,
         N,
@@ -476,33 +496,32 @@ fn a_namespace_quota_rotates_inside_the_shared_class_budget() {
     hog.sync().unwrap();
     store.shutdown();
     let stats = store.stats();
-    // The lock on the root is released with the last handle: a series and a
-    // namespace keep the store alive.
+    let occupied = retained_bytes(&store, Some("orc-hog"));
     drop(bulk);
     drop(hog);
     drop(store);
-
-    let occupied = bytes_under(&dir.path().join("orc-hog"));
     assert!(
         occupied > 0 && occupied <= QUOTA,
         "the namespace takes {occupied} on a quota of {QUOTA}"
     );
+    assert!(stats.records_written > 0);
     assert!(
-        stats.segments_rotated > 0,
-        "the quota had to fire: {stats:?}"
+        occupied < QUOTA,
+        "whole-block retention stays below the logical quota"
     );
 
-    // A quota smaller than two segments is meaningless and is refused at open
-    // time.
+    // Logical namespace quotas need no private pair of physical log files.
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(256 << 20)).unwrap();
-    let err = store
+    let tiny = store
         .namespace_with_quota(
             "orc-tiny",
             pressure::SCHEMA,
             NsQuota::new().limit_bytes(StorageClass::Default, 1 << 20),
         )
-        .expect_err("a quota of one segment is meaningless");
-    assert!(matches!(err, dduroc::Error::BadChannel { .. }), "{err}");
+        .unwrap();
+    tiny.try_log(pressure::events::Mark).unwrap();
+    tiny.sync().unwrap();
+    assert!(retained_bytes(&store, Some("orc-tiny")) <= 1 << 20);
     store.shutdown();
 }
 
@@ -534,19 +553,8 @@ fn a_class_can_live_on_its_own_root() {
         store.shutdown();
     }
 
-    // The segments landed on their own media.
-    assert!(
-        bytes_under(&vault.path().join("orc-0").join("critical")) > 0,
-        "the critical channel lives on its own partition"
-    );
-    assert!(
-        !main.path().join("orc-0").join("critical").exists(),
-        "there is no critical directory in the main root"
-    );
-    assert!(
-        bytes_under(&main.path().join("orc-0").join("default")) > 0,
-        "the ordinary channel stayed in the main root"
-    );
+    assert!(bytes_under(&vault.path().join("raft-engine")) > 0);
+    assert!(bytes_under(&main.path().join("raft-engine")) > 0);
 
     // The reader gathers both trees: a dump is opened with every root at once.
     let reader = Reader::open_dump([main.path(), vault.path()], &[pressure::SCHEMA]).unwrap();
@@ -575,6 +583,7 @@ fn a_class_can_live_on_its_own_root() {
     // A dump without the second tree is not a "short answer" but a refusal:
     // completeness is checked against the schema at open time, and the critical
     // part must not be lost silently.
+    drop(reader);
     let e = Reader::open_dump([main.path()], &[pressure::SCHEMA]).unwrap_err();
     assert!(
         matches!(

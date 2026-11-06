@@ -1,25 +1,47 @@
 # dduroc — the byte specification of the storage format
 
-Container version: **2**. Status: draft.
+Record/block codec version: **2**. Current storage backend: **dduroc-raft-v1**.
 
-This document describes the layout the code implements. Everything written
-here is covered by the format's tests (property tests for resilience to
-arbitrary garbage included) — a divergence between the specification and the
-code counts as a defect in the specification.
+The current writer uses Raft Engine files, not the legacy segment directory
+layout. The block and record encoding in sections 3.1–3.3 remains the payload
+codec. Sections describing segment files, their reserved tails and footer
+rotation document the legacy container and its offline reader.
 
-### The container's version history
+### Current backend envelope
+
+A root contains the `dduroc-raft-v1` marker and a `raft-engine/` directory owned
+by the pinned storage dependency. Compact control metadata also records store
+identity and clock epochs. Live readers share the engine; an offline Raft reader
+requires exclusive engine access and is not advertised as a filesystem-read-only
+operation.
+
+Each log entry is a protobuf `BytesValue` containing:
+
+| bytes | meaning |
+|---|---|
+| 0..8 | little-endian u64 block index within the channel |
+| 8..12 | little-endian u32 boot counter |
+| 12..14 | little-endian u16 event-schema protocol version |
+| 14..22 | little-endian u64 root-local append sequence for retention order |
+| 22..end | encoded dduroc block header and body; empty for a migration tombstone |
+
+Namespace/class identity and retention metadata live in the group's catalog.
+No message text, source labels or schemas are repeated in event payloads.
+Raft Engine owns its framing, checksums, journal files and garbage collection;
+dduroc does not parse or repair those files. Recovery is strict and may refuse
+a torn tail without changing it; the reason is documented in `DESIGN.md`.
+
+### Legacy container history
 
 | version | what changed |
 |---|---|
-| 1 | the first layout: a sample referred to a segment-local series number, a separate `SeriesDef` record tied that number to a metric and to runtime tags, and the series↔metric table was duplicated in the footer |
-| 2 | no runtime tags: a series is identified by its metric, a sample carries `metric_id` directly, and both the `SeriesDef` record (kind `0x3`) and the series table in the footer are gone |
+| 1 | samples referenced a segment-local series and runtime tags |
+| 2 | samples carry metric_id directly; SeriesDef and footer series tables removed |
 
-A reader accepts **only** the current version: a mismatch is a clear error
-rather than an attempt to guess the layout. A store written by an earlier
-version does open (the `store-meta` file is rewritten and the identity is
-preserved), but its segments are not read by this build and will go with
-rotation; the fact that it came up from an older version is reported to the
-caller.
+The current Store refuses legacy stores before modification. There is no
+implicit in-place backend upgrade or deletion of history. Explicit offline
+legacy reading remains available; an eventual history importer must use a new
+root and verify the result before the old data can be removed.
 
 ## 0. Conventions
 
@@ -54,9 +76,9 @@ on every sample (an f32 sample: 7 → 8 bytes, +14%). The format does not break
 from it, but telemetry is the most frequent record there is, and there is no
 reason to pay for arbitrary numbers.
 
-### The design limits (the scale claimed plus a little headroom)
+### Historical sizing targets (not backend acceptance)
 
-| Quantity | Claimed | Design limit |
+| Quantity | Historical target | Sizing headroom |
 |---|---|---|
 | Microservice types | ~200 | **256** |
 | Instances per type | ≤64 | **96** |
@@ -70,10 +92,11 @@ segment inventories). The wire format does not change with them: an id is a
 varint in a u16 space, so holes left by migrations and growth past the limit
 do not break the format but merely lengthen an id to 2 bytes (values ≥128).
 
-The namespace and the channel are encoded nowhere on disk — they are implicit
-in the file path: `<root>/<namespace>/<channel>/<segment>`.
+In the legacy container the namespace and channel are implicit in the path
+`<root>/<namespace>/<channel>/<segment>`. The current backend persists this
+identity in its group catalog; it is not repeated in individual events.
 
-## 1. The directory tree
+## 1. The legacy directory tree
 
 ```
 <root>/
@@ -107,7 +130,7 @@ readable deliberately: a web interface and the dump-collection utility often
 run as a separate user in a shared group. The kernel can only narrow these
 permissions with its umask, never widen them.
 
-## 2. The segment
+## 2. The legacy segment
 
 ```
 [SegmentHeader 32B] [Block]* [Footer]?   // a Footer only on sealed segments

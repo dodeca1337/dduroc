@@ -128,19 +128,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Temp answers under its new identifier. Not one record is shown in the old
     // layout.
     // -----------------------------------------------------------------------
-    let before = read_all(&root)?;
+    let before = read_all(&store.reader())?;
     println!("\nbefore the run:");
     print_entries(&before);
 
     // -----------------------------------------------------------------------
-    // The physical run. The heavy work happens on the calling thread; writing
-    // does not stop meanwhile. A power loss anywhere is safe: every segment stays
-    // either as it was or already rewritten, and a repeat call continues with the
-    // rest.
+    // Physical block replacement is serialized with the writer. Each replacement
+    // is atomic; strict recovery may refuse a damaged tail after a crash instead
+    // of discarding it. This example does not qualify physical power loss.
     // -----------------------------------------------------------------------
     let report = ns.migrate()?;
     println!("\nthe run's report:");
-    println!("  segments rewritten:    {}", report.rewritten);
+    println!("  blocks rewritten:    {}", report.rewritten);
     println!("  already current:       {}", report.already_current);
     println!("  untouched by the steps: {}", report.skipped_untouched);
     println!("  records rewritten:     {}", report.records_rewritten);
@@ -148,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("the debt after the run: {:?}", ns.pending_migration());
 
     // A run changes the medium, not the answer: reading gives the same thing.
-    let after = read_all(&root)?;
+    let after = read_all(&store.reader())?;
     println!("\nafter the run:");
     print_entries(&after);
     assert_eq!(before, after, "the reader's answer has no right to change");
@@ -161,8 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Read the whole journal and telemetry through the eyes of schema v2.
-fn read_all(root: &std::path::Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let reader = Reader::open_dump([root], &[today::radio::SCHEMA])?;
+fn read_all(reader: &Reader) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let result = reader.query(
         &Query::new()
             .kinds(KindFilter {

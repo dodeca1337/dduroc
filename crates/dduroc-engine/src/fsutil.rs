@@ -128,6 +128,7 @@ pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 /// Delete a file if it exists and make the deletion durable.
+#[cfg(test)]
 pub fn remove_synced(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => {}

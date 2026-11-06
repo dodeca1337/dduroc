@@ -785,7 +785,7 @@ impl SegmentCursor {
 }
 
 /// A cursor over the segments of one channel.
-pub struct ChannelCursor {
+pub struct LegacyChannelCursor {
     dir: PathBuf,
     /// The segment names in walk order.
     segments: Vec<SegmentName>,
@@ -922,7 +922,7 @@ fn select_segments(
     segments
 }
 
-impl ChannelCursor {
+impl LegacyChannelCursor {
     /// Open a channel, selecting segments by time range.
     pub fn open(
         dir: &Path,
@@ -1202,15 +1202,330 @@ impl std::fmt::Debug for SegmentCursor {
     }
 }
 
-impl std::fmt::Debug for ChannelCursor {
+impl std::fmt::Debug for LegacyChannelCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChannelCursor")
+        f.debug_struct("LegacyChannelCursor")
             .field("namespace", &self.namespace)
             .field("channel", &self.channel)
             .field("segments", &self.segments.len())
             .field("next_segment", &self.next_segment)
             .field("damaged", &self.damaged.len())
             .finish()
+    }
+}
+
+/// Storage-independent cursor used by the query and live merge. Legacy segment
+/// support remains available for old offline captures; new stores page raft blocks.
+#[derive(Debug)]
+pub struct ChannelCursor {
+    pub namespace: Arc<str>,
+    pub channel: StorageClass,
+    inner: ChannelStorage,
+}
+#[derive(Debug)]
+enum ChannelStorage {
+    Legacy(Box<LegacyChannelCursor>),
+    Raft(Box<RaftChannelCursor>),
+}
+impl ChannelCursor {
+    pub fn open(
+        dir: &Path,
+        namespace: Arc<str>,
+        channel: StorageClass,
+        scope: &ChannelScope,
+    ) -> Result<Self> {
+        Ok(Self {
+            namespace: namespace.clone(),
+            channel,
+            inner: ChannelStorage::Legacy(Box::new(LegacyChannelCursor::open(
+                dir, namespace, channel, scope,
+            )?)),
+        })
+    }
+    pub fn open_backend(
+        backend: Arc<dduroc_engine::backend::ReadBackend>,
+        info: dduroc_engine::backend::ChannelInfo,
+        scope: &ChannelScope,
+    ) -> Self {
+        Self {
+            namespace: Arc::from(info.key.namespace.as_str()),
+            channel: info.key.class,
+            inner: ChannelStorage::Raft(Box::new(RaftChannelCursor::new(backend, info, scope))),
+        }
+    }
+    pub fn peek(&mut self) -> Option<&RawEntry> {
+        match &mut self.inner {
+            ChannelStorage::Legacy(c) => c.peek(),
+            ChannelStorage::Raft(c) => c.peek(),
+        }
+    }
+    pub fn next_entry(&mut self) -> Option<RawEntry> {
+        match &mut self.inner {
+            ChannelStorage::Legacy(c) => c.next_entry(),
+            ChannelStorage::Raft(c) => c.next_entry(),
+        }
+    }
+    pub fn damaged(&self) -> Vec<Damage> {
+        match &self.inner {
+            ChannelStorage::Legacy(c) => c.damaged(),
+            ChannelStorage::Raft(c) => c.damaged.clone(),
+        }
+    }
+    pub fn unanchored(&self) -> &[BootCounter] {
+        match &self.inner {
+            ChannelStorage::Legacy(c) => c.unanchored(),
+            ChannelStorage::Raft(c) => &c.unanchored,
+        }
+    }
+    pub fn extend(&mut self, relist: bool) -> bool {
+        match &mut self.inner {
+            ChannelStorage::Legacy(c) => c.extend(relist),
+            ChannelStorage::Raft(c) => c.extend(),
+        }
+    }
+    pub fn drained(&self) -> bool {
+        match &self.inner {
+            ChannelStorage::Raft(c) => c.pos >= c.records.len() && c.next >= c.end,
+            ChannelStorage::Legacy(_) => false,
+        }
+    }
+    pub fn take_damage(&mut self) -> Vec<Damage> {
+        match &mut self.inner {
+            ChannelStorage::Legacy(c) => c.take_damage(),
+            ChannelStorage::Raft(c) => std::mem::take(&mut c.damaged),
+        }
+    }
+}
+struct RaftChannelCursor {
+    backend: Arc<dduroc_engine::backend::ReadBackend>,
+    key: dduroc_engine::backend::ChannelKey,
+    next: u64,
+    first: u64,
+    end: u64,
+    reverse: bool,
+    scope: ChannelScope,
+    records: Vec<Option<RawEntry>>,
+    pos: usize,
+    damaged: Vec<Damage>,
+    unanchored: Vec<BootCounter>,
+    blocks_left: Option<usize>,
+}
+impl std::fmt::Debug for RaftChannelCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RaftChannelCursor")
+            .field("key", &self.key)
+            .field("next", &self.next)
+            .field("end", &self.end)
+            .finish()
+    }
+}
+impl RaftChannelCursor {
+    fn new(
+        backend: Arc<dduroc_engine::backend::ReadBackend>,
+        info: dduroc_engine::backend::ChannelInfo,
+        scope: &ChannelScope,
+    ) -> Self {
+        let first = info.first_index.unwrap_or(1);
+        let end = info.last_index.map_or(first, |last| last.saturating_add(1));
+        Self {
+            backend,
+            key: info.key,
+            next: if scope.reverse { end } else { first },
+            first,
+            end,
+            reverse: scope.reverse,
+            scope: scope.clone(),
+            records: Vec::new(),
+            pos: 0,
+            damaged: Vec::new(),
+            unanchored: Vec::new(),
+            blocks_left: scope.max_segments.map(|n| n.saturating_mul(128)),
+        }
+    }
+    fn damage(&mut self, index: u64, reason: impl ToString) {
+        self.damaged.push(Damage {
+            path: PathBuf::from(&self.key.namespace).join(self.key.class.as_str()),
+            offset: index,
+            reason: reason.to_string(),
+        });
+    }
+    fn extend(&mut self) -> bool {
+        if !self.scope.liveness.is_following() {
+            return false;
+        }
+        match self.backend.read_blocks(&self.key, 0, 0, 1, 1, false) {
+            Ok(page) => {
+                let old = self.end;
+                self.end = page.last_index.map_or(self.end, |i| i.saturating_add(1));
+                self.first = page.first_index.unwrap_or(self.first);
+                self.next = self.next.max(self.first);
+                self.end > old
+            }
+            Err(err) => {
+                self.damage(self.next, err);
+                false
+            }
+        }
+    }
+
+    fn peek(&mut self) -> Option<&RawEntry> {
+        if self.pos >= self.records.len() && !self.fill() {
+            return None;
+        }
+        self.records.get(self.pos).and_then(Option::as_ref)
+    }
+    fn next_entry(&mut self) -> Option<RawEntry> {
+        if self.pos >= self.records.len() && !self.fill() {
+            return None;
+        }
+        let record = self.records.get_mut(self.pos).and_then(Option::take);
+        self.pos += 1;
+        if self.pos == self.records.len() {
+            // A dormant follower needs only its index watermark, not the
+            // allocation for a block it has already handed out completely.
+            self.records = Vec::new();
+            self.pos = 0;
+        }
+        record
+    }
+    fn fill(&mut self) -> bool {
+        self.records.clear();
+        self.pos = 0;
+        while if self.reverse {
+            self.next > self.first
+        } else {
+            self.next < self.end
+        } {
+            if self.blocks_left == Some(0) {
+                return false;
+            }
+            // A one-entry index window bounds raft-engine's index allocation as well
+            // as the returned bytes. At most one decoded block is retained.
+            let (begin, end) = if self.reverse {
+                (self.next.saturating_sub(1), self.next)
+            } else {
+                (self.next, self.next.saturating_add(1))
+            };
+            let page =
+                self.backend
+                    .read_blocks(&self.key, begin, end, 1, 4 * 1024 * 1024, self.reverse);
+            self.next = if self.reverse { begin } else { end };
+            let page = match page {
+                Ok(page) => page,
+                Err(err) => {
+                    self.damage(begin, err);
+                    continue;
+                }
+            };
+            if let Some(first) = page.first_index {
+                self.first = self.first.max(first);
+                if !self.reverse {
+                    self.next = self.next.max(first);
+                }
+            }
+            for stored in page.blocks {
+                if self.scope.boot.is_some_and(|boot| boot != stored.boot) {
+                    continue;
+                }
+                let window = match self.scope.bounds.fit(stored.boot) {
+                    Fit::In(window) => window,
+                    Fit::Outside => continue,
+                    Fit::Unanchored => {
+                        if !self.unanchored.contains(&stored.boot) {
+                            self.unanchored.push(stored.boot);
+                        }
+                        continue;
+                    }
+                };
+                let chain = match self.scope.migrations {
+                    Some(ctx) if stored.protocol_version.0 > ctx.current_version => {
+                        self.damage(
+                            stored.index,
+                            format!(
+                                "protocol version {} is newer than schema {}",
+                                stored.protocol_version.0, ctx.current_version
+                            ),
+                        );
+                        continue;
+                    }
+                    Some(ctx) => match migrate::chain_between(
+                        ctx.steps,
+                        stored.protocol_version.0,
+                        ctx.current_version,
+                    ) {
+                        Ok(chain) => chain,
+                        Err(err) => {
+                            self.damage(stored.index, err);
+                            continue;
+                        }
+                    },
+                    None => Vec::new(),
+                };
+                let block = match parse_block(&stored.bytes) {
+                    Ok(Some(block)) => block,
+                    Ok(None) => {
+                        self.damage(stored.index, "incomplete committed block");
+                        continue;
+                    }
+                    Err(err) => {
+                        self.damage(stored.index, err);
+                        continue;
+                    }
+                };
+                let mut first_error = None;
+                let mut in_window = false;
+                for item in block.records() {
+                    let (at, record) = match item {
+                        Ok(item) => item,
+                        Err(err) => {
+                            first_error.get_or_insert_with(|| err.to_string());
+                            break;
+                        }
+                    };
+                    if !window.contains(at) {
+                        continue;
+                    }
+                    in_window = true;
+                    let migrated = match migrate::apply(&chain, record) {
+                        Ok(record) => record,
+                        Err(err) => {
+                            first_error.get_or_insert_with(|| err.to_string());
+                            continue;
+                        }
+                    };
+                    let Some(record) = migrated.record() else {
+                        continue;
+                    };
+                    if self
+                        .scope
+                        .prefilter
+                        .as_ref()
+                        .is_some_and(|filter| !filter(&record))
+                    {
+                        continue;
+                    }
+                    self.records.push(Some(RawEntry {
+                        at: BootTime::new(stored.boot, at),
+                        record: own(&record),
+                    }));
+                }
+                if let Some(left) = &mut self.blocks_left
+                    && in_window
+                {
+                    *left = left.saturating_sub(1);
+                }
+                if let Some(error) = first_error {
+                    self.damage(stored.index, error);
+                }
+            }
+            if self.reverse {
+                self.records.reverse();
+            }
+            if !self.records.is_empty() {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -1374,9 +1689,13 @@ mod tests {
                 liveness,
                 ..ChannelScope::default()
             };
-            let mut c =
-                ChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
-                    .unwrap();
+            let mut c = LegacyChannelCursor::open(
+                dir.path(),
+                Arc::from("ns"),
+                StorageClass::Default,
+                &scope,
+            )
+            .unwrap();
             // The listing is already done — now "rotation" takes the later
             // segment.
             std::fs::remove_file(&later).unwrap();
@@ -1543,7 +1862,8 @@ mod tests {
                 liveness,
                 ..ChannelScope::default()
             };
-            ChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope).unwrap()
+            LegacyChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
+                .unwrap()
         };
         let mut following = open(Liveness::Following);
         let mut once = open(Liveness::Live);
@@ -1590,8 +1910,9 @@ mod tests {
             liveness: Liveness::Following,
             ..ChannelScope::default()
         };
-        let mut c = ChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
-            .unwrap();
+        let mut c =
+            LegacyChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
+                .unwrap();
 
         let mut seen = Vec::new();
         for i in 1..40u64 {
@@ -1682,8 +2003,9 @@ mod tests {
             liveness: Liveness::Following,
             ..ChannelScope::default()
         };
-        let mut c = ChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
-            .unwrap();
+        let mut c =
+            LegacyChannelCursor::open(dir.path(), Arc::from("ns"), StorageClass::Default, &scope)
+                .unwrap();
         assert_eq!(c.next_entry().map(|e| e.at.at.0), Some(100));
         assert!(
             c.next_entry().is_none(),

@@ -14,7 +14,7 @@
 //!   to it too ([`Reader::follow`]): instead of polling on a timer, the reader
 //!   sleeps while there is nothing to write and wakes on the very first block
 //!   that lands in a file;
-//! - a **dump** ([`Reader::open_dump`]) is a frozen snapshot: every root and
+//! - a **dump** ([`Reader::open_dump`]) is an exclusive offline engine view: every root and
 //!   schema is named at once, because records cannot be decoded without a
 //!   schema — only identifiers and binary fields lie on disk — and a dump
 //!   missing some class's tree is refused at open time rather than silently

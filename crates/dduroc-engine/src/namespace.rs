@@ -270,36 +270,21 @@ impl Namespace {
         (stored < current).then_some((stored, current))
     }
 
-    /// Bring the namespace's segments up to the current schema version.
+    /// Bring retained blocks up to the current schema version.
     ///
-    /// An explicit call rather than something automatic at open time: a run
-    /// reads and rewrites the whole history — minutes on gigabytes — and burns
-    /// flash wear. Only the application knows when a device can afford that
-    /// (after a start, in a quiet hour); meanwhile the debt is visible in
-    /// [`Namespace::pending_migration`], and everything reads correctly without
-    /// a run — the steps are applied at read time.
+    /// Each affected channel is copied to a shadow raft group one block at a
+    /// time and published by one synchronous atomic switch. Appends wait during
+    /// that channel's copy. Failure before publication leaves its old history
+    /// authoritative; completed channels remain valid after interruption.
+    /// The completion metadata is stamped only after all channels succeed.
     ///
-    /// The heavy work happens on the calling thread; the writer takes part only
-    /// in committing each segment (a rename over the old name), so writing does
-    /// not stop. A run is idempotent and resumable: an interruption anywhere
-    /// leaves every segment either as it was or already rewritten, and the next
-    /// call carries on with the rest.
+    /// A channel containing only current or unaffected records is not copied.
+    /// Unaffected blocks keep their original protocol version even inside a
+    /// copied channel. Read-time migration remains available before this call.
     ///
-    /// Segments no step touches are not rewritten and keep the earlier version
-    /// in their header — which is legitimate: being untouched is precisely what
-    /// makes the current decoders read them correctly.
-    ///
-    /// # Space on the medium
-    ///
-    /// A run rewrites a segment into a temporary file next to it and swaps it for
-    /// the original: while the rewrite goes on, both lie on the medium. So roughly
-    /// **one segment** (`ChannelConfig::segment_bytes`) has to be free on top of
-    /// what is occupied — and no more: the temporary file's capacity is taken from
-    /// the original's actual data and grows only if a step really did swell the
-    /// records. That file does not count towards the class budget, and the engine
-    /// does not evict anything to make room for it: an `Err` with
-    /// [`Error::is_no_space`] means the run is deferred until the space appears.
-    /// The original is untouched.
+    /// The medium must accommodate a shadow copy of the channel's retained
+    /// history. The backend's physical limit also applies during copying; lack
+    /// of headroom defers migration without silently evicting source history.
     pub fn migrate(&self) -> Result<crate::migrate::MigrationReport> {
         let Some((_, to)) = self.pending_migration() else {
             return Ok(crate::migrate::MigrationReport::default());
@@ -324,10 +309,24 @@ impl Namespace {
             schema_name: self.inner.meta.schema_name.clone(),
             protocol_version: to,
         };
-        fsutil::write_atomic(
-            &self.inner.dir.join(NS_META),
-            &postcard::to_allocvec(&meta)?,
-        )?;
+        let backend = self.inner.writer.backend();
+        let root = self
+            .inner
+            .dir
+            .parent()
+            .ok_or_else(|| Error::Backend("namespace root missing".into()))?;
+        let root_index = backend.root_index(root)?;
+        let paths = [
+            self.inner.dir.clone(),
+            self.inner.dir.join(NS_META),
+            self.inner.dir.join("ns-meta.tmp"),
+        ];
+        backend.metadata_update(root_index, &paths, || {
+            fsutil::write_atomic(
+                &self.inner.dir.join(NS_META),
+                &postcard::to_allocvec(&meta)?,
+            )
+        })?;
         self.inner
             .migrated_to
             .store(to, std::sync::atomic::Ordering::Release);
@@ -421,7 +420,8 @@ impl Namespace {
     /// Write an event; the payload is already assembled in the write buffer.
     ///
     /// It deliberately returns nothing: logging must not influence control flow
-    /// in application code, and there is nothing to do with a failure at the
+    /// in application code. It uses the same durability policy as the fallible
+    /// method, including waiting for critical writes. There is nothing to do with a failure at the
     /// call site — retrying against a lagging disk only makes it worse. What
     /// happened is visible in [`crate::stats::Stats`] and in the record stream
     /// itself; whoever needs an answer on the spot has
@@ -432,9 +432,16 @@ impl Namespace {
 
     /// Write an event and say how it ended.
     ///
+    /// For critical events, `Ok(())` confirms a nonempty synchronous backend
+    /// write. Ordinary events acknowledge admission to a bounded queue; call
+    /// [`Namespace::sync`] to wait for persistence. Dynamic payloads are limited
+    /// to [`crate::writer::MAX_RECORD_BYTES`] before queue admission.
+    /// An unconfirmed write must not be retried automatically: it may already
+    /// be present after reopening the store.
+    ///
     /// There are two kinds of `Err`, and telling them apart matters more than
-    /// the text: [`Error::loses_record`] means the record did not reach the
-    /// medium (the disk is lagging), [`Error::breaks_contract`] that the event
+    /// the text: [`Error::loses_record`] means delivery was not confirmed
+    /// (an I/O error may still leave the record on the medium), [`Error::breaks_contract`] that the event
     /// is not from this schema, that is, a build defect.
     ///
     /// The verdict belongs to the caller entirely: a contract violation here does
@@ -957,8 +964,8 @@ impl SpanGuard {
     /// happens when the guard is dropped.
     ///
     /// Unlike dropping, the channel's ordinary policy applies here: on a
-    /// critical span the caller will wait for room in the queue, but the span's
-    /// end is guaranteed not to be lost.
+    /// critical span, `Ok(())` confirms that its end reached a synchronous
+    /// backend write. An error is unconfirmed and may still have persisted.
     pub fn close(mut self) -> Result<()> {
         self.closed = true;
         self.write_end(true)
@@ -1152,6 +1159,28 @@ mod tests {
         Store::open(StoreConfig::new(dir).with_budget_per_class(16 * 1024 * 1024)).unwrap()
     }
 
+    fn stored_blocks(
+        store: &Store,
+        namespace: &str,
+        class: StorageClass,
+    ) -> Vec<crate::backend::StoredBlock> {
+        store
+            .read_backend()
+            .read_blocks(
+                &crate::backend::ChannelKey {
+                    namespace: namespace.into(),
+                    class,
+                },
+                0,
+                u64::MAX,
+                1024,
+                64 << 20,
+                false,
+            )
+            .unwrap()
+            .blocks
+    }
+
     #[test]
     fn writes_land_on_disk() {
         let dir = tempfile::tempdir().unwrap();
@@ -1168,14 +1197,8 @@ mod tests {
         assert!(stats.blocks_written >= 1);
         assert!(stats.is_clean(), "there must be no losses: {stats:?}");
 
-        // A segment appeared in the "default" channel.
-        let seg_dir = dir.path().join("orc-radio-0").join("default");
-        let files: Vec<_> = std::fs::read_dir(&seg_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
-            .collect();
-        assert_eq!(files.len(), 1, "exactly one segment was created");
+        let blocks = stored_blocks(&store, "orc-radio-0", StorageClass::Default);
+        assert_eq!(blocks.len(), 1, "one raft block was created");
     }
 
     #[test]
@@ -1190,11 +1213,7 @@ mod tests {
         ns.sync().unwrap();
         assert!(store.stats().syncs >= 1, "a critical event must be synced");
 
-        let crit_dir = dir.path().join("orc-radio-0").join("critical");
-        assert!(
-            crit_dir.is_dir(),
-            "the critical channel is created separately"
-        );
+        assert!(!stored_blocks(&store, "orc-radio-0", StorageClass::Critical).is_empty());
     }
 
     #[test]
@@ -1246,11 +1265,20 @@ mod tests {
         let store = open_store(dir.path());
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
-        const BURST: usize = 500;
+        const BURST: usize = 128;
+        let barrier = Arc::new(std::sync::Barrier::new(BURST + 1));
+        let mut threads = Vec::new();
         for i in 0..BURST {
-            while ns.try_log_raw(EventId(2), &[i as u8], None).is_err() {
-                std::thread::yield_now();
-            }
+            let ns = ns.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                ns.try_log_raw(EventId(2), &[i as u8], None).unwrap();
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
         }
         ns.sync().unwrap();
 
@@ -1381,20 +1409,10 @@ mod tests {
         let meta: NsMeta = postcard::from_bytes(&raw).unwrap();
         assert_eq!(meta.protocol_version, 1);
 
-        // And the segments carry a version each — a mixed state is legitimate.
-        let seg_dir = dir.path().join("orc-radio-0").join("default");
-        let mut versions: Vec<u16> = std::fs::read_dir(&seg_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "seg"))
-            .map(|p| {
-                crate::segment::SegmentReader::open(&p)
-                    .unwrap()
-                    .header()
-                    .protocol_version
-                    .0
-            })
+        // Every raft block retains the schema version it was encoded with.
+        let mut versions: Vec<u16> = stored_blocks(&store, "orc-radio-0", StorageClass::Default)
+            .iter()
+            .map(|b| b.protocol_version.0)
             .collect();
         versions.sort_unstable();
         assert_eq!(
@@ -1463,6 +1481,11 @@ mod tests {
         ns.sync().unwrap();
 
         let report = ns.migrate().expect("the run goes through");
+        let backend = ns.inner.writer.backend();
+        assert_eq!(
+            backend.cached_allocation(0).unwrap(),
+            backend.usage().unwrap()[0].allocated_bytes
+        );
         assert_eq!(report.rewritten, 1, "{report:?}");
         assert_eq!(report.already_current, 1, "the active segment is untouched");
         assert_eq!(
@@ -1482,35 +1505,20 @@ mod tests {
         let meta: NsMeta = postcard::from_bytes(&raw).unwrap();
         assert_eq!(meta.protocol_version, 2, "and on disk");
 
-        // The rewritten segment: the version is current, there is a footer, and
-        // the content follows the step — the payloads are replaced and no
-        // samples are left.
-        let seg_dir = dir.path().join("orc-radio-0").join("default");
         let mut rewritten_payloads = Vec::new();
         let mut samples = 0;
-        for entry in std::fs::read_dir(&seg_dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|x| x != "seg") {
-                continue;
-            }
-            let mut reader = crate::segment::SegmentReader::open(&path).unwrap();
-            assert_eq!(
-                reader.header().protocol_version.0,
-                2,
-                "no earlier versions are left on disk: {path:?}"
-            );
-            let mut buf = Vec::new();
-            for offset in reader.scan_block_offsets().0 {
-                reader.read_block_at(offset, &mut buf).unwrap();
-                let block = crate::segment::parse_block(&buf).unwrap().unwrap();
-                for item in block.records() {
-                    match item.unwrap().1 {
-                        dduroc_format::Record::Message(m) => {
-                            rewritten_payloads.push(m.payload.to_vec());
-                        }
-                        dduroc_format::Record::Sample(_) => samples += 1,
-                        _ => {}
+        for stored in stored_blocks(&store, "orc-radio-0", StorageClass::Default) {
+            assert_eq!(stored.protocol_version.0, 2);
+            let block = dduroc_format::block::Block::parse(&stored.bytes)
+                .unwrap()
+                .unwrap();
+            for item in block.records() {
+                match item.unwrap().1 {
+                    dduroc_format::Record::Message(m) => {
+                        rewritten_payloads.push(m.payload.to_vec())
                     }
+                    dduroc_format::Record::Sample(_) => samples += 1,
+                    _ => {}
                 }
             }
         }
@@ -1574,18 +1582,10 @@ mod tests {
         assert_eq!(report.rewritten, 0, "the flash is untouched");
         assert_eq!(ns.pending_migration(), None, "the metadata is stamped");
 
-        let seg_dir = dir.path().join("orc-radio-0").join("default");
-        let old = std::fs::read_dir(&seg_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|x| x == "seg"))
-            .unwrap();
-        let reader = crate::segment::SegmentReader::open(&old).unwrap();
+        let old = stored_blocks(&store, "orc-radio-0", StorageClass::Default);
         assert_eq!(
-            reader.header().protocol_version.0,
-            1,
-            "an untouched segment keeps its version, and that is legitimate"
+            old[0].protocol_version.0, 1,
+            "untouched blocks retain their version"
         );
         store.shutdown();
     }
@@ -1695,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_name_matches_time_of_its_first_record() {
+    fn raft_block_base_matches_time_of_its_first_record() {
         // A segment's name and base have to match the time of its FIRST record:
         // selecting segments by range at read time rests on that. Taking the
         // time of the previous record (zero for a new channel) would mean
@@ -1715,20 +1715,12 @@ mod tests {
         ns.sync().unwrap();
         let after = ns.now();
 
-        let seg_dir = dir.path().join("orc-radio-0").join("default");
-        let name = std::fs::read_dir(&seg_dir)
+        let blocks = stored_blocks(&store, "orc-radio-0", StorageClass::Default);
+        let block = dduroc_format::block::Block::parse(&blocks[0].bytes)
             .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .find(|n| n.ends_with(".seg"))
-            .expect("a segment was created");
-        let parsed = dduroc_format::segment::SegmentName::parse(&name).expect("the name parses");
-
-        assert!(
-            parsed.start() >= before && parsed.start() <= after,
-            "segment name {name} must carry the time of the first record ({before}..{after})"
-        );
-        assert_ne!(parsed.base.0, 0, "a zero base is the sign of the old bug");
+            .unwrap();
+        assert!(block.header.base >= before.at && block.header.base <= after.at);
+        assert_ne!(block.header.base.0, 0);
     }
 
     #[test]
@@ -1747,13 +1739,24 @@ mod tests {
         }
         ns.sync().expect("syncing must work");
 
-        let seg_dir = dir.path().join("orc-radio-0").join("default");
-        let total: u64 = std::fs::read_dir(&seg_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
-            .count() as u64;
-        assert!(total >= 1, "the data was written to disk");
+        let backend = ns.inner.writer.backend();
+        let blocks = backend
+            .read_blocks(
+                &crate::backend::ChannelKey {
+                    namespace: "orc-radio-0".into(),
+                    class: StorageClass::Default,
+                },
+                0,
+                u64::MAX,
+                1024,
+                64 << 20,
+                false,
+            )
+            .unwrap();
+        assert!(
+            !blocks.blocks.is_empty(),
+            "namespace keeps the live engine owned"
+        );
     }
 
     #[test]
@@ -1804,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_segment_lists_its_metrics_in_the_footer() {
+    fn raft_blocks_preserve_metric_and_event_identifiers() {
         // A migration decides from this set whether to rewrite a segment, and a
         // reader whether it is worth opening. An empty set would mean a
         // migration silently skips the whole telemetry history, and a search
@@ -1819,28 +1822,29 @@ mod tests {
         ns.log_raw(EventId(1), &[1], None);
         store.shutdown();
 
-        let seg_dir = dir.path().join("orc-radio-0").join("default");
-        let path = std::fs::read_dir(&seg_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|x| x == "seg"))
-            .expect("a segment was created");
-
-        let reader = crate::segment::SegmentReader::open(&path).unwrap();
-        assert!(reader.is_sealed(), "shutdown seals the segment");
-        let footer = reader.footer().expect("the footer reads");
+        let mut metrics = std::collections::BTreeSet::new();
+        let mut events = std::collections::BTreeSet::new();
+        for stored in stored_blocks(&store, "orc-radio-0", StorageClass::Default) {
+            let block = dduroc_format::block::Block::parse(&stored.bytes)
+                .unwrap()
+                .unwrap();
+            for record in block.records() {
+                match record.unwrap().1 {
+                    dduroc_format::Record::Sample(s) => {
+                        metrics.insert(s.metric);
+                    }
+                    dduroc_format::Record::Message(m) => {
+                        events.insert(m.event);
+                    }
+                    _ => {}
+                }
+            }
+        }
         assert_eq!(
-            footer.metrics,
-            vec![MetricId(1), MetricId(2)],
-            "both metrics must be listed"
+            metrics.into_iter().collect::<Vec<_>>(),
+            vec![MetricId(1), MetricId(2)]
         );
-        assert_eq!(footer.events, vec![EventId(1)]);
-        assert!(
-            footer.touches(&[], &[MetricId(2)]),
-            "a migration must see that the segment is affected"
-        );
-        assert!(!footer.touches(&[], &[MetricId(9)]));
+        assert_eq!(events.into_iter().collect::<Vec<_>>(), vec![EventId(1)]);
     }
 
     #[test]

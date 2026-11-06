@@ -24,15 +24,51 @@ use std::sync::{Arc, Mutex};
 const LOCK_FILE: &str = ".lock";
 /// The name of the store metadata file.
 const STORE_META: &str = "store-meta";
+const RAFT_MARKER: &str = "dduroc-raft-v1";
+const RAFT_MARKER_CONTENT: &[u8] = b"dduroc raft store v1\n";
+
+fn check_store_format(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let marker = root.join(RAFT_MARKER);
+    if marker.exists() {
+        if std::fs::read(&marker).ctx_path("reading raft store marker", &marker)?
+            != RAFT_MARKER_CONTENT
+        {
+            return Err(Error::Backend("unknown raft store marker".into()));
+        }
+        return Ok(());
+    }
+    if root.join(STORE_META).exists() {
+        return Err(Error::Backend(
+            "legacy store requires explicit migration".into(),
+        ));
+    }
+    for entry in std::fs::read_dir(root).ctx_path("checking legacy store", root)? {
+        let entry = entry.ctx_path("checking legacy store entry", root)?;
+        let path = entry.path();
+        if path.is_dir()
+            && StorageClass::ALL
+                .iter()
+                .any(|class| path.join(class.as_str()).is_dir())
+        {
+            return Err(Error::Backend(
+                "legacy channel data requires explicit migration".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// The store's metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreMeta {
     /// The container format version.
     pub container_version: u8,
-    /// The store's identity. Stamped into every segment so that files copied
-    /// from another device do not blend with the local ones: they have their
-    /// own run numbering and their own anchoring to time.
+    /// Durable identity shared by the main metadata and every configured raft
+    /// root. Mismatched roots are refused so foreign runs cannot inherit local
+    /// time anchors. Legacy segment headers also carry their store identity.
     pub store_id: u64,
 }
 
@@ -49,44 +85,26 @@ pub struct StoreConfig {
     /// the defaults with a budget of [`StoreConfig::default_budget_bytes`].
     ///
     /// The key is [`StorageClass`], an enum: a misspelled class is
-    /// unrepresentable, and a channel's directory name is derived from the
-    /// class — there is no second source of that name.
+    /// unrepresentable. Logical channel identities pair namespace and class;
+    /// physical files are shared within a root.
     pub channels: HashMap<StorageClass, ChannelConfig>,
     /// The default budget **per class** — for classes not named in
     /// [`StoreConfig::channels`].
     ///
-    /// A class budget is shared across the whole store: "all telemetry gets
-    /// this much". The channels of every namespace of the class draw on it, and
-    /// when it is exceeded the class's oldest segment is evicted whoever's
-    /// namespace it lies in. The sum of the class budgets is the occupancy
-    /// ceiling; there is no separate "store ceiling" knob — with classes on
-    /// different media (see [`ChannelConfig::custom_root`]) a shared ceiling
-    /// would mean nothing.
-    ///
-    /// A class ceiling cannot be smaller than what the active segments hold.
-    /// They hold their reserve window, which grows along with what was written,
-    /// rather than `segment_bytes` — so how many channels can write at once is
-    /// set by how much they wrote. An attempt to exceed the ceiling is visible
-    /// in [`crate::stats::Stats::budget_overruns`].
+    /// Every namespace of a class draws on this logical retained-block budget.
+    /// Exceeding it compacts the oldest blocks, including inactive namespaces.
+    /// Physical raft append/rewrite files and their temporary GC headroom are
+    /// accounted separately per root; the sum of logical class budgets is not
+    /// a measurement of disk usage. See ReadBackend::usage().
     pub default_budget_bytes: u64,
     /// The write queue capacities. Allocated whole when the store is opened.
     pub queues: QueueSizes,
-    /// The ceiling on the total bytes writing channels hold in memory for
-    /// blocks. `None` means there is no ceiling, and that is the default.
-    ///
-    /// The memory per channel is the active block buffer and its serialized
-    /// copy; they grow to the largest block that passed through and are given
-    /// back once the channel goes quiet. Only a handful of channels write at
-    /// any moment, and usually that is enough. The ceiling is for where "a
-    /// handful" stops being true: a class with hundreds of channels writing at
-    /// once at 64 KiB per block is tens of megabytes, and armv7 may not have
-    /// them.
-    ///
-    /// Not a budget: a budget is about space on the medium and belongs to a
-    /// class, while this ceiling is about RAM and belongs to the process. It is
-    /// honoured by freeing the buffers of the largest holders; an unmeetable
-    /// ceiling is announced by the [`crate::stats::Stats::buffer_overruns`]
-    /// counter rather than by discarded records.
+    /// Flush threshold for aggregate writer block buffers. `None` selects the
+    /// 16 MiB default; it does not disable the bound. The writer flushes and
+    /// releases block allocations at the threshold, which can be exceeded by
+    /// the frame currently being encoded. This is not a bound on total RSS.
+    /// Producer admission is independently bounded by record size, queue
+    /// capacity and separate ordinary/critical payload-byte pools.
     pub buffer_ceiling_bytes: Option<u64>,
     /// The policies of namespace groups: a name prefix and how the group
     /// differs from the shared class settings.
@@ -221,9 +239,36 @@ impl StoreConfig {
     ///
     /// **Synthesized** configurations are checked too — the ones a class gets when
     /// the application set nothing for it: a `default_budget_bytes` smaller than
-    /// two segments (16 MiB with the defaults) yields a class whose eviction would
-    /// eat the only segment right after it was sealed.
+    /// two shared log targets violates the conservative root rotation/rewrite
+    /// headroom constraint. This is independent of a namespace's logical quota.
     fn validate(&self) -> Result<()> {
+        // raft-engine 0.4.2 uses usize for its physical size counters. Leave
+        // room for log rotation and rewriting on 32-bit targets.
+        let mut root_budgets: HashMap<PathBuf, u64> = HashMap::new();
+        for class in StorageClass::ALL {
+            let channel = self.config_for(None, class);
+            let root = channel.custom_root.as_ref().unwrap_or(&self.root);
+            let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            let sum = root_budgets.entry(key).or_default();
+            *sum = sum
+                .checked_add(channel.budget_bytes)
+                .ok_or(Error::BadStore {
+                    setting: "budget_bytes",
+                    reason: "the combined root budget overflows",
+                })?;
+            if *sum > 1024 * 1024 * 1024 {
+                return Err(Error::BadStore {
+                    setting: "budget_bytes",
+                    reason: "the combined root budget exceeds the 1 GiB engine limit",
+                });
+            }
+        }
+        if self.queues.normal > 65_536 || self.queues.critical > 65_536 {
+            return Err(Error::BadStore {
+                setting: "queues",
+                reason: "a queue exceeds the 65536 record limit",
+            });
+        }
         // Immediate syncing is the definition of the critical class, not a
         // setting: a channel the application is prepared to wait in a queue for
         // has no right to fall behind the medium. Overriding the interval
@@ -277,6 +322,16 @@ impl StoreConfig {
         // applies to a name, and there are no names yet when the store is
         // opened.
         for (i, (prefix, policy)) in self.groups.iter().enumerate() {
+            if policy
+                .channels
+                .values()
+                .any(|override_| override_.segment_bytes.is_some())
+            {
+                return Err(Error::BadGroup {
+                    prefix: prefix.clone(),
+                    reason: "segment_bytes is a shared root setting and cannot be overridden per namespace group",
+                });
+            }
             let bad = |reason| Error::BadGroup {
                 prefix: prefix.clone(),
                 reason,
@@ -318,15 +373,8 @@ impl StoreConfig {
                 let Some(quota) = policy.quota.get(class) else {
                     continue;
                 };
-                let mut config = self.config_for(None, class);
-                if let Some(over) = policy.channels.get(&class) {
-                    over.apply_to(&mut config);
-                }
-                if quota < config.segment_bytes.saturating_mul(2) {
-                    return Err(bad(
-                        "the quota is smaller than two segments — rotation would eat the \
-                         data right after sealing",
-                    ));
+                if quota == 0 {
+                    return Err(bad("a namespace quota cannot be zero"));
                 }
             }
         }
@@ -434,6 +482,7 @@ pub struct Store {
     clock: Clock,
     epochs: Mutex<EpochStore>,
     writer: Arc<Writer>,
+    backend: Arc<crate::backend::ReadBackend>,
     counters: Arc<Counters>,
     /// The span counter, shared by the process: a span lives inside one run, so
     /// there is no reason to persist it.
@@ -464,11 +513,19 @@ impl Store {
     /// `boot_counter` values, which would make segment names collide.
     pub fn open(config: StoreConfig) -> Result<Arc<Self>> {
         config.validate()?;
+        // Inspect every configured root before creating or modifying anything.
+        check_store_format(&config.root)?;
+        for class in StorageClass::ALL {
+            if let Some(root) = &config.config_for(None, class).custom_root {
+                check_store_format(root)?;
+            }
+        }
         fsutil::create_dir_all_synced(&config.root)?;
         let lock = acquire_lock(&config.root)?;
-        fsutil::sweep_tmp(&config.root)?;
-
-        let (meta, upgraded_from) = load_or_create_meta(&config.root)?;
+        let marker = config.root.join(RAFT_MARKER);
+        if !marker.exists() {
+            fsutil::write_atomic(&marker, RAFT_MARKER_CONTENT)?;
+        }
 
         // The class roots and the budget groups. The medium key comes from
         // paths actually matching: classes on one partition share ENOSPC
@@ -485,7 +542,19 @@ impl Store {
                 .clone()
                 .unwrap_or_else(|| config.root.clone());
             fsutil::create_dir_all_synced(&base)?;
+            let marker = base.join(RAFT_MARKER);
+            if !marker.exists() {
+                fsutil::write_atomic(&marker, RAFT_MARKER_CONTENT)?;
+            }
             let c = canon(&base);
+            if keys.iter().any(|existing| {
+                *existing != c && (existing.starts_with(&c) || c.starts_with(existing))
+            }) {
+                return Err(Error::BadStore {
+                    setting: "custom_root",
+                    reason: "distinct storage roots cannot contain one another",
+                });
+            }
             let key = keys.iter().position(|k| *k == c).unwrap_or_else(|| {
                 keys.push(c);
                 scan_roots.push(base.clone());
@@ -498,6 +567,55 @@ impl Store {
             class_roots.push(base);
         }
 
+        // Strict recovery must succeed on every root before mutating the
+        // existing metadata or registering a new epoch.
+        let mut root_budgets = vec![0u64; scan_roots.len()];
+        let mut root_targets = vec![u64::MAX; scan_roots.len()];
+        for group in &groups {
+            let budget = &mut root_budgets[usize::from(group.root_key)];
+            *budget = budget
+                .checked_add(group.budget_bytes)
+                .ok_or(Error::BadStore {
+                    setting: "budget_bytes",
+                    reason: "the combined root budget overflows",
+                })?;
+            if *budget > 1024 * 1024 * 1024 {
+                return Err(Error::BadStore {
+                    setting: "budget_bytes",
+                    reason: "the combined root budget exceeds the 1 GiB engine limit",
+                });
+            }
+        }
+        for class in StorageClass::ALL {
+            let group = groups[class.index()];
+            let target = config.config_for(None, class).segment_bytes;
+            root_targets[usize::from(group.root_key)] =
+                root_targets[usize::from(group.root_key)].min(target);
+        }
+        for target in &mut root_targets {
+            if *target == u64::MAX {
+                *target = 64 * 1024;
+            }
+        }
+        let backend =
+            crate::backend::ReadBackend::open_live(&scan_roots, &root_budgets, &root_targets)?;
+        let mut class_limits = [0u64; 3];
+        for class in StorageClass::ALL {
+            class_limits[class.index()] = config.config_for(None, class).budget_bytes;
+        }
+        backend.set_class_limits(class_limits)?;
+        let store_meta_paths = [
+            config.root.clone(),
+            config.root.join(STORE_META),
+            config.root.join("store-meta.tmp"),
+        ];
+        let (meta, upgraded_from) = backend.metadata_update(0, &store_meta_paths, || {
+            fsutil::sweep_tmp(&config.root)?;
+            load_or_create_meta(&config.root)
+        })?;
+        backend.bind_store(meta.store_id)?;
+        backend.cleanup_shadows()?;
+
         // The clock's base and the entry in epochs.bin take one and the same
         // BOOTTIME value: a discrepancy between them would carry into the UTC
         // conversion.
@@ -509,8 +627,16 @@ impl Store {
         // `EpochStore::open_and_register`). The walk over names is lazy — only
         // when no epochs file is left; and ALL roots are walked: a class's
         // history may live entirely on its own medium.
-        let epochs = EpochStore::open_and_register(&config.root, base_us, &|| {
-            Ok(live_boots(&scan_roots)?.into_iter().next_back())
+        let epoch_paths = [
+            config.root.clone(),
+            config.root.join(crate::epochs::EPOCHS_FILE),
+            config.root.join("epochs.bin.tmp"),
+            config.root.join("epochs.corrupt"),
+        ];
+        let epochs = backend.metadata_update(0, &epoch_paths, || {
+            EpochStore::open_and_register(&config.root, base_us, &|| {
+                Ok(backend.retained_boots()?.into_iter().next_back())
+            })
         })?;
         let clock = Clock::with_base(
             dduroc_format::BootCounter(epochs.current_run().boot_counter),
@@ -525,6 +651,7 @@ impl Store {
             groups,
             config.buffer_ceiling_bytes,
             Arc::clone(&pulse),
+            Arc::clone(&backend),
         )?;
 
         let store = Arc::new(Self {
@@ -537,6 +664,7 @@ impl Store {
             clock,
             epochs: Mutex::new(epochs),
             writer,
+            backend,
             counters,
             next_span: Arc::new(AtomicU32::new(1)),
             pulse,
@@ -559,13 +687,16 @@ impl Store {
         &self.root
     }
 
+    pub fn read_backend(&self) -> Arc<crate::backend::ReadBackend> {
+        Arc::clone(&self.backend)
+    }
+
     /// Every root the store's data lies in; the first is the main one.
     ///
     /// There is more than one when a class has been moved to its own medium
     /// ([`ChannelConfig::custom_root`]): critical data on a protected partition
-    /// is a second `<root>/<namespace>/<class>/` tree. A reader has to know
-    /// them all, or it will show the store without the class that was moved out
-    /// and say nothing about it.
+    /// is a second shared raft engine. An offline reader must name every
+    /// configured root; a live reader shares this complete engine set.
     pub fn roots(&self) -> &[PathBuf] {
         &self.scan_roots
     }
@@ -598,12 +729,9 @@ impl Store {
         &self.pulse
     }
 
-    /// The earlier container version, if the store came up from an old one.
-    ///
-    /// `Some(v)` means there are segments of version `v` in the directory but
-    /// this build does not read them and they will go with rotation. This event
-    /// is worth logging — silently losing access to history is worse than
-    /// saying so.
+    /// Earlier metadata container version normalized inside a recognized raft
+    /// store, if any. This is not a legacy-history migration: opening an old
+    /// segment store is refused until an explicit migration is performed.
     pub fn upgraded_from(&self) -> Option<u8> {
         self.upgraded_from
     }
@@ -650,6 +778,12 @@ impl Store {
             name: schema.name.to_owned(),
             reason: e.to_string(),
         })?;
+        if schema.name.len() > 128 * 1024 {
+            return Err(Error::BadSchema {
+                name: schema.name.to_owned(),
+                reason: "schema name exceeds metadata limit".into(),
+            });
+        }
 
         // The name is marked taken under the same lock that checks it: between
         // "free" and "taken" two threads managed to get an independent writer
@@ -670,17 +804,37 @@ impl Store {
             armed: true,
         };
 
-        let dir = self.root.join(name);
-        fsutil::create_dir_all_synced(&dir)?;
-        fsutil::sweep_tmp(&dir)?;
+        let classes = schema.classes();
+        for class in &classes {
+            let personal = quota
+                .get(*class)
+                .or_else(|| self.config.group_quota(name, *class));
+            if personal == Some(0) {
+                return Err(Error::BadChannel {
+                    class: *class,
+                    namespace: Some(name.to_owned()),
+                    reason: "a namespace quota cannot be zero",
+                });
+            }
+        }
 
+        let dir = self.root.join(name);
         // A namespace's schema is fixed at the first open: equal event
         // identifiers in different schemas mean different things, and mixing
         // them in one directory means decoding records with the wrong
         // templates.
-        let meta = NsMeta::open(&dir, name, &schema)?;
+        let paths = [
+            self.root.clone(),
+            dir.clone(),
+            dir.join("ns-meta"),
+            dir.join("ns-meta.tmp"),
+        ];
+        let meta = self.backend.metadata_update(0, &paths, || {
+            fsutil::create_dir_all_synced(&dir)?;
+            fsutil::sweep_tmp(&dir)?;
+            NsMeta::open(&dir, name, &schema)
+        })?;
 
-        let classes = schema.classes();
         // A channel lives in the directory of its class — possibly on another
         // medium; the budget group is the class.
         let mut specs = Vec::with_capacity(classes.len());
@@ -692,17 +846,9 @@ impl Store {
             let personal = quota
                 .get(*class)
                 .or_else(|| self.config.group_quota(name, *class));
-            if let Some(q) = personal
-                && q < config.segment_bytes.saturating_mul(2)
-            {
-                return Err(Error::BadChannel {
-                    class: *class,
-                    namespace: Some(name.to_owned()),
-                    reason: "the quota is smaller than two segments — rotation would \
-                             eat the data right after sealing",
-                });
-            }
             specs.push(ChannelSpec {
+                class: *class,
+                root_index: self.backend.root_index(&self.class_roots[class.index()])?,
                 dir: self.class_roots[class.index()]
                     .join(name)
                     .join(class.as_str()),
@@ -718,6 +864,7 @@ impl Store {
 
         let id = self.writer.register(NsSetup {
             name: name.to_owned(),
+            schema_name: schema.name.to_owned(),
             protocol_version: schema.version,
             store_id: self.meta.store_id,
             boot,
@@ -787,7 +934,14 @@ impl Store {
         if !is_plausible_utc(utc) {
             return Ok(false);
         }
-        self.locked_epochs().record_sync(utc, source)
+        let paths = [
+            self.root.clone(),
+            self.root.join(crate::epochs::EPOCHS_FILE),
+            self.root.join("epochs.bin.tmp"),
+            self.root.join("epochs.corrupt"),
+        ];
+        self.backend
+            .metadata_update(0, &paths, || self.locked_epochs().record_sync(utc, source))
     }
 
     /// Remove entries from `epochs.bin` about runs of which no segments are
@@ -802,11 +956,19 @@ impl Store {
     /// with thousands of namespaces is not free, while a stale epoch entry
     /// costs tens of bytes. An application may call the cleanup itself.
     pub fn compact_epochs(&self) -> Result<usize> {
-        let live = live_boots(&self.scan_roots)?;
-        let mut epochs = self.locked_epochs();
-        let before = epochs.epochs().runs.len();
-        epochs.retain_runs(&|boot| live.contains(&boot))?;
-        Ok(before - epochs.epochs().runs.len())
+        let live = self.backend.retained_boots()?;
+        let paths = [
+            self.root.clone(),
+            self.root.join(crate::epochs::EPOCHS_FILE),
+            self.root.join("epochs.bin.tmp"),
+            self.root.join("epochs.corrupt"),
+        ];
+        self.backend.metadata_update(0, &paths, || {
+            let mut epochs = self.locked_epochs();
+            let before = epochs.epochs().runs.len();
+            epochs.retain_runs(&|boot| live.contains(&boot))?;
+            Ok(before - epochs.epochs().runs.len())
+        })
     }
 
     /// Convert relative time into wall-clock time. `None` means there is no
@@ -931,73 +1093,6 @@ impl Drop for Store {
 /// not lost.
 const EPOCH_COMPACT_THRESHOLD: usize = 1024;
 
-/// The run numbers segments still stand behind.
-///
-/// Only `readdir` and name parsing — not one file is opened: a segment's name
-/// carries `boot_counter` in its first eight characters.
-///
-/// An error while walking is a **failure**, not an empty set. The result is
-/// used in two ways, and in both an oversight is irreversible: cleaning epochs
-/// from an incomplete list would delete the anchors of runs whose segments
-/// merely could not be listed, and the lower bound on the run number derived
-/// from the same list would give repeated numbering. "Could not look" and
-/// "there is nothing there" are different answers.
-///
-/// The strictness extends only to what is **ours**. A store root is sometimes
-/// a mount point, and foreign things lie next to the namespaces: a `lost+found`
-/// owned by root, the directories of neighbouring subsystems, dangling
-/// symlinks. Falling over them in `Store::open` would leave the device without
-/// a journal exactly when it is needed most — and in exactly the scenario the
-/// walk exists for (the epochs file did not survive the previous run, the very
-/// first start included).
-///
-/// The sign of "not ours" is the name: a namespace directory is created only
-/// through [`Store::namespace`], which checks the name with the same
-/// [`validate_component`]. An entry with an invalid name cannot hold segments
-/// of **this** store, so it is not entered at all — before any `read_dir`.
-/// Everything that passed the name check is walked strictly.
-fn live_boots(roots: &[PathBuf]) -> Result<std::collections::BTreeSet<u32>> {
-    use crate::channel::validate_component;
-    use dduroc_format::segment::SegmentName;
-
-    /// List a directory. `NotADirectory` means an ordinary file where a
-    /// directory should be, `NotFound` that the entry vanished between the
-    /// listing and the descent (an external cleanup, a dangling symlink): both
-    /// mean "there are no segments here" rather than "could not look".
-    fn entries(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
-        use std::io::ErrorKind::{NotADirectory, NotFound};
-        match std::fs::read_dir(path) {
-            Ok(it) => it
-                .collect::<std::io::Result<Vec<_>>>()
-                .ctx_path("walking a directory", path),
-            Err(e) if matches!(e.kind(), NotADirectory | NotFound) => Ok(Vec::new()),
-            Err(e) => Err(e).ctx_path("walking a directory", path),
-        }
-    }
-
-    /// Whether this name could have been created by the store.
-    fn ours(entry: &std::fs::DirEntry) -> bool {
-        entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| validate_component(n).is_ok())
-    }
-
-    let mut out = std::collections::BTreeSet::new();
-    for root in roots {
-        for ns in entries(root)?.iter().filter(|e| ours(e)) {
-            for ch in entries(&ns.path())?.iter().filter(|e| ours(e)) {
-                for seg in entries(&ch.path())? {
-                    if let Some(name) = seg.file_name().to_str().and_then(SegmentName::parse) {
-                        out.insert(name.boot.0);
-                    }
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Whether a moment in time is sensible: between 2001-09-09 and 2100-01-01.
 ///
 /// Below the lower bound lie zeros and garbage from uninitialized clocks, above
@@ -1040,19 +1135,10 @@ fn acquire_lock(root: &Path) -> Result<File> {
 
 /// Read or create the store's metadata.
 ///
-/// A store written by an **earlier** container version comes up: the metadata
-/// file is rewritten to the current version, `store_id` is preserved, and the
-/// old segments stay where they are until rotation.
-///
-/// Refusing would be the worst of all: a firmware update would mean
-/// `Store::open` failed and the device stopped logging entirely — exactly when
-/// the journal is needed most. The earlier version's data is not substituted
-/// for or passed off as ours: every segment header carries its container
-/// version, and the reader reports them as an unread fragment rather than
-/// parsing them on a guess.
-///
-/// A version **from the future** is still an error: there is nothing to guess a
-/// layout this build does not know with.
+/// Normalize metadata within an already recognized raft store, preserving its
+/// durable identity. The format guard runs first and refuses legacy stores;
+/// this helper never imports or silently upgrades their segment history.
+/// Future metadata versions are rejected before decoding payload history.
 fn load_or_create_meta(root: &Path) -> Result<(StoreMeta, Option<u8>)> {
     let path = root.join(STORE_META);
     let current = dduroc_format::CONTAINER_VERSION;
@@ -1131,6 +1217,58 @@ pub(crate) fn next_span_id(counter: &AtomicU32) -> dduroc_format::SpanId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_metadata_allocation_tracks_namespace_and_epochs() {
+        use crate::schema::{EventDesc, Language};
+        use dduroc_format::{EventId, Level, ProtocolVersion};
+        static LANGUAGES: &[Language] = &[Language("en")];
+        static EVENTS: &[EventDesc] = &[EventDesc {
+            id: EventId(1),
+            name: "Tick",
+            level: Level::Info,
+            class: StorageClass::Default,
+            tags: &[],
+            templates: &["tick"],
+            fields: &[],
+            decoders: None,
+        }];
+        let schema = Schema {
+            name: "cache-test",
+            version: ProtocolVersion(1),
+            languages: LANGUAGES,
+            events: EVENTS,
+            metrics: &[],
+            spans: &[],
+            migrations: &[],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path())).unwrap();
+        let check = || {
+            assert_eq!(
+                store.backend.cached_allocation(0).unwrap(),
+                store.backend.usage().unwrap()[0].allocated_bytes
+            )
+        };
+        check();
+        let ns = store.namespace("radio", schema).unwrap();
+        check();
+        ns.log_raw(EventId(1), &[1], None);
+        ns.sync().unwrap();
+        check();
+        store
+            .record_sync(utc_ms(1_700_000_000_000), SyncSource::Gps)
+            .unwrap();
+        check();
+        store.compact_epochs().unwrap();
+        check();
+        let wrong = Schema {
+            name: "other-schema",
+            ..schema
+        };
+        assert!(store.namespace("bad name!", wrong).is_err());
+        check();
+    }
 
     /// A moment in time from epoch milliseconds.
     fn utc_ms(ms: i64) -> DateTime<Utc> {
@@ -1260,15 +1398,14 @@ mod tests {
     fn a_group_is_refused_for_what_a_class_would_be_refused_for() {
         let base = || StoreConfig::new("/tmp/nowhere").with_budget_per_class(64 << 20);
 
-        // A setting unfit for a class does not become fit by being given to a
-        // group: a segment larger than half the budget means rotation would eat
-        // the data right after it was sealed.
+        // A root file target cannot vary per namespace group, even when the
+        // requested value would otherwise be valid.
         let e = base()
             .group(
                 "orc-",
                 GroupPolicy::new().channel(
                     StorageClass::Default,
-                    ChannelOverride::new().segment_bytes(60 << 20),
+                    ChannelOverride::new().segment_bytes(2 << 20),
                 ),
             )
             .validate()
@@ -1310,7 +1447,7 @@ mod tests {
                 GroupPolicy::new()
                     .channel(
                         StorageClass::Default,
-                        ChannelOverride::new().segment_bytes(2 << 20),
+                        ChannelOverride::new().block_max_bytes(32 << 10),
                     )
                     .limit_bytes(StorageClass::Telemetry, 64 << 20),
             )
@@ -1323,7 +1460,7 @@ mod tests {
         let e = base()
             .group(
                 "orc-",
-                GroupPolicy::new().limit_bytes(StorageClass::Default, 4 << 20),
+                GroupPolicy::new().limit_bytes(StorageClass::Default, 0),
             )
             .validate()
             .unwrap_err();
@@ -1484,7 +1621,6 @@ mod tests {
         // placing new records BEFORE the old ones: rotation will start on the
         // fresh ones and a reader will hand the history back jumbled.
         use crate::schema::{EventDesc, Language, Schema, StorageClass};
-        use dduroc_format::segment::SegmentName;
         use dduroc_format::{EventId, Level, ProtocolVersion};
 
         static LANGS: &[Language] = &[Language("en")];
@@ -1520,18 +1656,9 @@ mod tests {
             store.shutdown();
         }
 
-        let channel = dir.path().join("orc-0").join("default");
-        let names = |dir: &std::path::Path| -> Vec<SegmentName> {
-            let mut v: Vec<SegmentName> = std::fs::read_dir(dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().to_str().and_then(SegmentName::parse))
-                .collect();
-            v.sort_by_key(|n| n.to_string());
-            v
-        };
-        let before = names(&channel);
-        let highest = before.iter().map(|n| n.boot.0).max().unwrap();
+        let snapshot = crate::backend::ReadBackend::open_dump(&[dir.path().to_path_buf()]).unwrap();
+        let highest = *snapshot.retained_boots().unwrap().last().unwrap();
+        drop(snapshot);
         assert_eq!(highest, 2, "three runs: the segments of runs 0, 1, 2");
 
         // The epochs file is lost: a cleanup of the medium, a quarantine after
@@ -1550,17 +1677,16 @@ mod tests {
         ns.sync().unwrap();
         store.shutdown();
 
-        // And most importantly the consequence: the new segment sorts AFTER all
-        // the earlier ones, that is, it lands at the end of the history rather
-        // than at its start.
-        let after = names(&channel);
-        let fresh = after
-            .iter()
-            .find(|n| !before.contains(n))
-            .expect("a new segment was created");
-        assert!(
-            before.iter().all(|old| old.to_string() < fresh.to_string()),
-            "the new name must sort after the old ones: {fresh} against {before:?}"
+        drop(ns);
+        drop(store);
+        let snapshot = crate::backend::ReadBackend::open_dump(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(
+            snapshot
+                .retained_boots()
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
         );
     }
 
