@@ -25,10 +25,14 @@ use crate::fsutil;
 use chrono::{DateTime, Utc};
 use dduroc_format::{BootTime, Micros};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// The name of the epochs file in the store root.
 pub const EPOCHS_FILE: &str = "epochs.bin";
+
+/// Maximum encoded epoch metadata size, shared with strict recovery.
+pub const MAX_EPOCHS_BYTES: usize = 8 * 1024 * 1024;
 
 /// The source of a time synchronization. The order is the priority: a more
 /// trustworthy source overwrites a less trustworthy one, but not the reverse.
@@ -114,6 +118,35 @@ pub struct Epochs {
 }
 
 impl Epochs {
+    /// Validate durable identities while allowing bounded callers to stop work.
+    pub(crate) fn validate_with(
+        &self,
+        mut checkpoint: impl FnMut() -> std::result::Result<(), String>,
+    ) -> std::result::Result<(), String> {
+        let mut hardware = std::collections::HashSet::new();
+        let mut kernels = std::collections::HashSet::new();
+        for boot in &self.hw_boots {
+            checkpoint()?;
+            if !hardware.insert(boot.hw_boot_id) || !kernels.insert(boot.kernel_boot_id) {
+                return Err("duplicate hardware boot identity".into());
+            }
+            if boot
+                .utc_anchor_ms
+                .is_some_and(|utc| DateTime::from_timestamp_millis(utc).is_none())
+            {
+                return Err("invalid UTC anchor".into());
+            }
+        }
+        let mut runs = std::collections::HashSet::new();
+        for run in &self.runs {
+            checkpoint()?;
+            if !runs.insert(run.boot_counter) || !hardware.contains(&run.hw_boot_id) {
+                return Err("duplicate run identity or missing hardware boot".into());
+            }
+        }
+        Ok(())
+    }
+
     /// A run by its number.
     ///
     /// The search is binary: `to_utc` is called on **every** record of an
@@ -261,12 +294,8 @@ impl EpochStore {
     /// clock's base to the microsecond.
     ///
     /// `floor_boot` is the largest run number written on the names of segments
-    /// already on disk. It is asked for **only** if the epochs file did not
-    /// survive the previous run (lost, or quarantined after corruption): with
-    /// an intact file the maximum over `runs` already covers everything on
-    /// disk, and walking directories with thousands of namespaces costs more
-    /// than it saves — which is exactly why epoch cleanup runs on a threshold
-    /// rather than at every start.
+    /// already on disk. It is checked on every open because a syntactically
+    /// valid file may nevertheless be missing runs that still have records.
     ///
     /// Without that floor, losing `epochs.bin` would restart the numbering on
     /// top of runs whose segments are still there. A segment's name is `(boot,
@@ -280,8 +309,10 @@ impl EpochStore {
         floor_boot: &dyn Fn() -> Result<Option<u32>>,
     ) -> Result<Self> {
         let path = root.join(EPOCHS_FILE);
-        let (mut epochs, lost) = Self::load_for_write(&path)?;
-        let floor_boot = if lost { floor_boot()? } else { None };
+        let (mut epochs, _lost) = Self::load_for_write(&path)?;
+        // A syntactically valid file may still have lost its newest runs.
+        // Compare against retained data on every open to avoid identity reuse.
+        let floor_boot = floor_boot()?;
         let kernel_boot_id = read_kernel_boot_id()?;
 
         // The same hardware boot as the previous run? Compare the kernel UUID.
@@ -297,7 +328,12 @@ impl EpochStore {
                     .iter()
                     .map(|b| b.hw_boot_id)
                     .max()
-                    .map_or(0, |m| m.saturating_add(1));
+                    .map(|m| {
+                        m.checked_add(1)
+                            .ok_or(Error::EpochIdentityExhausted("hardware boot"))
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
                 epochs.hw_boots.push(HwBoot {
                     hw_boot_id: id,
                     kernel_boot_id,
@@ -315,7 +351,9 @@ impl EpochStore {
             .map(|r| r.boot_counter)
             .chain(floor_boot)
             .max()
-            .map_or(0, |m| m.saturating_add(1));
+            .map(|m| m.checked_add(1).ok_or(Error::EpochIdentityExhausted("run")))
+            .transpose()?
+            .unwrap_or(0);
 
         let current = Run {
             boot_counter,
@@ -350,13 +388,34 @@ impl EpochStore {
 
     /// Read the file without touching it.
     fn read(path: &Path) -> Result<Loaded> {
-        let Some(bytes) = fsutil::read_optional(path)? else {
-            return Ok(Loaded::Missing);
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Loaded::Missing);
+            }
+            Err(error) => return Err(error).ctx_path("opening epochs", path),
         };
-        Ok(match postcard::from_bytes(&bytes) {
-            Ok(e) => Loaded::Ok(e),
-            Err(_) => Loaded::Corrupt,
-        })
+        let mut bytes = Vec::new();
+        file.take((MAX_EPOCHS_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .ctx_path("reading epochs", path)?;
+        if bytes.len() > MAX_EPOCHS_BYTES {
+            return Err(Error::Corrupt {
+                path: path.to_owned(),
+                reason: "epoch metadata exceeds byte limit".into(),
+            });
+        }
+        let epochs: Epochs = match postcard::take_from_bytes(&bytes) {
+            Ok((epochs, [])) => epochs,
+            _ => return Ok(Loaded::Corrupt),
+        };
+        epochs
+            .validate_with(|| Ok(()))
+            .map_err(|reason| Error::Corrupt {
+                path: path.to_owned(),
+                reason,
+            })?;
+        Ok(Loaded::Ok(epochs))
     }
 
     /// The same for the writing side: a damaged file is moved to quarantine.
@@ -365,15 +424,21 @@ impl EpochStore {
     /// work out what happened to the anchoring of time.
     ///
     /// The second element means "no previous state survived": either the file
-    /// was not there or it turned out unreadable. That is the only case in
-    /// which run numbering has to be reconstructed from the disk.
+    /// was not there or it turned out unreadable. The retained-data floor is
+    /// checked independently on every open.
     fn load_for_write(path: &Path) -> Result<(Epochs, bool)> {
         match Self::read(path)? {
             Loaded::Ok(e) => Ok((e, false)),
             Loaded::Missing => Ok((Epochs::default(), true)),
             Loaded::Corrupt => {
                 let backup = path.with_extension("corrupt");
-                let _ = std::fs::rename(path, &backup);
+                if backup.exists() {
+                    return Err(Error::Corrupt {
+                        path: path.to_owned(),
+                        reason: "quarantine already exists".into(),
+                    });
+                }
+                std::fs::rename(path, &backup).ctx_path("quarantining epochs", path)?;
                 Ok((Epochs::default(), true))
             }
         }
@@ -390,30 +455,68 @@ impl EpochStore {
     /// Record a time synchronization for the current hardware boot. Returns
     /// `false` if the source is less trustworthy than the current anchor.
     pub fn record_sync(&mut self, utc: DateTime<Utc>, source: SyncSource) -> Result<bool> {
-        let accepted = self
-            .epochs
-            .set_anchor(self.current.hw_boot_id, utc, source, boottime_us());
-        if accepted {
-            self.persist()?;
-        }
+        let (accepted, candidate) = self.prepare_record_sync(utc, source)?;
+        self.publish(candidate);
         Ok(accepted)
+    }
+
+    pub(crate) fn prepare_record_sync(
+        &self,
+        utc: DateTime<Utc>,
+        source: SyncSource,
+    ) -> Result<(bool, Option<Epochs>)> {
+        let mut candidate = self.epochs.clone();
+        let accepted = candidate.set_anchor(self.current.hw_boot_id, utc, source, boottime_us());
+        if accepted {
+            self.persist_epochs(&candidate)?;
+            Ok((true, Some(candidate)))
+        } else {
+            Ok((false, None))
+        }
     }
 
     /// Remove entries for runs of which no segments are left.
     pub fn retain_runs(&mut self, alive: &dyn Fn(u32) -> bool) -> Result<()> {
-        let current = self.current.boot_counter;
-        let before = self.epochs.runs.len();
-        // The current run must never be removed: it is still writing.
-        self.epochs
-            .retain_runs(&|boot| boot == current || alive(boot));
-        if self.epochs.runs.len() != before {
-            self.persist()?;
-        }
+        let (_, candidate) = self.prepare_retain_runs(alive)?;
+        self.publish(candidate);
         Ok(())
     }
 
+    pub(crate) fn prepare_retain_runs(
+        &self,
+        alive: &dyn Fn(u32) -> bool,
+    ) -> Result<(usize, Option<Epochs>)> {
+        let current = self.current.boot_counter;
+        let mut candidate = self.epochs.clone();
+        let before = candidate.runs.len();
+        candidate.retain_runs(&|boot| boot == current || alive(boot));
+        let removed = before - candidate.runs.len();
+        if removed != 0 {
+            self.persist_epochs(&candidate)?;
+            Ok((removed, Some(candidate)))
+        } else {
+            Ok((0, None))
+        }
+    }
+
+    pub(crate) fn publish(&mut self, candidate: Option<Epochs>) {
+        if let Some(candidate) = candidate {
+            self.epochs = candidate;
+        }
+    }
+
     fn persist(&self) -> Result<()> {
-        let bytes = postcard::to_allocvec(&self.epochs)?;
+        self.persist_epochs(&self.epochs)
+    }
+
+    fn persist_epochs(&self, epochs: &Epochs) -> Result<()> {
+        let bytes = postcard::to_allocvec(epochs)?;
+        if bytes.len() > MAX_EPOCHS_BYTES {
+            return Err(Error::Corrupt {
+                path: self.path.clone(),
+                reason: "epoch metadata exceeds byte limit".into(),
+            });
+        }
         fsutil::write_atomic(&self.path, &bytes)
     }
 }
@@ -460,6 +563,24 @@ mod tests {
     }
 
     #[test]
+    fn failed_epoch_persistence_never_publishes_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = store(dir.path(), 1_000);
+        let before = first.epochs().clone();
+        std::fs::create_dir(dir.path().join("epochs.bin.tmp")).unwrap();
+        let utc = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        assert!(first.record_sync(utc, SyncSource::User).is_err());
+        assert_eq!(*first.epochs(), before);
+        std::fs::remove_dir(dir.path().join("epochs.bin.tmp")).unwrap();
+        drop(first);
+        let mut second = store(dir.path(), 2_000);
+        let before = second.epochs().clone();
+        std::fs::create_dir(dir.path().join("epochs.bin.tmp")).unwrap();
+        assert!(second.retain_runs(&|_| false).is_err());
+        assert_eq!(*second.epochs(), before);
+    }
+
+    #[test]
     fn a_lost_epochs_file_does_not_restart_run_numbering() {
         // `boot_counter` goes into the name of every segment, and the order of
         // names is declared to be chronological. Restarting the numbering on
@@ -491,10 +612,9 @@ mod tests {
     }
 
     #[test]
-    fn an_intact_epochs_file_is_never_second_guessed_by_the_disk() {
-        // The floor is asked for lazily: walking the names with thousands of
-        // namespaces costs more than it saves, and an intact epochs file does
-        // not need it — its maximum already covers everything on disk.
+    fn retained_floor_is_checked_even_when_epochs_file_decodes() {
+        // A decodable file can be missing newer runs. Retained records are an
+        // independent lower bound even when the metadata itself parses.
         let dir = tempfile::tempdir().unwrap();
         store(dir.path(), 1_000);
 
@@ -504,11 +624,9 @@ mod tests {
             Ok(Some(1_000_000))
         })
         .unwrap();
-        assert!(
-            !asked.get(),
-            "an intact epochs file needs no walk of the disk"
-        );
-        assert_eq!(next.current_run().boot_counter, 1);
+        assert!(asked.get(), "retained data must be checked on every open");
+        assert_eq!(next.current_run().boot_counter, 1_000_001);
+        assert_eq!(next.epochs().runs.last().unwrap().boot_counter, 1_000_001);
     }
 
     /// A moment in time from epoch milliseconds — shorter than parsing a date.
@@ -684,6 +802,81 @@ mod tests {
         assert_eq!(hw.anchor_source, Some(SyncSource::Gps));
         // A new run inherits the anchor of its hardware boot.
         assert!(s.epochs().to_utc(BootTime::from_raw(1, 0)).is_some());
+    }
+
+    #[test]
+    fn exhausted_hardware_boot_id_does_not_overwrite_epoch_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EPOCHS_FILE);
+        let mut other_boot = read_kernel_boot_id().unwrap();
+        other_boot[0] ^= 0xff;
+        let epochs = Epochs {
+            runs: vec![],
+            hw_boots: vec![HwBoot {
+                hw_boot_id: u32::MAX,
+                kernel_boot_id: other_boot,
+                utc_anchor_ms: None,
+                anchor_source: None,
+                anchor_captured_us: None,
+            }],
+        };
+        let bytes = postcard::to_allocvec(&epochs).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            EpochStore::open_and_register(dir.path(), 0, &|| Ok(None)),
+            Err(Error::EpochIdentityExhausted("hardware boot"))
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn ambiguous_or_oversized_epochs_are_refused_without_modifying_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EPOCHS_FILE);
+        let boot = HwBoot {
+            hw_boot_id: 1,
+            kernel_boot_id: [1; 16],
+            utc_anchor_ms: None,
+            anchor_source: None,
+            anchor_captured_us: None,
+        };
+        let invalid = [
+            Epochs {
+                runs: vec![],
+                hw_boots: vec![boot, boot],
+            },
+            Epochs {
+                runs: vec![Run {
+                    boot_counter: 1,
+                    hw_boot_id: 2,
+                    boottime_at_init_us: 0,
+                }],
+                hw_boots: vec![boot],
+            },
+            Epochs {
+                runs: vec![],
+                hw_boots: vec![HwBoot {
+                    utc_anchor_ms: Some(i64::MAX),
+                    ..boot
+                }],
+            },
+        ];
+        for epochs in invalid {
+            let bytes = postcard::to_allocvec(&epochs).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(EpochStore::open_read_only(dir.path()).is_err());
+            assert!(EpochStore::open_and_register(dir.path(), 0, &|| Ok(None)).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(!path.with_extension("corrupt").exists());
+        }
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_EPOCHS_BYTES + 1) as u64).unwrap();
+        assert!(EpochStore::open_read_only(dir.path()).is_err());
+        assert!(EpochStore::open_and_register(dir.path(), 0, &|| Ok(None)).is_err());
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            (MAX_EPOCHS_BYTES + 1) as u64
+        );
     }
 
     #[test]

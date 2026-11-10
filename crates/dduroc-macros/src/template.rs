@@ -6,6 +6,40 @@
 //!
 //! Format specifiers are preserved: `{dbm:.1}` becomes `{:.1}`.
 
+/// Reject unmatched braces before rewriting can disguise a malformed template.
+pub fn validate(template: &str) -> Result<(), &'static str> {
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+            }
+            '{' => {
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    match ch {
+                        '{' => return Err("a placeholder cannot contain an opening brace"),
+                        '}' => {
+                            closed = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !closed {
+                    return Err("a placeholder is missing its closing brace");
+                }
+            }
+            '}' => return Err("an unmatched closing brace must be escaped as `}}`"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// A template's placeholder names in order of appearance.
 pub fn placeholders(template: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -44,10 +78,11 @@ pub fn rewrite(template: &str) -> (String, Vec<String>) {
                 order.push(template[start..j].to_owned());
                 fmt.push('{');
                 if j < bytes.len() && bytes[j] == b':' {
+                    let spec_start = j;
                     while j < bytes.len() && bytes[j] != b'}' {
-                        fmt.push(bytes[j] as char);
                         j += 1;
                     }
+                    fmt.push_str(&template[spec_start..j]);
                 }
                 fmt.push('}');
                 i = if j < bytes.len() { j + 1 } else { j };
@@ -136,6 +171,14 @@ mod tests {
 
         let (fmt, _) = rewrite("{v:>8}");
         assert_eq!(fmt, "{:>8}");
+
+        let (fmt, order) = rewrite("{v:界>8}");
+        assert_eq!(fmt, "{:界>8}");
+        assert_eq!(order, vec!["v"]);
+
+        let (fmt, order) = rewrite("{v:界>8}");
+        assert_eq!(fmt, "{:界>8}");
+        assert_eq!(order, vec!["v"]);
     }
 
     #[test]

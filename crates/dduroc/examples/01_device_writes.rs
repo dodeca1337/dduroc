@@ -38,8 +38,8 @@ dduroc::schema! {
             dbm: f32,
         },
         // `store: critical` sends the type into the critical channel: its own
-        // directory, an fdatasync at once (group commit), no compression, and a
-        // separate queue where on overflow the caller waits rather than loses.
+        // policy and a synchronous backend write acknowledgment, with a
+        // separate queue that waits for room. I/O failures remain possible.
         Overheat = 0x02 {
             level: Error,
             store: critical,
@@ -88,8 +88,8 @@ dduroc::schema! {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = std::env::temp_dir().join("dduroc-examples").join("01");
-    let _ = std::fs::remove_dir_all(&root);
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
 
     // -----------------------------------------------------------------------
     // The store. One Store per process: it owns the writer thread and the run
@@ -97,11 +97,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the medium.
     // -----------------------------------------------------------------------
     let store = Store::open(
-        StoreConfig::new(&root)
+        StoreConfig::new(root)
             // The budget of a CLASS across the whole store: "all logs get this
             // much". The channels of every namespace of the class draw on the
-            // shared budget; the sum of the class budgets is the medium's
-            // occupancy ceiling.
+            // shared logical retention budget. Physical raft allocation also
+            // needs rotation/rewrite headroom and is reported separately.
             .with_budget_per_class(16 << 20)
             // A class's policy can be overridden whole: its own budget, its own
             // sync rhythm, its own medium (`root:` — critical data on a
@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 StorageClass::Telemetry,
                 ChannelConfig {
                     // Telemetry tolerates a minute unwritten — fewer
-                    // fdatasyncs.
+                    // storage barriers.
                     sync_interval: std::time::Duration::from_secs(60),
                     ..ChannelConfig::new(64 << 20)
                 },
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // A namespace is an instance of a service: "orc-radio-0" and "orc-radio-1"
-    // have their own history and their own directories, and may share a schema.
+    // have their own logical history in shared raft files and may share a schema.
     let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
 
     // -----------------------------------------------------------------------
@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ns.log(radio::events::PowerSet { dbm: 27.5 });
 
     // Whoever needs a verdict on the spot has the paired `try_*`. Errors come
-    // in two kinds: `loses_record` (the disk is behind, the record is lost) and
+    // include `loses_record` (delivery unconfirmed; do not retry blindly) and
     // `breaks_contract` (the type is not from this schema — a build defect).
     if let Err(e) = ns.try_log(radio::events::Overheat { t: 91.0, sensor: 1 }) {
         eprintln!(
@@ -172,7 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // series.
     println!(
         "65.0 °C by the effective limits: {:?} (by the schema's it would be Normal)",
-        ns.severity_of(radio::metrics::TempPa, 65.0)
+        ns.severity_of(radio::metrics::TempPa, 65.0)?
     );
     if temp.severity_of(65.0) >= Severity::Warn {
         ns.log(radio::events::Overheat { t: 65.0, sensor: 0 });
@@ -190,7 +190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // in a reader of a dump alike.
     println!(
         "VSWR 0.5 (a broken feeder): {:?} — a range of what is normal cannot express that",
-        ns.severity_of(radio::metrics::Vswr, 0.5)
+        ns.severity_of(radio::metrics::Vswr, 0.5)?
     );
 
     // The extreme form of a limit is a closure with captured context: it takes
@@ -209,10 +209,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Severity::Normal
         }
     })?;
-    let _ = ns.severity_of(radio::metrics::TempPa, 65.0); // latched
+    let _ = ns.severity_of(radio::metrics::TempPa, 65.0)?; // latched
     println!(
         "36.6 °C after the overheat: {:?} — the closure remembers the context",
-        ns.severity_of(radio::metrics::TempPa, 36.6)
+        ns.severity_of(radio::metrics::TempPa, 36.6)?
     );
     ns.clear_severity_fn(radio::metrics::TempPa)?; // the data applies again
 
@@ -293,7 +293,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // channel metadata and the shared `raft-engine` log rather than `.seg` files in
     // those.
     println!("\nthe store in {}:", root.display());
-    print_tree(&root, 0)?;
+    print_tree(root, 0)?;
     Ok(())
 }
 

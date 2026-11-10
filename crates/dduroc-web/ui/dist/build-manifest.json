@@ -1,0 +1,14 @@
+{
+  "assets": {
+    "LICENSE-THIRD-PARTY.txt": "1784141c6ab6e305478e3a9e0330534444b4908283dc76cf217ad6fd99c1e114",
+    "assets/IBMPlexMono-Regular-Du0PCiXT.woff2": "ba204497f16b6d334cee9d1e963a831b73e3a56e1d6300a8489d18df7214b350",
+    "assets/IBMPlexSans-Light-CKaMwcwk.woff2": "769209c2a0dbf2e3f012c22e4c604100cb3f1e7b8beb0ef77bc7d982d85509cc",
+    "assets/IBMPlexSans-Regular-BiEB_oxT.woff2": "ba711a3085ff9f27440b6b9c4550cfc47c97bf36591d5da958b975bb3add8c1a",
+    "assets/IBMPlexSans-SemiBold-KfaJl9PC.woff2": "f78048030eab62e860efa39a0df79e2e5581bf122eb95b9bc42c0b8a4988d205",
+    "assets/index-BTXn5nnH.js": "377c41a7a888ef19439ed0501bd3a46cd0fca9e3549badab8e4545a04c7a905c",
+    "assets/index-C9ZB23mR.css": "5c75788a019d650c04d26a22e11fbfa287a5edb2ed53b107d6d85bf71c7e9497",
+    "index.html": "f1dd8e0748555b7a149d520b21f77344790b1936fa181a365392fc5c198cd519"
+  },
+  "sourceSha256": "81bea8eb6ea9e78a61d41d1ded1ff7675f6fb1ecf06e9ed8b58f873fccd509c2",
+  "version": 1
+}

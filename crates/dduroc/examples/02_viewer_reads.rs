@@ -44,9 +44,9 @@ dduroc::schema! {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = std::env::temp_dir().join("dduroc-examples").join("02");
-    let _ = std::fs::remove_dir_all(&root);
-    let cfg = StoreConfig::new(&root).with_budget_per_class(16 << 20);
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    let cfg = StoreConfig::new(root).with_budget_per_class(16 << 20);
 
     // -----------------------------------------------------------------------
     // The history. Run 1: the link came up — the only change of state in the
@@ -94,8 +94,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Live reading: the store is being WRITTEN right now and is read by the
         // same process — `store.reader()` is parallel to writing by construction.
         // It is created once and asks the store for the truth (the roots, the
-        // schemas, the time anchors) on every query; rotation and a segment's
-        // growing tail are ordinary events for it rather than damage. What is
+        // schemas, the time anchors) on every query; compaction and new committed
+        // blocks are ordinary events for it rather than damage. What is
         // visible is what is on the medium — which is what the `sync()` a line
         // above was for.
         // -------------------------------------------------------------------
@@ -143,12 +143,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // From here on it is the offline viewer: the store is closed and its dump is
     // taken apart. A `Store` is not opened for a dump (it takes a lock on the root
     // and sweeps temporary files) — ALL of the dump's roots and schemas are named
-    // at once; for a dump from another device there is `allow_foreign_segments`.
+    // at once; foreign store identities are checked against the dump metadata.
     // Completeness is checked at open time: a dump missing some class's tree is an
     // error rather than a silently shortened history. A dump's Reader changes
     // nothing and freezes a snapshot at the moment it opens.
     // -----------------------------------------------------------------------
-    let reader = Reader::open_dump([&root], &[radio::SCHEMA])?;
+    let reader = Reader::open_dump([root], &[radio::SCHEMA])?;
 
     println!("— what is in the store —");
     let listing = reader.namespaces()?;
@@ -182,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -----------------------------------------------------------------------
     // Filters are computed from the schema BEFORE any scanning: levels and tags
     // are properties of types, and for such a selection the disk is read only
-    // where those types are.
+    // for the selected namespaces; schema filters select decoded records.
     // -----------------------------------------------------------------------
     println!("\n— Warn and above only —");
     for e in &reader
@@ -354,18 +354,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // emptiness — but names the runs that dropped out instead of "the device wrote
     // nothing".
     // -----------------------------------------------------------------------
-    let lone = std::env::temp_dir()
-        .join("dduroc-examples")
-        .join("02-no-sync");
-    let _ = std::fs::remove_dir_all(&lone);
+    let no_sync_directory = tempfile::tempdir()?;
+    let lone = no_sync_directory.path();
     {
-        let store = Store::open(StoreConfig::new(&lone).with_budget_per_class(16 << 20))?;
+        let store = Store::open(StoreConfig::new(lone).with_budget_per_class(16 << 20))?;
         let ns = store.namespace("orc-radio-0", radio::SCHEMA)?;
         ns.log(radio::events::Started);
         ns.sync()?;
         store.shutdown(); // record_sync was never called: there is no anchor
     }
-    let no_clock = Reader::open_dump([&lone], &[radio::SCHEMA])?;
+    let no_clock = Reader::open_dump([lone], &[radio::SCHEMA])?;
     let asked = no_clock
         .query(&Query::new().time_window(sync_at - chrono::TimeDelta::hours(1), sync_at))?;
     println!(

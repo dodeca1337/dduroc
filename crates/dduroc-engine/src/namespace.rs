@@ -38,23 +38,44 @@ pub struct NsMeta {
 }
 
 impl NsMeta {
+    /// Read namespace metadata without changing the directory.
+    pub fn read(dir: &Path) -> Result<Option<Self>> {
+        let path = dir.join(NS_META);
+        fsutil::read_optional_bounded(&path)?
+            .map(|bytes| fsutil::decode_metadata(&path, &bytes))
+            .transpose()
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        if self.schema_name.len() > fsutil::CONTROL_METADATA_MAX_BYTES {
+            return Err(Error::Corrupt {
+                path: path.to_owned(),
+                reason: "control metadata exceeds byte limit".into(),
+            });
+        }
+        let bytes = postcard::to_allocvec(self)?;
+        if bytes.len() > fsutil::CONTROL_METADATA_MAX_BYTES {
+            return Err(Error::Corrupt {
+                path: path.to_owned(),
+                reason: "control metadata exceeds byte limit".into(),
+            });
+        }
+        fsutil::write_atomic(path, &bytes)
+    }
+
     /// Read or create the metadata, checking schema compatibility.
     pub fn open(dir: &Path, ns_name: &str, schema: &Schema) -> Result<Self> {
         let path = dir.join(NS_META);
-        match fsutil::read_optional(&path)? {
+        match Self::read(dir)? {
             None => {
                 let meta = Self {
                     schema_name: schema.name.to_owned(),
                     protocol_version: schema.version.0,
                 };
-                fsutil::write_atomic(&path, &postcard::to_allocvec(&meta)?)?;
+                meta.write(&path)?;
                 Ok(meta)
             }
-            Some(bytes) => {
-                let meta: Self = postcard::from_bytes(&bytes).map_err(|_| Error::Corrupt {
-                    path: path.clone(),
-                    reason: "the namespace metadata does not parse".to_owned(),
-                })?;
+            Some(meta) => {
                 if meta.schema_name != schema.name {
                     return Err(Error::SchemaMismatch {
                         namespace: ns_name.to_owned(),
@@ -220,6 +241,34 @@ impl Namespace {
         self.inner.id
     }
 
+    /// Validate a typed schema before serialization, mutation or queue admission.
+    pub fn check_schema(&self, identity: crate::schema::SchemaIdentity) -> Result<()> {
+        if self.inner.schema.accepts(identity) {
+            Ok(())
+        } else {
+            Err(Error::ForeignSchema {
+                schema: self.inner.schema.name,
+            })
+        }
+    }
+
+    fn check_metric<T>(&self, metric: Metric<T>) -> Result<MetricId> {
+        let identity = metric.identity().ok_or(Error::ForeignSchema {
+            schema: self.inner.schema.name,
+        })?;
+        self.check_schema(identity)?;
+        Ok(metric.id())
+    }
+
+    /// A span may cross namespaces, but only inside this live store activation.
+    pub fn check_span(&self, span: &SpanGuard) -> Result<()> {
+        if !span.closed && Arc::ptr_eq(&self.inner.writer, &span.ns.inner.writer) {
+            Ok(())
+        } else {
+            Err(Error::ForeignSpan)
+        }
+    }
+
     pub fn schema(&self) -> &Schema {
         &self.inner.schema
     }
@@ -322,10 +371,7 @@ impl Namespace {
             self.inner.dir.join("ns-meta.tmp"),
         ];
         backend.metadata_update(root_index, &paths, || {
-            fsutil::write_atomic(
-                &self.inner.dir.join(NS_META),
-                &postcard::to_allocvec(&meta)?,
-            )
+            meta.write(&self.inner.dir.join(NS_META))
         })?;
         self.inner
             .migrated_to
@@ -548,7 +594,7 @@ impl Namespace {
     /// because the metric may be from a foreign schema; that is one call per
     /// series, not per sample.
     pub fn series<M>(&self, metric: Metric<M>) -> Result<Series<M>> {
-        let id: MetricId = metric.into();
+        let id = self.check_metric(metric)?;
         let desc = self.metric_desc(id)?;
         Ok(Series {
             ns: self.clone(),
@@ -636,18 +682,30 @@ impl Namespace {
         warn: impl std::ops::RangeBounds<f64>,
         alarm: impl std::ops::RangeBounds<f64>,
     ) -> Result<()> {
-        self.set_limits(metric, MetricLimits::numeric(Thresholds::new(warn, alarm)))
+        self.set_limits_raw(metric, MetricLimits::numeric(Thresholds::new(warn, alarm)))
     }
 
     /// Set the whole override: the bounds, the state severities, or both.
-    pub fn set_limits(&self, metric: impl Into<MetricId>, limits: MetricLimits) -> Result<()> {
+    /// Schema-bound counterpart of [`Namespace::set_limits_raw`].
+    pub fn set_limits<T>(&self, metric: Metric<T>, limits: MetricLimits) -> Result<()> {
+        let id = self.check_metric(metric)?;
+        self.set_limits_raw(id, limits)
+    }
+
+    pub fn set_limits_raw(&self, metric: impl Into<MetricId>, limits: MetricLimits) -> Result<()> {
         self.inner
             .limits
             .set(&self.inner.schema, metric.into(), Some(limits))
     }
 
     /// Remove the override: what the schema declared applies again.
-    pub fn clear_limits(&self, metric: impl Into<MetricId>) -> Result<()> {
+    /// Schema-bound counterpart of [`Namespace::clear_limits_raw`].
+    pub fn clear_limits<T>(&self, metric: Metric<T>) -> Result<()> {
+        let id = self.check_metric(metric)?;
+        self.clear_limits_raw(id)
+    }
+
+    pub fn clear_limits_raw(&self, metric: impl Into<MetricId>) -> Result<()> {
         self.inner
             .limits
             .set(&self.inner.schema, metric.into(), None)
@@ -661,7 +719,17 @@ impl Namespace {
     /// state code as a number too), and a blob metric cannot be given a
     /// closure. Like the other limits it is never written to disk — a reader of
     /// a dump will not see it.
-    pub fn set_severity_fn(
+    /// Schema-bound counterpart of [`Namespace::set_severity_fn_raw`].
+    pub fn set_severity_fn<T>(
+        &self,
+        metric: Metric<T>,
+        check: impl Fn(f64) -> Severity + Send + Sync + 'static,
+    ) -> Result<()> {
+        let id = self.check_metric(metric)?;
+        self.set_severity_fn_raw(id, check)
+    }
+
+    pub fn set_severity_fn_raw(
         &self,
         metric: impl Into<MetricId>,
         check: impl Fn(f64) -> Severity + Send + Sync + 'static,
@@ -673,14 +741,26 @@ impl Namespace {
 
     /// Remove the diagnosis closure: the data — the overrides and the schema —
     /// applies again.
-    pub fn clear_severity_fn(&self, metric: impl Into<MetricId>) -> Result<()> {
+    /// Schema-bound counterpart of [`Namespace::clear_severity_fn_raw`].
+    pub fn clear_severity_fn<T>(&self, metric: Metric<T>) -> Result<()> {
+        let id = self.check_metric(metric)?;
+        self.clear_severity_fn_raw(id)
+    }
+
+    pub fn clear_severity_fn_raw(&self, metric: impl Into<MetricId>) -> Result<()> {
         self.inner
             .limits
             .set_fn(&self.inner.schema, metric.into(), None)
     }
 
     /// A metric's effective limits: the schema plus the overrides.
-    pub fn limits(&self, metric: impl Into<MetricId>) -> Result<EffectiveLimits> {
+    /// Schema-bound counterpart of [`Namespace::limits_raw`].
+    pub fn limits<T>(&self, metric: Metric<T>) -> Result<EffectiveLimits> {
+        let id = self.check_metric(metric)?;
+        self.limits_raw(id)
+    }
+
+    pub fn limits_raw(&self, metric: impl Into<MetricId>) -> Result<EffectiveLimits> {
         self.inner
             .limits
             .effective(&self.inner.schema, metric.into())
@@ -697,16 +777,32 @@ impl Namespace {
     /// `type: f32`, a state for an enum. The compiler checks the type — from
     /// the same metric constant that opens a series:
     ///
-    /// ```ignore
-    /// ns.severity_of(radio::metrics::TempPa, 65.0);
-    /// ns.severity_of(radio::metrics::LinkState, radio::metrics::LinkState::Los);
+    /// ```no_run
+    /// # use dduroc_engine::{Namespace, metric::{Metric, MetricValue}, staged::OwnedValue};
+    /// # #[derive(Clone, Copy)]
+    /// # enum LinkState { Los }
+    /// # impl MetricValue<LinkState> for LinkState {
+    /// #     fn into_owned(self) -> OwnedValue { OwnedValue::U64(0) }
+    /// # }
+    /// # fn diagnose(ns: &Namespace, temp: Metric<f32>, link: Metric<LinkState>)
+    /// #     -> dduroc_engine::Result<()> {
+    /// // `temp` and `link` are the descriptors from the namespace's schema.
+    /// ns.severity_of(temp, 65.0)?;
+    /// ns.severity_of(link, LinkState::Los)?;
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// A metric known only at runtime is served by
     /// [`Namespace::severity_of_raw`].
     #[inline]
-    pub fn severity_of<T, V: MetricValue<T>>(&self, metric: Metric<T>, value: V) -> Severity {
-        self.severity_of_raw(metric, &value.into_owned())
+    pub fn severity_of<T, V: MetricValue<T>>(
+        &self,
+        metric: Metric<T>,
+        value: V,
+    ) -> Result<Severity> {
+        let id = self.check_metric(metric)?;
+        Ok(self.severity_of_raw(id, &value.into_owned()))
     }
 
     /// The same for a metric and a value assembled at runtime.
@@ -724,43 +820,85 @@ impl Namespace {
     /// stack unwinding included — an unclosed span is indistinguishable from a
     /// crash.
     ///
-    /// The guard is handed out always, even if the span's start could not be
-    /// written: otherwise application code would get a `?` in a place where
-    /// nesting matters more than the record, and a reader has to be able to
-    /// show a span without a start anyway — that is exactly what a span cut
-    /// short by a process crash looks like.
-    pub fn span(&self, kind: SpanKindId) -> SpanGuard {
+    /// A refused start returns an inert guard: it emits no end and cannot
+    /// attach events or start children. Use [`Namespace::try_span`] when the
+    /// outcome matters. Normal critical starts still wait for durable completion.
+    pub fn span(&self, kind: crate::schema::SpanKind) -> SpanGuard {
         self.span_with_parent(kind, None)
     }
 
-    /// Begin a span with an explicit parent.
-    pub fn span_with_parent(&self, kind: SpanKindId, parent: Option<SpanId>) -> SpanGuard {
-        let span = next_span_id(&self.inner.next_span);
-        // A span kind not from this schema is no reason not to open the span:
-        // the ordinary storage class is taken, and the contract violation is
-        // reported as usual.
-        let class = self
-            .inner
-            .schema
-            .span(kind)
-            .map_or(StorageClass::Default, |d| d.class);
-        let channel = match self.channel_of(class) {
-            Ok(c) => c,
-            Err(e) => {
-                self.report(Err(e));
-                ChannelIdx(0)
-            }
-        };
-        let critical = class == StorageClass::Critical;
+    /// Begin a schema-bound span and acknowledge its start according to its class.
+    pub fn try_span(&self, kind: crate::schema::SpanKind) -> Result<SpanGuard> {
+        self.try_span_with_parent(kind, None)
+    }
 
-        if self.inner.schema.span(kind).is_none() {
-            self.report(Err(Error::UnknownSpanKind {
-                schema: self.inner.schema.name,
-                kind: kind.0,
-            }));
+    pub fn span_with_parent(
+        &self,
+        kind: crate::schema::SpanKind,
+        parent: Option<&SpanGuard>,
+    ) -> SpanGuard {
+        self.quiet_span(self.try_span_with_parent(kind, parent))
+    }
+
+    pub fn try_span_with_parent(
+        &self,
+        kind: crate::schema::SpanKind,
+        parent: Option<&SpanGuard>,
+    ) -> Result<SpanGuard> {
+        self.check_schema(kind.identity())?;
+        if let Some(guard) = parent {
+            self.check_span(guard)?;
         }
+        self.try_span_with_parent_raw(kind.id(), parent.map(SpanGuard::id))
+    }
 
-        self.report(self.inner.writer.write(
+    /// Explicit descriptor-ID escape for manually described schemas.
+    pub fn span_raw(&self, kind: SpanKindId) -> SpanGuard {
+        self.span_with_parent_raw(kind, None)
+    }
+
+    pub fn span_with_parent_raw(&self, kind: SpanKindId, parent: Option<SpanId>) -> SpanGuard {
+        self.quiet_span(self.try_span_with_parent_raw(kind, parent))
+    }
+
+    fn quiet_span(&self, result: Result<SpanGuard>) -> SpanGuard {
+        match result {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.report(Err(error));
+                // An inert guard cannot emit an end, attach events or start children.
+                SpanGuard {
+                    ns: self.clone(),
+                    span: SpanId(0),
+                    channel: ChannelIdx(0),
+                    critical: false,
+                    closed: true,
+                }
+            }
+        }
+    }
+
+    pub fn try_span_raw(&self, kind: SpanKindId) -> Result<SpanGuard> {
+        self.try_span_with_parent_raw(kind, None)
+    }
+
+    pub fn try_span_with_parent_raw(
+        &self,
+        kind: SpanKindId,
+        parent: Option<SpanId>,
+    ) -> Result<SpanGuard> {
+        let desc = self.inner.schema.span(kind).ok_or(Error::UnknownSpanKind {
+            schema: self.inner.schema.name,
+            kind: kind.0,
+        })?;
+        let channel = self.channel_of(desc.class)?;
+        let span = next_span_id(&self.inner.next_span).ok_or_else(|| {
+            self.inner.drops.record(channel);
+            Counters::publish(&self.inner.writer.counters().dropped);
+            Error::SpanIdExhausted
+        })?;
+        let critical = desc.class == StorageClass::Critical;
+        self.inner.writer.write(
             Staged {
                 ns: self.inner.id,
                 channel,
@@ -769,18 +907,16 @@ impl Namespace {
             },
             critical,
             &self.inner.drops,
-        ));
-
-        SpanGuard {
+        )?;
+        Ok(SpanGuard {
             ns: self.clone(),
             span,
             channel,
             critical,
             closed: false,
-        }
+        })
     }
 
-    /// Wait until what has accumulated is on the medium.
     pub fn sync(&self) -> Result<()> {
         self.inner.writer.sync(Some(self.inner.id))
     }
@@ -941,22 +1077,38 @@ impl SpanGuard {
     }
 
     /// A nested span: this one becomes its parent.
-    pub fn child(&self, kind: SpanKindId) -> SpanGuard {
-        self.ns.span_with_parent(kind, Some(self.span))
+    pub fn child(&self, kind: crate::schema::SpanKind) -> SpanGuard {
+        self.ns.quiet_span(self.try_child(kind))
+    }
+
+    pub fn try_child(&self, kind: crate::schema::SpanKind) -> Result<SpanGuard> {
+        self.ns.check_span(self)?;
+        self.ns.try_span_with_parent(kind, Some(self))
+    }
+
+    /// Explicit descriptor-ID escape, still refusing an inert parent.
+    pub fn child_raw(&self, kind: SpanKindId) -> SpanGuard {
+        self.ns.quiet_span(
+            self.ns
+                .check_span(self)
+                .and_then(|()| self.ns.try_span_with_parent_raw(kind, Some(self.span))),
+        )
     }
 
     /// Write an event attached to this span.
     pub fn log_raw(&self, event: EventId, payload: &[u8]) {
-        self.ns.log_raw(event, payload, Some(self.span));
+        self.ns
+            .report(self.try_log_payload(event, Payload::from_slice(payload)));
     }
 
     /// The same, but with the payload already assembled in the write buffer.
     pub fn log_payload(&self, event: EventId, payload: Payload) {
-        self.ns.log_payload(event, payload, Some(self.span));
+        self.ns.report(self.try_log_payload(event, payload));
     }
 
     /// The same with an answer about the outcome.
     pub fn try_log_payload(&self, event: EventId, payload: Payload) -> Result<()> {
+        self.ns.check_span(self)?;
         self.ns.try_log_payload(event, payload, Some(self.span))
     }
 
@@ -967,6 +1119,7 @@ impl SpanGuard {
     /// critical span, `Ok(())` confirms that its end reached a synchronous
     /// backend write. An error is unconfirmed and may still have persisted.
     pub fn close(mut self) -> Result<()> {
+        self.ns.check_span(&self)?;
         self.closed = true;
         self.write_end(true)
     }
@@ -1011,6 +1164,8 @@ fn contract_bit(e: &Error) -> u8 {
         Error::UnknownEvent { .. } => 1 << 0,
         Error::UnknownMetric { .. } => 1 << 1,
         Error::UnknownSpanKind { .. } => 1 << 2,
+        Error::ForeignSchema { .. } => 1 << 6,
+        Error::ForeignSpan => 1 << 7,
         Error::ValueTypeMismatch { .. } => 1 << 3,
         Error::ClassNotDeclared { .. } => 1 << 4,
         Error::EncodeFailed { .. } => 1 << 5,
@@ -1023,10 +1178,44 @@ fn contract_bit(e: &Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_metadata_refuses_trailing_oversize_and_oversize_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(NS_META);
+        let meta = NsMeta {
+            schema_name: "example".into(),
+            protocol_version: 1,
+        };
+        meta.write(&path).unwrap();
+        assert_eq!(NsMeta::read(dir.path()).unwrap(), Some(meta));
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(NsMeta::read(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((fsutil::CONTROL_METADATA_MAX_BYTES + 1) as u64)
+            .unwrap();
+        assert!(NsMeta::read(dir.path()).is_err());
+        let oversized = NsMeta {
+            schema_name: "x".repeat(fsutil::CONTROL_METADATA_MAX_BYTES),
+            protocol_version: 1,
+        };
+        assert!(oversized.write(&path).is_err());
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            (fsutil::CONTROL_METADATA_MAX_BYTES + 1) as u64
+        );
+    }
+
     use crate::schema::{EventDesc, Language, MetricDesc, SpanDesc};
     use crate::store::{Store, StoreConfig};
     use dduroc_format::ValueType;
 
+    struct TestSchema;
+    const TEST_IDENTITY: crate::schema::SchemaIdentity =
+        crate::schema::SchemaIdentity::of::<TestSchema>(ProtocolVersion(1));
     static LANGS: &[Language] = &[Language("en"), Language("ru")];
     static EVENTS: &[EventDesc] = &[
         EventDesc {
@@ -1109,8 +1298,8 @@ mod tests {
 
     /// Typed metric constants — what the macro produces for a real schema: the
     /// value type arrives together with the identifier.
-    const TEMP: Metric<f32> = Metric::new(MetricId(1));
-    const LINK: Metric<LinkState> = Metric::new(MetricId(2));
+    const TEMP: Metric<f32> = Metric::bound(MetricId(1), TEST_IDENTITY);
+    const LINK: Metric<LinkState> = Metric::bound(MetricId(2), TEST_IDENTITY);
 
     /// The channel state — what the macro would produce for a real schema.
     #[derive(Debug, Clone, Copy)]
@@ -1145,6 +1334,7 @@ mod tests {
 
     fn schema() -> Schema {
         Schema {
+            identity: Some(TEST_IDENTITY),
             name: "radio",
             version: ProtocolVersion(1),
             languages: LANGS,
@@ -1179,6 +1369,39 @@ mod tests {
             )
             .unwrap()
             .blocks
+    }
+
+    #[test]
+    fn exhausted_span_ids_refuse_start_and_keep_quiet_guards_inert() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path());
+        let ns = store.namespace("span-exhaustion", schema()).unwrap();
+        ns.inner.next_span.store(u32::MAX, Ordering::Relaxed);
+        let last = ns.try_span_raw(SpanKindId(1)).unwrap();
+        assert_eq!(last.id(), SpanId(u32::MAX));
+        assert!(matches!(
+            ns.try_span_raw(SpanKindId(1)),
+            Err(Error::SpanIdExhausted)
+        ));
+        let inert = ns.span_raw(SpanKindId(1));
+        assert_eq!(inert.id(), SpanId(0));
+        assert!(inert.close().is_err());
+        last.close().unwrap();
+        ns.sync().unwrap();
+        assert_eq!(store.stats().dropped, 2);
+        let mut span_ids = Vec::new();
+        for block in stored_blocks(&store, "span-exhaustion", StorageClass::Default) {
+            let block = dduroc_format::Block::parse(&block.bytes).unwrap().unwrap();
+            for record in block.records() {
+                match record.unwrap().1 {
+                    dduroc_format::Record::SpanStart(start) => span_ids.push(start.span),
+                    dduroc_format::Record::SpanEnd { span } => span_ids.push(span),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(span_ids, vec![SpanId(u32::MAX), SpanId(u32::MAX)]);
     }
 
     #[test]
@@ -1323,6 +1546,7 @@ mod tests {
 
         let store2 = open_store(dir.path());
         let other = Schema {
+            identity: None,
             name: "another-schema",
             ..schema()
         };
@@ -1624,9 +1848,9 @@ mod tests {
         );
 
         {
-            let cal = ns.span(SpanKindId(1));
+            let cal = ns.span_raw(SpanKindId(1));
             cal.log_raw(EventId(1), &[7]);
-            let _child = cal.child(SpanKindId(1));
+            let _child = cal.child_raw(SpanKindId(1));
         } // both spans close here
 
         ns.sync().unwrap();
@@ -1875,7 +2099,7 @@ mod tests {
         let ns = store.namespace("orc-radio-0", schema()).unwrap();
 
         // The schema's defaults.
-        let sev = |v: f32| ns.severity_of(TEMP, v);
+        let sev = |v: f32| ns.severity_of(TEMP, v).unwrap();
         assert_eq!(sev(36.6), Severity::Normal);
         assert_eq!(sev(75.0), Severity::Warn);
         assert_eq!(sev(90.0), Severity::Alarm);
@@ -1888,18 +2112,21 @@ mod tests {
             Severity::Warn,
             "the schema would have said Normal"
         );
-        let eff = ns.limits(MetricId(1)).unwrap();
+        let eff = ns.limits_raw(MetricId(1)).unwrap();
         assert!(eff.overridden);
         assert_eq!(eff.unit, "°C");
         assert_eq!(eff.kind, MetricKind::Gauge);
 
         // States: the severity comes from the state, not from ranges.
-        let link = ns.limits(MetricId(2)).unwrap();
+        let link = ns.limits_raw(MetricId(2)).unwrap();
         assert_eq!(link.kind, MetricKind::State);
         assert_eq!(link.states.len(), 3);
         assert_eq!(link.states[0].name, "Los");
         assert_eq!(link.states[0].severity, Severity::Alarm);
-        assert_eq!(ns.severity_of(LINK, LinkState::Los), Severity::Alarm);
+        assert_eq!(
+            ns.severity_of(LINK, LinkState::Los).unwrap(),
+            Severity::Alarm
+        );
 
         // A series knows its metric: severity is asked with the same value as a
         // sample — without assembling an OwnedValue by hand and without
@@ -1927,7 +2154,7 @@ mod tests {
         assert!(!ns.limits(TEMP).unwrap().overridden);
 
         // A metric not from this schema is a defect in the call, not a loss.
-        let e = ns.clear_limits(MetricId(99)).unwrap_err();
+        let e = ns.clear_limits_raw(MetricId(99)).unwrap_err();
         assert!(e.breaks_contract(), "{e}");
     }
 
@@ -1949,7 +2176,7 @@ mod tests {
         // And on a numeric metric the same bounds go in through the hatch.
         ns.set_thresholds_raw(MetricId(1), ..=40.0, ..=50.0)
             .unwrap();
-        assert_eq!(ns.severity_of(TEMP, 45.0), Severity::Warn);
+        assert_eq!(ns.severity_of(TEMP, 45.0).unwrap(), Severity::Warn);
     }
 
     #[test]
@@ -1963,9 +2190,9 @@ mod tests {
 
         a.set_thresholds(TEMP, ..=10.0, ..).unwrap();
 
-        assert_eq!(a.severity_of(TEMP, 20.0), Severity::Warn);
+        assert_eq!(a.severity_of(TEMP, 20.0).unwrap(), Severity::Warn);
         assert_eq!(
-            b.severity_of(TEMP, 20.0),
+            b.severity_of(TEMP, 20.0).unwrap(),
             Severity::Normal,
             "the neighbour kept its limits"
         );
@@ -2001,9 +2228,9 @@ mod tests {
             stats.records_written
         );
 
-        // A span kind from a foreign schema: the guard is handed out all the
-        // same, or application code's nesting would depend on the schema.
-        let span = ns.span(SpanKindId(99));
-        assert!(span.id().0 > 0);
+        // The quiet raw API preserves RAII ergonomics, but a refused start
+        // produces an inert guard and must never fabricate an end record.
+        let span = ns.span_raw(SpanKindId(99));
+        assert_eq!(span.id().0, 0, "a rejected span is inert");
     }
 }

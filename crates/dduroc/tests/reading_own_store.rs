@@ -6,6 +6,8 @@
 //! without it. With no error, no damage notice, not a single sign that anything
 //! was missing — just shorter.
 
+#![cfg(feature = "read")]
+
 use dduroc::prelude::*;
 use dduroc::{ChannelConfig, StorageClass, StoreConfig, StoreExt};
 use dduroc_read::{KindFilter, Order, Query, Reader};
@@ -334,7 +336,7 @@ fn a_foreign_namespace_needs_its_schema_named() {
         "without a schema there is nothing to render with — and a reader will not invent a text"
     );
     assert_eq!(
-        lines(&store.reader().with_schema(split::SCHEMA)),
+        lines(&store.reader().with_schema(split::SCHEMA).unwrap()),
         ["ping 2"]
     );
     store.shutdown();

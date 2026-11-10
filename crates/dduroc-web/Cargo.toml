@@ -1,0 +1,40 @@
+[package]
+name = "dduroc-web"
+description = "Embeddable Axum router and prebuilt UI for dduroc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+include = ["src/**", "examples/**", "tests/**", "ui/src/**", "ui/index.html", "ui/run.mjs", "ui/.npmrc", "ui/package.json", "ui/package-lock.json", "ui/vite.config.*", "ui/tsconfig*.json", "ui/svelte.config.*", "ui/LICENSE*", "ui/dist/**", "build.rs", "/update-dist.mjs", "Cargo.toml", "Cargo.lock", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
+
+[features]
+default = []
+# Explicitly rebuild the packaged sources in OUT_DIR; requires Node and npm.
+build-ui = []
+
+[dependencies]
+axum = { workspace = true, features = ["original-uri"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+async-graphql.workspace = true
+async-graphql-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
+dduroc.workspace = true
+dduroc-graphql.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tower.workspace = true

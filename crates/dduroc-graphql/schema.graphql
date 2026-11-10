@@ -1,0 +1,442 @@
+type BackfillStatisticsView {
+	more: Boolean!
+}
+
+type BootTimeView {
+	boot: UInt64!
+	micros: UInt64!
+}
+
+type BytesView {
+	base64: String!
+	bytes: UInt64!
+}
+
+"""
+Catalog selection has no event/time window: it describes channels, not records.
+"""
+input CatalogInput {
+	namespaces: [String!]
+	namespacePrefix: String
+	classes: [Class!]
+}
+
+type CatalogView {
+	apiVersion: String!
+	defaultLanguages: [String!]!
+	namespaces: [NamespaceView!]!
+	schemas: [SchemaView!]!
+}
+
+enum Class {
+	DEFAULT
+	CRITICAL
+	TELEMETRY
+}
+
+type ClassStatisticsView {
+	class: Class!
+	logicalRetainedBytes: UInt64!
+	limitBytes: UInt64
+}
+
+type CountedReadSessionOpened {
+	id: String!
+	revision: UInt64!
+	totalMatches: UInt64!
+	totalSeeds: UInt64!
+	totalPages: UInt64!
+}
+
+enum CountingState {
+	COMPLETE
+	BACKFILL_REQUIRED
+	IN_PROGRESS
+}
+
+type DamageView {
+	offset: UInt64!
+	message: String!
+}
+
+enum EntryType {
+	MESSAGE
+	TEXT
+	SPAN_START
+	SPAN_END
+	SAMPLE
+	EXTENSION
+}
+
+type EntryView {
+	namespace: String!
+	class: Class!
+	at: BootTimeView!
+	utc: String
+	span: UInt64
+	kind: EntryType!
+	message: MessageView
+	text: TextView
+	sample: SampleView
+	spanEvent: SpanView
+	extension: BytesView
+}
+
+type EventDescriptorView {
+	id: UInt64!
+	name: String!
+	level: Level!
+	class: Class!
+	tags: [String!]!
+	templates: [String!]!
+	fields: [FieldView!]!
+}
+
+type FieldView {
+	name: String!
+	typeName: String!
+}
+
+enum FieldsStatus {
+	DECODED
+	UNKNOWN_SCHEMA
+	UNSUPPORTED_DECODER
+	NOT_REQUESTED
+}
+
+input FilterInput {
+	minLevel: Level
+	anyTags: [String!]
+	eventIds: [UInt64!]
+	eventNames: [String!]
+	spanIds: [UInt64!]
+	kinds: KindsInput
+}
+
+enum FloatClass {
+	FINITE
+	NAN
+	POSITIVE_INFINITY
+	NEGATIVE_INFINITY
+}
+
+type FloatView {
+	"""
+	IEEE-754 source width, 32 or 64 bits.
+	"""
+	width: Int!
+	"""
+	Finite, NaN or a signed infinity. No non-finite JSON number is emitted.
+	"""
+	class: FloatClass!
+	"""
+	Human-readable value; bits remain authoritative for signed zero and NaN payloads.
+	"""
+	decimal: String!
+	"""
+	Fixed-width lowercase hexadecimal IEEE-754 bit pattern (8 or 16 digits).
+	"""
+	bits: String!
+}
+
+type FollowBatchView {
+	entries: [EntryView!]!
+	seeds: [EntryView!]!
+	damaged: [DamageView!]!
+	unanchored: [UInt64!]!
+	ended: Boolean!
+}
+
+input KindsInput {
+	messages: Boolean
+	text: Boolean
+	samples: Boolean
+	spans: Boolean
+}
+
+enum Level {
+	DEV_TRACE
+	TRACE
+	DEBUG
+	INFO
+	WARN
+	ERROR
+}
+
+"""
+Every supplied ceiling is intersected with the service ceiling.
+"""
+input LimitsInput {
+	epochRuns: UInt64
+	hardwareBoots: UInt64
+	rosterEntries: UInt64
+	channels: UInt64
+	blocks: UInt64
+	compressedBytes: UInt64
+	decodedBytes: UInt64
+	examinedRecords: UInt64
+	returnedBytes: UInt64
+	"""
+	Cumulative deadline for the read, session or follow created by this call.
+	It is measured from this call and is not reset when requesting another page.
+	"""
+	timeoutMillis: UInt64
+}
+
+type LogMutation {
+	"""
+	Perform one bounded index-maintenance step; repeat until `more` is false.
+	"""
+	backfillStatistics(limits: LimitsInput): BackfillStatisticsView!
+	openReadSession(query: QueryInput, limits: LimitsInput, presentation: PresentationInput): ReadSessionOpened!
+	openCountedReadSession(query: QueryInput, limits: LimitsInput, presentation: PresentationInput, page: PageInput!): CountedReadSessionOpened!
+	readSession(id: String!, expectedRevision: UInt64!, page: PageInput): ReadSessionPage!
+	seekReadSession(id: String!, expectedRevision: UInt64!, targetPage: UInt64!, page: PageInput, presentation: PresentationInput): ReadSessionSeekPage!
+	closeReadSession(id: String!, expectedRevision: UInt64!): Boolean!
+	cancelReadSession(id: String!): Boolean!
+}
+
+type LogQuery {
+	apiVersion: String!
+	"""
+	Global retained counts are null until the count index is complete.
+	"""
+	statistics(limits: LimitsInput): StatisticsView!
+	catalog(query: CatalogInput, limits: LimitsInput): CatalogView!
+	read(query: QueryInput, limits: LimitsInput, page: PageInput, presentation: PresentationInput): PageView!
+}
+
+type LogSubscription {
+	follow(query: QueryInput, limits: LimitsInput, presentation: PresentationInput): FollowBatchView!
+}
+
+type MessageView {
+	eventId: UInt64!
+	name: String
+	level: Level
+	tags: [String!]!
+	rendered: String
+	renderStatus: RenderStatus!
+	language: String
+	languagePreferenceIndex: Int
+	payload: BytesView
+	fieldsStatus: FieldsStatus!
+	fields: ValueView
+}
+
+type MetricDescriptorView {
+	id: UInt64!
+	name: String!
+	valueType: String!
+	class: Class!
+	unit: String!
+	tags: [String!]!
+	kind: String!
+	states: [StateView!]!
+}
+
+type NamespaceView {
+	namespace: String!
+	class: Class!
+	schemaName: String!
+	protocolVersion: UInt64!
+	retainedBytes: UInt64!
+	quotaBytes: UInt64
+}
+
+enum Order {
+	OLDEST
+	NEWEST
+}
+
+input PageInput {
+	maxRecords: UInt64
+	maxBytes: UInt64
+}
+
+type PageView {
+	entries: [EntryView!]!
+	seeds: [EntryView!]!
+	exhausted: Boolean!
+	truncated: Boolean!
+	damaged: [DamageView!]!
+	unanchored: [UInt64!]!
+}
+
+input PresentationInput {
+	language: String
+	languages: [String!]
+}
+
+input QueryInput {
+	"""
+	Exact names. Omit names and prefix to select all namespaces.
+	"""
+	namespaces: [String!]
+	namespacePrefix: String
+	classes: [Class!]
+	boot: UInt64
+	from: TimeInput
+	to: TimeInput
+	filter: FilterInput
+	order: Order
+	limit: UInt64
+	seedStates: Boolean
+}
+
+type ReadSessionOpened {
+	id: String!
+	revision: UInt64!
+}
+
+type ReadSessionPage {
+	revision: UInt64!
+	page: PageView!
+}
+
+type ReadSessionSeekPage {
+	revision: UInt64!
+	reachedPage: UInt64!
+	targetReached: Boolean!
+	exhausted: Boolean!
+	page: PageView
+}
+
+enum RenderStatus {
+	RENDERED
+	UNKNOWN_SCHEMA
+	UNSUPPORTED_DECODER
+	NOT_REQUESTED
+}
+
+type RootStatisticsView {
+	index: UInt64!
+	allocatedBytes: UInt64!
+	logBytes: UInt64!
+	rewriteBytes: UInt64!
+	metadataBytes: UInt64!
+	physicalLimitBytes: UInt64
+}
+
+type RuntimeStatisticsView {
+	recordsWritten: UInt64!
+	blocksWritten: UInt64!
+	bytesWritten: UInt64!
+	dropped: UInt64!
+	rejected: UInt64!
+	ioErrors: UInt64!
+}
+
+type SampleView {
+	metricId: UInt64!
+	name: String
+	unit: String
+	tags: [String!]!
+	kind: String
+	stateName: String
+	severity: String
+	value: ValueView
+}
+
+type SchemaView {
+	name: String!
+	version: UInt64!
+	languages: [String!]!
+	events: [EventDescriptorView!]!
+	metrics: [MetricDescriptorView!]!
+	spans: [SpanDescriptorView!]!
+}
+
+type SpanDescriptorView {
+	id: UInt64!
+	name: String!
+	class: Class!
+}
+
+type SpanView {
+	id: UInt64!
+	kindName: String
+	parent: UInt64
+}
+
+type StateView {
+	code: UInt64!
+	name: String!
+	severity: String!
+}
+
+type StatisticsView {
+	capturedAt: String!
+	countingState: CountingState!
+	retainedRecords: UInt64
+	retainedBlocks: UInt64
+	logicalRetainedBytes: UInt64!
+	channels: UInt64!
+	classes: [ClassStatisticsView!]!
+	runtime: RuntimeStatisticsView
+	roots: [RootStatisticsView!]
+}
+
+type TextView {
+	level: Level!
+	target: String!
+	text: String!
+}
+
+"""
+Exactly one clock scale must be supplied. UTC is an RFC3339 timestamp.
+"""
+input TimeInput {
+	boot: UInt64
+	micros: UInt64
+	utc: String
+}
+
+"""
+Unsigned 64-bit integer encoded as a canonical decimal JSON string.
+GraphQL Int and JSON numeric input are rejected; no leading zeros or plus sign.
+"""
+scalar UInt64
+
+enum ValueKind {
+	NULL
+	BOOLEAN
+	SIGNED
+	UNSIGNED
+	FLOAT
+	STRING
+	BYTES
+	SEQUENCE
+	MAP
+	VARIANT
+}
+
+type ValuePair {
+	key: ValueView!
+	value: ValueView!
+}
+
+type ValueView {
+	kind: ValueKind!
+	text: String
+	boolean: Boolean
+	float: FloatView
+	bytes: BytesView
+	items: [ValueView!]!
+	pairs: [ValuePair!]!
+	variant: String
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: LogQuery
+	mutation: LogMutation
+	subscription: LogSubscription
+}

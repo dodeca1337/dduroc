@@ -1,8 +1,8 @@
 //! Bounded reads of the versioned raft-backed block store.
 //!
 //! Payloads are dduroc-format blocks, never raft-engine metadata values.
-use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result, schema::StorageClass};
 
 const META_KEY: &[u8] = b"dduroc.channel.v1";
+const COUNTS_KEY: &[u8] = b"dduroc.counts.v1";
 const MAX_PAGE_ENTRIES: usize = 1024;
 const MAX_PAGE_BYTES: usize = 64 * 1024 * 1024;
 // A single block is one raft batch, so reading an entry cannot cause raft to
 // allocate an arbitrarily large writer-produced batch.
 const MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 const ENVELOPE_BYTES: usize = 22;
+const SHADOW_PREFIX: &[u8] = b"dduroc.shadow.";
 fn shadow_key(id: u64) -> Vec<u8> {
     format!("dduroc.shadow.{id}").into_bytes()
 }
@@ -111,7 +113,36 @@ pub struct ChannelInfo {
     pub protocol_version: u16,
     pub first_index: Option<u64>,
     pub last_index: Option<u64>,
+    /// The next monotonic block index, retained even when history is empty.
+    pub next_write_index: u64,
     pub retained_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub counting_state: CountingState,
+    pub retained_records: Option<u64>,
+    pub retained_blocks: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountingState {
+    Complete,
+    BackfillRequired,
+    InProgress,
+}
+
+/// A channel identity and bounds captured under the backend mutation lock.
+#[derive(Debug, Clone)]
+pub struct ChannelSnapshot {
+    pub info: ChannelInfo,
+    /// Opaque physical generation, changed when a channel is rewritten.
+    pub generation: (usize, u64),
+    owner: Arc<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotStatus {
+    Current,
+    Replaced,
+    Evicted,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +159,7 @@ pub struct BlockPage {
     pub next_index: Option<u64>,
     pub first_index: Option<u64>,
     pub last_index: Option<u64>,
+    pub next_write_index: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +167,28 @@ pub struct RootUsage {
     pub root: PathBuf,
     pub allocated_bytes: u64,
     pub logical_retained_bytes: u64,
+    pub physical_limit_bytes: u64,
+}
+
+/// Constant-time global aggregates maintained with the persisted count index.
+#[derive(Debug, Clone)]
+pub struct CachedStatistics {
+    pub counting_state: CountingState,
+    pub retained_records: Option<u64>,
+    pub retained_blocks: Option<u64>,
+    pub logical_class_bytes: [u64; 3],
+    pub class_limits: [u64; 3],
+    pub channels: u64,
+}
+
+/// Allocated filesystem blocks, not logical retained payload bytes.
+#[derive(Debug, Clone)]
+pub struct RootPhysicalStats {
+    pub index: usize,
+    pub allocated_bytes: u64,
+    pub log_bytes: u64,
+    pub rewrite_bytes: u64,
+    pub metadata_bytes: u64,
     pub physical_limit_bytes: u64,
 }
 
@@ -147,6 +201,87 @@ pub(crate) struct ChannelMeta {
     pub retained_bytes: u64,
     pub next_index: u64,
     pub quota_bytes: Option<u64>,
+}
+
+/// Counts of retained on-disk wire records, including text and extensions.
+/// Incomplete counts are never presented as totals.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct CountIndex {
+    version: u8,
+    next: u64,
+    records: u64,
+    blocks: u64,
+    complete: bool,
+}
+impl CountIndex {
+    fn empty(next: u64, complete: bool) -> Self {
+        Self {
+            version: 1,
+            next,
+            records: 0,
+            blocks: 0,
+            complete,
+        }
+    }
+    fn add(&mut self, count: u64) -> Result<()> {
+        self.records = self
+            .records
+            .checked_add(count)
+            .ok_or_else(|| Error::Backend("record count overflow".into()))?;
+        self.blocks = self
+            .blocks
+            .checked_add(1)
+            .ok_or_else(|| Error::Backend("block count overflow".into()))?;
+        Ok(())
+    }
+    fn remove(&mut self, count: u64) -> Result<()> {
+        self.records = self
+            .records
+            .checked_sub(count)
+            .ok_or_else(|| Error::Backend("invalid record count".into()))?;
+        self.blocks = self
+            .blocks
+            .checked_sub(1)
+            .ok_or_else(|| Error::Backend("invalid block count".into()))?;
+        Ok(())
+    }
+}
+fn block_record_count(bytes: &[u8]) -> Result<Option<u64>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let header = dduroc_format::block::BlockHeader::parse(bytes)?
+        .ok_or_else(|| Error::Backend("empty block header".into()))?;
+    let body = bytes
+        .get(dduroc_format::block::BlockHeader::SIZE..)
+        .ok_or_else(|| Error::Backend("truncated block".into()))?;
+    if body.len() != header.body_len as usize {
+        return Err(Error::Backend("invalid block length".into()));
+    }
+    header.verify(body)?;
+    Ok(Some(u64::from(header.count)))
+}
+fn load_counts(engine: &Engine, id: u64) -> Result<Option<CountIndex>> {
+    let Some(bytes) = engine.get(id, COUNTS_KEY) else {
+        return Ok(None);
+    };
+    let counts: CountIndex = postcard::from_bytes(&bytes)?;
+    if counts.version != 1 {
+        return Err(Error::Backend("unsupported count index version".into()));
+    }
+    Ok(Some(counts))
+}
+fn count_state(counts: Option<CountIndex>) -> CountingState {
+    match counts {
+        None => CountingState::BackfillRequired,
+        Some(counts) if counts.complete => CountingState::Complete,
+        Some(_) => CountingState::InProgress,
+    }
+}
+fn put_counts(batch: &mut LogBatch, id: u64, counts: &CountIndex) -> Result<()> {
+    batch
+        .put(id, COUNTS_KEY.to_vec(), postcard::to_allocvec(counts)?)
+        .map_err(backend_error)
 }
 
 #[derive(Debug)]
@@ -165,11 +300,22 @@ impl MessageExt for BlockEntry {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CommitFault {
+    BeforeEio = 1,
+    BeforeEnospc = 2,
+    AfterEio = 3,
+    AfterEnospc = 4,
+}
+
 pub struct ReadBackend {
     roots: Vec<(PathBuf, Arc<Engine>)>,
     index: RwLock<HashMap<ChannelKey, (usize, u64)>>,
     mutation: Mutex<()>,
     failed: Arc<AtomicBool>,
+    #[cfg(test)]
+    commit_fault: std::sync::atomic::AtomicU8,
     physical_limits: Vec<u64>,
     rewrite_reserves: Vec<u64>,
     targets: Vec<u64>,
@@ -177,6 +323,7 @@ pub struct ReadBackend {
     class_limits: RwLock<[u64; 3]>,
     class_index: Mutex<ClassIndex>,
     workers: Vec<RootWorker>,
+    snapshot_owner: Arc<()>,
     metadata_accounting: Mutex<Vec<MetadataAccounting>>,
 }
 
@@ -285,6 +432,119 @@ impl Drop for RootWorker {
 struct ClassIndex {
     totals: [u64; 3],
     heads: [BTreeSet<(u64, usize, u64)>; 3],
+    counts: CountTotals,
+}
+#[derive(Debug, Default)]
+struct CountTotals {
+    records: u64,
+    blocks: u64,
+    // value is true for backfill-required, false for in-progress.
+    pending: BTreeMap<(usize, u64), (bool, ChannelKey)>,
+    required: usize,
+}
+impl CountTotals {
+    fn numbers(&self, changes: &[(Option<CountIndex>, Option<CountIndex>)]) -> Result<(u64, u64)> {
+        let (mut records, mut blocks) = (self.records, self.blocks);
+        for (old, new) in changes {
+            if let Some(old) = old.filter(|c| c.complete) {
+                records = records
+                    .checked_sub(old.records)
+                    .ok_or_else(|| Error::Backend("invalid aggregate record count".into()))?;
+                blocks = blocks
+                    .checked_sub(old.blocks)
+                    .ok_or_else(|| Error::Backend("invalid aggregate block count".into()))?;
+            }
+            if let Some(new) = new.filter(|c| c.complete) {
+                records = records
+                    .checked_add(new.records)
+                    .ok_or_else(|| Error::Backend("aggregate record count overflow".into()))?;
+                blocks = blocks
+                    .checked_add(new.blocks)
+                    .ok_or_else(|| Error::Backend("aggregate block count overflow".into()))?;
+            }
+        }
+        Ok((records, blocks))
+    }
+    fn insert_initial(
+        &mut self,
+        root: usize,
+        id: u64,
+        key: &ChannelKey,
+        counts: Option<CountIndex>,
+    ) -> Result<()> {
+        if let Some(counts) = counts.filter(|c| c.complete) {
+            self.records = self
+                .records
+                .checked_add(counts.records)
+                .ok_or_else(|| Error::Backend("aggregate record count overflow".into()))?;
+            self.blocks = self
+                .blocks
+                .checked_add(counts.blocks)
+                .ok_or_else(|| Error::Backend("aggregate block count overflow".into()))?;
+        } else {
+            let required = counts.is_none();
+            self.pending.insert((root, id), (required, key.clone()));
+            self.required += usize::from(required);
+        }
+        Ok(())
+    }
+    fn apply(
+        &mut self,
+        root: usize,
+        old_id: u64,
+        new_id: u64,
+        new: Option<CountIndex>,
+        key: Option<&ChannelKey>,
+        totals: (u64, u64),
+    ) {
+        self.records = totals.0;
+        self.blocks = totals.1;
+        let old_pending = self.pending.remove(&(root, old_id));
+        if let Some((required, _)) = &old_pending {
+            self.required -= usize::from(*required);
+        }
+        if !new.is_some_and(|c| c.complete) {
+            let required = new.is_none();
+            let key = key
+                .cloned()
+                .or_else(|| old_pending.map(|(_, key)| key))
+                .expect("pending channel key");
+            self.pending.insert((root, new_id), (required, key));
+            self.required += usize::from(required);
+        }
+    }
+    fn state(&self) -> CountingState {
+        if self.required > 0 {
+            CountingState::BackfillRequired
+        } else if !self.pending.is_empty() {
+            CountingState::InProgress
+        } else {
+            CountingState::Complete
+        }
+    }
+}
+
+fn subtract_counted_prefix(
+    worker: &RootWorker,
+    id: u64,
+    counts: &mut CountIndex,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    for index in start..end.min(counts.next) {
+        let entry = worker
+            .read(id, index)?
+            .ok_or_else(|| Error::Backend("missing counted block".into()))?;
+        if entry.value.len() < ENVELOPE_BYTES
+            || u64::from_le_bytes(entry.value[..8].try_into().unwrap()) != index
+        {
+            return Err(Error::Backend("invalid block envelope".into()));
+        }
+        if let Some(count) = block_record_count(&entry.value[ENVELOPE_BYTES..])? {
+            counts.remove(count)?;
+        }
+    }
+    Ok(())
 }
 
 fn head_sequence(worker: &RootWorker, id: u64, at: u64) -> Result<u64> {
@@ -313,6 +573,224 @@ fn backend_error(e: impl std::fmt::Display) -> Error {
 }
 
 impl ReadBackend {
+    /// Resolve a namespace schema without cloning or scanning the catalog.
+    pub fn schema_name(&self, namespace: &str) -> Result<Option<String>> {
+        let index = self.index.read().map_err(backend_error)?;
+        for class in StorageClass::ALL {
+            let key = ChannelKey {
+                namespace: namespace.to_owned(),
+                class,
+            };
+            if let Some(&(root, id)) = index.get(&key) {
+                let data = self.roots[root]
+                    .1
+                    .get(id, META_KEY)
+                    .ok_or_else(|| Error::Backend("channel metadata missing".into()))?;
+                let meta: ChannelMeta = postcard::from_bytes(&data)?;
+                return Ok(Some(meta.schema_name));
+            }
+        }
+        Ok(None)
+    }
+    /// Visit a single, atomically captured roster. The callback runs under the
+    /// mutation lock and must remain quick and never call back into the store.
+    pub fn snapshot_channels(
+        &self,
+        accept: impl FnMut(&ChannelKey) -> Result<bool>,
+    ) -> Result<Vec<ChannelSnapshot>> {
+        self.snapshot_channels_with(|| Ok(()), accept)
+            .map(|(_, channels)| channels)
+    }
+
+    /// Capture auxiliary metadata under the same mutation lock as the roster.
+    /// Neither callback may re-enter the backend or wait on store schema locks.
+    pub fn snapshot_channels_with<T>(
+        &self,
+        capture: impl FnOnce() -> Result<T>,
+        mut accept: impl FnMut(&ChannelKey) -> Result<bool>,
+    ) -> Result<(T, Vec<ChannelSnapshot>)> {
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        let captured = capture()?;
+        let index = self.index.read().map_err(backend_error)?;
+        let mut out = Vec::new();
+        for (key, &(root, id)) in index.iter() {
+            if !accept(key)? {
+                continue;
+            }
+            let engine = &self.roots[root].1;
+            let bytes = engine
+                .get(id, META_KEY)
+                .ok_or_else(|| Error::Backend("channel metadata missing".into()))?;
+            let meta: ChannelMeta = postcard::from_bytes(&bytes)?;
+            let counts = load_counts(engine, id)?;
+            out.push(ChannelSnapshot {
+                info: ChannelInfo {
+                    key: key.clone(),
+                    schema_name: meta.schema_name,
+                    protocol_version: meta.protocol_version,
+                    first_index: engine.first_index(id),
+                    last_index: engine.last_index(id),
+                    next_write_index: meta.next_index,
+                    retained_bytes: meta.retained_bytes,
+                    quota_bytes: meta.quota_bytes,
+                    counting_state: count_state(counts),
+                    retained_records: counts.filter(|c| c.complete).map(|c| c.records),
+                    retained_blocks: counts.filter(|c| c.complete).map(|c| c.blocks),
+                },
+                generation: (root, id),
+                owner: Arc::clone(&self.snapshot_owner),
+            });
+        }
+        out.sort_by(|a, b| {
+            (&a.info.key.namespace, a.info.key.class)
+                .cmp(&(&b.info.key.namespace, b.info.key.class))
+        });
+        Ok((captured, out))
+    }
+
+    /// Check generation and the next unread index without racing retention.
+    pub fn validate_snapshot(
+        &self,
+        channel: &ChannelSnapshot,
+        next_unread: Option<u64>,
+    ) -> Result<bool> {
+        if !Arc::ptr_eq(&self.snapshot_owner, &channel.owner) {
+            return Ok(false);
+        }
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        let index = self.index.read().map_err(backend_error)?;
+        let Some(&(root, id)) = index.get(&channel.info.key) else {
+            return Ok(false);
+        };
+        if (root, id) != channel.generation {
+            return Ok(false);
+        }
+        if let Some(next) = next_unread
+            && self.roots[root]
+                .1
+                .first_index(id)
+                .is_none_or(|first| first > next)
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Atomically classify a frozen session's unread position.
+    pub fn snapshot_status(
+        &self,
+        channel: &ChannelSnapshot,
+        required: Option<u64>,
+    ) -> Result<SnapshotStatus> {
+        if !Arc::ptr_eq(&self.snapshot_owner, &channel.owner) {
+            return Ok(SnapshotStatus::Replaced);
+        }
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        let index = self.index.read().map_err(backend_error)?;
+        let Some(&(root, id)) = index.get(&channel.info.key) else {
+            return Ok(SnapshotStatus::Replaced);
+        };
+        if (root, id) != channel.generation {
+            return Ok(SnapshotStatus::Replaced);
+        }
+        if required.is_some_and(|at| {
+            self.roots[root]
+                .1
+                .first_index(id)
+                .is_none_or(|first| first > at)
+        }) {
+            return Ok(SnapshotStatus::Evicted);
+        }
+        Ok(SnapshotStatus::Current)
+    }
+
+    /// Atomically check activation and an observed live-follow watermark.
+    pub fn follow_status(
+        &self,
+        channel: &ChannelSnapshot,
+        required: u64,
+    ) -> Result<SnapshotStatus> {
+        if !Arc::ptr_eq(&self.snapshot_owner, &channel.owner) {
+            return Ok(SnapshotStatus::Replaced);
+        }
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        let index = self.index.read().map_err(backend_error)?;
+        let Some(&(root, id)) = index.get(&channel.info.key) else {
+            return Ok(SnapshotStatus::Replaced);
+        };
+        if (root, id) != channel.generation {
+            return Ok(SnapshotStatus::Replaced);
+        }
+        let engine = &self.roots[root].1;
+        let data = engine
+            .get(id, META_KEY)
+            .ok_or_else(|| Error::Backend("channel metadata missing".into()))?;
+        let meta: ChannelMeta = postcard::from_bytes(&data)?;
+        if engine.first_index(id).is_some_and(|first| first > required)
+            || (engine.first_index(id).is_none() && meta.next_index > required)
+        {
+            return Ok(SnapshotStatus::Evicted);
+        }
+        Ok(SnapshotStatus::Current)
+    }
+
+    /// Read only if the captured activation still exists and the requested
+    /// block was not evicted. The check and read share the mutation lock.
+    pub fn read_snapshot_block(
+        &self,
+        channel: &ChannelSnapshot,
+        index: u64,
+    ) -> Result<Option<BlockPage>> {
+        if channel.info.first_index.is_none_or(|first| index < first)
+            || channel.info.last_index.is_none_or(|last| index > last)
+        {
+            return Ok(None);
+        }
+        self.read_generation_block(channel, index)
+    }
+
+    /// Read an index from the same generation, including blocks appended
+    /// after capture. Intended for controlled live subscriptions.
+    pub fn read_generation_block(
+        &self,
+        channel: &ChannelSnapshot,
+        index: u64,
+    ) -> Result<Option<BlockPage>> {
+        if !Arc::ptr_eq(&self.snapshot_owner, &channel.owner) {
+            return Ok(None);
+        }
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        {
+            let index_map = self.index.read().map_err(backend_error)?;
+            let Some(&(root, id)) = index_map.get(&channel.info.key) else {
+                return Ok(None);
+            };
+            if (root, id) != channel.generation
+                || self.roots[root]
+                    .1
+                    .first_index(id)
+                    .is_none_or(|first| first > index)
+            {
+                return Ok(None);
+            }
+        }
+        let end = index
+            .checked_add(1)
+            .ok_or_else(|| Error::Backend("block index exhausted".into()))?;
+        Ok(Some(self.read_blocks(
+            &channel.info.key,
+            index,
+            end,
+            1,
+            MAX_PAGE_BYTES,
+            false,
+        )?))
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_commit_fault(&self, fault: CommitFault) {
+        self.commit_fault.store(fault as u8, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_for_test(&self) {
         self.failed.store(true, Ordering::Release);
@@ -329,12 +807,27 @@ impl ReadBackend {
         let mut opened = Vec::with_capacity(roots.len());
         for ((root, budget), target) in roots.iter().zip(budgets).zip(targets) {
             let marker = root.join("dduroc-raft-v1");
-            if std::fs::read(&marker).map_err(backend_error)? != b"dduroc raft store v1\n" {
-                return Err(Error::Backend("unknown raft store marker".into()));
-            }
             let path = root.join("raft-engine");
+            let missing_marker = match crate::fsutil::read_optional_bounded(&marker)? {
+                Some(value)
+                    if value == b"dduroc raft store v1\n"
+                        || value == b"dduroc raft store v2 stats-writer\n" =>
+                {
+                    false
+                }
+                None => true,
+                Some(_) => return Err(Error::Backend("unknown raft store marker".into())),
+            };
             crate::fsutil::create_dir_all_synced(&path)?;
-            opened.push((root.clone(), Arc::new(open_root(&path, *budget, *target)?)));
+            let engine = Arc::new(open_root(&path, *budget, *target)?);
+            // An interrupted first open may leave an empty engine before its
+            // marker is installed. Never adopt unmarked existing history.
+            if missing_marker && !engine.raft_groups().is_empty() {
+                return Err(Error::Backend(
+                    "raft store marker missing for nonempty root".into(),
+                ));
+            }
+            opened.push((root.clone(), engine));
         }
         if opened.is_empty() {
             return Err(Error::Backend("no roots".into()));
@@ -366,7 +859,9 @@ impl ReadBackend {
     pub fn open_dump(roots: &[PathBuf]) -> Result<Arc<Self>> {
         for root in roots {
             let marker = root.join("dduroc-raft-v1");
-            if std::fs::read(&marker).map_err(backend_error)? != b"dduroc raft store v1\n" {
+            let value = crate::fsutil::read_required_bounded(&marker)?;
+            if value != b"dduroc raft store v1\n" && value != b"dduroc raft store v2 stats-writer\n"
+            {
                 return Err(Error::Backend("unknown raft store marker".into()));
             }
             if !root.join("raft-engine").is_dir() {
@@ -397,9 +892,8 @@ impl ReadBackend {
             .1
             .get(0, b"dduroc.store-id")
             .ok_or_else(|| Error::Backend("root store identity missing".into()))?;
-        let store_meta: crate::store::StoreMeta = postcard::from_bytes(
-            &std::fs::read(roots[0].join("store-meta")).map_err(backend_error)?,
-        )?;
+        let store_meta = crate::store::StoreMeta::read(&roots[0])?
+            .ok_or_else(|| Error::Backend("store metadata missing".into()))?;
         if store_id.as_slice() != store_meta.store_id.to_le_bytes() {
             return Err(Error::Backend("store metadata identity mismatch".into()));
         }
@@ -439,6 +933,25 @@ impl ReadBackend {
         Ok(boots)
     }
 
+    /// Verify existing bindings without creating or modifying any root metadata.
+    pub(crate) fn validate_existing_bindings(&self, expected: Option<u64>) -> Result<()> {
+        for (_, engine) in &self.roots {
+            match (expected, engine.get(0, b"dduroc.store-id")) {
+                (Some(id), Some(value)) if value == id.to_le_bytes() => {}
+                (_, None) if engine.raft_groups().is_empty() => {}
+                (Some(_), Some(_)) => {
+                    return Err(Error::Backend("foreign root store identity".into()));
+                }
+                _ => {
+                    return Err(Error::Backend(
+                        "root store identity missing or unexpected".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn bind_store(&self, store_id: u64) -> Result<()> {
         let _guard = self.mutation.lock().map_err(backend_error)?;
         let expected = store_id.to_le_bytes();
@@ -466,9 +979,28 @@ impl ReadBackend {
 
     fn cleanup_shadows_locked(&self) -> Result<()> {
         for (root, (_, engine)) in self.roots.iter().enumerate() {
-            for id in engine.raft_groups() {
-                if id == 0 || engine.get(0, &shadow_key(id)).is_none() {
-                    continue;
+            // A failed transform can leave only the durable reservation: the
+            // staging group does not exist until its first entry is copied.
+            // Enumerate reservations, not raft groups, or that ID could later
+            // be reused by a real channel while its shadow marker survives.
+            let mut reservations = Vec::new();
+            engine
+                .scan_raw_messages(0, Some(SHADOW_PREFIX), None, false, |key, value| {
+                    if !key.starts_with(SHADOW_PREFIX) {
+                        return false;
+                    }
+                    reservations.push((key.to_vec(), value.to_vec()));
+                    true
+                })
+                .map_err(backend_error)?;
+            for (pending, source) in reservations {
+                let id = std::str::from_utf8(&pending[SHADOW_PREFIX.len()..])
+                    .ok()
+                    .and_then(|suffix| suffix.parse::<u64>().ok())
+                    .filter(|&id| id != 0 && shadow_key(id) == pending)
+                    .ok_or_else(|| Error::Backend("invalid staging reservation".into()))?;
+                if source.len() != 8 || source == 0u64.to_le_bytes() || source == id.to_le_bytes() {
+                    return Err(Error::Backend("invalid staging reservation source".into()));
                 }
                 if engine.get(id, META_KEY).is_some() {
                     return Err(Error::Backend(
@@ -477,7 +1009,7 @@ impl ReadBackend {
                 }
                 let mut batch = LogBatch::default();
                 batch.add_command(id, raft_engine::Command::Clean);
-                batch.delete(0, shadow_key(id));
+                batch.delete(0, pending);
                 self.commit_maintenance(engine, &mut batch, true)?;
                 self.workers[root].purge().inspect_err(|_| {
                     self.failed.store(true, Ordering::Release);
@@ -548,6 +1080,9 @@ impl ReadBackend {
                     namespace: meta.namespace,
                     class,
                 };
+                class_index
+                    .counts
+                    .insert_initial(root_no, id, &key, load_counts(engine, id)?)?;
                 if index.insert(key, (root_no, id)).is_some() {
                     return Err(Error::Backend("duplicate channel identity".into()));
                 }
@@ -564,6 +1099,8 @@ impl ReadBackend {
             index: RwLock::new(index),
             mutation: Mutex::new(()),
             failed,
+            #[cfg(test)]
+            commit_fault: std::sync::atomic::AtomicU8::new(0),
             physical_limits,
             rewrite_reserves,
             targets,
@@ -571,6 +1108,7 @@ impl ReadBackend {
             class_limits: RwLock::new([u64::MAX; 3]),
             class_index: Mutex::new(class_index),
             workers,
+            snapshot_owner: Arc::new(()),
             metadata_accounting: Mutex::new(metadata_accounting),
         })
     }
@@ -588,6 +1126,19 @@ impl ReadBackend {
         paths: &[PathBuf],
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        self.metadata_update_apply(root, paths, operation, false, |value| value)
+    }
+
+    // `publish` runs only after durability and accounting succeed, while the
+    // mutation lock still serializes it with competing metadata writers.
+    pub(crate) fn metadata_update_apply<T, R>(
+        &self,
+        root: usize,
+        paths: &[PathBuf],
+        operation: impl FnOnce() -> Result<T>,
+        fence_operation_error: bool,
+        publish: impl FnOnce(T) -> R,
+    ) -> Result<R> {
         let _guard = self.mutation.lock().map_err(backend_error)?;
         if self.failed.load(Ordering::Acquire) {
             return Err(Error::StorageUnavailable(
@@ -659,13 +1210,24 @@ impl ReadBackend {
             }
         }
         drop(accounting);
-        if self.root_allocation(root)? > self.physical_limits[root] {
+        let allocation = self.root_allocation(root).map_err(|error| {
+            self.failed.store(true, Ordering::Release);
+            Error::StorageUnavailable(error.to_string())
+        })?;
+        if allocation > self.physical_limits[root] {
             self.failed.store(true, Ordering::Release);
             return Err(Error::StorageUnavailable(
                 "metadata exceeded physical root allocation limit".into(),
             ));
         }
-        result
+        match result {
+            Ok(value) => Ok(publish(value)),
+            Err(error) if fence_operation_error => {
+                self.failed.store(true, Ordering::Release);
+                Err(Error::StorageUnavailable(error.to_string()))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(test)]
@@ -722,9 +1284,39 @@ impl ReadBackend {
                 "physical root allocation limit reached".into(),
             ));
         }
+        #[cfg(test)]
+        let fault = if sync && !maintenance {
+            self.commit_fault.swap(0, Ordering::AcqRel)
+        } else {
+            0
+        };
+        #[cfg(test)]
+        if fault == 1 || fault == 2 {
+            self.failed.store(true, Ordering::Release);
+            return Err(Error::StorageUnavailable(
+                if fault == 1 {
+                    "injected pre-write EIO"
+                } else {
+                    "injected pre-write ENOSPC"
+                }
+                .into(),
+            ));
+        }
         if let Err(error) = engine.write(batch, sync) {
             self.failed.store(true, Ordering::Release);
             return Err(Error::StorageUnavailable(error.to_string()));
+        }
+        #[cfg(test)]
+        if fault == 3 || fault == 4 {
+            self.failed.store(true, Ordering::Release);
+            return Err(Error::StorageUnavailable(
+                if fault == 3 {
+                    "injected post-commit EIO"
+                } else {
+                    "injected post-commit ENOSPC"
+                }
+                .into(),
+            ));
         }
         Ok(())
     }
@@ -808,6 +1400,7 @@ impl ReadBackend {
         if index.len() >= 65536 {
             return Err(Error::Backend("channel catalog exceeds limit".into()));
         }
+        self.cleanup_shadows_locked()?;
         let id = engine
             .raft_groups()
             .into_iter()
@@ -828,6 +1421,7 @@ impl ReadBackend {
         batch
             .put(id, META_KEY.to_vec(), postcard::to_allocvec(&meta)?)
             .map_err(backend_error)?;
+        put_counts(&mut batch, id, &CountIndex::empty(meta.next_index, true))?;
         self.commit(engine, &mut batch, true)?;
         index.insert(key, (root, id));
         Ok(())
@@ -1053,7 +1647,49 @@ impl ReadBackend {
         raw.extend_from_slice(bytes);
         let mut entry = BytesValue::new();
         entry.set_value(raw);
+        let old_own_counts = load_counts(engine, id)?;
+        let mut own_counts = old_own_counts;
+        if let Some(counts) = own_counts.as_mut() {
+            subtract_counted_prefix(&self.workers[root], id, counts, first_before, compact_to)?;
+            if counts.complete {
+                match block_record_count(bytes) {
+                    Ok(Some(count)) => {
+                        counts.add(count)?;
+                        counts.next = meta.next_index;
+                    }
+                    // A malformed block must never result in a fabricated count.
+                    _ => own_counts = None,
+                }
+            }
+        }
+        let mut other_counts = Vec::new();
+        for (other_id, _, before, first, _) in &others {
+            if before > first
+                && let Some(mut counts) = load_counts(engine, *other_id)?
+            {
+                subtract_counted_prefix(
+                    &self.workers[root],
+                    *other_id,
+                    &mut counts,
+                    *first,
+                    *before,
+                )?;
+                let old = load_counts(engine, *other_id)?;
+                other_counts.push((*other_id, old, counts));
+            }
+        }
+        let mut changes = vec![(old_own_counts, own_counts)];
+        changes.extend(other_counts.iter().map(|(_, old, new)| (*old, Some(*new))));
+        let total_counts = class_index.counts.numbers(&changes)?;
         let mut batch = LogBatch::default();
+        if let Some(counts) = own_counts {
+            put_counts(&mut batch, id, &counts)?;
+        } else {
+            batch.delete(id, COUNTS_KEY.to_vec());
+        }
+        for (other_id, _, counts) in &other_counts {
+            put_counts(&mut batch, *other_id, counts)?;
+        }
         batch
             .put(
                 0,
@@ -1090,6 +1726,19 @@ impl ReadBackend {
             .put(id, META_KEY.to_vec(), postcard::to_allocvec(&meta)?)
             .map_err(backend_error)?;
         self.commit(engine, &mut batch, sync)?;
+        class_index
+            .counts
+            .apply(root, id, id, own_counts, Some(key), total_counts);
+        for (other_id, _, counts) in &other_counts {
+            class_index.counts.apply(
+                root,
+                *other_id,
+                *other_id,
+                Some(*counts),
+                None,
+                total_counts,
+            );
+        }
         self.retained_blocks.store(total, Ordering::Relaxed);
         class_index.totals[class] = class_total;
         if let Some(old) = old_self_head {
@@ -1166,6 +1815,10 @@ impl ReadBackend {
             .get(old_id, META_KEY)
             .ok_or_else(|| Error::Backend("channel metadata missing".into()))?;
         let mut meta: ChannelMeta = postcard::from_bytes(&raw_meta)?;
+        let old_counts = load_counts(engine, old_id)?;
+        let mut rewritten_counts = old_counts
+            .filter(|counts| counts.complete)
+            .map(|_| CountIndex::empty(meta.next_index, true));
         let new_id = engine
             .raft_groups()
             .into_iter()
@@ -1221,6 +1874,13 @@ impl ReadBackend {
                 entry.value.truncate(ENVELOPE_BYTES);
                 entry.value.extend_from_slice(new_bytes);
             }
+            if let Some(counts) = rewritten_counts.as_mut() {
+                match block_record_count(&entry.value[ENVELOPE_BYTES..]) {
+                    Ok(Some(count)) => counts.add(count)?,
+                    Ok(None) => {}
+                    Err(_) => rewritten_counts = None,
+                }
+            }
             let mut copy = LogBatch::default();
             copy.add_entries::<BlockEntry>(new_id, &[entry])
                 .map_err(backend_error)?;
@@ -1256,14 +1916,28 @@ impl ReadBackend {
         let old_head = head_sequence(&self.workers[root], old_id, first)?;
         let mut index_guard = self.index.write().map_err(backend_error)?;
         let mut class_index = self.class_index.lock().map_err(backend_error)?;
+        let total_counts = class_index
+            .counts
+            .numbers(&[(old_counts, rewritten_counts)])?;
         self.reserve_rewrite(root)?;
         let mut switch = LogBatch::default();
         switch
             .put(new_id, META_KEY.to_vec(), postcard::to_allocvec(&meta)?)
             .map_err(backend_error)?;
+        if let Some(counts) = rewritten_counts {
+            put_counts(&mut switch, new_id, &counts)?;
+        }
         switch.add_command(old_id, raft_engine::Command::Clean);
         switch.delete(0, pending);
         self.commit(engine, &mut switch, true)?;
+        class_index.counts.apply(
+            root,
+            old_id,
+            new_id,
+            rewritten_counts,
+            Some(key),
+            total_counts,
+        );
         index_guard.insert(key.clone(), (root, new_id));
         let class = key.class.index();
         class_index.heads[class].remove(&(old_head, root, old_id));
@@ -1284,18 +1958,247 @@ impl ReadBackend {
                 .get(id, META_KEY)
                 .ok_or_else(|| Error::Backend("channel metadata missing".into()))?;
             let meta: ChannelMeta = postcard::from_bytes(&bytes)?;
+            let counts = load_counts(engine, id)?;
             channels.push(ChannelInfo {
                 key: key.clone(),
                 schema_name: meta.schema_name,
                 protocol_version: meta.protocol_version,
                 retained_bytes: meta.retained_bytes,
+                quota_bytes: meta.quota_bytes,
+                counting_state: count_state(counts),
+                retained_records: counts.filter(|c| c.complete).map(|c| c.records),
+                retained_blocks: counts.filter(|c| c.complete).map(|c| c.blocks),
                 first_index: engine.first_index(id),
                 last_index: engine.last_index(id),
+                next_write_index: meta.next_index,
             });
         }
         channels
             .sort_by(|a, b| (&a.key.namespace, a.key.class).cmp(&(&b.key.namespace, b.key.class)));
         Ok(channels)
+    }
+
+    /// Global aggregates without visiting channels or reading retained blocks.
+    pub fn cached_statistics(&self) -> Result<CachedStatistics> {
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::StorageUnavailable(
+                "statistics unavailable after a storage failure".into(),
+            ));
+        }
+        let channels = self.index.read().map_err(backend_error)?.len() as u64;
+        let index = self.class_index.lock().map_err(backend_error)?;
+        let state = index.counts.state();
+        Ok(CachedStatistics {
+            counting_state: state,
+            retained_records: (state == CountingState::Complete).then_some(index.counts.records),
+            retained_blocks: (state == CountingState::Complete).then_some(index.counts.blocks),
+            logical_class_bytes: index.totals,
+            class_limits: *self.class_limits.read().map_err(backend_error)?,
+            channels,
+        })
+    }
+
+    /// Select the first incomplete channel from the bounded in-memory index.
+    pub fn pending_count_channel(&self) -> Result<Option<ChannelKey>> {
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::StorageUnavailable(
+                "count index unavailable after a storage failure".into(),
+            ));
+        }
+        Ok(self
+            .class_index
+            .lock()
+            .map_err(backend_error)?
+            .counts
+            .pending
+            .first_key_value()
+            .map(|(_, (_, key))| key.clone()))
+    }
+
+    /// Current configured logical class budgets. Offline callers must not
+    /// treat the backend's unconfigured defaults as persisted policy.
+    pub fn class_limits(&self) -> Result<[u64; 3]> {
+        Ok(*self.class_limits.read().map_err(backend_error)?)
+    }
+
+    /// Sample allocated storage under a bounded directory walk. The result is
+    /// a separate instant from a catalog snapshot and never exposes paths.
+    pub fn physical_stats(
+        &self,
+        max_entries: usize,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Vec<RootPhysicalStats>> {
+        if max_entries == 0 {
+            return Err(Error::Backend("invalid physical statistics limit".into()));
+        }
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::StorageUnavailable(
+                "statistics unavailable after a storage failure".into(),
+            ));
+        }
+        let accounting = self.metadata_accounting.lock().map_err(backend_error)?;
+        let mut result = Vec::with_capacity(self.roots.len());
+        let mut visited = 0usize;
+        for (index, (root, _)) in self.roots.iter().enumerate() {
+            let mut pending = vec![root.join("raft-engine")];
+            let (mut raft, mut log, mut rewrite) = (0u64, 0u64, 0u64);
+            while let Some(path) = pending.pop() {
+                if !keep_going() {
+                    return Err(Error::Backend("physical statistics cancelled".into()));
+                }
+                visited += 1;
+                if visited > max_entries {
+                    return Err(Error::Backend(
+                        "physical statistics directory limit exceeded".into(),
+                    ));
+                }
+                let meta = std::fs::symlink_metadata(&path).map_err(backend_error)?;
+                let allocated = meta
+                    .blocks()
+                    .checked_mul(512)
+                    .ok_or_else(|| Error::Backend("allocated byte count overflow".into()))?;
+                raft = raft
+                    .checked_add(allocated)
+                    .ok_or_else(|| Error::Backend("allocated byte count overflow".into()))?;
+                match path.extension().and_then(|s| s.to_str()) {
+                    Some("raftlog") => {
+                        log = log
+                            .checked_add(allocated)
+                            .ok_or_else(|| Error::Backend("allocated byte count overflow".into()))?
+                    }
+                    Some("rewrite") => {
+                        rewrite = rewrite
+                            .checked_add(allocated)
+                            .ok_or_else(|| Error::Backend("allocated byte count overflow".into()))?
+                    }
+                    _ => {}
+                }
+                if meta.is_dir() {
+                    for entry in std::fs::read_dir(&path).map_err(backend_error)? {
+                        if !keep_going() {
+                            return Err(Error::Backend("physical statistics cancelled".into()));
+                        }
+                        if pending.len().saturating_add(visited) >= max_entries {
+                            return Err(Error::Backend(
+                                "physical statistics directory limit exceeded".into(),
+                            ));
+                        }
+                        pending.push(entry.map_err(backend_error)?.path());
+                    }
+                }
+            }
+            let metadata = accounting[index].total;
+            result.push(RootPhysicalStats {
+                index,
+                allocated_bytes: metadata
+                    .checked_add(raft)
+                    .ok_or_else(|| Error::Backend("allocated byte count overflow".into()))?,
+                log_bytes: log,
+                rewrite_bytes: rewrite,
+                metadata_bytes: metadata,
+                physical_limit_bytes: self.physical_limits[index],
+            });
+        }
+        Ok(result)
+    }
+
+    /// Count one channel in a bounded durable step. This is explicit
+    /// maintenance; ordinary statistics snapshots never scan history.
+    /// The callback must be fast and must not re-enter this backend.
+    pub fn backfill_count_step(
+        &self,
+        key: &ChannelKey,
+        max_blocks: usize,
+        max_bytes: usize,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<CountingState> {
+        if max_blocks == 0 || max_blocks > 1024 || max_bytes == 0 || max_bytes > 64 * 1024 * 1024 {
+            return Err(Error::Backend("invalid backfill work limit".into()));
+        }
+        let _guard = self.mutation.lock().map_err(backend_error)?;
+        let marker = crate::fsutil::read_required_bounded(&self.roots[0].0.join("dduroc-raft-v1"))?;
+        let store_meta = crate::store::StoreMeta::read(&self.roots[0].0)?
+            .ok_or_else(|| Error::Backend("store metadata missing".into()))?;
+        if marker != b"dduroc raft store v2 stats-writer\n"
+            || store_meta.container_version != crate::store::STORE_METADATA_VERSION
+        {
+            return Err(Error::Backend(
+                "count backfill requires a writer-upgraded store".into(),
+            ));
+        }
+        let index = self.index.read().map_err(backend_error)?;
+        let (root, id) = *index
+            .get(key)
+            .ok_or_else(|| Error::Backend("unknown channel".into()))?;
+        if crate::fsutil::read_required_bounded(&self.roots[root].0.join("dduroc-raft-v1"))?
+            != b"dduroc raft store v2 stats-writer\n"
+        {
+            return Err(Error::Backend(
+                "count backfill requires an upgraded root".into(),
+            ));
+        }
+        let engine = &self.roots[root].1;
+        let raw = engine
+            .get(id, META_KEY)
+            .ok_or_else(|| Error::Backend("channel metadata missing".into()))?;
+        let meta: ChannelMeta = postcard::from_bytes(&raw)?;
+        let first = engine.first_index(id).unwrap_or(meta.next_index);
+        let old_counts = load_counts(engine, id)?;
+        let mut counts = old_counts.unwrap_or_else(|| CountIndex::empty(first, false));
+        if counts.complete {
+            return Ok(CountingState::Complete);
+        }
+        counts.next = counts.next.max(first);
+        if counts.next > meta.next_index {
+            return Err(Error::Backend("invalid count index".into()));
+        }
+        let mut blocks = 0usize;
+        let mut bytes = 0usize;
+        while counts.next < meta.next_index && blocks < max_blocks {
+            if !keep_going() {
+                return Err(Error::Backend("count backfill cancelled".into()));
+            }
+            let entry = self.workers[root]
+                .read(id, counts.next)?
+                .ok_or_else(|| Error::Backend("missing retained block".into()))?;
+            if entry.value.len() < ENVELOPE_BYTES
+                || u64::from_le_bytes(entry.value[..8].try_into().unwrap()) != counts.next
+            {
+                return Err(Error::Backend("invalid block envelope".into()));
+            }
+            let size = entry.value.len();
+            if size > max_bytes.saturating_sub(bytes) {
+                if blocks == 0 {
+                    return Err(Error::Backend("block exceeds backfill byte limit".into()));
+                }
+                break;
+            }
+            if let Some(count) = block_record_count(&entry.value[ENVELOPE_BYTES..])? {
+                counts.add(count)?;
+            }
+            counts.next = counts
+                .next
+                .checked_add(1)
+                .ok_or_else(|| Error::Backend("count index overflow".into()))?;
+            bytes += size;
+            blocks += 1;
+        }
+        if !keep_going() {
+            return Err(Error::Backend("count backfill cancelled".into()));
+        }
+        counts.complete = counts.next == meta.next_index;
+        let mut class_index = self.class_index.lock().map_err(backend_error)?;
+        let totals = class_index.counts.numbers(&[(old_counts, Some(counts))])?;
+        let mut batch = LogBatch::default();
+        put_counts(&mut batch, id, &counts)?;
+        self.commit(engine, &mut batch, true)?;
+        class_index
+            .counts
+            .apply(root, id, id, Some(counts), Some(key), totals);
+        Ok(count_state(Some(counts)))
     }
 
     pub fn read_blocks(
@@ -1322,12 +2225,17 @@ impl ReadBackend {
         let engine = &self.roots[root_no].1;
         let first = engine.first_index(id);
         let last = engine.last_index(id);
+        let meta = engine
+            .get(id, META_KEY)
+            .ok_or_else(|| Error::Backend("channel metadata missing".into()))?;
+        let next_write_index = postcard::from_bytes::<ChannelMeta>(&meta)?.next_index;
         if first.is_none() && last.is_none() {
             return Ok(BlockPage {
                 blocks: Vec::new(),
                 next_index: None,
                 first_index: None,
                 last_index: None,
+                next_write_index,
             });
         }
         if first.is_none() || last.is_none() {
@@ -1393,11 +2301,12 @@ impl ReadBackend {
             },
             first_index: first,
             last_index: last,
+            next_write_index,
         })
     }
 }
 
-fn validate_file_spans(path: &Path, target: u64) -> Result<()> {
+pub(crate) fn validate_file_spans(path: &Path, target: u64) -> Result<()> {
     let mut spans: [Option<(u64, u64)>; 2] = [None, None];
     if path.is_dir() {
         for entry in std::fs::read_dir(path).map_err(backend_error)? {
@@ -1498,6 +2407,336 @@ mod tests {
             .register_channel(0, key.clone(), "schema", 1)
             .unwrap();
         (dir, backend, key)
+    }
+
+    fn valid_block(records: usize) -> Vec<u8> {
+        let mut builder = dduroc_format::block::BlockBuilder::new();
+        for at in 0..records {
+            builder
+                .push(
+                    dduroc_format::Micros(at as u64),
+                    &dduroc_format::Record::Ext { bytes: b"x" },
+                )
+                .unwrap();
+        }
+        let mut bytes = Vec::new();
+        builder
+            .finish(0, dduroc_format::block::Compression::None, &mut bytes)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn retained_counts_follow_eviction_rewrite_and_bounded_backfill() {
+        let (dir, backend, key) = setup();
+        std::fs::write(
+            dir.path().join("dduroc-raft-v1"),
+            b"dduroc raft store v2 stats-writer\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("store-meta"),
+            postcard::to_allocvec(&crate::store::StoreMeta {
+                container_version: crate::store::STORE_METADATA_VERSION,
+                store_id: 42,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let bytes = valid_block(2);
+        let quota = (bytes.len() * 2) as u64;
+        for _ in 0..3 {
+            backend
+                .append_block(
+                    &key,
+                    BootCounter(0),
+                    ProtocolVersion(1),
+                    &bytes,
+                    Some(quota),
+                    true,
+                )
+                .unwrap();
+        }
+        let info = &backend.catalog().unwrap()[0];
+        assert_eq!(
+            (info.retained_records, info.retained_blocks),
+            (Some(4), Some(2))
+        );
+        let summary = backend.cached_statistics().unwrap();
+        assert_eq!(
+            (summary.retained_records, summary.retained_blocks),
+            (Some(4), Some(2))
+        );
+        let first = info.first_index.unwrap();
+        backend
+            .rewrite_channel(&key, |block| {
+                if block.index == first {
+                    Ok(None)
+                } else {
+                    Ok(Some(block))
+                }
+            })
+            .unwrap();
+        let info = &backend.catalog().unwrap()[0];
+        assert_eq!(
+            (info.retained_records, info.retained_blocks),
+            (Some(2), Some(1))
+        );
+        let summary = backend.cached_statistics().unwrap();
+        assert_eq!(
+            (summary.retained_records, summary.retained_blocks),
+            (Some(2), Some(1))
+        );
+        let (_, id) = backend.index.read().unwrap()[&key];
+        let mut batch = LogBatch::default();
+        batch.delete(id, COUNTS_KEY.to_vec());
+        backend
+            .commit(&backend.roots[0].1, &mut batch, true)
+            .unwrap();
+        drop(backend);
+        let backend =
+            ReadBackend::open_live(&[dir.path().to_path_buf()], &[1024 * 1024], &[128 * 1024])
+                .unwrap();
+        assert_eq!(
+            backend.cached_statistics().unwrap().counting_state,
+            CountingState::BackfillRequired
+        );
+        assert_eq!(
+            backend.catalog().unwrap()[0].counting_state,
+            CountingState::BackfillRequired
+        );
+        assert_eq!(
+            backend
+                .backfill_count_step(&key, 1, 1024 * 1024, || true)
+                .unwrap(),
+            CountingState::InProgress
+        );
+        assert_eq!(backend.catalog().unwrap()[0].retained_records, None);
+        assert_eq!(
+            backend
+                .backfill_count_step(&key, 1, 1024 * 1024, || true)
+                .unwrap(),
+            CountingState::Complete
+        );
+        let info = &backend.catalog().unwrap()[0];
+        assert_eq!(
+            (info.retained_records, info.retained_blocks),
+            (Some(2), Some(1))
+        );
+        let summary = backend.cached_statistics().unwrap();
+        assert_eq!(
+            (summary.retained_records, summary.retained_blocks),
+            (Some(2), Some(1))
+        );
+        assert!(backend.pending_count_channel().unwrap().is_none());
+        drop(backend);
+        let reopened = ReadBackend::open_dump(&[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(reopened.catalog().unwrap()[0].retained_records, Some(2));
+    }
+
+    #[test]
+    fn interrupted_backfill_tracks_concurrent_retention_and_append() {
+        let (dir, backend, key) = setup();
+        std::fs::write(
+            dir.path().join("dduroc-raft-v1"),
+            b"dduroc raft store v2 stats-writer\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("store-meta"),
+            postcard::to_allocvec(&crate::store::StoreMeta {
+                container_version: crate::store::STORE_METADATA_VERSION,
+                store_id: 42,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let bytes = valid_block(2);
+        let quota = (bytes.len() * 2) as u64;
+        for _ in 0..2 {
+            backend
+                .append_block(
+                    &key,
+                    BootCounter(0),
+                    ProtocolVersion(1),
+                    &bytes,
+                    Some(quota),
+                    true,
+                )
+                .unwrap();
+        }
+        let (_, id) = backend.index.read().unwrap()[&key];
+        let mut batch = LogBatch::default();
+        batch.delete(id, COUNTS_KEY.to_vec());
+        backend
+            .commit(&backend.roots[0].1, &mut batch, true)
+            .unwrap();
+        drop(backend);
+        let backend =
+            ReadBackend::open_live(&[dir.path().to_path_buf()], &[1024 * 1024], &[128 * 1024])
+                .unwrap();
+        let mut checkpoints = 0;
+        assert!(
+            backend
+                .backfill_count_step(&key, 2, 1024 * 1024, || {
+                    checkpoints += 1;
+                    checkpoints < 2
+                })
+                .is_err()
+        );
+        assert_eq!(
+            backend.cached_statistics().unwrap().counting_state,
+            CountingState::BackfillRequired
+        );
+        assert_eq!(
+            backend
+                .backfill_count_step(&key, 1, 1024 * 1024, || true)
+                .unwrap(),
+            CountingState::InProgress
+        );
+        backend
+            .append_block(
+                &key,
+                BootCounter(0),
+                ProtocolVersion(1),
+                &bytes,
+                Some(quota),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            backend
+                .backfill_count_step(&key, 2, 1024 * 1024, || true)
+                .unwrap(),
+            CountingState::Complete
+        );
+        let stats = backend.cached_statistics().unwrap();
+        assert_eq!(
+            (stats.retained_records, stats.retained_blocks),
+            (Some(4), Some(2))
+        );
+    }
+
+    #[test]
+    fn corrupt_block_never_becomes_a_fabricated_count() {
+        let (dir, backend, key) = setup();
+        std::fs::write(
+            dir.path().join("dduroc-raft-v1"),
+            b"dduroc raft store v2 stats-writer\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("store-meta"),
+            postcard::to_allocvec(&crate::store::StoreMeta {
+                container_version: crate::store::STORE_METADATA_VERSION,
+                store_id: 42,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut bytes = valid_block(1);
+        *bytes.last_mut().unwrap() ^= 1;
+        backend
+            .append_block(&key, BootCounter(0), ProtocolVersion(1), &bytes, None, true)
+            .unwrap();
+        assert_eq!(backend.cached_statistics().unwrap().retained_records, None);
+        assert!(
+            backend
+                .backfill_count_step(&key, 2, 1024 * 1024, || true)
+                .is_err()
+        );
+        let stats = backend.cached_statistics().unwrap();
+        assert_eq!(stats.counting_state, CountingState::BackfillRequired);
+        assert_eq!(stats.retained_records, None);
+    }
+
+    #[test]
+    fn class_eviction_updates_both_channels_cached_counts() {
+        let (_dir, backend, first) = setup();
+        let second = ChannelKey {
+            namespace: "other".into(),
+            class: StorageClass::Critical,
+        };
+        backend
+            .register_channel(0, second.clone(), "schema", 1)
+            .unwrap();
+        let bytes = valid_block(2);
+        backend
+            .set_class_limits([u64::MAX, (2 * bytes.len()) as u64, u64::MAX])
+            .unwrap();
+        backend
+            .append_block(
+                &first,
+                BootCounter(0),
+                ProtocolVersion(1),
+                &bytes,
+                None,
+                true,
+            )
+            .unwrap();
+        backend
+            .append_block(
+                &second,
+                BootCounter(0),
+                ProtocolVersion(1),
+                &bytes,
+                None,
+                true,
+            )
+            .unwrap();
+        backend
+            .append_block(
+                &second,
+                BootCounter(0),
+                ProtocolVersion(1),
+                &bytes,
+                None,
+                true,
+            )
+            .unwrap();
+        let rows = backend.catalog().unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key == first)
+                .unwrap()
+                .retained_records,
+            Some(0)
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key == second)
+                .unwrap()
+                .retained_records,
+            Some(4)
+        );
+        let stats = backend.cached_statistics().unwrap();
+        assert_eq!(
+            (stats.retained_records, stats.retained_blocks),
+            (Some(4), Some(2))
+        );
+    }
+
+    #[test]
+    fn cached_global_counts_cover_more_than_256_channels() {
+        let (_dir, backend, _) = setup();
+        for n in 0..300 {
+            backend
+                .register_channel(
+                    0,
+                    ChannelKey {
+                        namespace: format!("node-{n:03}"),
+                        class: StorageClass::Default,
+                    },
+                    "schema",
+                    1,
+                )
+                .unwrap();
+        }
+        let stats = backend.cached_statistics().unwrap();
+        assert_eq!(stats.channels, 301);
+        assert_eq!(stats.retained_records, Some(0));
+        assert_eq!(stats.retained_blocks, Some(0));
+        assert_eq!(stats.counting_state, CountingState::Complete);
     }
 
     #[test]
@@ -1878,6 +3117,41 @@ mod tests {
             let page = backend.read_blocks(key, 1, 10, 10, 100, false).unwrap();
             assert!(page.blocks.iter().all(|block| block.bytes == expected));
         }
+    }
+
+    #[test]
+    fn snapshot_from_another_backend_cannot_read_same_geometry() {
+        let (_a_dir, a, a_key) = setup();
+        let (_b_dir, b, b_key) = setup();
+        a.append_block(
+            &a_key,
+            BootCounter(1),
+            ProtocolVersion(1),
+            b"first",
+            None,
+            true,
+        )
+        .unwrap();
+        b.append_block(
+            &b_key,
+            BootCounter(1),
+            ProtocolVersion(1),
+            b"other",
+            None,
+            true,
+        )
+        .unwrap();
+        let snapshot = a
+            .snapshot_channels(|key| Ok(*key == a_key))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(!b.validate_snapshot(&snapshot, Some(1)).unwrap());
+        assert!(b.read_snapshot_block(&snapshot, 1).unwrap().is_none());
+        assert_eq!(
+            b.follow_status(&snapshot, 1).unwrap(),
+            SnapshotStatus::Replaced
+        );
     }
 
     #[test]

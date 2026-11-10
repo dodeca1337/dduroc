@@ -42,13 +42,18 @@ impl Timestamp {
         matches!(self, Timestamp::Boot(_))
     }
 
-    /// The moment one microsecond earlier — a "strictly before" bound.
+    /// A strictly earlier bound: one microsecond for boot time and one
+    /// nanosecond for UTC, saturating at the minimum representable time.
+    /// At that minimum no strictly earlier bound is representable.
     pub fn just_before(self) -> Self {
         match self {
             Timestamp::Boot(bt) => {
                 Timestamp::Boot(BootTime::new(bt.boot, Micros(bt.at.0.saturating_sub(1))))
             }
-            Timestamp::Utc(t) => Timestamp::Utc(t - chrono::TimeDelta::microseconds(1)),
+            Timestamp::Utc(t) => Timestamp::Utc(
+                t.checked_sub_signed(chrono::TimeDelta::nanoseconds(1))
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+            ),
         }
     }
 }
@@ -342,6 +347,12 @@ impl Query {
         self
     }
 
+    /// Select exactly one namespace, replacing any previous selection.
+    pub fn namespace(mut self, name: impl Into<String>) -> Self {
+        self.namespaces = NsSelect::Names(vec![name.into()]);
+        self
+    }
+
     pub fn group(mut self, prefix: impl Into<String>) -> Self {
         self.namespaces = NsSelect::Group(prefix.into());
         self
@@ -459,6 +470,18 @@ impl Query {
     /// window has to be broken down by run: each has its own scale and its own
     /// anchor.
     pub fn resolve(&self, epochs: &Epochs) -> Resolution {
+        self.resolve_controlled(epochs, || true)
+            .expect("unbounded resolution")
+    }
+
+    pub(crate) fn resolve_controlled(
+        &self,
+        epochs: &Epochs,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Option<Resolution> {
+        if !keep_going() {
+            return None;
+        }
         let relative = self.from.is_none_or(Timestamp::is_relative)
             && self.to.is_none_or(Timestamp::is_relative);
         if relative {
@@ -469,16 +492,19 @@ impl Query {
                     to: to.and_then(boot_time),
                 },
             };
-            return Resolution {
+            return Some(Resolution {
                 bounds,
                 unanchored: Vec::new(),
-            };
+            });
         }
 
         let mut runs = BTreeMap::new();
         let mut anchored = BTreeSet::new();
         let mut unanchored = Vec::new();
         for run in epochs.runs() {
+            if !keep_going() {
+                return None;
+            }
             match run_bounds(run.boot_counter, self.from, self.to, epochs) {
                 Fit::In(b) => {
                     anchored.insert(run.boot_counter);
@@ -490,10 +516,10 @@ impl Query {
                 Fit::Unanchored => unanchored.push(BootCounter(run.boot_counter)),
             }
         }
-        Resolution {
+        Some(Resolution {
             bounds: Bounds::Wall { runs, anchored },
             unanchored,
-        }
+        })
     }
 }
 
@@ -512,25 +538,65 @@ fn run_bounds(boot: u32, from: Option<Timestamp>, to: Option<Timestamp>, epochs:
         Some(Timestamp::Boot(b)) if b.boot.0 > boot => return Fit::Outside,
         Some(Timestamp::Boot(b)) if b.boot.0 == boot => Some(b.at),
         Some(Timestamp::Boot(_)) => None,
-        Some(Timestamp::Utc(t)) => match epochs.from_utc(boot, t) {
-            RunOffset::Unanchored => return Fit::Unanchored,
-            // The run started later than the lower bound — there is nothing to
-            // restrict.
-            RunOffset::BeforeStart => None,
-            RunOffset::At(m) => Some(m),
-        },
+        Some(Timestamp::Utc(t)) => {
+            if t.timestamp_subsec_nanos() >= 1_000_000_000 {
+                if matches!(epochs.from_utc(boot, t), RunOffset::Unanchored) {
+                    return Fit::Unanchored;
+                }
+                // Records have no leap-second representation. A lower bound
+                // during the leap begins at the following normal second.
+                let Some(next) = t
+                    .timestamp()
+                    .checked_add(1)
+                    .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+                else {
+                    return Fit::Outside;
+                };
+                match epochs.from_utc(boot, next) {
+                    RunOffset::Unanchored => return Fit::Unanchored,
+                    RunOffset::BeforeStart => None,
+                    RunOffset::At(m) => Some(m),
+                }
+            } else {
+                match epochs.from_utc(boot, t) {
+                    RunOffset::Unanchored => return Fit::Unanchored,
+                    // The run started later than the lower bound — there is nothing to
+                    // restrict.
+                    RunOffset::BeforeStart => None,
+                    // Records are on a microsecond grid. An inclusive lower bound
+                    // between ticks must round upward, not include the previous tick.
+                    RunOffset::At(m) => {
+                        let fractional = u64::from(t.timestamp_subsec_nanos() % 1_000 != 0);
+                        let Some(rounded) = m.0.checked_add(fractional) else {
+                            return Fit::Outside;
+                        };
+                        Some(Micros(rounded))
+                    }
+                }
+            }
+        }
     };
     let upper = match to {
         None => None,
         Some(Timestamp::Boot(b)) if b.boot.0 < boot => return Fit::Outside,
         Some(Timestamp::Boot(b)) if b.boot.0 == boot => Some(b.at),
         Some(Timestamp::Boot(_)) => None,
-        Some(Timestamp::Utc(t)) => match epochs.from_utc(boot, t) {
-            RunOffset::Unanchored => return Fit::Unanchored,
-            // The run started later than the upper bound — it is not here.
-            RunOffset::BeforeStart => return Fit::Outside,
-            RunOffset::At(m) => Some(m),
-        },
+        Some(Timestamp::Utc(t)) => {
+            let bound = if t.timestamp_subsec_nanos() >= 1_000_000_000 {
+                // The final representable tick before a leap is the last
+                // microsecond of its preceding normal second.
+                chrono::DateTime::from_timestamp(t.timestamp(), 999_999_000)
+                    .expect("a valid leap second has a preceding normal second")
+            } else {
+                t
+            };
+            match epochs.from_utc(boot, bound) {
+                RunOffset::Unanchored => return Fit::Unanchored,
+                // The run started later than the upper bound — it is not here.
+                RunOffset::BeforeStart => return Fit::Outside,
+                RunOffset::At(m) => Some(m),
+            }
+        }
     };
     Fit::In(RunBounds {
         from: lower,
@@ -686,6 +752,106 @@ mod tests {
     }
 
     #[test]
+    fn leap_second_bounds_select_only_representable_normal_ticks() {
+        use dduroc_engine::epochs::{HwBoot, Run};
+        let mut epochs = Epochs {
+            runs: vec![Run {
+                boot_counter: 0,
+                hw_boot_id: 0,
+                boottime_at_init_us: 0,
+            }],
+            hw_boots: vec![HwBoot {
+                hw_boot_id: 0,
+                kernel_boot_id: [0; 16],
+                utc_anchor_ms: Some(1_483_228_799_000),
+                anchor_source: None,
+                anchor_captured_us: None,
+            }],
+        };
+        let leap = chrono::DateTime::parse_from_rfc3339("2016-12-31T23:59:60.5Z")
+            .unwrap()
+            .to_utc();
+        let lower = Query::new().since(leap).resolve(&epochs);
+        assert_eq!(
+            lower.bounds.for_boot(BootCounter(0)).unwrap().from,
+            Some(Micros(1_000_000))
+        );
+        let upper = Query::new().until(leap).resolve(&epochs);
+        assert_eq!(
+            upper.bounds.for_boot(BootCounter(0)).unwrap().to,
+            Some(Micros(999_999))
+        );
+        assert!(!upper.bounds.contains(BootTime::from_raw(0, 1_000_000)));
+        assert!(lower.bounds.contains(BootTime::from_raw(0, 1_000_000)));
+        epochs.hw_boots[0].utc_anchor_ms = None;
+        assert_eq!(
+            Query::new().since(leap).resolve(&epochs).unanchored,
+            vec![BootCounter(0)]
+        );
+        assert_eq!(
+            Query::new().until(leap).resolve(&epochs).unanchored,
+            vec![BootCounter(0)]
+        );
+    }
+
+    #[test]
+    fn fractional_utc_bounds_round_on_the_record_grid_without_overflow() {
+        use dduroc_engine::epochs::{HwBoot, Run};
+        let mut epochs = Epochs {
+            runs: vec![Run {
+                boot_counter: 0,
+                hw_boot_id: 0,
+                boottime_at_init_us: 0,
+            }],
+            hw_boots: vec![HwBoot {
+                hw_boot_id: 0,
+                kernel_boot_id: [0; 16],
+                utc_anchor_ms: Some(-1_000),
+                anchor_source: None,
+                anchor_captured_us: None,
+            }],
+        };
+        let tick = chrono::DateTime::from_timestamp(-1, 2_000).unwrap();
+        let fractional = tick + chrono::TimeDelta::nanoseconds(1);
+        let bounds = Query::new()
+            .time_window(fractional, fractional)
+            .resolve(&epochs)
+            .bounds
+            .for_boot(BootCounter(0))
+            .unwrap();
+        assert_eq!(bounds.from, Some(Micros(3)));
+        assert_eq!(bounds.to, Some(Micros(2)));
+        let before = chrono::DateTime::<chrono::Utc>::MIN_UTC;
+        assert_eq!(Timestamp::Utc(before).just_before(), Timestamp::Utc(before));
+        assert_eq!(
+            Query::new()
+                .since(before)
+                .resolve(&epochs)
+                .bounds
+                .for_boot(BootCounter(0)),
+            Some(RunBounds::default())
+        );
+        assert_eq!(
+            Query::new()
+                .until(before)
+                .resolve(&epochs)
+                .bounds
+                .for_boot(BootCounter(0)),
+            None
+        );
+        epochs.hw_boots[0].utc_anchor_ms = Some(i64::MIN);
+        let far = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+        assert_eq!(
+            Query::new()
+                .since(far)
+                .resolve(&epochs)
+                .bounds
+                .for_boot(BootCounter(0)),
+            None
+        );
+    }
+
+    #[test]
     fn wall_lower_bound_before_run_start_keeps_whole_run() {
         use dduroc_engine::epochs::{HwBoot, Run};
         let anchor_ms = 1_700_000_000_000;
@@ -724,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn just_before_steps_one_microsecond_in_both_scales() {
+    fn just_before_steps_one_tick_in_each_scale() {
         let t = Timestamp::Boot(BootTime::from_raw(2, 100));
         assert_eq!(
             t.just_before(),

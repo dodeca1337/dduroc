@@ -24,7 +24,9 @@ pub struct Counters {
     pub segments_sealed: AtomicU64,
     /// Legacy segment counter, retained for API compatibility; zero in the raft writer.
     pub segments_rotated: AtomicU64,
-    /// Records lost to bounded admission or writer/storage failure.
+    /// Records refused by bounded admission or whose delivery was unconfirmed
+    /// after writer/storage failure. A failed sync may have persisted records;
+    /// this counter is not an exact count of records missing from disk.
     pub dropped: AtomicU64,
     /// Refusals reported by the quiet API for schema/type/size validation.
     /// Explicit try_* callers handle such refusals themselves. They differ
@@ -120,6 +122,7 @@ pub struct Stats {
     pub segments_sealed: u64,
     /// Legacy segment counter; zero for raft-backed stores.
     pub segments_rotated: u64,
+    /// Admission losses and unconfirmed delivery failures; see [`Counters::dropped`].
     pub dropped: u64,
     /// Refused as breaking the schema contract — see the field of the same name
     /// on [`Counters`].

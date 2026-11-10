@@ -71,7 +71,7 @@ that observed namespace-count penalty. Metadata/catalog memory and disk space
 still grow with distinct namespaces; this is bounded by explicit admission
 and count limits, not evidence of zero cost or unlimited namespace churn.
 
-## Verification environment
+## Published 0.1 verification environment
 
 The final workspace gate passed 423 tests, with two existing ignored doctests.
 Formatting, Clippy on all targets with warnings denied, and Rustdoc with
@@ -85,9 +85,213 @@ The concurrent-page/retention regression reproduced a missing-block error
 before page/append locking and passed after the fix. No physical board,
 filesystem power-cut campaign or target throughput measurement was performed.
 
+## Development checkpoints before the release audit
+
+These incremental checkpoints precede the final 0.2 release audit below. Their
+test counts describe earlier development states, not the current workspace.
+
+### Native API verification
+
+The development API passed 463 workspace tests, including 31 independently
+authored public API regressions; two existing doctests remain ignored. The
+public-contract test lives in `crates/dduroc/tests/public_api_contract.rs`.
+These are correctness checks, not fresh latency or target hardware benchmarks.
+
+| Contract | Verified cases |
+|---|---|
+| Schema ownership | Foreign events/metrics/limits/span kinds rejected before serialization; inert rejected spans; same-store cross-namespace parents; foreign-store rejection; typed migration output scope |
+| Decode provenance | Same names, IDs and compatible fields cannot reinterpret another reader's generated schema; conflicting live/offline registries rejected |
+| Finite cursor | Both orders, real identical timestamps, page-size retries, fixed roster/watermarks/time anchors, owned dump lock, strict pending/seed expiry |
+| Read budgets | Initial roster/epoch admission, filtered-out records, compressed and decoded bytes, cumulative output and state-seed work |
+| Cancellation and live | Stops during scanning, seed work and long waits; tracked empty-channel loss, unseen evicted intervals, generation change before cached output and after EOF |
+
+The equal-time fixture writes ordinary production blocks, then uses the pinned
+engine on a fresh isolated thread to re-encode their timestamps with the public
+format codec. Assertions preserve lengths, payloads, envelopes and metadata.
+It needs no production clock override or writable backend testing API.
+
+Formatting, Clippy and Rustdoc with warnings denied passed, as did all-target
+checks on Rust 1.88 and ARMv7 GNU and the writer-only library configuration.
+`06_bounded_reads` compiled and ran, paging six messages and reporting explicit
+cancellation. These gates do not change the physical acceptance limits above.
+
+### GraphQL verification
+
+The workspace including GraphQL passed 494 tests; two existing doctests remain
+ignored. The independent `crates/dduroc-graphql/tests/public_graphql.rs` suite
+passed all 23 public-execution scenarios through `execute`/`execute_stream`.
+This is host correctness evidence, not a target throughput or memory benchmark.
+
+| Contract | Verified cases |
+|---|---|
+| Reading and schema presentation | Multiple schemas, offline/unknown/manual schemas, exact wide integers and float bits, nested values, raw payloads, seeds, unanchored boots and truncation |
+| Cursor lifecycle | CAS revisions, busy/stale operations, page-size retry, idle/absolute lifetimes, explicit cancellation, operation timeout distinct from cursor lifetime |
+| Resource retirement | Pending-open admission, worker permits retained after timeout/abort, failed-operation capability cleanup, stream-drop cancellation, unread terminal queues retaining subscription capacity |
+| Bounded work | Client ceilings only tighten server limits, typed scan/retention/snapshot errors, bounded decode/render, selection/directive projection, aggregate alias budgets and reuse after rejection |
+
+The direct `embedded_schema` example executed both a query and a finite follow
+subscription. Its `--sdl` mode exported the checked-in GraphQL schema. No HTTP
+listener or frontend was exercised.
+
+Formatting, all-target Clippy and Rustdoc with warnings denied passed, as did
+the actual Rust 1.88 and ARMv7 GNU all-target workspace checks. The writer-only
+library configuration passed and its normal dependency graph excludes Tokio
+and GraphQL. The final example ran successfully and its SDL export exactly
+matched the checked-in schema. These gates do not establish physical target
+latency, flash behavior or a total RSS bound.
+
+### Embedded viewer and calendar-time verification
+
+The final Rust workspace passed 507 tests with two existing ignored doctests.
+Formatting, all-target Clippy and Rustdoc with warnings denied passed, along
+with actual Rust 1.88 and ARMv7 GNU all-target checks. The writer-only library
+and normal dependency graph still exclude Tokio, GraphQL and web hosting.
+The six router/asset cases passed again against the final generated assets.
+
+The frontend passed 62 tests with both opt-in real-browser cases enabled,
+using Node 22.23.2, npm 12.0.2 and the system Chrome executable. Svelte checking
+reported zero errors and warnings. The independent acceptance files exercised
+actual downloads, HTTP and modern WebSocket transport; the parent repeated the
+full suite. These are host correctness checks, not hardware throughput or a
+process-RSS guarantee.
+
+| Contract | Verified cases |
+|---|---|
+| Calendar time | Persisted anchor/reopen, live reader anchor refresh, RFC3339 offset equivalence, inclusive microsecond-grid bounds, nanosecond state seeds, leap seconds and minimum UTC saturation |
+| Time presentation | Calendar UTC by default, exact fractions, boot fallback, mixed anchored/unanchored rows, display switches without RPC or row reordering |
+| Export | Actual CSV/JSONL bytes, filters and exact UTC point, wide integers/float bits/Unicode/CSV escaping, metadata/diagnostics/summary, explicit partial download, output ceilings and cancellation/late acknowledgements |
+| Theme and layout | All four Carbon themes, stored choice across reload and OS preference changes, denied storage, no page/modal horizontal overflow at 320/477/698/1280 pixels |
+| Asset delivery | Nested mounts and proxy paths, exact bytes/MIME/cache, traversal rejection, production demo disabled, cold-cache local fonts across scripts/weights without unexpected network requests |
+
+The final generated distribution contains eight manifest-listed assets and
+956,581 bytes including its manifest. Its 25 build inputs fingerprint to
+`a47e93fad3b38e6e762b9642416697d847d1fb155f45e31bece0d423257b6e17`.
+The source-build path matched the shipped asset manifest and bytes exactly;
+temporary npm dependencies/cache were removed. Cargo package listing includes
+source, lockfile, fonts, licenses and generated assets without `node_modules`.
+A fresh default Cargo build succeeded with failing Node/npm/npx sentinels at
+the front of PATH and invoked none of them.
+
+Anchor storage resolution is milliseconds, while event offsets and returned
+UTC retain microseconds. This does not establish microsecond absolute clock
+accuracy. A host must explicitly supply a trusted current clock reading.
+Unknown session IDs after a lost open acknowledgement remain subject to host
+expiry; navigation cancellation is best effort. Physical flash/power-cut
+acceptance and target latency remain as limited in the earlier sections.
+
+### Retained statistics and operational verification
+
+The updated workspace passed 573 Rust tests with two existing ignored
+doctests. The optional recovery feature separately passed 18 recovery and
+metadata-acceptance cases. The final frontend passed 112 tests with all six
+real-browser cases enabled, serialized against the shared example server; Svelte checking reported zero errors/warnings.
+The parent repeated full gates after the independent acceptance work. The counted-opening change was checked through native, GraphQL and packaged viewer tests; count/rewind retain work ceilings while output quotas and snapshot identity are verified separately.
+
+| Contract | Verified cases |
+|---|---|
+| Exact retained statistics | Append, class/personal retention, rewrite tombstones, closed namespaces/reopen, CRC-checked incremental backfill and unchanged entries; cached global summary with 301 channels beyond ordinary read-channel limits |
+| Native/GraphQL semantics | Retained versus process-lifetime counters, offline null policy/runtime, exact wide scalars, optional physical root samples, bounded explicit indexing and real unknown-to-complete progression |
+| Metadata and critical failures | ENOSPC/EIO injections at five atomic metadata stages and critical adapter boundaries; no false ACK, old live UTC publication, post-rename/post-sync ambiguity, sticky refusal and prompt worker-exit handling |
+| Ownership and compatibility | Busy and inactive foreign custom-root markers remain unchanged on refusal; all existing bindings checked before writes; old writer guard upgraded independently of block codec |
+| Failure accounting | Four independently authored cases count queued, current, failed-block and other active-builder records exactly once as known/unconfirmed delivery failures |
+| Recovery copies | Existing source locks, overlap/symlink/limits/cancellation, immutable evidence manifests, initial/final strict inspection, explicit tolerant candidate only, corrupt/missing metadata and valid older closed classes/migrations |
+| Large-history UI | 5,030 real records over 79 pages through one cursor, no duplicates, at most five cached pages/320 records and 64 rendered record rows; cached back/forward adds no RPC |
+| Ergonomics | Header light/dark icon and persistence, actual Carbon ComboBox keyboard/custom values, separate exact allocated/retained values, downloads, local fonts and responsive layouts |
+| Carbon paging and row overflow | Native numeric picker from counted opening, no separate Go form or page-option list; 713×932 and 1440×932 Chromium transition sampling verifies natural table height and preserved horizontal/detail/page scrolling |
+| Exact filtered opening | Nine independent Rust cases cover filter families, byte-limited page counts, seeds, limits/zero results, incomplete/damaged/unknown data, retention, cancellation/deadline and prepared-seed quota; 5,000 matches traverse 79 pages on the original snapshot |
+| Initial native pagination | Actual first counted response exposes 5,030 matches/79 pages before first seek; radio-1 yields 3/1 while global retained stats stay 5,030; All namespace reset restores 5,030/79 and no Go form is present |
+| Message languages | Seven independent public Rust cases: ordered exact/equivalent choice, fallback, isolated readers and concurrent clients, service default inheritance, query/session/follow metadata, unknown schemas and confirmed compiled identity; new preferred manual-decoder refusal reproduced red then green |
+| Viewer language lifecycle | Persisted primary/secondary, exact schema alias choices, automatic current-page rendering without another snapshot, serialized rapid changes and pending acknowledgements, unchanged draft filters, explicit live resync, frozen export preferences and actual JSONL language metadata; raw text stays unchanged |
+| Indexed navigation | Nine independent public cases cover bounded progress, append/new-channel exclusion, forward/back/EOF replay, exact and filtered-tail page boundaries, CAS/dimension/mode errors, terminal retention/PageTooSmall, cumulative replay budgets and cached returned-byte accounting without repeated block scans |
+| Direct controls | Actual Go-to-page selection with one open snapshot/document, cached and uncached navigation after eviction/EOF; parent separately verified page 1 → 75 → 5 and automatic English-to-Russian rendering at page 5 |
+| Namespace reset | Regression reproduced before the fix: All namespaces must clear both ComboBox text and selected ID; native query and inherited/edited export scopes are checked, including real JSONL query metadata |
+
+The small compiled resource-profile example read 13 records with zero damaged
+blocks and no truncation. Its configured logical budgets derive a 20,971,520 B
+physical admission ceiling; its disposable host root occupied 24,576 B. These
+are a functional example, not a measured board profile or total-RSS bound.
+
+All-target Clippy and Rustdoc passed with warnings denied for the normal
+workspace and optional recovery code. Actual Rust 1.88 and ARMv7 GNU all-target
+checks passed, including recovery. The writer-only graph excludes Tokio,
+GraphQL, Axum and the optional SHA256 recovery dependency. The facade's optional
+recovery configuration and checked-in SDL were checked separately.
+
+Final UI inputs fingerprint to
+`81bea8eb6ea9e78a61d41d1ded1ff7675f6fb1ecf06e9ed8b58f873fccd509c2`.
+The 28 inputs produced eight manifest-listed assets; distribution size including
+the manifest is 1,077,883 B. Individual changed files are below 1 MB. Rebuilt
+assets match prebuilt bytes, npm scratch is removed, and default Cargo builds
+still succeed with failing Node/npm/npx sentinels without invoking them.
+
+Fault injection here models errors at host filesystem/adapter boundaries.
+It is not a physical power cut, actual full-flash/inode exhaustion, target
+throughput benchmark or multi-day target soak. Broader release automation remains deferred. The existing gate now includes
+recovery, writer-only tests and denied Rustdoc warnings. Recovery candidates may have lost data;
+preserving original/evidence bytes does not establish external ACK survival.
+
+## 0.2 release audit
+
+The final host gate passes 621 Rust tests with recovery enabled. The only
+ignored test is the opt-in disk characterization below; no doctests remain
+ignored. Formatting, all-target Clippy and Rustdoc with warnings denied,
+writer-only tests and actual Rust 1.88/ARMv7 all-target checks pass.
+
+Independent regressions cover failed-first-record migration/reopen, exhausted
+run/hardware/span identities, malformed or oversized metadata, final follow
+tails/new namespaces, release under critical traffic, full diagnostic blocks,
+invalid runtime thresholds, extreme channel configuration, Unicode templates,
+state migration wire types and malformed block counts/deltas. Production
+modules across all seven crates were reviewed; this is not a measured line or
+branch coverage percentage, and large test modules were sampled by risk.
+
+`cargo package --workspace --allow-dirty --locked -j 2` creates and builds all
+seven isolated archives. Failing Node/npm/npx sentinels were not invoked by
+this default path. All seven facade examples and the direct GraphQL example run successfully;
+the exported SDL matches the checked-in contract. The frontend passes all
+112 tests, with all six real-browser cases enabled against the rebuilt host;
+Svelte reports zero errors/warnings. Light/dark screenshots are actual Chromium
+captures under docs/images. Packaged source rebuilding with
+`--features dduroc-web/build-ui` and `DDUROC_VERIFY_PREBUILT=1` matches the asset
+manifest; scratch dependencies/cache are removed. Publication, commit/tag and push are separate steps.
+
+### Transient rewrite disk use
+
+Run the ignored fixture explicitly on a disposable disk-backed parent:
+
+```sh
+DDUROC_TEST_DISK_ROOT=/path/to/parent cargo test -p dduroc-engine --test rewrite_headroom -- --ignored --nocapture --test-threads=1
+```
+
+The ext4 host fixture uses a 32 MiB critical class budget, a 1 MiB file target,
+48 cold records of 512 KiB and a hot namespace with an 8 MiB quota. Compression
+is disabled. The sampler checks stable file identities in two inventories and
+discards scans crossing unlink/replacement, so its accepted file-byte samples
+are conservative lower bounds; directories are excluded.
+
+| Measurement | Result |
+|---|---|
+| Physical admission ceiling | 50,331,648 B (48 MiB) |
+| Sampled transient allocated file peak | 64,217,088 B (61.242 MiB) |
+| Final allocated root / retained logical data | 47,382,528 / 33,032,538 B |
+| Hot writes before explicit admission refusal | 52 acknowledged; next result unconfirmed |
+| Accepted / discarded inventory samples | 7,643 / 47 |
+| Cold payloads after reopen / hot quota | All 48 exact / at most 8 MiB |
+
+This confirms that admission headroom is not a hard transient rewrite ceiling.
+A partition needs additional GC working space; this single peak is not a
+universal sizing multiplier or maximum. The fixture verifies cold payloads,
+not the exact retained hot suffix, physical power cuts or long-duration wear.
+Stop producers and obtain a successful explicit sync when ordinary delivery
+needs a verdict; concurrent shutdown admission is not such a verdict.
+
 ## Scope of the historical tables
 
-The tables below describe the former custom segment backend. They are not
+The tables below describe the former custom segment backend. Historical
+end-to-end fixtures also used quiet writes without confirming every delivery;
+the current benchmark retries only QueueFull and checks completed writer counts.
+Those old throughput figures must not be treated as confirmed delivered-event
+rates under queue pressure. They are not
 performance evidence for the Raft Engine backend. Codec-only measurements
 remain useful for the unchanged record encoding; end-to-end and retention
 figures must be measured again for the new storage path.

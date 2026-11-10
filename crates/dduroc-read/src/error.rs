@@ -36,12 +36,34 @@ pub enum ReadError {
 
     #[error("invalid namespace selection pattern {0:?}")]
     BadPattern(String),
+    #[error("conflicting schema declarations for {0:?}")]
+    ConflictingSchema(String),
 
     #[error("such a query cannot be subscribed to: {0}")]
     NotFollowable(&'static str),
 
     #[error("invalid pagination cursor")]
     BadCursor,
+    #[error("read cancelled")]
+    Cancelled,
+    #[error("read deadline exceeded")]
+    Deadline,
+    #[error("read limit exceeded: {0:?}")]
+    LimitExceeded(crate::ReadResource),
+    #[error("snapshot was replaced")]
+    SnapshotExpired,
+    #[error("snapshot history was evicted")]
+    RetentionGap,
+    #[error("pagination is unavailable: {0}")]
+    UnsupportedSession(&'static str),
+    #[error("invalid or mixed pagination mode")]
+    InvalidNavigation,
+    #[error("exact count unavailable because the snapshot is incomplete")]
+    IncompleteCount,
+    #[error("page cannot contain the next entry")]
+    PageTooSmall,
+    #[error("read session stopped: {0}")]
+    SessionFailed(String),
 
     #[error("io: {context}: {source}")]
     Io {

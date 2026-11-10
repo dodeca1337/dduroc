@@ -35,6 +35,7 @@ const EVENTS: &[EventDesc] = &[
 ];
 fn schema() -> Schema {
     Schema {
+        identity: None,
         name: "acceptance",
         version: ProtocolVersion(1),
         languages: &[Language("en")],

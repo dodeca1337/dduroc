@@ -13,7 +13,10 @@ A root contains the `dduroc-raft-v1` marker and a `raft-engine/` directory owned
 by the pinned storage dependency. Compact control metadata also records store
 identity and clock epochs. Live readers share the engine; an offline Raft reader
 requires exclusive engine access and is not advertised as a filesystem-read-only
-operation.
+operation. The marker filename stays unchanged; a 0.2 writer uses marker content
+`dduroc raft store v2 stats-writer\n` and independent store-metadata writer
+version 3. A 0.2 reader accepts the original marker; 0.1 opens refuse upgraded
+roots. Block codec version 2 is independent of those backend metadata versions.
 
 Each log entry is a protobuf `BytesValue` containing:
 
@@ -58,7 +61,7 @@ root and verify the result before the old data can be removed.
 |---|---|---|---|
 | `boot_counter` | u32 | fixed u32 (the segment header) | one width everywhere (this cures the prototype's u16/u32 mismatch) |
 | µs since the run started | **a full u64** | u64 fixed / varint | the boot is no longer packed into the same 64 bits (it lives in the segment header), so the prototype's 48-bit ceiling is gone |
-| `event_id` | u16 | varint | ≤150 types per unit: usually 1 byte, with ×400 of headroom |
+| `event_id` | u16 | varint | usually 1 byte; up to 3 bytes across the full u16 space |
 | `metric_id` | u16 | varint | the identity of a telemetry series; ≤160 metrics means usually 1 byte |
 | `span_kind_id` | u16 | varint | — |
 | `span_id` | (boot u32, local u32) | varint local | a span lives strictly inside one run, so the boot is implicit from the segment; 0 means "outside any span" |
@@ -70,7 +73,7 @@ In the macro, `event_id`/`metric_id`/`span_kind_id` are **explicit only**
 prototype's silent remapping; remaps are done by migrations).
 
 **Number metrics densely from 1.** `metric_id` goes into every sample as a
-varint, so values below 128 cost one byte and values from 128 up cost two.
+varint, so values below 128 cost one byte and values 128–16383 cost two and 16384–65535 cost three.
 With dense numbering that changes nothing; a hole above `0x7F` costs +1 byte
 on every sample (an f32 sample: 7 → 8 bytes, +14%). The format does not break
 from it, but telemetry is the most frequent record there is, and there is no
@@ -90,7 +93,7 @@ reason to pay for arbitrary numbers.
 The limits are targets for validation and for sizing RAM (block buffers,
 segment inventories). The wire format does not change with them: an id is a
 varint in a u16 space, so holes left by migrations and growth past the limit
-do not break the format but merely lengthen an id to 2 bytes (values ≥128).
+do not break the format but merely lengthen an id to two or three bytes (values ≥128 or ≥16384).
 
 In the legacy container the namespace and channel are implicit in the path
 `<root>/<namespace>/<channel>/<segment>`. The current backend persists this
@@ -241,7 +244,7 @@ format but the codec is not built in (a C dependency complicates
 cross-building for armv7) — reading such a block gives a clear error rather
 than garbage.
 
-Recovery of an active segment: a sequential walk over the blocks, stopping at
+Legacy active-segment recovery (not current strict Raft recovery): a sequential walk over the blocks, stopping at
 a zero header (the normal case), at running past the file, at a CRC that does
 not agree, or at a gap in `seq` → the file's logical length is the end of the
 last valid block.
@@ -264,7 +267,9 @@ A sequence of records. Every record:
 
 `Δt` is the µs since the **previous record in the block** (for the first one,
 since `base_micros`, so 0). A delta from the neighbour rather than from the
-base: smaller numbers, shorter varints.
+base: smaller numbers, shorter varints. A nonzero first delta, premature end
+before `count` records or trailing records beyond `count` is a format error.
+The iterator stops after its first error.
 
 | kind | record | fields after Δt |
 |---|---|---|
@@ -343,7 +348,7 @@ The other record invariants the decoder checks:
 A state machine's state costs as much as a small integer: only the code
 reaches the disk, while its label and severity live in the schema.
 
-## 4. The footer (on sealed segments only)
+## 4. The legacy footer (on sealed segments only)
 
 Written at seal time: `ftruncate` to the actual end of the data → append the
 footer → `fdatasync`. The sign of sealedness: the file's last 4 bytes are the
@@ -407,7 +412,11 @@ physically fit in the sections. Surplus bytes after the parsed sections are
 rejected: the length in the trailer is covered by the CRC, so a discrepancy is
 a sign of forgery rather than of slack.
 
-## 5. The write rules
+## 5. The legacy write rules
+
+These rules describe the former segment writer. Current Raft write, barrier,
+retention and staging-group migration rules are in DESIGN.md; they do not
+preallocate or seal one segment per channel.
 
 - The order of bytes to disk: append only; a block is written with one
   `pwrite` (header plus body), then the channel's policy (`fdatasync` for
@@ -539,8 +548,8 @@ a sign of forgery rather than of slack.
 
 ## 6. epochs.bin
 
-A small file (kilobytes), updated atomically: temp plus `fdatasync` plus
-`rename`. A postcard-serialized structure:
+Bounded control metadata updated atomically: temp plus `fdatasync`, `rename`
+and parent-directory `fsync`. A postcard-serialized structure:
 
 ```
 Epochs {
@@ -559,14 +568,12 @@ HwBoot { hw_boot_id u32,
 - A run is registered at start; the hardware boot is determined from the
   kernel's `kernel_boot_id` rather than from `BOOTTIME` increasing (the latter
   got it wrong on a quick restart after a reboot).
-- A run number is one greater than the largest in the file. If no file is left
-  (a quarantine after corruption, a cleanup of the medium), the lower bound is
-  taken from the **segment names**: they outlived the file, and `boot_counter`
-  is written into every one of them. Starting the numbering over would place
-  new segments before the old ones in the history — the order of names is
-  declared chronological — and rotation, deleting the oldest, would start on
-  the fresh records. The walk over names is done only in that case: with an
-  intact file the maximum over `runs` already covers everything on disk.
+- A live writer allocates above both the metadata maximum and the maximum
+  boot counter retained in backend blocks (legacy helpers inspect segment
+  names). The retained floor is checked on every live open, including when
+  the file is parseable but incomplete. A u32 identity space exhausted at
+  either run or hardware-boot allocation returns an error; IDs never wrap or
+  saturate into reuse.
 - `utc_anchor_ms` is **milliseconds as an integer** rather than a serialized
   date: eight bytes against twelve, and the file format does not depend on how
   some other crate represents a date. The API hands out a `DateTime<Utc>`
@@ -582,19 +589,18 @@ HwBoot { hw_boot_id u32,
 - A knowably implausible moment in time (outside 2001-09-09 … 2100-01-01) is
   rejected: the anchor is retroactive, and one call with garbage would distort
   the UTC of that boot's whole history.
-- A damaged file is moved to quarantine (`epochs.corrupt`) **only by the
-  writing side**. A reader writes nothing: a dump brought in for analysis may
-  sit on read-only media or be material evidence in the incident being
-  investigated.
-- Retention: runs of which no segments are left are cleaned out
-  (`Store::compact_epochs`). The live runs are determined by a walk over
-  segment **names** — a `readdir` per channel, without opening a single file;
-  the current run is never deleted. The cleanup is called on its own when the
-  store comes up, but only once the file really has grown (of the order of a
-  thousand entries): walking directories with thousands of namespaces is not
-  free, while a stale entry costs tens of bytes. A run of which segments
-  remain is not touched — otherwise its records would lose their anchoring to
-  UTC.
+- Ordinary opens bound the encoded file to 8 MiB and require exactly one
+  complete postcard value. Missing/decode-corrupt files retain the original
+  fallback: a reader exposes boot time without anchors; a writer preserves
+  decode-corrupt evidence as `epochs.corrupt` before starting new metadata.
+  It refuses to overwrite an existing quarantine. Oversized metadata, duplicate
+  run/hardware/kernel identities, missing hardware references and unrepresentable
+  UTC anchors return an error without resetting the file.
+- Retention removes runs without retained blocks (`Store::compact_epochs`),
+  preserving the current run. Automatic cleanup begins after the metadata
+  grows past its maintenance threshold. Retained run discovery uses backend
+  block metadata; the legacy path uses segment names. The encoded-size cap
+  remains an admission limit rather than a guarantee of indefinite retention.
 
 ## 7. What is deliberately NOT on disk
 
@@ -623,7 +629,12 @@ Resolved from the binary's schema at read time:
 Records of types absent from the current schema are read as "an unknown type"
 (skipped by `payload_len`) — until a migration is run.
 
-## 8. Migrations
+## 8. Legacy container migrations
+
+The schema migration chain and typed payload rules also apply to the current
+backend. The physical `.seg.tmp`/rename procedure below is historical; the
+Raft backend instead copies a channel into a staging group and atomically
+publishes its replacement. See DESIGN.md for the current commit protocol.
 
 Two places carry a protocol version, and they mean different things:
 

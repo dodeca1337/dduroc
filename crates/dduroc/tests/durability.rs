@@ -6,10 +6,30 @@
 //! the existing tests: they need either a real death of the process or
 //! knowingly awkward sizes.
 
+#![cfg(feature = "read")]
+
 use dduroc::prelude::*;
 use dduroc::{ChannelConfig, StorageClass, StoreConfig};
 use dduroc_read::{Order, Query, Reader};
 use std::path::Path;
+
+/// Retry only a pre-admission queue refusal, with a bounded test deadline.
+fn retry_queue_full(mut write: impl FnMut() -> dduroc::Result<()>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match write() {
+            Ok(()) => return,
+            Err(dduroc::Error::QueueFull) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "write queue did not drain"
+                );
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("test write failed: {error}"),
+        }
+    }
+}
 
 dduroc::schema! {
     name: durability,
@@ -161,7 +181,7 @@ fn crashed_blocks_keep_their_protocol_version_and_record_types() {
         .unwrap();
     assert!(!out.status.success());
     let store = Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
-    let reader = store.reader().with_schema(durability::SCHEMA);
+    let reader = store.reader().with_schema(durability::SCHEMA).unwrap();
     let records = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(records.is_complete());
     assert_eq!(records.entries.len(), 2);
@@ -226,7 +246,7 @@ fn oversized_records_are_rejected_before_enqueue_and_announced() {
     );
 
     // The hole is announced in the stream itself, not only in a counter.
-    let reader = store.reader().with_schema(durability::SCHEMA);
+    let reader = store.reader().with_schema(durability::SCHEMA).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     let announced = result.entries.iter().any(|e| {
         matches!(&e.kind, dduroc_read::EntryKind::Text { target,text,.. }
@@ -272,7 +292,7 @@ fn reopened_namespace_does_not_leave_a_second_state_on_the_directory() {
     store.shutdown();
 
     // Not one record was lost on the way.
-    let reader = store.reader().with_schema(durability::SCHEMA);
+    let reader = store.reader().with_schema(durability::SCHEMA).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(result.is_complete(), "damage: {:?}", result.damaged);
     assert_eq!(result.entries.len(), 200, "four rounds of fifty");
@@ -291,9 +311,7 @@ fn records_enqueued_before_the_handle_is_dropped_still_land() {
     {
         let ns = store.namespace("orc-0", durability::SCHEMA).unwrap();
         for _ in 0..2_000 {
-            while ns.try_log(durability::events::Tick).is_err() {
-                std::thread::yield_now();
-            }
+            retry_queue_full(|| ns.try_log(durability::events::Tick));
             accepted += 1;
         }
     } // the handle was released without a sync
@@ -303,7 +321,7 @@ fn records_enqueued_before_the_handle_is_dropped_still_land() {
     drop(store.namespace("orc-0", durability::SCHEMA).unwrap());
     store.shutdown();
 
-    let reader = store.reader().with_schema(durability::SCHEMA);
+    let reader = store.reader().with_schema(durability::SCHEMA).unwrap();
     let result = reader.query(&Query::new().order(Order::Oldest)).unwrap();
     assert!(
         result.entries.len() as u64 >= accepted,

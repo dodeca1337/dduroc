@@ -34,8 +34,10 @@
 // `ChannelScope`, `Prefilter` and the rest live here, but only the fruits of
 // their work, listed below, belong to the public API. An open module would
 // oblige us to keep the machinery compatible too.
+mod budget;
 mod cursor;
 mod error;
+mod language;
 pub mod query;
 mod reader;
 
@@ -43,16 +45,19 @@ mod reader;
 /// our own, and a user should not have to add a dependency for a query bound.
 pub use chrono;
 
+pub use budget::{Cancellation, PageLimits, ReadLimits, ReadResource};
 pub use cursor::{Damage, Liveness, OwnedRecord, OwnedSampleValue, RawEntry};
 /// The storage class — the same type as on the writing side: a channel is a
 /// class.
 pub use dduroc_engine::schema::StorageClass;
 pub use dduroc_format::{BootCounter, BootTime, Micros};
 pub use error::{ReadError, Result};
+pub use language::{InvalidLanguagePreferences, LanguagePreferences, LanguageSelection};
 pub use query::{
     Bounds, Filter, KindFilter, NsSelect, Order, Query, Resolution, RunBounds, Timestamp,
 };
 pub use reader::{
-    Entry, EntryKind, EntryStream, Follow, NamespaceInfo, NamespaceListing, QueryResult, Reader,
-    Tail, render as render_with_schema,
+    CatalogChannel, ClassStatistics, ControlledFollow, Entry, EntryKind, EntryStream, Follow,
+    FollowItem, NamespaceInfo, NamespaceListing, QueryPage, QueryResult, QuerySession, QueryTotals,
+    Reader, RenderedMessage, SeekPage, Statistics, Tail, render as render_with_schema,
 };

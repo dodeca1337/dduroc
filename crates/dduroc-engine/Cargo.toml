@@ -22,9 +22,22 @@ postcard.workspace = true
 rustix.workspace = true
 serde.workspace = true
 smallvec.workspace = true
+sha2 = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+
+[features]
+default = []
+recovery = ["dep:sha2", "dep:serde_json"]
+
+[[example]]
+name = "recover_copy"
+required-features = ["recovery"]
+
+[package.metadata.docs.rs]
+features = ["recovery"]

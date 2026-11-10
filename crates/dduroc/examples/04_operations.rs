@@ -22,9 +22,8 @@ dduroc::schema! {
 
     events {
         Ping = 0x01 { level: Debug, en: "ping {seq}", seq: u32 },
-        // Critical data goes into its own channel: an fdatasync right after the
-        // write (group commit), no compression, and a queue in which on
-        // overflow the caller WAITS for room rather than losing the record.
+        // Critical success acknowledges a synchronous backend write. Its own
+        // queue waits for room; I/O failures still leave durability unconfirmed.
         Fault = 0x02 { level: Error, store: critical, en: "fault {code}", code: u8 },
     }
 
@@ -44,8 +43,8 @@ fn chunk(index: u64) -> Vec<u8> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let base = std::env::temp_dir().join("dduroc-examples").join("04");
-    let _ = std::fs::remove_dir_all(&base);
+    let directory = tempfile::tempdir()?;
+    let base = directory.path();
 
     rotation(&base.join("rotation"))?;
     ceiling(&base.join("ceiling"))?;
@@ -56,8 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ---------------------------------------------------------------------------
 // 1. Rotation within a class budget. The budget answers "how much history to
-// keep for ALL telemetry": the class writes in a circle, the oldest segment
-// goes whole, and fresh data is never refused.
+// keep for ALL telemetry": oldest blocks are removed from logical history.
+// The backend reclaims physical space separately; writes can still fail.
 // ---------------------------------------------------------------------------
 fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     println!("— rotation within a class budget —");
@@ -67,9 +66,9 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             // The snapshots are dense already — compression would only burn
             // CPU.
             compression: Compression::None,
-            // Telemetry tolerates a minute unwritten — fewer fdatasyncs.
+            // Telemetry tolerates a minute unwritten — fewer storage barriers.
             sync_interval: std::time::Duration::from_secs(60),
-            // 12 MiB of budget with a 4 MiB segment: three segments live.
+            // 12 MiB of logical retention; shared raft files target 4 MiB.
             segment_bytes: 4 << 20,
             ..ChannelConfig::new(12 << 20)
         },
@@ -90,10 +89,16 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 
     let stats = store.stats();
     println!(
-        "  segments created {}, sealed {}, rotated {}; records lost {}",
-        stats.segments_created, stats.segments_sealed, stats.segments_rotated, stats.dropped
+        "  blocks written {}, encoded bytes {}; records lost {}",
+        stats.blocks_written, stats.bytes_written, stats.dropped
     );
-    assert!(stats.segments_rotated > 0, "{stats:?}");
+    assert!(
+        store.read_backend().catalog()?.iter().any(|channel| {
+            channel.key.class == StorageClass::Telemetry
+                && channel.first_index.is_some_and(|first| first > 1)
+        }),
+        "the class budget must evict a real block prefix"
+    );
     store.shutdown();
 
     // What survived: the oldest available snapshot is no longer number zero.
@@ -118,7 +123,7 @@ fn rotation(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 // 2. A class budget is shared by every namespace. The number of services grows
 // while the budget of "all telemetry" does not: the channels draw on it
-// together, and when it is exceeded the CLASS's oldest segment is evicted
+// together, and when it is exceeded the CLASS's oldest blocks are evicted
 // whoever's namespace it lies in — a quiet service does not hold space a noisy
 // one lacks. (A personal limit for a greedy service is
 // `store.namespace_with_quota` plus NsQuota, and one for a whole group at once
@@ -146,7 +151,7 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
                 "orc-",
                 GroupPolicy::new().channel(
                     StorageClass::Telemetry,
-                    ChannelOverride::new().segment_bytes(2 << 20),
+                    ChannelOverride::new().block_max_bytes(32 << 10),
                 ),
             )
             // A ceiling on the RAM held for block buffers — not a budget: a
@@ -193,8 +198,8 @@ fn ceiling(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         println!("  {}: {} KiB taken", ns.name, ns.total_bytes >> 10);
     }
     println!(
-        "  the quiet one wrote 6 MiB — its head was evicted by another stream of the \
-         same class; neither ceiling was ever exceeded (space: {}, memory: {})\n",
+        "  the quiet one wrote 6 MiB — retained history competes across the class; \
+         observed overruns (logical budget: {}, buffer target: {})\n",
         stats.budget_overruns, stats.buffer_overruns
     );
     Ok(())
@@ -231,10 +236,9 @@ fn losses(root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The critical channel: the queue is full and the caller waits for room.
-    // Slower, but the alarm will not be lost.
+    // Success acknowledges a synchronous backend write; errors must be handled.
     for code in 0..2_000u32 {
-        ns.try_log(probe::events::Fault { code: code as u8 })
-            .expect("a critical write is not lost");
+        ns.try_log(probe::events::Fault { code: code as u8 })?;
     }
 
     // Writing a type that is not in the schema is a contract violation, a build

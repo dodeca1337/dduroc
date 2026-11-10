@@ -24,8 +24,12 @@ use std::sync::{Arc, Mutex};
 const LOCK_FILE: &str = ".lock";
 /// The name of the store metadata file.
 const STORE_META: &str = "store-meta";
+// This is the store writer-compatibility version, independent of the block
+// and legacy segment codec version in dduroc-format.
+pub(crate) const STORE_METADATA_VERSION: u8 = 3;
 const RAFT_MARKER: &str = "dduroc-raft-v1";
-const RAFT_MARKER_CONTENT: &[u8] = b"dduroc raft store v1\n";
+const RAFT_MARKER_OLD: &[u8] = b"dduroc raft store v1\n";
+const RAFT_MARKER_CONTENT: &[u8] = b"dduroc raft store v2 stats-writer\n";
 
 fn check_store_format(root: &Path) -> Result<()> {
     if !root.exists() {
@@ -33,9 +37,9 @@ fn check_store_format(root: &Path) -> Result<()> {
     }
     let marker = root.join(RAFT_MARKER);
     if marker.exists() {
-        if std::fs::read(&marker).ctx_path("reading raft store marker", &marker)?
-            != RAFT_MARKER_CONTENT
-        {
+        let value = fsutil::read_optional_bounded(&marker)?
+            .ok_or_else(|| Error::Backend("raft store marker disappeared".into()))?;
+        if value != RAFT_MARKER_CONTENT && value != RAFT_MARKER_OLD {
             return Err(Error::Backend("unknown raft store marker".into()));
         }
         return Ok(());
@@ -64,12 +68,22 @@ fn check_store_format(root: &Path) -> Result<()> {
 /// The store's metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreMeta {
-    /// The container format version.
+    /// Store metadata and writer-compatibility version, independent of block codec.
     pub container_version: u8,
     /// Durable identity shared by the main metadata and every configured raft
     /// root. Mismatched roots are refused so foreign runs cannot inherit local
     /// time anchors. Legacy segment headers also carry their store identity.
     pub store_id: u64,
+}
+
+impl StoreMeta {
+    /// Read store metadata without changing the directory.
+    pub fn read(root: &Path) -> Result<Option<Self>> {
+        let path = root.join(STORE_META);
+        fsutil::read_optional_bounded(&path)?
+            .map(|bytes| fsutil::decode_metadata(&path, &bytes))
+            .transpose()
+    }
 }
 
 /// The store's settings.
@@ -99,6 +113,8 @@ pub struct StoreConfig {
     pub default_budget_bytes: u64,
     /// The write queue capacities. Allocated whole when the store is opened.
     pub queues: QueueSizes,
+    /// Aggregate producer payload limits for normal and critical queues.
+    pub queue_byte_limits: crate::QueueByteLimits,
     /// Flush threshold for aggregate writer block buffers. `None` selects the
     /// 16 MiB default; it does not disable the bound. The writer flushes and
     /// releases block allocations at the threshold, which can be exceeded by
@@ -123,6 +139,7 @@ impl StoreConfig {
             channels: HashMap::new(),
             default_budget_bytes: 64 * 1024 * 1024,
             queues: QueueSizes::default(),
+            queue_byte_limits: crate::QueueByteLimits::default(),
             buffer_ceiling_bytes: None,
             groups: Vec::new(),
         }
@@ -152,6 +169,12 @@ impl StoreConfig {
     /// behind becomes noticeable.
     pub fn with_queues(mut self, queues: QueueSizes) -> Self {
         self.queues = queues;
+        self
+    }
+
+    /// Set independent producer byte limits for normal and critical queues.
+    pub fn with_queue_byte_limits(mut self, limits: crate::QueueByteLimits) -> Self {
+        self.queue_byte_limits = limits;
         self
     }
 
@@ -242,6 +265,7 @@ impl StoreConfig {
     /// two shared log targets violates the conservative root rotation/rewrite
     /// headroom constraint. This is independent of a namespace's logical quota.
     fn validate(&self) -> Result<()> {
+        self.queue_byte_limits.validate()?;
         // raft-engine 0.4.2 uses usize for its physical size counters. Leave
         // room for log rotation and rewriting on 32-bit targets.
         let mut root_budgets: HashMap<PathBuf, u64> = HashMap::new();
@@ -522,9 +546,13 @@ impl Store {
         }
         fsutil::create_dir_all_synced(&config.root)?;
         let lock = acquire_lock(&config.root)?;
-        let marker = config.root.join(RAFT_MARKER);
-        if !marker.exists() {
-            fsutil::write_atomic(&marker, RAFT_MARKER_CONTENT)?;
+        // Recheck after locking: another writer could have upgraded a marker
+        // after the initial preflight and before our lock acquisition.
+        check_store_format(&config.root)?;
+        for class in StorageClass::ALL {
+            if let Some(root) = &config.config_for(None, class).custom_root {
+                check_store_format(root)?;
+            }
         }
 
         // The class roots and the budget groups. The medium key comes from
@@ -542,10 +570,6 @@ impl Store {
                 .clone()
                 .unwrap_or_else(|| config.root.clone());
             fsutil::create_dir_all_synced(&base)?;
-            let marker = base.join(RAFT_MARKER);
-            if !marker.exists() {
-                fsutil::write_atomic(&marker, RAFT_MARKER_CONTENT)?;
-            }
             let c = canon(&base);
             if keys.iter().any(|existing| {
                 *existing != c && (existing.starts_with(&c) || c.starts_with(existing))
@@ -597,8 +621,44 @@ impl Store {
                 *target = 64 * 1024;
             }
         }
+        // Open all engines first: their exclusive locks prevent altering a
+        // busy foreign root. Verify all existing bindings without writing.
         let backend =
             crate::backend::ReadBackend::open_live(&scan_roots, &root_budgets, &root_targets)?;
+        let meta_path = config.root.join(STORE_META);
+        let existing_meta = StoreMeta::read(&config.root)?;
+        if let Some(meta) = &existing_meta
+            && meta.container_version > STORE_METADATA_VERSION
+        {
+            return Err(Error::Corrupt {
+                path: meta_path,
+                reason: format!(
+                    "container version {} is newer than the supported one ({}): this build cannot parse a layout from the future",
+                    meta.container_version, STORE_METADATA_VERSION
+                ),
+            });
+        }
+        backend.validate_existing_bindings(existing_meta.as_ref().map(|meta| meta.store_id))?;
+        // Only verified, locked roots are upgraded. Old writers reject this
+        // marker, while store metadata version 3 guards their preflight race.
+        for (index, root) in scan_roots.iter().enumerate() {
+            let marker = root.join(RAFT_MARKER);
+            let paths = [
+                root.clone(),
+                marker.clone(),
+                root.join("dduroc-raft-v1.tmp"),
+            ];
+            backend.metadata_update(index, &paths, || {
+                match fsutil::read_optional_bounded(&marker)? {
+                    Some(value) if value == RAFT_MARKER_CONTENT => Ok(()),
+                    Some(value) if value == RAFT_MARKER_OLD => {
+                        fsutil::write_atomic(&marker, RAFT_MARKER_CONTENT)
+                    }
+                    None => fsutil::write_atomic(&marker, RAFT_MARKER_CONTENT),
+                    Some(_) => Err(Error::Backend("unknown raft store marker".into())),
+                }
+            })?;
+        }
         let mut class_limits = [0u64; 3];
         for class in StorageClass::ALL {
             class_limits[class.index()] = config.config_for(None, class).budget_bytes;
@@ -648,6 +708,7 @@ impl Store {
         let writer = Writer::spawn(
             Arc::clone(&counters),
             config.queues,
+            config.queue_byte_limits,
             groups,
             config.buffer_ceiling_bytes,
             Arc::clone(&pulse),
@@ -719,6 +780,15 @@ impl Store {
         self.meta
     }
 
+    /// One compiled schema descriptor without cloning the entire registry.
+    pub fn schema(&self, name: &str) -> Option<Schema> {
+        self.schemas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .copied()
+    }
+
     /// The store's marks about new data — what a reader's subscription sleeps
     /// on.
     ///
@@ -755,6 +825,9 @@ impl Store {
     /// The channels draw on the shared budgets of their classes; for a
     /// namespace that deserves a personal limit there is
     /// [`Store::namespace_with_quota`].
+    /// A schema name selects one compiled declaration/version for this Store's
+    /// lifetime. Reuse that declaration across namespaces; reopen the Store
+    /// when activating new code/version and its explicit migrations.
     pub fn namespace(self: &Arc<Self>, name: &str, schema: Schema) -> Result<Namespace> {
         self.namespace_with_quota(name, schema, NsQuota::default())
     }
@@ -782,6 +855,19 @@ impl Store {
             return Err(Error::BadSchema {
                 name: schema.name.to_owned(),
                 reason: "schema name exceeds metadata limit".into(),
+            });
+        }
+
+        // The reader resolves durable schema names through this registry. A
+        // second declaration with the same name must not replace the first
+        // decoder. Hold the registry lock through successful registration so
+        // concurrent namespace opens cannot both pass this check.
+        let mut schemas = self.schemas.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = schemas.get(schema.name)
+            && (existing.identity != schema.identity || existing.version != schema.version)
+        {
+            return Err(Error::ForeignSchema {
+                schema: schema.name,
             });
         }
 
@@ -873,10 +959,7 @@ impl Store {
         })?;
 
         self.locked_open().insert(name.to_owned(), Some(id));
-        self.schemas
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(schema.name, schema);
+        schemas.insert(schema.name, schema);
         guard.disarm();
 
         Ok(Namespace::new(
@@ -923,7 +1006,9 @@ impl Store {
         self.epochs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record a time synchronization.
+    /// Record a time synchronization. `utc` must represent the current time
+    /// at this call, not the timestamp of an earlier event: it is paired with
+    /// the current hardware clock to establish a retroactive anchor.
     ///
     /// Returns `false` if the source is less trustworthy than the anchor
     /// already written (a manual entry does not beat GPS).
@@ -940,8 +1025,16 @@ impl Store {
             self.root.join("epochs.bin.tmp"),
             self.root.join("epochs.corrupt"),
         ];
-        self.backend
-            .metadata_update(0, &paths, || self.locked_epochs().record_sync(utc, source))
+        self.backend.metadata_update_apply(
+            0,
+            &paths,
+            || self.locked_epochs().prepare_record_sync(utc, source),
+            true,
+            |(accepted, candidate)| {
+                self.locked_epochs().publish(candidate);
+                accepted
+            },
+        )
     }
 
     /// Remove entries from `epochs.bin` about runs of which no segments are
@@ -963,12 +1056,19 @@ impl Store {
             self.root.join("epochs.bin.tmp"),
             self.root.join("epochs.corrupt"),
         ];
-        self.backend.metadata_update(0, &paths, || {
-            let mut epochs = self.locked_epochs();
-            let before = epochs.epochs().runs.len();
-            epochs.retain_runs(&|boot| live.contains(&boot))?;
-            Ok(before - epochs.epochs().runs.len())
-        })
+        self.backend.metadata_update_apply(
+            0,
+            &paths,
+            || {
+                self.locked_epochs()
+                    .prepare_retain_runs(&|boot| live.contains(&boot))
+            },
+            true,
+            |(removed, candidate)| {
+                self.locked_epochs().publish(candidate);
+                removed
+            },
+        )
     }
 
     /// Convert relative time into wall-clock time. `None` means there is no
@@ -988,6 +1088,26 @@ impl Store {
         self.locked_epochs().epochs().clone()
     }
 
+    /// Capture time anchors only when both registry sizes fit the caller's
+    /// limits. Counts are checked while locked, before cloning either vector.
+    pub fn epochs_limited(&self, max_runs: usize, max_hw: usize) -> Result<crate::epochs::Epochs> {
+        let store = self.locked_epochs();
+        let epochs = store.epochs();
+        if epochs.runs.len() > max_runs {
+            return Err(Error::EpochLimit {
+                resource: "epoch_runs",
+                limit: max_runs,
+            });
+        }
+        if epochs.hw_boots.len() > max_hw {
+            return Err(Error::EpochLimit {
+                resource: "hardware_boots",
+                limit: max_hw,
+            });
+        }
+        Ok(epochs.clone())
+    }
+
     /// The current moment in the same coordinates as the records.
     pub fn now(&self) -> BootTime {
         self.clock.now_at()
@@ -1005,9 +1125,9 @@ impl Store {
     /// stopped or the thread has died. The losses are accounted for in
     /// [`Stats::dropped`].
     ///
-    /// A reader's subscription needs this so as not to wait forever for someone
-    /// there is nobody left to write for: a thread killed by a panic never gets
-    /// to set the close mark ([`crate::pulse::Pulse::close`]).
+    /// Reader subscriptions also observe the publication pulse, closed by the
+    /// worker exit guard after its final committed writes. Liveness remains
+    /// independently available through this method.
     pub fn is_writing(&self) -> bool {
         self.writer.is_alive()
     }
@@ -1017,7 +1137,9 @@ impl Store {
         self.writer.sync(None)
     }
 
-    /// Finish: write out, seal the segments, stop the writer.
+    /// Stop new admission, perform a bounded drain/barrier and stop the writer.
+    /// Stop producers first and call `sync()` when ordinary delivery needs an
+    /// explicit verdict; concurrent ordinary admission is not a shutdown ACK.
     pub fn shutdown(&self) {
         self.writer.shutdown();
     }
@@ -1141,13 +1263,9 @@ fn acquire_lock(root: &Path) -> Result<File> {
 /// Future metadata versions are rejected before decoding payload history.
 fn load_or_create_meta(root: &Path) -> Result<(StoreMeta, Option<u8>)> {
     let path = root.join(STORE_META);
-    let current = dduroc_format::CONTAINER_VERSION;
+    let current = STORE_METADATA_VERSION;
 
-    if let Some(bytes) = fsutil::read_optional(&path)? {
-        let meta: StoreMeta = postcard::from_bytes(&bytes).map_err(|_| Error::Corrupt {
-            path: path.clone(),
-            reason: "the store metadata does not parse".to_owned(),
-        })?;
+    if let Some(meta) = StoreMeta::read(root)? {
         if meta.container_version > current {
             return Err(Error::Corrupt {
                 path,
@@ -1204,19 +1322,64 @@ fn fresh_store_id() -> u64 {
     h
 }
 
-/// Allocate a span identifier.
+/// Allocate a span identifier exactly once within this run.
 ///
-/// The numbering is local to a run and is not persisted. On a u32 overflow the
-/// counter wraps to 1: reading matches a span's start with its end within a
-/// time window, and billions of events pass between repeats of one number.
-pub(crate) fn next_span_id(counter: &AtomicU32) -> dduroc_format::SpanId {
-    let raw = counter.fetch_add(1, Ordering::Relaxed);
-    dduroc_format::SpanId(if raw == 0 { 1 } else { raw })
+/// Zero is a permanent exhaustion marker. Reusing an identifier could attach
+/// new events or an end record to a still-open span from earlier in the run.
+pub(crate) fn next_span_id(counter: &AtomicU32) -> Option<dduroc_format::SpanId> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |raw| {
+            (raw != 0).then(|| raw.wrapping_add(1))
+        })
+        .ok()
+        .map(dduroc_format::SpanId)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_store_metadata_refuses_trailing_and_oversized_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path())).unwrap();
+        store.shutdown();
+        drop(store);
+        let path = dir.path().join(STORE_META);
+        let original = std::fs::read(&path).unwrap();
+        let mut trailing = original.clone();
+        trailing.push(0);
+        std::fs::write(&path, &trailing).unwrap();
+        assert!(StoreMeta::read(dir.path()).is_err());
+        assert!(Store::open(StoreConfig::new(dir.path())).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), trailing);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((fsutil::CONTROL_METADATA_MAX_BYTES + 1) as u64)
+            .unwrap();
+        assert!(StoreMeta::read(dir.path()).is_err());
+        assert!(Store::open(StoreConfig::new(dir.path())).is_err());
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            (fsutil::CONTROL_METADATA_MAX_BYTES + 1) as u64
+        );
+    }
+
+    #[test]
+    fn epoch_snapshot_limits_are_checked_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path())).unwrap();
+        let epochs = store.epochs();
+        assert!(!epochs.runs.is_empty());
+        assert!(!epochs.hw_boots.is_empty());
+        assert!(store.epochs_limited(0, usize::MAX).is_err());
+        assert!(store.epochs_limited(usize::MAX, 0).is_err());
+        assert_eq!(
+            store
+                .epochs_limited(epochs.runs.len(), epochs.hw_boots.len())
+                .unwrap(),
+            epochs
+        );
+    }
 
     #[test]
     fn cached_metadata_allocation_tracks_namespace_and_epochs() {
@@ -1234,6 +1397,7 @@ mod tests {
             decoders: None,
         }];
         let schema = Schema {
+            identity: None,
             name: "cache-test",
             version: ProtocolVersion(1),
             languages: LANGUAGES,
@@ -1263,6 +1427,7 @@ mod tests {
         store.compact_epochs().unwrap();
         check();
         let wrong = Schema {
+            identity: None,
             name: "other-schema",
             ..schema
         };
@@ -1549,16 +1714,45 @@ mod tests {
             "the store identity must be preserved: otherwise our own segments \
              would become foreign"
         );
-        assert_eq!(
-            upgraded.meta().container_version,
-            dduroc_format::CONTAINER_VERSION
-        );
+        assert_eq!(upgraded.meta().container_version, STORE_METADATA_VERSION);
         upgraded.shutdown();
         drop(upgraded);
 
         // Opening it again no longer counts as coming up.
         let again = Store::open(cfg).unwrap();
         assert_eq!(again.upgraded_from(), None);
+    }
+
+    #[test]
+    fn writer_guard_upgrades_old_marker_and_metadata_without_changing_block_codec() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StoreConfig::new(dir.path());
+        let store = Store::open(config.clone()).unwrap();
+        let id = store.meta().store_id;
+        drop(store);
+        std::fs::write(dir.path().join(RAFT_MARKER), RAFT_MARKER_OLD).unwrap();
+        std::fs::write(
+            dir.path().join(STORE_META),
+            postcard::to_allocvec(&StoreMeta {
+                container_version: 2,
+                store_id: id,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // The new reader can still open an old-format dump before upgrade.
+        let reader = crate::backend::ReadBackend::open_dump(&[dir.path().to_path_buf()]).unwrap();
+        drop(reader);
+        let upgraded = Store::open(config).unwrap();
+        assert_eq!(upgraded.meta().container_version, STORE_METADATA_VERSION);
+        assert_eq!(upgraded.meta().store_id, id);
+        assert_eq!(
+            std::fs::read(dir.path().join(RAFT_MARKER)).unwrap(),
+            RAFT_MARKER_CONTENT
+        );
+        assert_ne!(RAFT_MARKER_CONTENT, RAFT_MARKER_OLD); // published 0.1's exact preflight
+        const { assert!(STORE_METADATA_VERSION > dduroc_format::CONTAINER_VERSION) }; // old writer's second guard
+        assert_eq!(dduroc_format::CONTAINER_VERSION, 2); // block/segment codec unchanged
     }
 
     #[test]
@@ -1573,7 +1767,7 @@ mod tests {
         drop(s);
 
         let future = StoreMeta {
-            container_version: dduroc_format::CONTAINER_VERSION + 1,
+            container_version: STORE_METADATA_VERSION + 1,
             store_id,
         };
         std::fs::write(
@@ -1635,6 +1829,7 @@ mod tests {
             decoders: None,
         }];
         let schema = Schema {
+            identity: None,
             name: "probe",
             version: ProtocolVersion(1),
             languages: LANGS,
@@ -1712,6 +1907,7 @@ mod tests {
             decoders: None,
         }];
         let schema = Schema {
+            identity: None,
             name: "probe",
             version: ProtocolVersion(1),
             languages: LANGS,
@@ -1816,17 +2012,23 @@ mod tests {
     }
 
     #[test]
-    fn span_ids_never_zero() {
-        let c = AtomicU32::new(u32::MAX - 1);
-        let a = next_span_id(&c);
-        let b = next_span_id(&c);
-        let wrapped = next_span_id(&c);
-        assert_ne!(a.0, 0);
-        assert_ne!(b.0, 0);
-        assert_ne!(
-            wrapped.0, 0,
-            "the sentinel must not be handed out after an overflow"
-        );
+    fn span_ids_exhaust_permanently_without_zero_or_reuse() {
+        let counter = AtomicU32::new(u32::MAX - 7);
+        let ids = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| next_span_id(&counter)))
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let mut raw: Vec<_> = ids.into_iter().map(|id| id.0).collect();
+        raw.sort_unstable();
+        assert_eq!(raw, ((u32::MAX - 7)..=u32::MAX).collect::<Vec<_>>());
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(next_span_id(&counter), None);
+        assert_eq!(next_span_id(&counter), None);
     }
 
     #[test]

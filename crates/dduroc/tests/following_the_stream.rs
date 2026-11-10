@@ -10,6 +10,8 @@
 //! but that a subscription does not lose it at the seams: an unfinished tail, a
 //! change of segment, a namespace brought up after it.
 
+#![cfg(feature = "read")]
+
 use dduroc::prelude::*;
 use dduroc::{ChannelConfig, StorageClass, StoreConfig, StoreExt};
 use dduroc_read::{Follow, Order, Query, Reader, Tail};

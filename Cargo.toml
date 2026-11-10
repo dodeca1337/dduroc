@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Dodeca Shaven <dodeca@tutamail.com>"]
 license = "MIT OR Apache-2.0"
@@ -17,6 +17,8 @@ members = [
     "crates/dduroc-format",
     "crates/dduroc-macros",
     "crates/dduroc-read",
+    "crates/dduroc-graphql",
+    "crates/dduroc-web",
 ]
 
 [workspace.dependencies]
@@ -29,6 +31,21 @@ crossbeam-channel = "0.5"
 smallvec = { version = "1", features = ["union"] }
 raft-engine = { version = "=0.4.2", default-features = false, features = ["std_fs"] }
 protobuf = "2.28"
+# 7.0.17 is the last family supporting this workspace's Rust 1.88 minimum.
+async-graphql = { version = "=7.0.17", default-features = false }
+async-graphql-derive = "=7.0.17"
+async-graphql-parser = "=7.0.17"
+async-graphql-value = "=7.0.17"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync", "time"] }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+getrandom = "0.3"
+base64 = "0.22"
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+async-graphql-axum = "=7.0.17"
+tower = { version = "0.5", features = ["util"] }
+sha2 = "0.10"
+
 # Wall-clock time is UTC only: a device does not need time zones, and `clock`
 # would drag in the zone database (iana-time-zone). `now` gives `Utc::now()`
 # without it.
@@ -48,10 +65,13 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 tempfile = "3"
 
 # ── internal ──────────────────────────────────────────────────────────────────
-dduroc-format = { version = "=0.1.0", path = "crates/dduroc-format" }
-dduroc-engine = { version = "=0.1.0", path = "crates/dduroc-engine" }
-dduroc-read = { version = "=0.1.0", path = "crates/dduroc-read" }
-dduroc-macros = { version = "=0.1.0", path = "crates/dduroc-macros" }
+dduroc = { version = "=0.2.0", path = "crates/dduroc" }
+dduroc-graphql = { version = "=0.2.0", path = "crates/dduroc-graphql" }
+dduroc-web = { version = "=0.2.0", path = "crates/dduroc-web" }
+dduroc-format = { version = "=0.2.0", path = "crates/dduroc-format" }
+dduroc-engine = { version = "=0.2.0", path = "crates/dduroc-engine" }
+dduroc-read = { version = "=0.2.0", path = "crates/dduroc-read" }
+dduroc-macros = { version = "=0.2.0", path = "crates/dduroc-macros" }
 
 [profile.release]
 # The target platform is armv7 with limited flash: the binary size matters.

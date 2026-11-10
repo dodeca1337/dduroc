@@ -105,11 +105,9 @@ impl ChannelConfig {
         // This preserves rotation/rewrite headroom; it is not a per-channel
         // active-segment reservation.
         //
-        // The multiplication saturates: `segment_bytes` comes from the
-        // application's configuration, and an ordinary one would overflow a u64
-        // into a debug panic where the answer is obvious — such a budget is
-        // knowably too small.
-        if self.budget_bytes < self.segment_bytes.saturating_mul(2) {
+        // Compare after division so extreme configuration values cannot
+        // overflow or make an unrepresentable two-target budget look valid.
+        if self.segment_bytes > self.budget_bytes / 2 {
             return Err(
                 "the class budget is below two shared log targets required for rotation/rewrite headroom",
             );
@@ -117,7 +115,7 @@ impl ChannelConfig {
         if self.block_max_bytes < 512 {
             return Err("the block is too small: the overhead would eat the savings");
         }
-        if (self.block_max_bytes as u64) * 2 > self.segment_bytes {
+        if self.block_max_bytes as u64 > self.segment_bytes / 2 {
             return Err(
                 "the block is comparable to a segment: a segment would not hold even two blocks",
             );
@@ -127,8 +125,11 @@ impl ChannelConfig {
 
     /// Ratio of the logical budget to the shared log target; not a physical
     /// file count, because raft files interleave namespaces and classes.
+    /// A zero log target returns zero; the configuration still fails validation.
     pub fn max_segments(&self) -> u64 {
-        (self.budget_bytes / self.segment_bytes).max(1)
+        self.budget_bytes
+            .checked_div(self.segment_bytes)
+            .map_or(0, |count| count.max(1))
     }
 }
 
@@ -304,6 +305,31 @@ mod tests {
         let mut c = ChannelConfig::new(64 * 1024 * 1024);
         c.block_max_bytes = c.segment_bytes as usize;
         assert!(c.validate(crate::schema::StorageClass::Default).is_err());
+    }
+
+    #[test]
+    fn extreme_and_zero_sizes_are_refused_without_arithmetic_panics() {
+        let mut config = ChannelConfig::new(u64::MAX);
+        config.segment_bytes = u64::MAX;
+        assert!(
+            config
+                .validate(crate::schema::StorageClass::Default)
+                .is_err()
+        );
+        config.segment_bytes = 0;
+        assert_eq!(config.max_segments(), 0);
+        assert!(
+            config
+                .validate(crate::schema::StorageClass::Default)
+                .is_err()
+        );
+        config.segment_bytes = 8 << 20;
+        config.block_max_bytes = usize::MAX;
+        assert!(
+            config
+                .validate(crate::schema::StorageClass::Default)
+                .is_err()
+        );
     }
 
     #[test]

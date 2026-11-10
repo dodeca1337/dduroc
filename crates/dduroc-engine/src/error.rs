@@ -41,6 +41,14 @@ pub enum Error {
     )]
     UnknownEvent { schema: &'static str, event: u16 },
 
+    #[error(
+        "typed descriptor belongs to a different schema declaration or version than {schema:?}"
+    )]
+    ForeignSchema { schema: &'static str },
+
+    #[error("span is inactive or belongs to a different live store")]
+    ForeignSpan,
+
     #[error("span kind {kind} is not declared in schema {schema:?}")]
     UnknownSpanKind { schema: &'static str, kind: u16 },
 
@@ -55,6 +63,17 @@ pub enum Error {
         schema: &'static str,
         class: crate::schema::StorageClass,
     },
+
+    /// A bounded anchor snapshot was refused before copying its registry.
+    #[error("epoch snapshot exceeds {resource} limit {limit}")]
+    EpochLimit {
+        resource: &'static str,
+        limit: usize,
+    },
+
+    /// A persistent epoch identity cannot be advanced without reuse.
+    #[error("epoch identity exhausted: {0}")]
+    EpochIdentityExhausted(&'static str),
 
     #[error("invalid store setting {setting}: {reason}")]
     BadStore {
@@ -144,6 +163,9 @@ pub enum Error {
     )]
     StoreBusy(PathBuf),
 
+    #[error("span identifier space exhausted for this run")]
+    SpanIdExhausted,
+
     #[error("the store is shutting down")]
     ShuttingDown,
 
@@ -226,7 +248,9 @@ impl<T> IoContext<T> for std::result::Result<T, rustix::io::Errno> {
 }
 
 impl Error {
-    /// Whether the error means the **record was lost**.
+    /// Whether delivery of the record was not confirmed.
+    /// An I/O failure can leave an unacknowledged record on the medium; this
+    /// predicate does not authorize an automatic retry.
     ///
     /// The caller's main question on the write path, and it must not require
     /// matching the whole enum: a loss is a state of the medium (the queue is
@@ -238,6 +262,7 @@ impl Error {
         matches!(
             self,
             Error::QueueFull
+                | Error::SpanIdExhausted
                 | Error::WriterDead
                 | Error::ShuttingDown
                 | Error::StorageUnavailable(_)
@@ -253,7 +278,9 @@ impl Error {
     pub fn breaks_contract(&self) -> bool {
         matches!(
             self,
-            Error::UnknownEvent { .. }
+            Error::ForeignSchema { .. }
+                | Error::ForeignSpan
+                | Error::UnknownEvent { .. }
                 | Error::UnknownMetric { .. }
                 | Error::UnknownSpanKind { .. }
                 | Error::ValueTypeMismatch { .. }

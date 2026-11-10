@@ -11,6 +11,11 @@
 //! retroactive, and one synchronization gives a UTC to every record of that
 //! boot, those made before it included.
 //!
+//! Generated events, metrics and span kinds are bound to their exact schema
+//! declaration and current version. Equal names or IDs do not make declarations
+//! interchangeable. A manual [`Schema`] sets `identity: None` and uses explicit
+//! raw-ID/payload APIs; it does not acquire a typed binding by matching a name.
+//!
 //! ```no_run
 //! dduroc::schema! {
 //!     name: radio,
@@ -119,7 +124,10 @@
 //! - `03_schema_grows` — migrations: `history {}`, rules, reading through the
 //!   steps and the explicit physical run `Namespace::migrate`;
 //! - `04_operations` — operating it: channel policy, rotation, the store
-//!   ceiling, accounting for and announcing losses.
+//!   ceiling, accounting for and announcing losses;
+//! - `05_quickstart` — a minimal critical event in a caller-selected directory;
+//! - `06_bounded_reads` — bounded pages and cooperative cancellation;
+//! - `07_small_resource_profile` — explicit queue, writer and read limits.
 //!
 //! `cargo run -p dduroc --example 01_device_writes`
 
@@ -132,7 +140,9 @@
 extern crate self as dduroc;
 
 /// Declare a namespace schema.
+mod lossless;
 pub use dduroc_macros::schema;
+pub use lossless::{decode_fields, decode_payload_bounded, render_bounded};
 
 /// Wall-clock time is [`chrono`], so as not to invent a date type of our own
 /// and not to make a user add a dependency for one call.
@@ -155,6 +165,7 @@ pub use serde;
 pub use serde_json;
 
 pub use dduroc_engine::MigrationReport;
+pub use dduroc_engine::QueueByteLimits;
 /// Bounded block access through the store's shared read backend.
 pub use dduroc_engine::backend::{
     BlockPage, ChannelInfo, ChannelKey, ReadBackend, RootUsage, StoredBlock,
@@ -164,10 +175,13 @@ pub use dduroc_engine::epochs::SyncSource;
 pub use dduroc_engine::limits::{EffectiveLimits, MetricLimits, SeverityFn, StateStatus};
 pub use dduroc_engine::metric::{Blob, Metric, MetricState, MetricValue, NumericValue, Untyped};
 pub use dduroc_engine::namespace::{Namespace, Series, SpanGuard};
+#[cfg(feature = "recovery")]
+pub use dduroc_engine::recovery;
 pub use dduroc_engine::schema::{
-    DecodeError, EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MetricKind, Migration,
-    MigrationInput, MigrationOutcome, Range, Schema, Severity, SpanDesc, StateDesc, StorageClass,
-    Thresholds,
+    BoundedFieldsDecoder, BoundedMessageRenderer, DecodeError, DecodedValue, DecodedValueLimits,
+    EventDecoders, EventDesc, FieldDesc, Language, MetricDesc, MetricKind, Migration,
+    MigrationInput, MigrationOutcome, Range, Schema, SchemaIdentity, Severity, SpanDesc, SpanKind,
+    StateDesc, StorageClass, Thresholds,
 };
 pub use dduroc_engine::staged::{OwnedValue, Payload};
 pub use dduroc_engine::stats::Stats;
@@ -180,7 +194,7 @@ pub use dduroc_format::{
 };
 
 /// Everything needed for writing, plus the bridge to reading one's own store
-/// ([`StoreExt::reader`]): the types and traits in one line.
+/// (`StoreExt::reader`): the types and traits in one line.
 pub mod prelude {
     pub use crate::{
         BootTime, Event, Level, MetricLimits, MetricState, NamespaceExt, OwnedValue, Severity,
@@ -188,9 +202,9 @@ pub mod prelude {
     };
     #[cfg(feature = "read")]
     pub use crate::{ReaderExt, StoreExt};
-    /// Wall-clock time is needed for exactly [`crate::Store::record_sync`], but
-    /// it is needed almost always: without a synchronization records have only
-    /// relative time.
+    /// Wall-clock types for synchronization and UTC query bounds. Without a
+    /// synchronization, records have only relative time and UTC queries report
+    /// the unanchored runs.
     pub use chrono::{DateTime, Utc};
 }
 
@@ -201,12 +215,23 @@ pub mod prelude {
 /// An event with no fields is a unit struct: `ns.log(events::Started)`, with no
 /// empty braces.
 pub trait Event: serde::Serialize {
+    /// Exact generated schema declaration and version.
+    const SCHEMA: SchemaIdentity;
     /// The identifier within the schema.
     const ID: EventId;
     /// The level is a static property of the type and is never written to disk.
     const LEVEL: Level;
     /// The type's name, for interfaces.
     const NAME: &'static str;
+}
+
+// Logging only borrows an event while serializing it, so reusable payloads
+// need not be cloned or moved just to satisfy the typed write API.
+impl<E: Event + ?Sized> Event for &E {
+    const SCHEMA: SchemaIdentity = E::SCHEMA;
+    const ID: EventId = E::ID;
+    const LEVEL: Level = E::LEVEL;
+    const NAME: &'static str = E::NAME;
 }
 
 /// The payload of an event of some schema version — what can go into a record.
@@ -217,11 +242,14 @@ pub trait Event: serde::Serialize {
 /// type, and in a long chain the next version's layout, which the next step
 /// will bring up to the current one.
 pub trait EventShape: serde::Serialize {
+    /// The generated declaration owning this migration layout.
+    const SHAPE_SCHEMA: SchemaIdentity;
     /// The event's identifier in the version the layout belongs to.
     const SHAPE_ID: EventId;
 }
 
 impl<E: Event> EventShape for E {
+    const SHAPE_SCHEMA: SchemaIdentity = E::SCHEMA;
     const SHAPE_ID: EventId = E::ID;
 }
 
@@ -233,11 +261,20 @@ impl<E: Event> EventShape for E {
 /// write `Some(...)`.
 pub trait IntoMigrationOutcome {
     /// Turn a rule's return into a step outcome.
-    fn into_outcome(self) -> std::result::Result<Option<MigrationOutcome>, DecodeError>;
+    fn into_outcome(
+        self,
+        expected: SchemaIdentity,
+    ) -> std::result::Result<Option<MigrationOutcome>, DecodeError>;
 }
 
 impl<E: EventShape> IntoMigrationOutcome for E {
-    fn into_outcome(self) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+    fn into_outcome(
+        self,
+        expected: SchemaIdentity,
+    ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+        if E::SHAPE_SCHEMA != expected {
+            return Err(DecodeError);
+        }
         Ok(Some(MigrationOutcome::Message {
             event: E::SHAPE_ID,
             payload: postcard::to_allocvec(&self).map_err(|_| DecodeError)?,
@@ -246,9 +283,12 @@ impl<E: EventShape> IntoMigrationOutcome for E {
 }
 
 impl<E: EventShape> IntoMigrationOutcome for Option<E> {
-    fn into_outcome(self) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
+    fn into_outcome(
+        self,
+        expected: SchemaIdentity,
+    ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
         match self {
-            Some(e) => e.into_outcome(),
+            Some(e) => e.into_outcome(expected),
             None => Ok(None),
         }
     }
@@ -383,8 +423,9 @@ pub fn __migrate_value<T: SampleValue, D: SampleValue, O: IntoSampleOutcome<D>>(
 pub fn __migrate_map<T, O: IntoMigrationOutcome>(
     map: impl FnOnce(T) -> O,
     old: T,
+    expected: SchemaIdentity,
 ) -> std::result::Result<Option<MigrationOutcome>, DecodeError> {
-    map(old).into_outcome()
+    map(old).into_outcome(expected)
 }
 
 /// An extension of [`Namespace`] with typed writing.
@@ -402,9 +443,12 @@ pub trait NamespaceExt {
     fn log_in<E: Event>(&self, span: &SpanGuard, event: E);
 
     /// The same with an answer about the outcome. An `Err` is told apart by two
-    /// predicates: [`Error::loses_record`] means the record did not reach the
-    /// medium, [`Error::breaks_contract`] that the event is not from this
-    /// schema.
+    /// predicates: [`Error::loses_record`] means delivery was not confirmed
+    /// (the record may nevertheless have persisted), [`Error::breaks_contract`]
+    /// means a typed descriptor does not belong to this schema declaration.
+    /// Critical success acknowledges a synchronous backend write; ordinary
+    /// success acknowledges queue admission and needs [`Namespace::sync`] for
+    /// persistence. Do not automatically retry an unconfirmed write.
     ///
     /// The verdict belongs to the caller entirely: a contract violation here
     /// does not reach the counters and is not announced in the journal — the
@@ -412,7 +456,8 @@ pub trait NamespaceExt {
     /// the engine there is [`Namespace::note_failure`].
     fn try_log<E: Event>(&self, event: E) -> Result<()>;
 
-    /// The same for an event inside a span.
+    /// The same for an event inside a span. The span may belong to another
+    /// namespace of this live Store; inactive or foreign-Store guards are refused.
     fn try_log_in<E: Event>(&self, span: &SpanGuard, event: E) -> Result<()>;
 }
 
@@ -429,11 +474,14 @@ impl NamespaceExt for Namespace {
 
     #[inline]
     fn try_log<E: Event>(&self, event: E) -> Result<()> {
+        self.check_schema(E::SCHEMA)?;
         self.try_log_payload(E::ID, encode(&event)?, None)
     }
 
     #[inline]
     fn try_log_in<E: Event>(&self, span: &SpanGuard, event: E) -> Result<()> {
+        self.check_schema(E::SCHEMA)?;
+        self.check_span(span)?;
         self.try_log_payload(E::ID, encode(&event)?, Some(span.id()))
     }
 }
@@ -456,6 +504,8 @@ impl SpanExt for SpanGuard {
 
     #[inline]
     fn try_log<E: Event>(&self, event: E) -> Result<()> {
+        self.namespace().check_schema(E::SCHEMA)?;
+        self.namespace().check_span(self)?;
         self.try_log_payload(E::ID, encode(&event)?)
     }
 }
@@ -496,14 +546,16 @@ impl StoreExt for std::sync::Arc<Store> {
 /// because an event identifier is unique only within a schema: a record of
 /// another namespace may hold a different type under the same id, and parsing
 /// it with a foreign layout would give plausible and wrong fields. The reader
-/// knows the schema of the record's namespace and checks the type against it.
+/// checks both the entry's effective schema provenance and the selected
+/// namespace schema against the generated type before decoding.
 #[cfg(feature = "read")]
 pub trait ReaderExt {
     /// The fields of an event, if the record is an event `E`.
     ///
     /// `None` means the record is not an event `E`: another type, telemetry,
     /// text, a span, or the record's namespace lives under a different schema
-    /// (or the schema is unknown to the reader — it will not invent a parse).
+    /// (or its effective schema provenance is unknown or belongs to another
+    /// declaration/version — it will not invent a parse).
     /// `Some(Err)` means the record declares itself an `E` but the fields did
     /// not parse: corruption, or a divergence of layout that must not be passed
     /// over.
@@ -526,14 +578,14 @@ impl ReaderExt for read::Reader {
         let read::EntryKind::Message { event, payload, .. } = &entry.kind else {
             return None;
         };
-        if *event != E::ID {
+        if entry.schema_identity != Some(E::SCHEMA) || *event != E::ID {
             return None;
         }
         // A matching id is not yet a matching type: an id is unique within a
         // schema. The type is confirmed by the schema of the record's own
         // namespace.
         let schema = self.schema_of(&entry.namespace)?;
-        if schema.event(*event)?.name != E::NAME {
+        if !schema.accepts(E::SCHEMA) || schema.event(*event)?.name != E::NAME {
             return None;
         }
         Some(postcard::from_bytes(payload).map_err(|_| DecodeError))
@@ -590,6 +642,7 @@ mod tests {
                 t: f32,
                 sensor: u8,
             },
+            Padded = 0x11 { level: Info, en: "{value:界>4}", ru: "{value:界>4}", value: u32 },
             Started = 0x10 {
                 level: Debug,
                 en: "started",
@@ -620,6 +673,235 @@ mod tests {
             Calibration = 0x01,
             PowerRamp = 0x02,
         }
+    }
+
+    mod collision {
+        use super::*;
+        schema! {
+            name: testing, version: 1, languages: [en],
+            events { PowerSet = 1 { level: Info, en: "power {dbm}", dbm: f32 } }
+            metrics {
+                Temp = 1 { type: f32 },
+                LinkState = 3 { states: [Los = 0, Lock = 2] },
+            }
+            spans { Calibration = 1 }
+        }
+    }
+
+    mod next_version {
+        use super::*;
+        schema! {
+            name: testing, version: 2, languages: [en],
+            events { PowerSet = 1 { level: Info, en: "power {dbm}", dbm: f32 } }
+            migrations { 1 => migrate_v1 }
+        }
+    }
+
+    #[test]
+    fn schema_binding_rejects_collisions_before_serialization_and_mutation() {
+        struct MustNotSerialize;
+        impl serde::Serialize for MustNotSerialize {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                panic!("foreign event must be refused before serialization")
+            }
+        }
+        impl Event for MustNotSerialize {
+            const SCHEMA: SchemaIdentity = collision::testing::SCHEMA.identity.unwrap();
+            const ID: EventId = EventId(1);
+            const LEVEL: Level = Level::Info;
+            const NAME: &'static str = "PowerSet";
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024))
+                .unwrap();
+        let ns = store.namespace("same-name", testing::SCHEMA).unwrap();
+        let conflict = store
+            .namespace("second-name", collision::testing::SCHEMA)
+            .unwrap_err();
+        assert!(conflict.breaks_contract());
+        assert!(
+            !dir.path().join("second-name").exists(),
+            "schema conflict precedes metadata effects"
+        );
+        let _same_scope = store.namespace("same-scope", testing::SCHEMA).unwrap();
+        let version_conflict = store
+            .namespace("next-version", next_version::testing::SCHEMA)
+            .unwrap_err();
+        assert!(matches!(version_conflict, Error::ForeignSchema { .. }));
+        assert!(!dir.path().join("next-version").exists());
+        assert!(ns.try_log(MustNotSerialize).unwrap_err().breaks_contract());
+        assert!(
+            ns.try_log(collision::testing::events::PowerSet { dbm: 3.0 })
+                .is_err()
+        );
+        assert!(ns.series(collision::testing::metrics::Temp).is_err());
+        assert!(ns.series(collision::testing::metrics::LinkState).is_err());
+        assert!(
+            ns.set_thresholds(collision::testing::metrics::Temp, ..=3.0, ..=4.0)
+                .is_err()
+        );
+        assert!(
+            ns.set_limits(collision::testing::metrics::Temp, MetricLimits::default())
+                .is_err()
+        );
+        assert!(ns.clear_limits(collision::testing::metrics::Temp).is_err());
+        assert!(
+            ns.set_severity_fn(collision::testing::metrics::Temp, |_| Severity::Alarm)
+                .is_err()
+        );
+        assert!(
+            ns.clear_severity_fn(collision::testing::metrics::Temp)
+                .is_err()
+        );
+        assert!(ns.limits(collision::testing::metrics::Temp).is_err());
+        assert!(
+            ns.severity_of(collision::testing::metrics::Temp, 2.0)
+                .is_err()
+        );
+        assert!(ns.try_span(collision::testing::spans::Calibration).is_err());
+        assert_eq!(store.stats().records_written, 0);
+        assert_eq!(
+            store.stats().rejected,
+            0,
+            "handled contract failures are not diagnostics"
+        );
+        assert!(!testing::SCHEMA.accepts(collision::testing::SCHEMA.identity.unwrap()));
+        let changed_version = Schema {
+            version: ProtocolVersion(2),
+            ..testing::SCHEMA
+        };
+        assert!(!changed_version.accepts(testing::SCHEMA.identity.unwrap()));
+        // Raw writing is explicit and stays available to manual/foreign format code.
+        ns.try_log_raw(
+            EventId(1),
+            &postcard::to_allocvec(&testing::events::PowerSet { dbm: 2.0 }).unwrap(),
+            None,
+        )
+        .unwrap();
+        ns.sync().unwrap();
+        assert_eq!(store.stats().records_written, 1);
+        #[cfg(feature = "read")]
+        {
+            let reader = store.reader();
+            let entry = reader.query(&read::Query::new()).unwrap().entries.remove(0);
+            assert_eq!(
+                reader
+                    .decode::<testing::events::PowerSet>(&entry)
+                    .unwrap()
+                    .unwrap()
+                    .dbm,
+                2.0
+            );
+            assert!(
+                reader
+                    .decode::<collision::testing::events::PowerSet>(&entry)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_migration_output_must_belong_to_the_target_declaration() {
+        let identity = testing::SCHEMA.identity.unwrap();
+        assert!(
+            __migrate_map(
+                |()| collision::testing::events::PowerSet { dbm: 1.0 },
+                (),
+                identity
+            )
+            .is_err()
+        );
+        assert!(
+            __migrate_map(|()| testing::events::PowerSet { dbm: 1.0 }, (), identity)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rejected_span_is_inert_even_when_explicitly_closed() {
+        struct MustNotSerialize;
+        impl serde::Serialize for MustNotSerialize {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                panic!("inactive span must be refused before serialization")
+            }
+        }
+        impl Event for MustNotSerialize {
+            const SCHEMA: SchemaIdentity = testing::SCHEMA.identity.unwrap();
+            const ID: EventId = EventId(1);
+            const LEVEL: Level = Level::Info;
+            const NAME: &'static str = "PowerSet";
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 * 1024 * 1024))
+                .unwrap();
+        let ns = store.namespace("same-name", testing::SCHEMA).unwrap();
+        let invalid = ns.span(collision::testing::spans::Calibration);
+        assert_eq!(invalid.id(), SpanId(0));
+        assert!(invalid.try_child(testing::spans::Calibration).is_err());
+        assert!(invalid.try_log(testing::events::Started).is_err());
+        assert!(invalid.try_log(MustNotSerialize).is_err());
+        assert!(ns.try_log_in(&invalid, MustNotSerialize).is_err());
+        assert!(invalid.close().is_err());
+        ns.sync().unwrap();
+        #[cfg(feature = "read")]
+        assert!(
+            store
+                .reader()
+                .query(&read::Query::new().kinds(read::KindFilter::SPANS))
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "read")]
+    #[test]
+    fn typed_decode_checks_entry_provenance_across_readers_with_equal_names() {
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = Store::open(StoreConfig::new(a_dir.path()).with_budget_per_class(16 * 1024 * 1024))
+            .unwrap();
+        let b = Store::open(StoreConfig::new(b_dir.path()).with_budget_per_class(16 * 1024 * 1024))
+            .unwrap();
+        let a_ns = a.namespace("same-name", testing::SCHEMA).unwrap();
+        let _b_ns = b
+            .namespace("same-name", collision::testing::SCHEMA)
+            .unwrap();
+        a_ns.try_log(testing::events::PowerSet { dbm: 2.0 })
+            .unwrap();
+        a_ns.sync().unwrap();
+        let a_reader = a.reader();
+        let b_reader = b.reader();
+        let entry = a_reader
+            .query(&read::Query::new())
+            .unwrap()
+            .entries
+            .remove(0);
+        assert!(
+            a_reader
+                .decode::<testing::events::PowerSet>(&entry)
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            a_reader
+                .decode::<collision::testing::events::PowerSet>(&entry)
+                .is_none()
+        );
+        assert!(
+            b_reader
+                .decode::<collision::testing::events::PowerSet>(&entry)
+                .is_none()
+        );
     }
 
     /// Migration steps live next to the schema declaration; the macro expands
@@ -765,14 +1047,17 @@ mod tests {
             store.shutdown();
         }
 
-        let reader = read::Reader::open_dump([dir.path()], &[testing::SCHEMA]).unwrap();
-        let listing = reader.namespaces().unwrap();
-        assert!(
-            listing.namespaces[0]
-                .channels
-                .contains(&StorageClass::Telemetry)
-        );
-        assert!(listing.namespaces[0].total_bytes > 0);
+        #[cfg(feature = "read")]
+        {
+            let reader = read::Reader::open_dump([dir.path()], &[testing::SCHEMA]).unwrap();
+            let listing = reader.namespaces().unwrap();
+            assert!(
+                listing.namespaces[0]
+                    .channels
+                    .contains(&StorageClass::Telemetry)
+            );
+            assert!(listing.namespaces[0].total_bytes > 0);
+        }
     }
 
     #[test]
@@ -821,7 +1106,7 @@ mod tests {
         testing::SCHEMA.validate().expect("the schema is valid");
         assert_eq!(testing::SCHEMA.name, "testing");
         assert_eq!(testing::SCHEMA.version, ProtocolVersion(1));
-        assert_eq!(testing::SCHEMA.events.len(), 3);
+        assert_eq!(testing::SCHEMA.events.len(), 4);
         assert_eq!(testing::SCHEMA.metrics.len(), 5);
         assert_eq!(testing::SCHEMA.spans.len(), 2);
     }
@@ -870,6 +1155,58 @@ mod tests {
 
         // A garbage payload is an error, not a panic.
         assert!((decoders.render)(&[0xFF, 0xFF, 0xFF, 0xFF], 0).is_err());
+    }
+
+    #[test]
+    fn typed_writes_accept_reusable_borrowed_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(StoreConfig::new(dir.path())).unwrap();
+        let ns = store.namespace("borrowed", testing::SCHEMA).unwrap();
+        let event = testing::events::PowerSet { dbm: 7.0 };
+        ns.try_log(&event).unwrap();
+        let span = ns.try_span(testing::spans::Calibration).unwrap();
+        ns.try_log_in(&span, &event).unwrap();
+        span.try_log(&event).unwrap();
+        assert_eq!(event.dbm, 7.0);
+        span.close().unwrap();
+        ns.sync().unwrap();
+        #[cfg(feature = "read")]
+        {
+            let reader = store.reader();
+            let answer = reader.query(&read::Query::new()).unwrap();
+            let values: Vec<_> = answer
+                .entries
+                .iter()
+                .filter_map(|entry| reader.decode::<testing::events::PowerSet>(entry))
+                .map(|value| value.unwrap().dbm)
+                .collect();
+            assert_eq!(values, vec![7.0, 7.0, 7.0]);
+        }
+    }
+
+    #[test]
+    fn generated_renderers_preserve_unicode_format_fill() {
+        let bytes = encode(&testing::events::Padded { value: 7 }).unwrap();
+        let decoders = testing::SCHEMA
+            .event(EventId(0x11))
+            .unwrap()
+            .decoders
+            .unwrap();
+        assert_eq!((decoders.render)(&bytes, 0).unwrap(), "界界界7");
+        assert_eq!(
+            (decoders.render_bounded.unwrap())(
+                &bytes,
+                0,
+                DecodedValueLimits {
+                    max_depth: 8,
+                    max_nodes: 16,
+                    max_bytes: 1024
+                },
+                10
+            )
+            .unwrap(),
+            "界界界7"
+        );
     }
 
     #[test]
@@ -1060,7 +1397,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            ns.severity_of(testing::metrics::Temp, 75.0),
+            ns.severity_of(testing::metrics::Temp, 75.0).unwrap(),
             Severity::Alarm,
             "by the schema it would be Warn: the closure won"
         );
@@ -1068,7 +1405,7 @@ mod tests {
 
         ns.clear_severity_fn(testing::metrics::Temp).unwrap();
         assert_eq!(
-            ns.severity_of(testing::metrics::Temp, 75.0),
+            ns.severity_of(testing::metrics::Temp, 75.0).unwrap(),
             Severity::Warn,
             "removing it brings the schema ranges back"
         );

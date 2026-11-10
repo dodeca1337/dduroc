@@ -2,8 +2,8 @@
 //!
 //! What is measured is what runs for every event on an application thread and
 //! what runs for every block in the writer. The numbers from this machine
-//! (x86-64) do not carry over to armv7 directly, but the ratios between the
-//! variants do, and it is those that show where the bottleneck is.
+//! (x86-64) and the ratios between variants must be remeasured on armv7;
+//! architecture, filesystem and storage can change which path dominates.
 //!
 //! The store is written to `/dev/shm` where it is available: the goal is to
 //! measure the cost of the code, not the speed of a developer's medium. The
@@ -69,7 +69,7 @@ fn store_config(root: &std::path::Path) -> StoreConfig {
     StoreConfig::new(root)
         .with_budget_per_class(256 * 1024 * 1024)
         // The ordinary channel's durability is turned off deliberately:
-        // otherwise the benchmark would measure the medium's fdatasync rather
+        // otherwise the benchmark would measure the medium's storage barrier rather
         // than the cost of our own code.
         .channel(
             StorageClass::Default,
@@ -80,12 +80,24 @@ fn store_config(root: &std::path::Path) -> StoreConfig {
         )
         // The critical one is left as it is: immediacy is not a setting but its
         // definition, and the store refuses such a substitution at open time.
-        // An application thread gains nothing from it anyway: the `fdatasync`
-        // is the writer's, and what is measured here is the enqueueing.
+        // A critical call waits for the backend acknowledgment, so its
+        // benchmark includes that latency rather than only queue admission.
         .channel(
             StorageClass::Critical,
             ChannelConfig::critical(64 * 1024 * 1024),
         )
+}
+
+/// Retry only a refusal that occurred before admission. Other errors can
+/// leave delivery unconfirmed and must stop a benchmark instead of spinning.
+fn retry_queue_full(mut write: impl FnMut() -> dduroc::Result<()>) {
+    loop {
+        match write() {
+            Ok(()) => return,
+            Err(dduroc::Error::QueueFull) => std::thread::yield_now(),
+            Err(error) => panic!("benchmark write failed: {error}"),
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -388,9 +400,10 @@ fn bench_throughput(c: &mut Criterion) {
             },
             |(root, store, ns)| {
                 for i in 0..BATCH {
-                    ns.log(bench::events::Tick { n: i as u32 });
+                    retry_queue_full(|| ns.try_log(bench::events::Tick { n: i as u32 }));
                 }
                 ns.sync().unwrap();
+                assert!(store.stats().records_written >= BATCH as u64);
                 store.shutdown();
                 let _ = std::fs::remove_dir_all(&root);
             },
@@ -415,9 +428,10 @@ fn bench_throughput(c: &mut Criterion) {
             },
             |(root, store, series)| {
                 for i in 0..BATCH {
-                    series.sample(20.0 + i as f32);
+                    retry_queue_full(|| series.try_sample(20.0 + i as f32));
                 }
                 store.sync().unwrap();
+                assert!(store.stats().records_written >= BATCH as u64);
                 store.shutdown();
                 let _ = std::fs::remove_dir_all(&root);
             },
@@ -483,9 +497,7 @@ fn bench_read(c: &mut Criterion) {
                 // The filling goes with retries: an ordinary channel may lose
                 // records under pressure, but the set to be read has to be
                 // predictable.
-                while ns.try_log(bench::events::Tick { n: i }).is_err() {
-                    std::thread::yield_now();
-                }
+                retry_queue_full(|| ns.try_log(bench::events::Tick { n: i }));
                 written += 1;
             }
             ns.sync().unwrap();

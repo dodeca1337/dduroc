@@ -18,6 +18,7 @@ include = ["src/**", "examples/**", "tests/**", "benches/**", "Cargo.toml", "Car
 # limited flash the binary size matters.
 default = ["read"]
 read = ["dep:dduroc-read"]
+recovery = ["dduroc-engine/recovery"]
 
 [dependencies]
 chrono.workspace = true
@@ -30,6 +31,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Fixture-only rewriting exercises tied timestamps without a production clock override.
+raft-engine.workspace = true
+protobuf.workspace = true
 criterion.workspace = true
 dduroc-read.workspace = true
 tempfile.workspace = true
@@ -37,3 +41,19 @@ tempfile.workspace = true
 [[bench]]
 name = "hot_path"
 harness = false
+required-features = ["read"]
+
+[[example]]
+name = "02_viewer_reads"
+required-features = ["read"]
+
+[[example]]
+name = "03_schema_grows"
+required-features = ["read"]
+
+[[example]]
+name = "04_operations"
+required-features = ["read"]
+
+[package.metadata.docs.rs]
+features = ["recovery"]

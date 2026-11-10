@@ -1,0 +1,38 @@
+[package]
+name = "dduroc-graphql"
+description = "Bounded GraphQL queries and subscriptions over the dduroc native read API"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+include = ["src/**", "examples/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "schema.graphql"]
+
+[dependencies]
+dduroc-read.workspace = true
+dduroc-engine.workspace = true
+dduroc-format.workspace = true
+async-graphql.workspace = true
+# Pin the whole macro/parser family: upstream's caret ranges otherwise admit
+# newer family members with a higher compiler minimum or different internals.
+async-graphql-derive.workspace = true
+async-graphql-parser.workspace = true
+async-graphql-value.workspace = true
+tokio.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+dduroc.workspace = true
+raft-engine.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

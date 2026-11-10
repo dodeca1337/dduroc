@@ -1,0 +1,9 @@
+<script lang="ts">
+  import { ComboBox, Select, SelectItem } from 'carbon-components-svelte';
+  import type { Filters } from './lib/filters';
+  let { filters = $bindable(), namespaces = [], prefix = 'query' }: { filters: Filters; namespaces?: string[]; prefix?: string } = $props();
+  let selectedNamespace = $state<string | undefined>(undefined);
+  const namespaceItems = $derived([...new Set(namespaces)].sort().map(name => ({ id: name, text: name })));
+</script>
+          <Select id={`${prefix}-namespace-match`} labelText="Namespace match" bind:selected={filters.namespaceMode} on:change={(event) => { filters.namespaceMode = (event.target as HTMLSelectElement).value as Filters['namespaceMode']; if (filters.namespaceMode === 'all') { selectedNamespace = undefined; filters.namespace = ''; } }}><SelectItem value="all" text="All namespaces" /><SelectItem value="exact" text="Exact namespace" /><SelectItem value="prefix" text="Namespace prefix" /></Select>
+          <ComboBox id={`${prefix}-namespace`} labelText="Namespace" placeholder={filters.namespaceMode === 'prefix' ? 'Type a namespace prefix' : 'Choose or type a namespace'} items={namespaceItems} allowCustomValue typeahead={filters.namespaceMode !== 'prefix'} shouldFilterItem={(item, value) => item.text.startsWith(value)} bind:selectedId={selectedNamespace} bind:value={filters.namespace} on:input={(event) => { if (filters.namespaceMode !== 'prefix') filters.namespaceMode = (event.target as HTMLInputElement).value ? 'exact' : 'all'; }} on:select={() => { if (filters.namespaceMode !== 'prefix') filters.namespaceMode = 'exact'; }} on:clear={() => { if (filters.namespaceMode !== 'prefix') filters.namespaceMode = 'all'; }} helperText={filters.namespaceMode === 'prefix' ? 'Typed prefixes are kept; selecting a suggestion uses its full name.' : 'Empty means all namespaces. Choose or type an exact name.'} />

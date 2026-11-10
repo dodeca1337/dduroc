@@ -33,6 +33,9 @@ pub mod metric;
 pub mod migrate;
 pub mod namespace;
 pub mod pulse;
+pub mod queue_limits;
+#[cfg(feature = "recovery")]
+pub mod recovery;
 pub mod rotation;
 pub mod schema;
 pub mod segment;
@@ -49,13 +52,17 @@ pub use limits::{EffectiveLimits, MetricLimits, StateStatus};
 pub use migrate::MigrationReport;
 pub use namespace::{Namespace, Series, SpanGuard};
 pub use pulse::{Beat, Pulse};
+pub use queue_limits::QueueByteLimits;
 pub use rotation::Inventory;
 pub use schema::{
-    EventDesc, Language, MetricDesc, MetricKind, Range, Schema, Severity, SpanDesc, StateDesc,
-    StorageClass, Thresholds,
+    EventDesc, Language, MetricDesc, MetricKind, Range, Schema, SchemaIdentity, Severity, SpanDesc,
+    SpanKind, StateDesc, StorageClass, Thresholds,
 };
 pub use segment::{BlockScan, Recovered, Scan, SegmentReader, SegmentWriter, seal_orphan};
 pub use staged::{NsId, Staged, StagedRecord};
 pub use stats::Stats;
 pub use store::{Store, StoreConfig};
 pub use writer::QueueSizes;
+
+#[cfg(test)]
+mod fault_acceptance_tests;

@@ -111,6 +111,9 @@ pub enum EntryKind {
 #[non_exhaustive]
 pub struct Entry {
     pub namespace: std::sync::Arc<str>,
+    /// In-process identity of the effective schema used to decode this entry.
+    /// Unknown schemas do not have an identity.
+    pub schema_identity: Option<dduroc_engine::schema::SchemaIdentity>,
     /// The storage class whose channel the record lay in. A channel is a class:
     /// it has no string name — it has a directory named after the class.
     pub channel: StorageClass,
@@ -181,9 +184,537 @@ pub struct QueryResult {
     pub unanchored: Vec<BootCounter>,
 }
 
+/// A page from an owned, in-process query session.
+#[derive(Debug, Clone)]
+pub struct QueryPage {
+    pub entries: Vec<Entry>,
+    pub seeds: Vec<Entry>,
+    pub exhausted: bool,
+    /// Whether the query limit cut the answer. With a zero query limit this
+    /// is conservative: retained blocks imply possible, not proven, matches.
+    pub truncated: bool,
+    pub damaged: Vec<Damage>,
+    pub unanchored: Vec<BootCounter>,
+}
+
+/// One bounded catalog row and its in-process schema, when known.
+#[derive(Debug, Clone)]
+pub struct CatalogChannel {
+    pub namespace: String,
+    pub class: StorageClass,
+    pub schema_name: String,
+    pub protocol_version: u16,
+    pub retained_bytes: u64,
+    pub quota_bytes: Option<u64>,
+    pub schema: Option<Schema>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassStatistics {
+    pub class: StorageClass,
+    pub logical_retained_bytes: u64,
+    /// Configured budget is available only from a live Store.
+    pub limit_bytes: Option<u64>,
+}
+
+/// Global retained wire-record counts and independently sampled storage use.
+/// Counts include text, samples, span boundaries and extension records.
+#[derive(Debug, Clone)]
+pub struct Statistics {
+    pub captured_at: chrono::DateTime<chrono::Utc>,
+    pub counting_state: dduroc_engine::backend::CountingState,
+    pub retained_records: Option<u64>,
+    pub retained_blocks: Option<u64>,
+    pub logical_retained_bytes: u64,
+    pub channels: u64,
+    pub classes: Vec<ClassStatistics>,
+    /// Process-lifetime writer counters; absent for an offline reader.
+    pub runtime: Option<dduroc_engine::Stats>,
+    /// Optional separately sampled allocated filesystem blocks per root.
+    pub roots: Option<Vec<dduroc_engine::backend::RootPhysicalStats>>,
+}
+
+/// A fixed roster and high-water snapshot. This is not a portable cursor and
+/// cannot be resumed after the session or process has ended.
+#[derive(Debug)]
+pub struct QuerySession {
+    reader: Arc<Reader>,
+    query: Query,
+    epochs: Epochs,
+    bounds: Bounds,
+    snapshots: Vec<dduroc_engine::backend::ChannelSnapshot>,
+    cursors: Vec<ChannelCursor>,
+    schemas: Vec<Option<Schema>>,
+    heads: BinaryHeap<Head>,
+    budget: Arc<crate::budget::Budget>,
+    pending: Option<PendingEntry>,
+    seeds: std::collections::VecDeque<Entry>,
+    seed_damage: Vec<Damage>,
+    yielded: usize,
+    done: bool,
+    zero_limit_truncated: bool,
+    navigation: Navigation,
+}
+
+#[derive(Debug, Default)]
+enum Navigation {
+    #[default]
+    Unset,
+    Sequential,
+    Indexed {
+        records: usize,
+        bytes: usize,
+        page_number: u64,
+        page: Option<QueryPage>,
+    },
+}
+
+/// Exact totals for a complete snapshot with fixed page dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryTotals {
+    /// Matching query entries, across all record types; excludes state seeds.
+    pub total_matches: u64,
+    /// State seeds included in the page layout, separate from query entries.
+    pub total_seeds: u64,
+    /// Pages with the requested dimensions; an empty result has one page.
+    pub total_pages: u64,
+}
+
+/// Result of a bounded indexed navigation step in a fixed snapshot.
+#[derive(Debug)]
+pub struct SeekPage {
+    pub reached_page: u64,
+    pub target_reached: bool,
+    pub exhausted: bool,
+    pub page: Option<QueryPage>,
+}
+
+#[derive(Debug)]
+struct PendingEntry {
+    entry: Entry,
+    cursor: usize,
+    required: Option<u64>,
+}
+
+fn session_error(stop: crate::budget::Stop) -> ReadError {
+    match stop {
+        crate::budget::Stop::Cancelled => ReadError::Cancelled,
+        crate::budget::Stop::Deadline => ReadError::Deadline,
+        crate::budget::Stop::Limit(name) => ReadError::LimitExceeded(name),
+        crate::budget::Stop::Expired => ReadError::SnapshotExpired,
+        crate::budget::Stop::RetentionGap => ReadError::RetentionGap,
+        crate::budget::Stop::PageTooSmall => ReadError::PageTooSmall,
+        crate::budget::Stop::Backend(message) => ReadError::SessionFailed(message),
+    }
+}
+
+fn entry_size(entry: &Entry) -> usize {
+    let payload = match &entry.kind {
+        EntryKind::Message { payload, .. } | EntryKind::Ext { bytes: payload } => payload.len(),
+        EntryKind::Text { target, text, .. } => target.len().saturating_add(text.len()),
+        EntryKind::Sample {
+            value: OwnedSampleValue::Blob(bytes),
+            ..
+        } => bytes.len(),
+        _ => 0,
+    };
+    std::mem::size_of::<Entry>()
+        .saturating_add(entry.namespace.len())
+        .saturating_add(payload)
+}
+
+impl QuerySession {
+    fn check(&self) -> Result<()> {
+        self.budget.checkpoint();
+        if let Some(stop) = self.budget.failure() {
+            return Err(session_error(stop));
+        }
+        let backend = self
+            .reader
+            .backend
+            .as_ref()
+            .expect("session has raft backend");
+        for (idx, (snapshot, cursor)) in self.snapshots.iter().zip(&self.cursors).enumerate() {
+            if !self.budget.checkpoint() {
+                return Err(session_error(self.budget.failure().unwrap()));
+            }
+            let mut required = cursor.required_index();
+            if let Some(pending) = self
+                .pending
+                .as_ref()
+                .filter(|pending| pending.cursor == idx)
+            {
+                required = match (required, pending.required) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            if !self.seeds.is_empty() {
+                required = match (required, snapshot.info.first_index) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            let status = backend
+                .snapshot_status(snapshot, required)
+                .map_err(|error| {
+                    self.budget
+                        .stop(crate::budget::Stop::Backend(error.to_string()));
+                    session_error(self.budget.failure().unwrap())
+                })?;
+            match status {
+                dduroc_engine::backend::SnapshotStatus::Current => {}
+                dduroc_engine::backend::SnapshotStatus::Replaced => {
+                    self.budget.stop(crate::budget::Stop::Expired)
+                }
+                dduroc_engine::backend::SnapshotStatus::Evicted => {
+                    self.budget.stop(crate::budget::Stop::RetentionGap)
+                }
+            }
+            if let Some(stop) = self.budget.failure() {
+                return Err(session_error(stop));
+            }
+        }
+        Ok(())
+    }
+
+    fn rewind(&mut self) -> Result<()> {
+        self.budget.checkpoint();
+        if let Some(stop) = self.budget.failure() {
+            return Err(session_error(stop));
+        }
+        let backend = self.reader.backend.as_ref().expect("session has backend");
+        for snapshot in &self.snapshots {
+            if !self.budget.checkpoint() {
+                return Err(session_error(self.budget.failure().unwrap()));
+            }
+            let status = backend
+                .snapshot_status(snapshot, snapshot.info.first_index)
+                .map_err(|error| {
+                    self.budget
+                        .stop(crate::budget::Stop::Backend(error.to_string()));
+                    session_error(self.budget.failure().unwrap())
+                })?;
+            match status {
+                dduroc_engine::backend::SnapshotStatus::Current => {}
+                dduroc_engine::backend::SnapshotStatus::Replaced => {
+                    self.budget.stop(crate::budget::Stop::Expired);
+                    return Err(session_error(self.budget.failure().unwrap()));
+                }
+                dduroc_engine::backend::SnapshotStatus::Evicted => {
+                    self.budget.stop(crate::budget::Stop::RetentionGap);
+                    return Err(session_error(self.budget.failure().unwrap()));
+                }
+            }
+        }
+        let (seeds, damage) = self.reader.snapshot_seeds(
+            &self.query,
+            &self.bounds,
+            &self.epochs,
+            &self.snapshots,
+            &self.budget,
+        )?;
+        let mut cursors = Vec::with_capacity(self.snapshots.len());
+        for (snapshot, schema) in self.snapshots.iter().zip(&self.schemas) {
+            if !self.budget.checkpoint() {
+                return Err(session_error(self.budget.failure().unwrap()));
+            }
+            let scope = crate::cursor::ChannelScope {
+                budget: Some(Arc::clone(&self.budget)),
+                bounds: self.bounds.clone(),
+                boot: self.query.boot,
+                reverse: self.query.order == Order::Newest,
+                expect_store: self.reader.store_id,
+                prefilter: Some(build_prefilter(&self.query, *schema)),
+                max_segments: None,
+                require_metrics: None,
+                migrations: schema.as_ref().map(crate::cursor::MigrationCtx::of),
+                liveness: crate::cursor::Liveness::Frozen,
+            };
+            cursors.push(ChannelCursor::open_snapshot(
+                Arc::clone(backend),
+                snapshot.clone(),
+                &scope,
+            ));
+        }
+        let mut heads = BinaryHeap::with_capacity(cursors.len());
+        for (idx, cursor) in cursors
+            .iter_mut()
+            .enumerate()
+            .filter(|_| self.query.limit != Some(0))
+        {
+            if let Some(head) = cursor.peek() {
+                heads.push(Head {
+                    at: head.at,
+                    idx,
+                    newest_first: self.query.order == Order::Newest,
+                });
+            }
+            if let Some(stop) = self.budget.failure() {
+                return Err(session_error(stop));
+            }
+        }
+        self.cursors = cursors;
+        self.heads = heads;
+        self.pending = None;
+        self.seeds = seeds.into();
+        self.seed_damage = damage;
+        self.yielded = 0;
+        self.done = self.query.limit == Some(0);
+        self.check()
+    }
+
+    /// Navigate within the original snapshot, examining at most `max_pages` per call.
+    /// Page dimensions are fixed for the session; work budgets remain cumulative.
+    pub fn seek_page(
+        &mut self,
+        target: u64,
+        page_limits: crate::PageLimits,
+        max_pages: usize,
+    ) -> Result<SeekPage> {
+        let records = page_limits.max_records();
+        let bytes = page_limits.max_bytes();
+        if target == 0 || max_pages == 0 {
+            return Err(ReadError::InvalidNavigation);
+        }
+        self.check()?;
+        match &self.navigation {
+            Navigation::Sequential => return Err(ReadError::InvalidNavigation),
+            Navigation::Indexed {
+                records: r,
+                bytes: b,
+                ..
+            } if *r != records || *b != bytes => return Err(ReadError::InvalidNavigation),
+            _ => {}
+        }
+        let previous = std::mem::take(&mut self.navigation);
+        let (mut number, mut page) = match previous {
+            Navigation::Indexed {
+                page_number, page, ..
+            } => (page_number, page),
+            _ => (0, None),
+        };
+        let mut page_read_this_call = false;
+        if target < number {
+            self.rewind()?;
+            number = 0;
+            page = None;
+        }
+        for _ in 0..max_pages {
+            if number >= target || page.as_ref().is_some_and(|p| p.exhausted) {
+                break;
+            }
+            let next = match self.read_page(records, bytes) {
+                Ok(page) => page,
+                Err(error) => {
+                    if matches!(error, ReadError::PageTooSmall) {
+                        self.budget.stop(crate::budget::Stop::PageTooSmall);
+                    }
+                    self.navigation = Navigation::Indexed {
+                        records,
+                        bytes,
+                        page_number: number,
+                        page,
+                    };
+                    return Err(error);
+                }
+            };
+            // A full preceding page can be followed only by filtered-out
+            // records. Fold that empty terminal scan into the actual last page.
+            if next.exhausted && next.entries.is_empty() && next.seeds.is_empty() && number > 0 {
+                if let Some(previous) = page.as_mut() {
+                    previous.exhausted = true;
+                    previous.truncated |= next.truncated;
+                    previous.damaged = next.damaged;
+                    previous.unanchored = next.unanchored;
+                }
+                break;
+            }
+            number += 1;
+            page = Some(next);
+            page_read_this_call = true;
+        }
+        let exhausted = page.as_ref().is_some_and(|p| p.exhausted);
+        let reached = number == target;
+        let output = if reached || exhausted {
+            if !page_read_this_call && let Some(cached) = &page {
+                for entry in cached.entries.iter().chain(&cached.seeds) {
+                    if !self.budget.returned(entry_size(entry) as u64) {
+                        return Err(session_error(self.budget.failure().unwrap()));
+                    }
+                }
+            }
+            page.clone()
+        } else {
+            None
+        };
+        self.navigation = Navigation::Indexed {
+            records,
+            bytes,
+            page_number: number,
+            page,
+        };
+        Ok(SeekPage {
+            reached_page: number,
+            target_reached: reached,
+            exhausted,
+            page: output,
+        })
+    }
+
+    /// Advance the session by one bounded page. `PageTooSmall` is retryable
+    /// with a larger byte limit and retains the pending entry. All cancellation,
+    /// resource, expiry and backend failures are terminal: any partial page
+    /// accumulated during the failed call is discarded and is never reported
+    /// as EOF.
+    pub fn next_page(&mut self, limits: crate::PageLimits) -> Result<QueryPage> {
+        if matches!(self.navigation, Navigation::Indexed { .. }) {
+            return Err(ReadError::InvalidNavigation);
+        }
+        self.navigation = Navigation::Sequential;
+        self.read_page(limits.max_records(), limits.max_bytes())
+    }
+
+    fn read_page(&mut self, max_records: usize, max_bytes: usize) -> Result<QueryPage> {
+        self.check()?;
+        if max_records == 0 || max_bytes == 0 {
+            return Err(ReadError::PageTooSmall);
+        }
+        let mut entries = Vec::new();
+        let mut seeds = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = self.zero_limit_truncated;
+        while entries.len() + seeds.len() < max_records {
+            let Some(seed) = self.seeds.front() else {
+                break;
+            };
+            let size = entry_size(seed);
+            if bytes.saturating_add(size) > max_bytes {
+                if seeds.is_empty() {
+                    return Err(ReadError::PageTooSmall);
+                }
+                break;
+            }
+            bytes += size;
+            seeds.push(self.seeds.pop_front().unwrap());
+        }
+        if !self.seeds.is_empty() {
+            self.check()?;
+            return Ok(QueryPage {
+                entries,
+                seeds,
+                exhausted: false,
+                truncated,
+                damaged: self.seed_damage.clone(),
+                unanchored: Vec::new(),
+            });
+        }
+        while entries.len() + seeds.len() < max_records && !self.done {
+            let entry = if let Some(entry) = self.pending.take() {
+                Some(entry)
+            } else {
+                loop {
+                    if !self.budget.checkpoint() {
+                        return Err(session_error(self.budget.failure().unwrap()));
+                    }
+                    let Some(Head { idx, .. }) = self.heads.pop() else {
+                        self.done = true;
+                        break None;
+                    };
+                    let required = self.cursors[idx].required_index();
+                    let raw = self.cursors[idx].next_entry();
+                    if let Some(head) = self.cursors[idx].peek() {
+                        self.heads.push(Head {
+                            at: head.at,
+                            idx,
+                            newest_first: self.query.order == Order::Newest,
+                        });
+                    }
+                    if let Some(stop) = self.budget.failure() {
+                        return Err(session_error(stop));
+                    }
+                    let Some(raw) = raw else {
+                        continue;
+                    };
+                    if !self.bounds.contains(raw.at) {
+                        continue;
+                    }
+                    let cursor = &self.cursors[idx];
+                    if let Some(entry) = self.reader.build_entry(
+                        Arc::clone(&cursor.namespace),
+                        cursor.channel,
+                        self.schemas[idx].as_ref(),
+                        raw,
+                        &self.query,
+                        &self.epochs,
+                    ) {
+                        break Some(PendingEntry {
+                            entry,
+                            cursor: idx,
+                            required,
+                        });
+                    }
+                }
+            };
+            let Some(entry) = entry else {
+                break;
+            };
+            if self.query.limit.is_some_and(|limit| self.yielded >= limit) {
+                self.done = true;
+                truncated = true;
+                break;
+            }
+            let size = entry_size(&entry.entry);
+            if bytes.saturating_add(size) > max_bytes {
+                self.pending = Some(entry);
+                if entries.is_empty() && seeds.is_empty() {
+                    return Err(ReadError::PageTooSmall);
+                }
+                break;
+            }
+            if !self.budget.returned(size as u64) {
+                self.pending = Some(entry);
+                return Err(session_error(self.budget.failure().unwrap()));
+            }
+            self.yielded += 1;
+            bytes += size;
+            entries.push(entry.entry);
+        }
+        if self.pending.is_none() && self.heads.is_empty() {
+            self.done = true;
+        }
+        self.check()?;
+        let mut damaged: Vec<_> = self
+            .cursors
+            .iter()
+            .flat_map(ChannelCursor::damaged)
+            .collect();
+        damaged.extend(self.seed_damage.clone());
+        let mut unanchored: Vec<_> = self
+            .cursors
+            .iter()
+            .flat_map(|c| c.unanchored().iter().copied())
+            .collect();
+        unanchored.sort_unstable();
+        unanchored.dedup();
+        Ok(QueryPage {
+            entries,
+            seeds,
+            exhausted: self.done,
+            truncated,
+            damaged,
+            unanchored,
+        })
+    }
+}
+
 impl QueryResult {
-    /// Whether the answer is complete: nothing was skipped because of damage.
+    /// Whether no data was skipped due to damage, truncation or absent anchors.
     pub fn is_complete(&self) -> bool {
+        self.damaged.is_empty() && !self.truncated && self.unanchored.is_empty()
+    }
+    /// Whether no damaged fragments were reported.
+    pub fn is_undamaged(&self) -> bool {
         self.damaged.is_empty()
     }
 }
@@ -398,6 +929,120 @@ pub enum Tail {
     Ended,
 }
 
+/// A controlled follow item with explicit state-seed provenance.
+#[derive(Debug)]
+pub enum FollowItem {
+    Entry { entry: Box<Entry>, seed: bool },
+    Idle,
+    Ended,
+}
+
+/// A live subscription with cumulative cooperative limits.
+#[derive(Debug)]
+pub struct ControlledFollow<'a> {
+    inner: Follow<'a>,
+    budget: Arc<crate::budget::Budget>,
+    charged_seeds: usize,
+    seed_snapshots: Vec<dduroc_engine::backend::ChannelSnapshot>,
+}
+impl ControlledFollow<'_> {
+    /// Equivalent to `next`, preserving whether an entry is an initial seed.
+    pub fn next_item(&mut self, wait: Duration) -> Result<FollowItem> {
+        let seed = self.charged_seeds > 0;
+        Ok(match self.next(wait)? {
+            Tail::Entry(entry) => FollowItem::Entry { entry, seed },
+            Tail::Idle => FollowItem::Idle,
+            Tail::Ended => FollowItem::Ended,
+        })
+    }
+    fn check(&self) -> Result<()> {
+        if !self.budget.checkpoint() {
+            return Err(session_error(self.budget.failure().unwrap()));
+        }
+        if self.charged_seeds > 0 {
+            let backend = self
+                .inner
+                .reader
+                .backend
+                .as_ref()
+                .expect("controlled follow has backend");
+            for snapshot in &self.seed_snapshots {
+                if !self.budget.checkpoint() {
+                    return Err(session_error(self.budget.failure().unwrap()));
+                }
+                let status = backend
+                    .snapshot_status(snapshot, snapshot.info.first_index)
+                    .map_err(|error| {
+                        self.budget
+                            .stop(crate::budget::Stop::Backend(error.to_string()));
+                        session_error(self.budget.failure().unwrap())
+                    })?;
+                match status {
+                    dduroc_engine::backend::SnapshotStatus::Current => {}
+                    dduroc_engine::backend::SnapshotStatus::Replaced => {
+                        self.budget.stop(crate::budget::Stop::Expired)
+                    }
+                    dduroc_engine::backend::SnapshotStatus::Evicted => {
+                        self.budget.stop(crate::budget::Stop::RetentionGap)
+                    }
+                }
+                if let Some(stop) = self.budget.failure() {
+                    return Err(session_error(stop));
+                }
+            }
+        }
+        for cursor in &self.inner.cursors {
+            if !self.budget.checkpoint() {
+                return Err(session_error(self.budget.failure().unwrap()));
+            }
+            if let Err(error) = cursor.validate_follow() {
+                let stop = match error {
+                    ReadError::SnapshotExpired => crate::budget::Stop::Expired,
+                    ReadError::RetentionGap => crate::budget::Stop::RetentionGap,
+                    other => crate::budget::Stop::Backend(other.to_string()),
+                };
+                self.budget.stop(stop);
+                return Err(session_error(self.budget.failure().unwrap()));
+            }
+        }
+        Ok(())
+    }
+    /// Cancellation and resource failures are terminal. The wait is checked
+    /// cooperatively at least every 25 ms, apart from a blocking I/O operation.
+    pub fn next(&mut self, wait: Duration) -> Result<Tail> {
+        self.check()?;
+        let tail = self.inner.next(wait);
+        if let Some(stop) = self.budget.failure() {
+            return Err(session_error(stop));
+        }
+        self.check()?;
+        if let Tail::Entry(entry) = &tail {
+            if self.charged_seeds > 0 {
+                self.charged_seeds -= 1;
+            } else if !self.budget.returned(entry_size(entry) as u64) {
+                return Err(session_error(self.budget.failure().unwrap()));
+            }
+        }
+        Ok(tail)
+    }
+    pub fn take_damage(&mut self) -> Vec<Damage> {
+        self.inner.take_damage()
+    }
+    /// Runs excluded from a UTC window because no clock anchor is available.
+    pub fn unanchored(&self) -> Result<Vec<BootCounter>> {
+        let mut out = std::collections::BTreeSet::new();
+        for cursor in &self.inner.cursors {
+            for boot in cursor.unanchored() {
+                if !self.budget.checkpoint() {
+                    return Err(session_error(self.budget.failure().unwrap()));
+                }
+                out.insert(*boot);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+}
+
 /// A subscription to the record stream of a live store.
 ///
 /// It reads the same things by the same means as [`Reader::query`] — but
@@ -425,6 +1070,7 @@ pub enum Tail {
 #[derive(Debug)]
 pub struct Follow<'a> {
     reader: &'a Reader,
+    budget: Option<Arc<crate::budget::Budget>>,
     query: Query,
     /// The window's bounds, computed once at open time.
     ///
@@ -484,6 +1130,13 @@ impl Follow<'_> {
     /// polled in a loop, and the timeout sets how quickly that loop can notice
     /// a stop the application itself ordered.
     pub fn next(&mut self, wait: Duration) -> Tail {
+        if self
+            .budget
+            .as_ref()
+            .is_some_and(|budget| !budget.checkpoint())
+        {
+            return Tail::Ended;
+        }
         if let Some(seed) = self.seeds.next() {
             return Tail::Entry(Box::new(seed));
         }
@@ -503,6 +1156,13 @@ impl Follow<'_> {
             .checked_add(wait.min(MAX_WAIT))
             .unwrap_or_else(Instant::now);
         loop {
+            if self
+                .budget
+                .as_ref()
+                .is_some_and(|budget| !budget.checkpoint())
+            {
+                return Tail::Ended;
+            }
             if let Some(entry) = self.pop_ready() {
                 return Tail::Entry(Box::new(entry));
             }
@@ -537,6 +1197,9 @@ impl Follow<'_> {
             // a subscription with a long timeout would learn of a new service
             // only after somebody wrote something.
             let mut rest = deadline - now;
+            if self.budget.is_some() {
+                rest = rest.min(Duration::from_millis(25));
+            }
             if let Some(at) = self.adopt_deadline() {
                 rest = rest.min(at);
             }
@@ -651,7 +1314,38 @@ impl Follow<'_> {
         if shape_changed || roster_changed {
             self.prune_backend_channels();
         }
-        self.epochs = self.reader.epochs_now().into_owned();
+        if let Some(budget) = &self.budget {
+            if !budget.checkpoint() {
+                return;
+            }
+            if let Source::Store(store) = &self.reader.source {
+                match store.epochs_limited(budget.limits.epoch_runs, budget.limits.hardware_boots) {
+                    Ok(epochs) => self.epochs = epochs,
+                    Err(dduroc_engine::Error::EpochLimit {
+                        resource: "epoch_runs",
+                        ..
+                    }) => {
+                        budget.stop(crate::budget::Stop::Limit(crate::ReadResource::EpochRuns));
+                        return;
+                    }
+                    Err(dduroc_engine::Error::EpochLimit {
+                        resource: "hardware_boots",
+                        ..
+                    }) => {
+                        budget.stop(crate::budget::Stop::Limit(
+                            crate::ReadResource::HardwareBoots,
+                        ));
+                        return;
+                    }
+                    Err(error) => {
+                        budget.stop(crate::budget::Stop::Backend(error.to_string()));
+                        return;
+                    }
+                }
+            }
+        } else {
+            self.epochs = self.reader.epochs_now().into_owned();
+        }
         // A root walk is triggered only by the store's roster — that is, by a
         // namespace coming up. While rotation triggered it too, a subscription
         // listed the whole store every half second on end: segments change
@@ -745,10 +1439,28 @@ impl Follow<'_> {
     /// Empty channels can later start at their new monotonic index; reopening
     /// them cannot replay history that the backend has already purged.
     fn prune_backend_channels(&mut self) {
+        // Controlled subscriptions retain every observed watermark. Dropping an
+        // empty channel would hide writes that are completely evicted between
+        // polls; the cumulative channel budget bounds this state instead.
+        if self.budget.is_some() {
+            return;
+        }
         let Some(backend) = &self.reader.backend else {
             return;
         };
-        let catalog = match backend.catalog() {
+        let catalog_result = if let Some(budget) = &self.budget {
+            backend
+                .snapshot_channels(|_| {
+                    if !budget.roster() {
+                        return Err(dduroc_engine::Error::Backend("session stopped".into()));
+                    }
+                    Ok(true)
+                })
+                .map(|items| items.into_iter().map(|item| item.info).collect())
+        } else {
+            backend.catalog()
+        };
+        let catalog = match catalog_result {
             Ok(catalog) => catalog,
             Err(error) => {
                 self.note_once(Damage {
@@ -795,14 +1507,20 @@ impl Follow<'_> {
     }
 
     fn adopt_new_channels(&mut self) {
-        let opened = self.reader.open_cursors_beyond(
-            &self.query,
-            &self.bounds,
-            |scope| {
-                scope.liveness = crate::cursor::Liveness::Following;
-            },
-            &self.known,
-        );
+        let opened = if let Some(budget) = &self.budget {
+            self.reader
+                .open_follow_cursors(&self.query, &self.bounds, &self.known, budget)
+                .map(|(opened, _)| opened)
+        } else {
+            self.reader.open_cursors_beyond(
+                &self.query,
+                &self.bounds,
+                |scope| {
+                    scope.liveness = crate::cursor::Liveness::Following;
+                },
+                &self.known,
+            )
+        };
         let OpenedCursors {
             cursors,
             schemas,
@@ -940,9 +1658,649 @@ pub struct Reader {
     /// the query path. A `None` value means "the namespace exists, this build
     /// has no schema for it"; that answer is worth remembering too.
     schema_cache: RwLock<HashMap<String, Option<Schema>>>,
+    language_preferences: crate::LanguagePreferences,
+}
+
+/// Rendered text and the actual schema language, if this is a schema message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedMessage {
+    /// Rendered text or the unchanged free text.
+    pub text: String,
+    /// Actual schema language; `None` for free text.
+    pub language: Option<String>,
+    /// Matching preference index; `None` for fallback or free text.
+    pub preference_index: Option<usize>,
 }
 
 impl Reader {
+    /// Sample global retained statistics without scanning block payloads.
+    /// Allocated root usage is sampled separately when requested.
+    pub fn statistics_controlled(
+        &self,
+        limits: crate::ReadLimits,
+        cancellation: crate::Cancellation,
+        include_roots: bool,
+    ) -> Result<Statistics> {
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or(ReadError::UnsupportedSession("legacy statistics"))?;
+        let budget = crate::budget::Budget::new(limits, cancellation);
+        if !budget.checkpoint() {
+            return Err(session_error(budget.failure().unwrap()));
+        }
+        let cached = backend.cached_statistics()?;
+        let bytes = cached
+            .logical_class_bytes
+            .iter()
+            .try_fold(0u64, |sum, value| sum.checked_add(*value))
+            .ok_or_else(|| {
+                ReadError::from(dduroc_engine::Error::Backend("statistics overflow".into()))
+            })?;
+        let roots = if include_roots {
+            Some(
+                backend
+                    .physical_stats(4096, || budget.checkpoint())
+                    .map_err(|e| {
+                        budget
+                            .failure()
+                            .map(session_error)
+                            .unwrap_or_else(|| e.into())
+                    })?,
+            )
+        } else {
+            None
+        };
+        let runtime = match &self.source {
+            Source::Store(store) => Some(store.stats()),
+            Source::Dump { .. } => None,
+        };
+        let limits = runtime.as_ref().map(|_| cached.class_limits);
+        let classes = StorageClass::ALL
+            .into_iter()
+            .map(|class| ClassStatistics {
+                class,
+                logical_retained_bytes: cached.logical_class_bytes[class.index()],
+                limit_bytes: limits.map(|limits| limits[class.index()]),
+            })
+            .collect();
+        Ok(Statistics {
+            captured_at: chrono::Utc::now(),
+            counting_state: cached.counting_state,
+            retained_records: cached.retained_records,
+            retained_blocks: cached.retained_blocks,
+            logical_retained_bytes: bytes,
+            channels: cached.channels,
+            classes,
+            runtime,
+            roots,
+        })
+    }
+
+    /// Perform one explicitly requested, bounded count-index maintenance step.
+    /// Returns whether more work remained immediately after the step.
+    pub fn backfill_statistics_step(
+        &self,
+        limits: crate::ReadLimits,
+        cancellation: crate::Cancellation,
+    ) -> Result<bool> {
+        if !matches!(self.source, Source::Store(_)) {
+            return Err(ReadError::UnsupportedSession("offline count backfill"));
+        }
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or(ReadError::UnsupportedSession("legacy count backfill"))?;
+        let budget = crate::budget::Budget::new(limits, cancellation);
+        if !budget.checkpoint() {
+            return Err(session_error(budget.failure().unwrap()));
+        }
+        let Some(channel) = backend.pending_count_channel()? else {
+            return Ok(false);
+        };
+        let max_blocks = budget.limits.blocks.min(128);
+        let max_bytes = usize::try_from(budget.limits.compressed_bytes.min(8 * 1024 * 1024))
+            .unwrap_or(8 * 1024 * 1024);
+        if max_blocks == 0 {
+            return Err(ReadError::LimitExceeded(crate::ReadResource::Blocks));
+        }
+        if max_bytes == 0 {
+            return Err(ReadError::LimitExceeded(
+                crate::ReadResource::CompressedBytes,
+            ));
+        }
+        backend
+            .backfill_count_step(&channel, max_blocks, max_bytes, || budget.checkpoint())
+            .map_err(|e| {
+                budget
+                    .failure()
+                    .map(session_error)
+                    .unwrap_or_else(|| e.into())
+            })?;
+        Ok(backend.pending_count_channel()?.is_some())
+    }
+
+    /// List selected channels using the same cooperative roster and output
+    /// budgets as sessions. Legacy segment discovery is not supported here.
+    pub fn catalog_controlled(
+        &self,
+        query: &Query,
+        limits: crate::ReadLimits,
+        cancellation: crate::Cancellation,
+    ) -> Result<Vec<CatalogChannel>> {
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or(ReadError::UnsupportedSession("legacy catalog"))?;
+        let budget = crate::budget::Budget::new(limits, cancellation);
+        let snapshots = backend
+            .snapshot_channels(|key| {
+                if !budget.roster() {
+                    return Err(dduroc_engine::Error::Backend("catalog stopped".into()));
+                }
+                if !query.namespaces.matches(&key.namespace)
+                    || (!query.channels.is_empty() && !query.channels.contains(&key.class))
+                {
+                    return Ok(false);
+                }
+                if !budget.channel() {
+                    return Err(dduroc_engine::Error::Backend("catalog stopped".into()));
+                }
+                Ok(true)
+            })
+            .map_err(|error| {
+                budget
+                    .failure()
+                    .map(session_error)
+                    .unwrap_or_else(|| error.into())
+            })?;
+        let mut rows = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            if !budget.checkpoint() {
+                return Err(session_error(budget.failure().unwrap()));
+            }
+            let info = snapshot.info;
+            let size = std::mem::size_of::<CatalogChannel>()
+                .saturating_add(info.key.namespace.len())
+                .saturating_add(info.schema_name.len());
+            if !budget.returned(size as u64) {
+                return Err(session_error(budget.failure().unwrap()));
+            }
+            let schema = self.schema_by_name(&info.schema_name);
+            rows.push(CatalogChannel {
+                namespace: info.key.namespace,
+                class: info.key.class,
+                schema_name: info.schema_name,
+                protocol_version: info.protocol_version,
+                retained_bytes: info.retained_bytes,
+                quota_bytes: info.quota_bytes,
+                schema,
+            });
+        }
+        Ok(rows)
+    }
+    fn open_follow_cursors(
+        &self,
+        query: &Query,
+        bounds: &Bounds,
+        known: &HashMap<String, u8>,
+        budget: &Arc<crate::budget::Budget>,
+    ) -> Result<(OpenedCursors, Vec<dduroc_engine::backend::ChannelSnapshot>)> {
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or(ReadError::UnsupportedSession("legacy follow"))?;
+        let snapshots = backend
+            .snapshot_channels(|key| {
+                if !budget.roster() {
+                    return Err(dduroc_engine::Error::Backend("session stopped".into()));
+                }
+                if !query.namespaces.matches(&key.namespace)
+                    || (!query.channels.is_empty() && !query.channels.contains(&key.class))
+                    || known.get(&key.namespace).copied().unwrap_or(0) & (1 << key.class.index())
+                        != 0
+                {
+                    return Ok(false);
+                }
+                if !budget.channel() {
+                    return Err(dduroc_engine::Error::Backend("session stopped".into()));
+                }
+                Ok(true)
+            })
+            .map_err(|error| {
+                budget
+                    .failure()
+                    .map(session_error)
+                    .unwrap_or_else(|| error.into())
+            })?;
+        let mut cursors = Vec::with_capacity(snapshots.len());
+        let mut schemas = Vec::with_capacity(snapshots.len());
+        for snapshot in &snapshots {
+            if !budget.checkpoint() {
+                return Err(session_error(budget.failure().unwrap()));
+            }
+            let schema = self.schema_by_name(&snapshot.info.schema_name);
+            let scope = crate::cursor::ChannelScope {
+                budget: Some(Arc::clone(budget)),
+                bounds: bounds.clone(),
+                boot: query.boot,
+                reverse: false,
+                expect_store: self.store_id,
+                prefilter: Some(build_prefilter(query, schema)),
+                max_segments: None,
+                require_metrics: None,
+                migrations: schema.as_ref().map(crate::cursor::MigrationCtx::of),
+                liveness: crate::cursor::Liveness::Following,
+            };
+            cursors.push(ChannelCursor::open_snapshot(
+                Arc::clone(backend),
+                snapshot.clone(),
+                &scope,
+            ));
+            schemas.push(schema);
+        }
+        Ok((
+            OpenedCursors {
+                cursors,
+                schemas,
+                damaged: Vec::new(),
+            },
+            snapshots,
+        ))
+    }
+
+    fn snapshot_seeds(
+        &self,
+        query: &Query,
+        window: &Bounds,
+        epochs: &Epochs,
+        snapshots: &[dduroc_engine::backend::ChannelSnapshot],
+        budget: &Arc<crate::budget::Budget>,
+    ) -> Result<(Vec<Entry>, Vec<Damage>)> {
+        let Some(from) = query.from.filter(|_| query.seed_states) else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let probe = Query {
+            from: None,
+            to: Some(from.just_before()),
+            order: Order::Newest,
+            limit: None,
+            seed_states: false,
+            filter: Filter {
+                kinds: KindFilter::TELEMETRY,
+                ..query.filter.clone()
+            },
+            ..query.clone()
+        };
+        let probe_bounds = probe
+            .resolve_controlled(epochs, || budget.checkpoint())
+            .ok_or_else(|| session_error(budget.failure().unwrap()))?
+            .bounds;
+        let backend = self.backend.as_ref().expect("snapshot has backend");
+        let mut seeds = Vec::new();
+        let mut damage = Vec::new();
+        for snapshot in snapshots {
+            if !budget.checkpoint() {
+                return Err(session_error(budget.failure().unwrap()));
+            }
+            let schema = self.schema_by_name(&snapshot.info.schema_name);
+            let wanted = state_metrics(schema.as_ref());
+            if wanted.is_empty() {
+                continue;
+            }
+            let scope = crate::cursor::ChannelScope {
+                budget: Some(Arc::clone(budget)),
+                bounds: probe_bounds.clone(),
+                boot: probe.boot,
+                reverse: true,
+                expect_store: self.store_id,
+                prefilter: Some(build_prefilter(&probe, schema)),
+                max_segments: None,
+                require_metrics: None,
+                migrations: schema.as_ref().map(crate::cursor::MigrationCtx::of),
+                liveness: crate::cursor::Liveness::Frozen,
+            };
+            let mut cursor =
+                ChannelCursor::open_snapshot(Arc::clone(backend), snapshot.clone(), &scope);
+            let mut seen = HashSet::new();
+            while let Some(raw) = cursor.next_entry() {
+                if window.contains(raw.at) || !probe_bounds.contains(raw.at) {
+                    continue;
+                }
+                let OwnedRecord::Sample { metric, .. } = &raw.record else {
+                    continue;
+                };
+                let metric = *metric;
+                if !wanted.contains(&metric) || !seen.insert(metric) {
+                    continue;
+                }
+                if let Some(entry) = self.build_entry(
+                    Arc::clone(&cursor.namespace),
+                    cursor.channel,
+                    schema.as_ref(),
+                    raw,
+                    &probe,
+                    epochs,
+                ) {
+                    if !budget.returned(entry_size(&entry) as u64) {
+                        return Err(session_error(budget.failure().unwrap()));
+                    }
+                    seeds.push(entry);
+                }
+                if wanted.iter().all(|metric| seen.contains(metric)) {
+                    break;
+                }
+            }
+            if let Some(stop) = budget.failure() {
+                return Err(session_error(stop));
+            }
+            damage.extend(cursor.damaged());
+        }
+        seeds.sort_by_key(|entry| entry.at);
+        Ok((seeds, damage))
+    }
+
+    /// Open an owned, bounded snapshot session. Legacy segment dumps are not
+    /// supported by this session API.
+    pub fn open_session(
+        self: &Arc<Self>,
+        query: Query,
+        limits: crate::ReadLimits,
+        cancellation: crate::Cancellation,
+    ) -> Result<QuerySession> {
+        self.open_session_inner(query, limits, cancellation, false)
+    }
+
+    /// Open and count the same frozen snapshot using fixed seek dimensions.
+    /// Counting consumes the session's cumulative work limits, but not its
+    /// returned-byte limit. Incomplete or truncated snapshots are refused.
+    /// The returned session supports indexed navigation with these dimensions.
+    pub fn open_counted_session(
+        self: &Arc<Self>,
+        query: Query,
+        limits: crate::ReadLimits,
+        cancellation: crate::Cancellation,
+        page_limits: crate::PageLimits,
+    ) -> Result<(QuerySession, QueryTotals)> {
+        let records = page_limits.max_records();
+        let bytes = page_limits.max_bytes();
+        let mut session = self.open_session_inner(query, limits, cancellation, true)?;
+        let mut totals = QueryTotals {
+            total_matches: 0,
+            total_seeds: 0,
+            total_pages: 0,
+        };
+        loop {
+            let page = session.read_page(records, bytes)?;
+            if page.truncated || !page.damaged.is_empty() || !page.unanchored.is_empty() {
+                return Err(ReadError::IncompleteCount);
+            }
+            let empty = page.entries.is_empty() && page.seeds.is_empty();
+            totals.total_matches = totals
+                .total_matches
+                .checked_add(page.entries.len() as u64)
+                .ok_or(ReadError::IncompleteCount)?;
+            totals.total_seeds = totals
+                .total_seeds
+                .checked_add(page.seeds.len() as u64)
+                .ok_or(ReadError::IncompleteCount)?;
+            if !empty || totals.total_pages == 0 {
+                totals.total_pages = totals
+                    .total_pages
+                    .checked_add(1)
+                    .ok_or(ReadError::IncompleteCount)?;
+            }
+            if page.exhausted {
+                break;
+            }
+        }
+        session.rewind()?;
+        session.budget.suppress_returned(false);
+        for seed in &session.seeds {
+            if !session.budget.returned(entry_size(seed) as u64) {
+                return Err(session_error(session.budget.failure().unwrap()));
+            }
+        }
+        session.navigation = Navigation::Indexed {
+            records,
+            bytes,
+            page_number: 0,
+            page: None,
+        };
+        Ok((session, totals))
+    }
+
+    fn open_session_inner(
+        self: &Arc<Self>,
+        query: Query,
+        limits: crate::ReadLimits,
+        cancellation: crate::Cancellation,
+        counting: bool,
+    ) -> Result<QuerySession> {
+        let backend = self
+            .backend
+            .as_ref()
+            .ok_or(ReadError::UnsupportedSession("legacy segment store"))?;
+        let budget = crate::budget::Budget::new(limits, cancellation);
+        budget.suppress_returned(counting);
+        if !budget.checkpoint() {
+            return Err(session_error(budget.failure().unwrap()));
+        }
+        let (epochs, snapshots) = backend
+            .snapshot_channels_with(
+                || {
+                    if !budget.checkpoint() {
+                        return Err(dduroc_engine::Error::Backend("session stopped".into()));
+                    }
+                    match &self.source {
+                        Source::Store(store) => store
+                            .epochs_limited(budget.limits.epoch_runs, budget.limits.hardware_boots),
+                        Source::Dump { epochs, .. } => {
+                            if epochs.runs.len() > budget.limits.epoch_runs {
+                                return Err(dduroc_engine::Error::EpochLimit {
+                                    resource: "epoch_runs",
+                                    limit: budget.limits.epoch_runs,
+                                });
+                            }
+                            if epochs.hw_boots.len() > budget.limits.hardware_boots {
+                                return Err(dduroc_engine::Error::EpochLimit {
+                                    resource: "hardware_boots",
+                                    limit: budget.limits.hardware_boots,
+                                });
+                            }
+                            Ok(epochs.clone())
+                        }
+                    }
+                },
+                |key| {
+                    if !budget.roster() {
+                        return Err(dduroc_engine::Error::Backend("session stopped".into()));
+                    }
+                    if !query.namespaces.matches(&key.namespace)
+                        || (!query.channels.is_empty() && !query.channels.contains(&key.class))
+                    {
+                        return Ok(false);
+                    }
+                    if !budget.channel() {
+                        return Err(dduroc_engine::Error::Backend("session stopped".into()));
+                    }
+                    Ok(true)
+                },
+            )
+            .map_err(|error| {
+                budget
+                    .failure()
+                    .map(session_error)
+                    .unwrap_or_else(|| match error {
+                        dduroc_engine::Error::EpochLimit {
+                            resource: "epoch_runs",
+                            ..
+                        } => ReadError::LimitExceeded(crate::ReadResource::EpochRuns),
+                        dduroc_engine::Error::EpochLimit {
+                            resource: "hardware_boots",
+                            ..
+                        } => ReadError::LimitExceeded(crate::ReadResource::HardwareBoots),
+                        other => other.into(),
+                    })
+            })?;
+        let bounds = query
+            .resolve_controlled(&epochs, || budget.checkpoint())
+            .ok_or_else(|| session_error(budget.failure().unwrap()))?
+            .bounds;
+        let (seeds, seed_damage) =
+            self.snapshot_seeds(&query, &bounds, &epochs, &snapshots, &budget)?;
+        let mut cursors = Vec::with_capacity(snapshots.len());
+        let mut schemas = Vec::with_capacity(snapshots.len());
+        for snapshot in &snapshots {
+            if !budget.checkpoint() {
+                return Err(session_error(budget.failure().unwrap()));
+            }
+            let schema = self.schema_by_name(&snapshot.info.schema_name);
+            let scope = crate::cursor::ChannelScope {
+                budget: Some(Arc::clone(&budget)),
+                bounds: bounds.clone(),
+                boot: query.boot,
+                reverse: query.order == Order::Newest,
+                expect_store: self.store_id,
+                prefilter: Some(build_prefilter(&query, schema)),
+                max_segments: None,
+                require_metrics: None,
+                migrations: schema.as_ref().map(crate::cursor::MigrationCtx::of),
+                liveness: crate::cursor::Liveness::Frozen,
+            };
+            cursors.push(ChannelCursor::open_snapshot(
+                Arc::clone(backend),
+                snapshot.clone(),
+                &scope,
+            ));
+            schemas.push(schema);
+        }
+        let mut heads = BinaryHeap::with_capacity(cursors.len());
+        for (idx, cursor) in cursors
+            .iter_mut()
+            .enumerate()
+            .filter(|_| query.limit != Some(0))
+        {
+            if let Some(head) = cursor.peek() {
+                heads.push(Head {
+                    at: head.at,
+                    idx,
+                    newest_first: query.order == Order::Newest,
+                });
+            }
+            if let Some(stop) = budget.failure() {
+                return Err(session_error(stop));
+            }
+        }
+        let done = query.limit == Some(0);
+        let zero_limit_truncated = done
+            && snapshots
+                .iter()
+                .any(|snapshot| snapshot.info.first_index.is_some());
+        let session = QuerySession {
+            reader: Arc::clone(self),
+            query,
+            epochs,
+            bounds,
+            snapshots,
+            cursors,
+            schemas,
+            heads,
+            budget,
+            pending: None,
+            seeds: seeds.into(),
+            seed_damage,
+            yielded: 0,
+            done,
+            zero_limit_truncated,
+            navigation: Navigation::Unset,
+        };
+        session.check()?;
+        Ok(session)
+    }
+
+    /// Follow a live store with cumulative limits and cooperative cancellation.
+    pub fn follow_controlled(
+        self: &Arc<Self>,
+        query: Query,
+        limits: crate::ReadLimits,
+        cancellation: crate::Cancellation,
+    ) -> Result<ControlledFollow<'_>> {
+        let Source::Store(store) = &self.source else {
+            return Err(ReadError::NotFollowable("a dump has no live writer"));
+        };
+        if query.order == Order::Newest {
+            return Err(ReadError::NotFollowable(
+                "follow requires oldest-first order",
+            ));
+        }
+        if query.to.is_some() {
+            return Err(ReadError::NotFollowable(
+                "follow cannot have an upper bound",
+            ));
+        }
+        let pulse = Arc::clone(store.pulse());
+        let seen = pulse.beat();
+        let session = self.open_session(query, limits, cancellation)?;
+        let QuerySession {
+            query,
+            epochs,
+            bounds,
+            snapshots,
+            mut cursors,
+            schemas,
+            heads,
+            budget,
+            seeds,
+            seed_damage,
+            ..
+        } = session;
+        for cursor in &mut cursors {
+            cursor.set_following();
+        }
+        let mut known: HashMap<String, u8> = HashMap::new();
+        for cursor in &cursors {
+            *known.entry(cursor.namespace.to_string()).or_default() |= 1 << cursor.channel.index();
+        }
+        let mut queued = vec![false; cursors.len()];
+        for head in &heads {
+            queued[head.idx] = true;
+        }
+        let charged_seeds = seeds.len();
+        let inner = Follow {
+            reader: self.as_ref(),
+            budget: Some(Arc::clone(&budget)),
+            limit: query.limit.unwrap_or(usize::MAX),
+            query,
+            bounds,
+            epochs,
+            cursors,
+            schemas,
+            heads,
+            queued,
+            known,
+            reported: seed_damage
+                .iter()
+                .map(|d| (d.path.clone(), d.reason.clone()))
+                .collect(),
+            damaged: seed_damage,
+            pulse,
+            seen,
+            seeds: seeds.into_iter().collect::<Vec<_>>().into_iter(),
+            last_adopt: None,
+            swept: false,
+            adopt_due: false,
+            yielded: 0,
+            ended: false,
+        };
+        Ok(ControlledFollow {
+            inner,
+            budget,
+            charged_seeds,
+            seed_snapshots: snapshots,
+        })
+    }
+
     /// Open a dump of a store: **all** of its roots and schemas at once.
     ///
     /// The first root is the main one (`ns-meta`, the epochs and the store's
@@ -974,6 +2332,20 @@ impl Reader {
         roots: impl IntoIterator<Item = P>,
         schemas: &[Schema],
     ) -> Result<Self> {
+        let mut schema_map = HashMap::new();
+        for schema in schemas {
+            if let Some(existing) = schema_map.get(schema.name) {
+                let existing: &Schema = existing;
+                if existing.identity.is_none()
+                    || existing.identity != schema.identity
+                    || existing.version != schema.version
+                {
+                    return Err(ReadError::ConflictingSchema(schema.name.to_owned()));
+                }
+            } else {
+                schema_map.insert(schema.name.to_owned(), *schema);
+            }
+        }
         let roots: Vec<PathBuf> = roots.into_iter().map(Into::into).collect();
         let Some(main_root) = roots.first() else {
             return Err(ReadError::Io {
@@ -1010,9 +2382,10 @@ impl Reader {
         let reader = Self {
             source: Source::Dump { roots, epochs },
             backend,
-            schemas: schemas.iter().map(|s| (s.name.to_owned(), *s)).collect(),
+            schemas: schema_map,
             store_id,
             schema_cache: RwLock::new(HashMap::new()),
+            language_preferences: crate::LanguagePreferences::default(),
         };
         reader.check_dump_completeness()?;
         Ok(reader)
@@ -1082,6 +2455,7 @@ impl Reader {
             schemas: HashMap::new(),
             store_id: Some(store_id),
             schema_cache: RwLock::new(HashMap::new()),
+            language_preferences: crate::LanguagePreferences::default(),
         }
     }
 
@@ -1115,7 +2489,7 @@ impl Reader {
             return Some(*s);
         }
         match &self.source {
-            Source::Store(store) => store.schemas().into_iter().find(|s| s.name == name),
+            Source::Store(store) => store.schema(name),
             Source::Dump { .. } => None,
         }
     }
@@ -1138,9 +2512,20 @@ impl Reader {
     /// Needed when the store holds another service's namespace: without a
     /// schema its records stay identifiers. A schema of the same name replaces
     /// the earlier one.
-    pub fn with_schema(mut self, schema: Schema) -> Self {
+    pub fn with_schema(mut self, schema: Schema) -> Result<Self> {
+        if let Some(existing) = self.schema_by_name(schema.name)
+            && (existing.identity.is_none()
+                || existing.identity != schema.identity
+                || existing.version != schema.version)
+        {
+            return Err(ReadError::ConflictingSchema(schema.name.to_owned()));
+        }
         self.schemas.insert(schema.name.to_owned(), schema);
-        self
+        self.schema_cache
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        Ok(self)
     }
 
     /// Permit foreign legacy segments. This applies only to the legacy segment
@@ -1166,6 +2551,58 @@ impl Reader {
         self.epochs_now().into_owned()
     }
 
+    /// Set the default message languages for this reader.
+    pub fn with_language_preferences(mut self, preferences: crate::LanguagePreferences) -> Self {
+        self.language_preferences = preferences;
+        self
+    }
+
+    /// This reader's ordered default message languages.
+    pub fn language_preferences(&self) -> &crate::LanguagePreferences {
+        &self.language_preferences
+    }
+
+    /// Render with this reader's preferences, falling back to the first schema language.
+    ///
+    /// Schema messages require a matching generated schema identity. Unknown or
+    /// raw/manual schemas have no such identity and return `None`; use
+    /// [`render`] explicitly for a caller-selected manual schema.
+    pub fn render_preferred(&self, entry: &Entry) -> Option<RenderedMessage> {
+        self.render_with_preferences(entry, &self.language_preferences)
+    }
+
+    /// Render one record with an explicit ordered language preference list.
+    ///
+    /// Schema messages require a matching generated schema identity. Unknown or
+    /// raw/manual schemas return `None`; free text is returned unchanged.
+    pub fn render_with_preferences(
+        &self,
+        entry: &Entry,
+        preferences: &crate::LanguagePreferences,
+    ) -> Option<RenderedMessage> {
+        match &entry.kind {
+            EntryKind::Message { event, payload, .. } => {
+                let schema = self.schema_of(&entry.namespace)?;
+                if entry.schema_identity.is_none() || entry.schema_identity != schema.identity {
+                    return None;
+                }
+                let selection = preferences.select(&schema)?;
+                let language = schema.languages[selection.language_index].0;
+                Some(RenderedMessage {
+                    text: render(&schema, *event, payload, language)?,
+                    language: Some(language.to_owned()),
+                    preference_index: selection.preference_index,
+                })
+            }
+            EntryKind::Text { text, .. } => Some(RenderedMessage {
+                text: text.clone(),
+                language: None,
+                preference_index: None,
+            }),
+            _ => None,
+        }
+    }
+
     /// A record's text in the given language.
     ///
     /// `None` means there is nothing to render: this is not a schema message,
@@ -1180,6 +2617,9 @@ impl Reader {
         match &entry.kind {
             EntryKind::Message { event, payload, .. } => {
                 let schema = self.schema_of(&entry.namespace)?;
+                if entry.schema_identity != schema.identity {
+                    return None;
+                }
                 render(&schema, *event, payload, lang)
             }
             // Free text is already text: it has neither a template nor
@@ -1207,14 +2647,10 @@ impl Reader {
         }
         let resolved = if let Some(backend) = &self.backend {
             backend
-                .catalog()
+                .schema_name(namespace)
                 .ok()
-                .and_then(|catalog| {
-                    catalog
-                        .into_iter()
-                        .find(|info| info.key.namespace == namespace)
-                })
-                .and_then(|info| self.schema_by_name(&info.schema_name))
+                .flatten()
+                .and_then(|name| self.schema_by_name(&name))
         } else {
             read_ns_meta(&self.root().join(namespace))
                 .and_then(|meta| self.schema_by_name(&meta.schema_name))
@@ -1560,6 +2996,7 @@ impl Reader {
 
         Ok(Follow {
             reader: self,
+            budget: None,
             query: q.clone(),
             bounds,
             epochs,
@@ -1792,6 +3229,7 @@ impl Reader {
             let schema = self.schema_by_name(&ns.schema_name);
             let ns_name: std::sync::Arc<str> = std::sync::Arc::from(ns.name.as_str());
             let mut scope = crate::cursor::ChannelScope {
+                budget: None,
                 bounds: bounds.clone(),
                 boot: q.boot,
                 reverse: q.order == Order::Newest,
@@ -2043,6 +3481,7 @@ impl Reader {
 
         Some(Entry {
             namespace: ns,
+            schema_identity: schema.and_then(|s| s.identity),
             channel,
             at,
             utc: epochs.to_utc(at),
@@ -2150,21 +3589,14 @@ fn state_metrics(schema: Option<&Schema>) -> HashSet<MetricId> {
 }
 
 fn read_ns_meta(dir: &Path) -> Option<NsMeta> {
-    let bytes = std::fs::read(dir.join(NS_META)).ok()?;
-    postcard::from_bytes(&bytes).ok()
+    NsMeta::read(dir).ok().flatten()
 }
 
 fn read_store_id(root: &Path) -> Option<u64> {
-    #[derive(serde::Deserialize)]
-    struct Meta {
-        #[allow(dead_code)]
-        container_version: u8,
-        store_id: u64,
-    }
-    let bytes = std::fs::read(root.join("store-meta")).ok()?;
-    postcard::from_bytes::<Meta>(&bytes)
+    dduroc_engine::store::StoreMeta::read(root)
         .ok()
-        .map(|m| m.store_id)
+        .flatten()
+        .map(|meta| meta.store_id)
 }
 
 /// Render a message from the schema's template.
@@ -2192,6 +3624,18 @@ mod tests {
     use dduroc_engine::schema::{EventDesc, Language, MetricDesc, SpanDesc, StorageClass};
     use dduroc_engine::store::{Store, StoreConfig};
     use dduroc_format::{MetricId, Micros, ProtocolVersion, Record, SpanKindId, ValueType};
+
+    #[test]
+    fn completeness_includes_truncation_and_unanchored_runs() {
+        let mut result = QueryResult::default();
+        assert!(result.is_complete());
+        result.truncated = true;
+        assert!(!result.is_complete());
+        assert!(result.is_undamaged());
+        result.truncated = false;
+        result.unanchored.push(BootCounter(1));
+        assert!(!result.is_complete());
+    }
 
     static LANGS: &[Language] = &[Language("en"), Language("ru")];
     static EVENTS: &[EventDesc] = &[
@@ -2271,8 +3715,12 @@ mod tests {
         class: StorageClass::Default,
     }];
 
+    struct ReaderTestSchema;
+    const READER_ID: dduroc_engine::schema::SchemaIdentity =
+        dduroc_engine::schema::SchemaIdentity::of::<ReaderTestSchema>(ProtocolVersion(1));
     fn schema() -> Schema {
         Schema {
+            identity: Some(READER_ID),
             name: "radio",
             version: ProtocolVersion(1),
             languages: LANGS,
@@ -2358,7 +3806,7 @@ mod tests {
 
     /// Typed metric constants — what the schema macro produces.
     const TEMP: dduroc_engine::metric::Metric<f32> =
-        dduroc_engine::metric::Metric::new(MetricId(1));
+        dduroc_engine::metric::Metric::bound(MetricId(1), READER_ID);
 
     /// Fill the store and close it.
     fn populate(root: &Path) {
@@ -2378,7 +3826,7 @@ mod tests {
                 temp.sample(20.0 + i as f32);
             }
             {
-                let cal = ns.span(SpanKindId(1));
+                let cal = ns.span_raw(SpanKindId(1));
                 cal.log_raw(EventId(1), &[99]);
             }
             ns.sync().unwrap();
@@ -2387,6 +3835,106 @@ mod tests {
         ns.log_raw(EventId(1), &[1], None);
         ns.sync().unwrap();
         store.shutdown();
+    }
+
+    #[test]
+    fn damaged_legacy_control_metadata_retains_existing_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        populate_legacy(dir.path());
+        let ns_path = dir.path().join("orc-radio-0").join(NS_META);
+        let mut ns_bytes = std::fs::read(&ns_path).unwrap();
+        ns_bytes.push(0);
+        std::fs::write(&ns_path, &ns_bytes).unwrap();
+        let store_path = dir.path().join("store-meta");
+        let mut store_bytes = std::fs::read(&store_path).unwrap();
+        store_bytes.push(0);
+        std::fs::write(&store_path, &store_bytes).unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
+        assert!(reader.store_id.is_none());
+        let result = reader.query(&Query::new()).unwrap();
+        assert!(
+            result
+                .damaged
+                .iter()
+                .any(|damage| damage.path == ns_path.parent().unwrap())
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .all(|entry| &*entry.namespace == "orc-radio-1")
+        );
+        assert_eq!(std::fs::read(&ns_path).unwrap(), ns_bytes);
+        assert_eq!(std::fs::read(&store_path).unwrap(), store_bytes);
+        std::fs::File::create(&ns_path)
+            .unwrap()
+            .set_len(256 * 1024 + 1)
+            .unwrap();
+        let reader = Reader::open_dump([dir.path()], &[schema()]).unwrap();
+        assert!(
+            reader
+                .query(&Query::new())
+                .unwrap()
+                .damaged
+                .iter()
+                .any(|damage| damage.path == ns_path.parent().unwrap())
+        );
+    }
+
+    #[test]
+    fn owned_session_pages_match_stream_and_preserve_small_page_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Arc::new(Reader::open_dump([dir.path()], &[schema()]).unwrap());
+        for order in [Order::Oldest, Order::Newest] {
+            let query = Query::new().order(order);
+            let expected = reader.query(&query).unwrap().entries;
+            let mut session = reader
+                .open_session(
+                    query,
+                    crate::ReadLimits::default(),
+                    crate::Cancellation::new(),
+                )
+                .unwrap();
+            assert!(matches!(
+                session.next_page(crate::PageLimits::new(1, 1).unwrap()),
+                Err(ReadError::PageTooSmall)
+            ));
+            let mut actual = Vec::new();
+            loop {
+                let page = session
+                    .next_page(crate::PageLimits::new(3, 1024 * 1024).unwrap())
+                    .unwrap();
+                actual.extend(page.entries);
+                if page.exhausted {
+                    break;
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+        fn assert_send_static<T: Send + 'static>() {}
+        assert_send_static::<QuerySession>();
+    }
+
+    #[test]
+    fn session_limits_and_cancellation_are_not_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        populate(dir.path());
+        let reader = Arc::new(Reader::open_dump([dir.path()], &[schema()]).unwrap());
+        let cancel = crate::Cancellation::new();
+        cancel.cancel();
+        assert!(matches!(
+            reader.open_session(Query::new(), crate::ReadLimits::default(), cancel),
+            Err(ReadError::Cancelled)
+        ));
+        let limits = crate::ReadLimits {
+            blocks: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            reader.open_session(Query::new(), limits, crate::Cancellation::new()),
+            Err(ReadError::LimitExceeded(crate::ReadResource::Blocks))
+        ));
     }
 
     #[test]
@@ -2564,7 +4112,7 @@ mod tests {
                 .unwrap()
                 .sample_raw(dduroc_engine::staged::OwnedValue::U64(1)); // link, tag rf
             {
-                let cal = ns.span(SpanKindId(1));
+                let cal = ns.span_raw(SpanKindId(1));
                 cal.log_raw(EventId(1), &[8]); // rf, inside a span
             }
             ns.sync().unwrap();
@@ -3365,6 +4913,39 @@ mod tests {
         // An unknown language falls back to the first declared, not to a refusal.
         assert_eq!(reader.render(msg, "de").as_deref(), Some("power set"));
 
+        let reader = reader
+            .with_language_preferences(crate::LanguagePreferences::new(["de", "RU"]).unwrap());
+        let rendered = reader.render_preferred(msg).unwrap();
+        assert_eq!(rendered.text, "мощность задана");
+        assert_eq!(rendered.language.as_deref(), Some("ru"));
+        assert_eq!(rendered.preference_index, Some(1));
+        let fallback = crate::LanguagePreferences::new(["de"]).unwrap();
+        let rendered = reader.render_with_preferences(msg, &fallback).unwrap();
+        assert_eq!(rendered.text, "power set");
+        assert_eq!(rendered.language.as_deref(), Some("en"));
+        assert_eq!(rendered.preference_index, None);
+        assert_eq!(
+            reader.render_preferred(msg).unwrap().text,
+            "мощность задана"
+        );
+        let mut mismatch = msg.clone();
+        mismatch.schema_identity = None;
+        assert_eq!(reader.render_preferred(&mismatch), None);
+        let mut free_text = msg.clone();
+        free_text.kind = EntryKind::Text {
+            level: Level::Info,
+            target: "test".into(),
+            text: "literal".into(),
+        };
+        assert_eq!(
+            reader.render_preferred(&free_text),
+            Some(RenderedMessage {
+                text: "literal".into(),
+                language: None,
+                preference_index: None,
+            })
+        );
+
         // Offline readers own an exclusive backend lock; release it before reopening.
         drop(reader);
         // A reader without schemas has nothing to render with, and will not invent.
@@ -3433,6 +5014,47 @@ mod tests {
         assert!(
             max_bytes <= min_bytes + 65536,
             "offline open leaked allocated blocks: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn follow_drains_existing_tail_and_new_namespace_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::open(StoreConfig::new(dir.path()).with_budget_per_class(16 << 20)).unwrap();
+        let existing = store.namespace("existing", schema()).unwrap();
+        existing.log_text(Level::Info, "test", "before", None);
+        existing.sync().unwrap();
+        let reader = Reader::of_store(&store);
+        let mut follow = reader.follow(&Query::new().order(Order::Oldest)).unwrap();
+        let Tail::Entry(initial) = follow.next(Duration::from_secs(1)) else {
+            panic!("initial entry missing");
+        };
+        assert!(matches!(&initial.kind, EntryKind::Text { text, .. } if text == "before"));
+        existing.log_text(Level::Info, "test", "tail", None);
+        let new_namespace = store.namespace("new", schema()).unwrap();
+        new_namespace.log_text(Level::Info, "test", "new", None);
+        store.shutdown();
+        let mut observed = Vec::new();
+        loop {
+            match follow.next(Duration::from_secs(1)) {
+                Tail::Entry(entry) => match &entry.kind {
+                    EntryKind::Text { text, .. } => {
+                        observed.push((entry.namespace.to_string(), text.clone()))
+                    }
+                    other => panic!("unexpected entry: {other:?}"),
+                },
+                Tail::Ended => break,
+                Tail::Idle => panic!("a stopped writer must not leave the follower idle"),
+            }
+        }
+        observed.sort();
+        assert_eq!(
+            observed,
+            [
+                ("existing".into(), "tail".into()),
+                ("new".into(), "new".into())
+            ]
         );
     }
 

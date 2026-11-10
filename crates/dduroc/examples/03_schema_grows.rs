@@ -97,9 +97,9 @@ mod today {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let root = std::env::temp_dir().join("dduroc-examples").join("03");
-    let _ = std::fs::remove_dir_all(&root);
-    let cfg = StoreConfig::new(&root).with_budget_per_class(16 << 20);
+    let directory = tempfile::tempdir()?;
+    let root = directory.path();
+    let cfg = StoreConfig::new(root).with_budget_per_class(16 << 20);
 
     // Yesterday: firmware v1 writes its history.
     {

@@ -8,6 +8,8 @@
 //! declarations of one name in different modules are "yesterday's" and
 //! "today's" builds.
 
+#![cfg(feature = "read")]
+
 use dduroc::prelude::*;
 use dduroc::{EventId, MetricId, StoreConfig};
 use dduroc_read::{EntryKind, Order, OwnedSampleValue, Query, Reader};
@@ -315,5 +317,86 @@ fn a_span_kind_and_a_sample_value_migrate_like_everything_else() {
         expected,
         "the answer did not change"
     );
+    store.shutdown();
+}
+
+mod state_codes_before {
+    dduroc::schema! {
+        name: state_codes, version: 1, languages: [en],
+        metrics {
+            Locked = 1 { type: bool, states: [Off = 0, On = 1] },
+            Mode = 2 { type: i64, states: [Idle = 0, Active = 1] },
+        }
+    }
+}
+
+mod state_codes_after {
+    dduroc::schema! {
+        name: state_codes, version: 2, languages: [en],
+        metrics {
+            Locked = 1 { type: bool, states: [Off = 0, On = 1] },
+            Mode = 2 { type: i64, states: [Idle = 0, Active = 1] },
+        }
+        migrations {
+            1 => {
+                metrics::Locked: |value: bool| !value,
+                metrics::Mode: |value: i64| 1 - value,
+            }
+        }
+    }
+}
+
+#[test]
+fn state_migration_returns_the_declared_wire_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = StoreConfig::new(dir.path()).with_budget_per_class(16 << 20);
+    {
+        let store = Store::open(config.clone()).unwrap();
+        let ns = store
+            .namespace("states", state_codes_before::state_codes::SCHEMA)
+            .unwrap();
+        ns.series(state_codes_before::state_codes::metrics::Locked)
+            .unwrap()
+            .sample(state_codes_before::state_codes::metrics::Locked::On);
+        ns.series(state_codes_before::state_codes::metrics::Mode)
+            .unwrap()
+            .sample(state_codes_before::state_codes::metrics::Mode::Idle);
+        ns.sync().unwrap();
+        store.shutdown();
+    }
+    let store = Store::open(config).unwrap();
+    let ns = store
+        .namespace("states", state_codes_after::state_codes::SCHEMA)
+        .unwrap();
+    let check = || {
+        let result = store
+            .reader()
+            .query(&Query::new().order(Order::Oldest))
+            .unwrap();
+        assert!(result.is_complete(), "{result:?}");
+        let samples: Vec<_> = result
+            .entries
+            .into_iter()
+            .filter_map(|entry| match entry.kind {
+                EntryKind::Sample {
+                    metric,
+                    value,
+                    state_name,
+                    ..
+                } => Some((metric, value, state_name)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            samples,
+            vec![
+                (MetricId(1), OwnedSampleValue::Bool(false), Some("Off")),
+                (MetricId(2), OwnedSampleValue::I64(1), Some("Active")),
+            ]
+        );
+    };
+    check();
+    assert_eq!(ns.migrate().unwrap().rewritten, 1);
+    check();
     store.shutdown();
 }

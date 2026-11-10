@@ -5,6 +5,9 @@
 # Frontend artifacts (dduroc-web)
 node_modules/
 dist/
+# The Rust package ships reviewed prebuilt assets.
+!/crates/dduroc-web/ui/dist/
+!/crates/dduroc-web/ui/dist/**
 
 # Local store data and dumps
 *.seg

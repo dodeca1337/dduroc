@@ -5,8 +5,9 @@
 use crate::backend::{ChannelKey, ReadBackend};
 use crate::channel::ChannelConfig;
 use crate::error::{Error, Result};
+use crate::queue_limits::QueueByteLimits;
 use crate::schema::StorageClass;
-use crate::staged::{ChannelIdx, DropCounters, NsId, Staged};
+use crate::staged::{ChannelIdx, DropCounters, NsId, OwnedValue, Staged, StagedRecord};
 use crate::stats::Counters;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use dduroc_format::block::BlockBuilder;
@@ -97,8 +98,31 @@ pub struct GroupBudget {
     pub root_key: u8,
 }
 
-// Separate byte pools preserve critical admission under telemetry pressure.
-const QUEUE_BYTE_LIMITS: [usize; 2] = [16 * 1024 * 1024, 4 * 1024 * 1024];
+// Account retained allocations rather than only serialized payload length.
+fn charged_bytes(item: &Staged) -> Option<usize> {
+    let mut bytes = std::mem::size_of::<Queued>();
+    let payload = match &item.record {
+        StagedRecord::Message { payload, .. } => Some(payload),
+        StagedRecord::Sample {
+            value: OwnedValue::Blob(payload),
+            ..
+        } => Some(payload),
+        StagedRecord::Text { target, text, .. } => {
+            bytes = bytes
+                .checked_add(target.len())?
+                .checked_add(std::mem::size_of::<[usize; 2]>())?
+                .checked_add(text.len())?;
+            None
+        }
+        _ => None,
+    };
+    if let Some(payload) = payload
+        && payload.spilled()
+    {
+        bytes = bytes.checked_add(payload.capacity())?;
+    }
+    Some(bytes)
+}
 #[derive(Debug)]
 struct QueuePermit {
     held: Arc<AtomicUsize>,
@@ -132,17 +156,20 @@ pub struct Writer {
     stopping: AtomicBool,
     backend: Arc<ReadBackend>,
     queued_bytes: [Arc<AtomicUsize>; 2],
+    queue_byte_limits: [usize; 2],
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 impl Writer {
     pub fn spawn(
         counters: Arc<Counters>,
         queues: QueueSizes,
+        queue_byte_limits: QueueByteLimits,
         _groups: Vec<GroupBudget>,
         buffer_ceiling: Option<u64>,
         pulse: Arc<crate::pulse::Pulse>,
         backend: Arc<ReadBackend>,
     ) -> Result<Arc<Self>> {
+        queue_byte_limits.validate()?;
         let queues = queues.sanitized();
         let (normal, nr) = crossbeam_channel::bounded(queues.normal);
         let (critical, cr) = crossbeam_channel::bounded(queues.critical);
@@ -162,7 +189,19 @@ impl Writer {
         // process stops before any acknowledgement can be sent.
         let handle = std::thread::Builder::new()
             .name("dduroc-writer".into())
-            .spawn(move || state.run(nr, cr, ctl))
+            .spawn(move || {
+                // Publish termination even if the worker unwinds. Closing the
+                // pulse means no further data can arrive, not that writes were
+                // durably acknowledged.
+                struct ClosePulse(Arc<crate::pulse::Pulse>);
+                impl Drop for ClosePulse {
+                    fn drop(&mut self) {
+                        self.0.close();
+                    }
+                }
+                let _close = ClosePulse(Arc::clone(&state.pulse));
+                state.run(nr, cr, ctl)
+            })
             .map_err(|source| Error::Io {
                 context: "starting writer thread".into(),
                 source,
@@ -175,6 +214,7 @@ impl Writer {
             backend,
             stopping: AtomicBool::new(false),
             queued_bytes: std::array::from_fn(|_| Arc::new(AtomicUsize::new(0))),
+            queue_byte_limits: [queue_byte_limits.normal, queue_byte_limits.critical],
             handle: Mutex::new(Some(handle)),
         }))
     }
@@ -186,14 +226,14 @@ impl Writer {
         self.control
             .send(Control::Key(ns, channel, tx))
             .map_err(|_| Error::WriterDead)?;
-        rx.recv().map_err(|_| Error::WriterDead)?
+        self.wait_reply(&rx)?
     }
     pub fn register(&self, setup: NsSetup) -> Result<NsId> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         self.control
             .send(Control::Register(Box::new(setup), tx))
             .map_err(|_| Error::WriterDead)?;
-        rx.recv().map_err(|_| Error::WriterDead)?
+        self.wait_reply(&rx)?
     }
     fn reserve(
         &self,
@@ -203,16 +243,24 @@ impl Writer {
         drops: &DropCounters,
     ) -> Result<QueuePermit> {
         let pool = usize::from(critical);
-        let bytes = item
-            .dynamic_bytes()
-            .saturating_add(std::mem::size_of::<Queued>());
+        let limit = self.queue_byte_limits[pool];
+        let too_large = |value: u64| {
+            Error::from(dduroc_format::Error::LimitExceeded {
+                what: "queued owned data accounting",
+                value,
+                max: limit as u64,
+            })
+        };
+        let bytes = charged_bytes(item).ok_or_else(|| too_large(u64::MAX))?;
+        if bytes > limit {
+            return Err(too_large(bytes as u64));
+        }
         let until = Instant::now() + BACKPRESSURE_TIMEOUT;
         let mut reported = false;
         loop {
             if self.queued_bytes[pool]
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    held.checked_add(bytes)
-                        .filter(|n| *n <= QUEUE_BYTE_LIMITS[pool])
+                    held.checked_add(bytes).filter(|n| *n <= limit)
                 })
                 .is_ok()
             {
@@ -279,7 +327,7 @@ impl Writer {
         }
         // No timeout after submission: timing out cannot cancel the write and
         // must not encourage a duplicate retry. Disconnect means unconfirmed.
-        rx.recv().map_err(|_| Error::WriterDead)?
+        self.wait_reply(&rx)?
     }
     pub fn write_no_wait(&self, item: Staged, critical: bool, drops: &DropCounters) -> Result<()> {
         validate_record(&item)?;
@@ -321,18 +369,37 @@ impl Writer {
         self.control
             .send(Control::Sync(ns, tx))
             .map_err(|_| Error::WriterDead)?;
-        rx.recv().map_err(|_| Error::WriterDead)?
+        self.wait_reply(&rx)?
     }
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::Release);
         let (tx, rx) = crossbeam_channel::bounded(1);
         if self.control.send(Control::Shutdown(tx)).is_ok() {
-            let _ = rx.recv();
+            let _ = self.wait_reply(&rx);
         }
         if let Ok(mut h) = self.handle.lock()
             && let Some(h) = h.take()
         {
             let _ = h.join();
+        }
+    }
+    // A failed worker can leave a reply sender inside a queued command while
+    // this Writer still owns the channel sender. Poll only worker liveness;
+    // do not time out or retry an operation while its worker is still alive.
+    fn wait_reply<T>(&self, receiver: &Receiver<T>) -> Result<T> {
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(value) => return Ok(value),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err(Error::WriterDead);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) if !self.is_alive() => {
+                    // The worker may have sent its reply and exited between
+                    // timeout and liveness check; preserve that real ACK.
+                    return receiver.try_recv().map_err(|_| Error::WriterDead);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            }
         }
     }
     pub fn counters(&self) -> &Counters {
@@ -466,6 +533,20 @@ impl WriterLoop {
         Ok(())
     }
     fn apply(&mut self, q: Queued) -> Result<()> {
+        let ns = q.item.ns;
+        let channel = q.item.channel;
+        let result = self.apply_inner(q);
+        // All fallible work precedes a successful builder push. On failure
+        // this dequeued record belongs to neither a builder nor a queue.
+        if result.is_err() {
+            if let Ok(ch) = self.channel(ns, channel) {
+                ch.drops.record(channel);
+            }
+            Counters::bump(&self.counters.dropped);
+        }
+        result
+    }
+    fn apply_inner(&mut self, q: Queued) -> Result<()> {
         let item = q.item;
         drop(q._permit);
         if self.buffered_bytes >= self.buffer_ceiling.unwrap_or(16 * 1024 * 1024) {
@@ -574,6 +655,17 @@ impl WriterLoop {
                 for (c, ch) in ns.iter_mut().enumerate() {
                     let lost = ch.drops.take(ch.index);
                     if lost != 0 {
+                        // A diagnostic is a record too: make space before its
+                        // append, just as for a producer's full block.
+                        if ch.builder.count() == u16::MAX {
+                            Self::flush(
+                                &self.backend,
+                                &self.counters,
+                                &self.pulse,
+                                ch,
+                                !ch.pending.is_empty() || ch.config.sync_interval.is_zero(),
+                            )?;
+                        }
                         let text = crate::diag::drop_notice(lost);
                         let rec = dduroc_format::Record::Text(dduroc_format::record::Text {
                             level: dduroc_format::Level::Warn,
@@ -631,6 +723,14 @@ impl WriterLoop {
         if result.is_err() {
             Counters::bump(&self.counters.io_errors);
         }
+        // Other channels may still hold admitted records when one flush fails.
+        // finish() already clears the failed block, and flush() counts its
+        // unconfirmed records, so only the remaining builders are counted here.
+        for ch in self.namespaces.values().flatten() {
+            let count = u64::from(ch.builder.count());
+            ch.drops.record_n(ch.index, count);
+            Counters::add(&self.counters.dropped, count);
+        }
         // Dropping both receivers releases blocked producers and durable ACK
         // waiters. A failed worker is never restarted in this Store instance.
         for q in normal.try_iter().chain(critical.try_iter()) {
@@ -673,7 +773,26 @@ impl WriterLoop {
                         });
                     }
                     Control::Release(ns) => {
-                        self.drain(normal, critical)?;
+                        // The last namespace lease has gone, so no more records
+                        // for this namespace can be admitted. Drain the finite
+                        // FIFO prefixes present now, even if other producers
+                        // keep replenishing their queues.
+                        let critical_prefix = critical.len();
+                        let normal_prefix = normal.len();
+                        for index in 0..critical_prefix {
+                            if let Ok(queued) = critical.try_recv() {
+                                self.apply(queued)?;
+                            }
+                            if (index + 1) % DRAIN_LIMIT == 0 {
+                                self.flush_critical()?;
+                            }
+                        }
+                        self.flush_critical()?;
+                        for _ in 0..normal_prefix {
+                            if let Ok(queued) = normal.try_recv() {
+                                self.apply(queued)?;
+                            }
+                        }
                         self.barrier()?;
                         self.namespaces.remove(&(ns.0 as usize));
                         self.active.retain(|&(n, _)| n != ns.0 as usize);
@@ -707,7 +826,6 @@ impl WriterLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::staged::{OwnedValue, StagedRecord};
     use dduroc_format::{MetricId, Value};
 
     struct Fixture {
@@ -724,6 +842,13 @@ mod tests {
         }
     }
     fn setup(config: ChannelConfig, queues: QueueSizes) -> Fixture {
+        setup_with_limits(config, queues, QueueByteLimits::default())
+    }
+    fn setup_with_limits(
+        config: ChannelConfig,
+        queues: QueueSizes,
+        queue_byte_limits: QueueByteLimits,
+    ) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("dduroc-raft-v1"), b"dduroc raft store v1\n").unwrap();
         let backend =
@@ -731,6 +856,7 @@ mod tests {
         let writer = Writer::spawn(
             Arc::new(Counters::default()),
             queues,
+            queue_byte_limits,
             vec![],
             Some(1024 * 1024),
             Arc::new(crate::pulse::Pulse::new()),
@@ -849,6 +975,18 @@ mod tests {
         assert!(f.writer.sync(None).is_err());
         assert!(f.writer.write(item(f.ns, 2), true, &f.drops).is_err());
         assert!(f.writer.counters.snapshot().io_errors > 0);
+        assert_eq!(f.writer.queued_bytes[0].load(Ordering::Acquire), 0);
+        assert_eq!(f.writer.queued_bytes[1].load(Ordering::Acquire), 0);
+        // A queued command may retain its reply sender even after the worker
+        // has exited. Waiters must detect that exit without a false ACK.
+        let (_sender, receiver) = crossbeam_channel::bounded::<()>(1);
+        assert!(matches!(
+            f.writer.wait_reply(&receiver),
+            Err(Error::WriterDead)
+        ));
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        sender.send(7).unwrap();
+        assert_eq!(f.writer.wait_reply(&receiver).unwrap(), 7);
     }
     #[test]
     fn admitted_critical_capacity_failure_is_delivery_loss_and_fences_later_sync() {
@@ -926,8 +1064,15 @@ mod tests {
     fn parked_handle(
         backend: Arc<ReadBackend>,
     ) -> (Arc<Writer>, Receiver<Queued>, Receiver<Queued>) {
-        let (normal, nr) = crossbeam_channel::bounded(1);
-        let (critical, cr) = crossbeam_channel::bounded(1);
+        parked_with_limits(backend, QueueByteLimits::default(), 1)
+    }
+    fn parked_with_limits(
+        backend: Arc<ReadBackend>,
+        limits: QueueByteLimits,
+        slots: usize,
+    ) -> (Arc<Writer>, Receiver<Queued>, Receiver<Queued>) {
+        let (normal, nr) = crossbeam_channel::bounded(slots);
+        let (critical, cr) = crossbeam_channel::bounded(slots);
         let (control, _ctl) = crossbeam_channel::bounded(1);
         (
             Arc::new(Writer {
@@ -938,6 +1083,7 @@ mod tests {
                 counters: Arc::new(Counters::default()),
                 stopping: AtomicBool::new(false),
                 queued_bytes: std::array::from_fn(|_| Arc::new(AtomicUsize::new(0))),
+                queue_byte_limits: [limits.normal, limits.critical],
                 handle: Mutex::new(None),
             }),
             nr,
@@ -1005,6 +1151,10 @@ mod tests {
             counters: Arc::new(Counters::default()),
             stopping: AtomicBool::new(false),
             queued_bytes: std::array::from_fn(|_| Arc::new(AtomicUsize::new(0))),
+            queue_byte_limits: [
+                QueueByteLimits::default().normal,
+                QueueByteLimits::default().critical,
+            ],
             handle: Mutex::new(None),
         };
         let mut blob = item(f.ns, 1);
@@ -1020,8 +1170,8 @@ mod tests {
             Err(Error::QueueFull)
         ));
         writer.write_no_wait(blob, true, &f.drops).unwrap();
-        assert!(writer.queued_bytes[0].load(Ordering::Acquire) <= QUEUE_BYTE_LIMITS[0]);
-        assert!(writer.queued_bytes[1].load(Ordering::Acquire) <= QUEUE_BYTE_LIMITS[1]);
+        assert!(writer.queued_bytes[0].load(Ordering::Acquire) <= writer.queue_byte_limits[0]);
+        assert!(writer.queued_bytes[1].load(Ordering::Acquire) <= writer.queue_byte_limits[1]);
         for queued in nr.try_iter().chain(cr.try_iter()) {
             drop(queued);
         }
@@ -1030,6 +1180,135 @@ mod tests {
         assert_eq!(writer.queued_bytes[0].load(Ordering::Acquire), 0);
         assert_eq!(writer.queued_bytes[1].load(Ordering::Acquire), 0);
     }
+    #[test]
+    fn owned_queue_accounting_includes_spilled_capacity_and_text_metadata() {
+        let mut record = item(NsId(0), 0);
+        assert_eq!(charged_bytes(&record), Some(std::mem::size_of::<Queued>()));
+        let mut payload = crate::staged::Payload::with_capacity(4096);
+        payload.push(1);
+        assert!(payload.spilled());
+        let capacity = payload.capacity();
+        record.record = StagedRecord::Sample {
+            metric: MetricId(1),
+            value: OwnedValue::Blob(payload),
+        };
+        assert_eq!(record.dynamic_bytes(), 1);
+        assert_eq!(
+            charged_bytes(&record),
+            Some(std::mem::size_of::<Queued>() + capacity)
+        );
+        record.record = StagedRecord::Text {
+            level: dduroc_format::Level::Info,
+            span: None,
+            target: Arc::from("target"),
+            text: "text".into(),
+        };
+        assert_eq!(
+            charged_bytes(&record),
+            Some(std::mem::size_of::<Queued>() + 6 + 4 + std::mem::size_of::<[usize; 2]>())
+        );
+    }
+
+    #[test]
+    fn oversized_owned_record_never_waits_for_an_impossible_pool_and_writer_stays_usable() {
+        let f = setup_with_limits(
+            ChannelConfig::critical(16 << 20),
+            QueueSizes::default(),
+            QueueByteLimits {
+                normal: 1024,
+                critical: 1024,
+            },
+        );
+        for critical in [false, true] {
+            let mut payload = crate::staged::Payload::with_capacity(4096);
+            payload.push(1);
+            let mut oversized = item(f.ns, 1);
+            oversized.record = StagedRecord::Sample {
+                metric: MetricId(1),
+                value: OwnedValue::Blob(payload),
+            };
+            let started = Instant::now();
+            let error = f.writer.write(oversized, critical, &f.drops).unwrap_err();
+            assert!(matches!(
+                error,
+                Error::Format(dduroc_format::Error::LimitExceeded {
+                    what: "queued owned data accounting",
+                    max: 1024,
+                    ..
+                })
+            ));
+            assert!(started.elapsed() < Duration::from_millis(100));
+        }
+        assert_eq!(f.writer.counters.snapshot().backpressure_waits, 0);
+        assert_eq!(f.writer.counters.snapshot().records_written, 0);
+        assert_eq!(f.writer.queued_bytes[0].load(Ordering::Acquire), 0);
+        assert_eq!(f.writer.queued_bytes[1].load(Ordering::Acquire), 0);
+        f.writer.write(item(f.ns, 9), true, &f.drops).unwrap();
+        assert_eq!(f.writer.counters.snapshot().records_written, 1);
+    }
+
+    #[test]
+    fn configured_byte_pools_are_independent_and_dropped_tickets_restore_capacity() {
+        let f = setup(ChannelConfig::new(16 << 20), QueueSizes::default());
+        let size = charged_bytes(&item(f.ns, 0)).unwrap();
+        let (writer, normal, critical) = parked_with_limits(
+            f.backend.clone(),
+            QueueByteLimits {
+                normal: size * 2,
+                critical: size * 3,
+            },
+            16,
+        );
+        for value in 0..2 {
+            writer
+                .write_no_wait(item(f.ns, value), false, &f.drops)
+                .unwrap();
+        }
+        assert!(matches!(
+            writer.write_no_wait(item(f.ns, 3), false, &f.drops),
+            Err(Error::QueueFull)
+        ));
+        for value in 0..3 {
+            writer
+                .write_no_wait(item(f.ns, value), true, &f.drops)
+                .unwrap();
+        }
+        assert!(matches!(
+            writer.write_no_wait(item(f.ns, 4), true, &f.drops),
+            Err(Error::QueueFull)
+        ));
+        assert_eq!(writer.queued_bytes[0].load(Ordering::Acquire), size * 2);
+        assert_eq!(writer.queued_bytes[1].load(Ordering::Acquire), size * 3);
+        drop(normal.recv().unwrap());
+        writer
+            .write_no_wait(item(f.ns, 5), false, &f.drops)
+            .unwrap();
+        assert_eq!(writer.queued_bytes[1].load(Ordering::Acquire), size * 3);
+        for queued in normal.try_iter().chain(critical.try_iter()) {
+            drop(queued);
+        }
+        drop(normal);
+        drop(critical);
+        assert_eq!(writer.queued_bytes[0].load(Ordering::Acquire), 0);
+        assert_eq!(writer.queued_bytes[1].load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn disconnected_queue_releases_a_newly_reserved_byte_ticket() {
+        let f = setup(ChannelConfig::new(16 << 20), QueueSizes::default());
+        let (writer, normal, critical) = parked_handle(f.backend.clone());
+        drop(normal);
+        drop(critical);
+        for priority in [false, true] {
+            assert!(matches!(
+                writer.write_no_wait(item(f.ns, 0), priority, &f.drops),
+                Err(Error::WriterDead)
+            ));
+        }
+        assert_eq!(writer.queued_bytes[0].load(Ordering::Acquire), 0);
+        assert_eq!(writer.queued_bytes[1].load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn release_reopen_reclaims_state_and_never_reuses_a_stale_address() {
         let f = setup(ChannelConfig::new(16 << 20), QueueSizes::default());
@@ -1065,3 +1344,11 @@ mod tests {
         assert_eq!(f.backend.catalog().unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "writer_failure_tests.rs"]
+mod failure_tests;
+
+#[cfg(test)]
+#[path = "writer_release_audit_tests.rs"]
+mod release_audit_tests;

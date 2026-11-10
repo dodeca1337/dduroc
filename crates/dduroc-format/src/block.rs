@@ -149,6 +149,22 @@ impl BlockHeader {
 
         let body_len = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
         let raw_len = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        Self::validate_lengths(body_len, raw_len, compression)?;
+
+        Ok(Some(Self {
+            body_len,
+            raw_len,
+            seq: u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]),
+            base: Micros(u64::from_le_bytes(
+                raw[16..24].try_into().expect("an 8-byte slice"),
+            )),
+            count: u16::from_le_bytes([raw[24], raw[25]]),
+            compression,
+            crc: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
+        }))
+    }
+
+    fn validate_lengths(body_len: u32, raw_len: u32, compression: Compression) -> Result<()> {
         // Lengths are checked before anything is allocated from them.
         if body_len == 0 || body_len > Self::MAX_BODY || raw_len > Self::MAX_BODY {
             return Err(Error::LimitExceeded {
@@ -176,17 +192,7 @@ impl BlockHeader {
             });
         }
 
-        Ok(Some(Self {
-            body_len,
-            raw_len,
-            seq: u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]),
-            base: Micros(u64::from_le_bytes(
-                raw[16..24].try_into().expect("an 8-byte slice"),
-            )),
-            count: u16::from_le_bytes([raw[24], raw[25]]),
-            compression,
-            crc: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
-        }))
+        Ok(())
     }
 
     /// Check the header CRC together with the body (the body as on disk).
@@ -208,6 +214,10 @@ impl BlockHeader {
 
     /// Decompress the body. Without compression this borrows, with no copy.
     pub fn decompress<'a>(&self, body_on_disk: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        Self::validate_lengths(self.body_len, self.raw_len, self.compression)?;
+        if body_on_disk.len() != self.body_len as usize {
+            return Err(Error::Truncated);
+        }
         match self.compression {
             Compression::None => {
                 if self.raw_len != self.body_len {
@@ -523,7 +533,9 @@ impl<'a> Block<'a> {
         BlockRecords {
             inner: record::iter(&self.body),
             at: self.header.base,
-            first: true,
+            expected: self.header.count,
+            seen: 0,
+            finished: false,
         }
     }
 }
@@ -533,25 +545,56 @@ impl<'a> Block<'a> {
 pub struct BlockRecords<'a> {
     inner: record::RecordIter<'a>,
     at: Micros,
-    first: bool,
+    expected: u16,
+    seen: u32,
+    finished: bool,
 }
 
 impl<'a> Iterator for BlockRecords<'a> {
     type Item = Result<(Micros, Record<'a>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let framed = match self.inner.next()? {
-            Ok(f) => f,
-            Err(e) => return Some(Err(e)),
-        };
-        // The first record sets the base; its delta is zero by construction.
-        if !self.first {
-            match self.at.checked_add_delta(framed.dt) {
-                Some(t) => self.at = t,
-                None => return Some(Err(Error::Truncated)),
-            }
+        if self.finished {
+            return None;
         }
-        self.first = false;
+        let framed = match self.inner.next() {
+            Some(Ok(framed)) => framed,
+            Some(Err(error)) => {
+                self.finished = true;
+                return Some(Err(error));
+            }
+            None => {
+                self.finished = true;
+                return (self.seen != u32::from(self.expected)).then_some(Err(
+                    Error::RecordCountMismatch {
+                        expected: self.expected,
+                        actual: self.seen,
+                    },
+                ));
+            }
+        };
+        self.seen += 1;
+        let error = if self.seen > u32::from(self.expected) {
+            Some(Error::RecordCountMismatch {
+                expected: self.expected,
+                actual: self.seen,
+            })
+        } else if self.seen == 1 {
+            // The first delta is always zero: the header already holds its time.
+            (framed.dt != 0).then_some(Error::ReservedValue)
+        } else {
+            match self.at.checked_add_delta(framed.dt) {
+                Some(time) => {
+                    self.at = time;
+                    None
+                }
+                None => Some(Error::Truncated),
+            }
+        };
+        if let Some(error) = error {
+            self.finished = true;
+            return Some(Err(error));
+        }
         Some(Ok((self.at, framed.record)))
     }
 }
@@ -569,6 +612,65 @@ mod tests {
             span: None,
             payload,
         })
+    }
+
+    #[test]
+    fn malformed_record_time_or_count_stops_iteration_permanently() {
+        fn block(base: u64, count: u16, deltas: &[u64]) -> Block<'static> {
+            let mut body = Vec::new();
+            for &delta in deltas {
+                record::encode(&msg(1, &[]), delta, &mut body).unwrap();
+            }
+            Block {
+                header: BlockHeader {
+                    body_len: body.len() as u32,
+                    raw_len: body.len() as u32,
+                    seq: 0,
+                    base: Micros(base),
+                    count,
+                    compression: Compression::None,
+                    crc: 0,
+                },
+                body: Cow::Owned(body),
+            }
+        }
+        for (block, valid) in [
+            (block(10, 1, &[1]), 0),
+            (block(10, 2, &[0]), 1),
+            (block(10, 1, &[0, 1]), 1),
+            (block(u64::MAX, 3, &[0, 1, 0]), 1),
+        ] {
+            let mut records = block.records();
+            for _ in 0..valid {
+                assert!(records.next().unwrap().is_ok());
+            }
+            assert!(records.next().unwrap().is_err());
+            assert!(records.next().is_none());
+            assert!(records.next().is_none());
+        }
+    }
+
+    #[test]
+    fn manually_constructed_headers_cannot_bypass_decompression_limits() {
+        let header = BlockHeader {
+            body_len: 1,
+            raw_len: u32::MAX,
+            seq: 0,
+            base: Micros(0),
+            count: 1,
+            compression: Compression::Lz4,
+            crc: 0,
+        };
+        assert!(matches!(
+            header.decompress(&[0]),
+            Err(Error::LimitExceeded { .. })
+        ));
+        let header = BlockHeader {
+            raw_len: 1,
+            compression: Compression::None,
+            ..header
+        };
+        assert_eq!(header.decompress(&[]), Err(Error::Truncated));
     }
 
     #[test]

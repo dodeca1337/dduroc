@@ -82,6 +82,8 @@ pub enum OwnedSampleValue {
 }
 
 impl OwnedSampleValue {
+    /// Convert numeric and boolean samples to `f64`. Large integer values may
+    /// lose precision; match the enum directly when the exact value matters.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             OwnedSampleValue::F32(v) => Some(f64::from(*v)),
@@ -825,6 +827,7 @@ pub struct LegacyChannelCursor {
 /// The parameters for opening a channel.
 #[derive(Clone, Default)]
 pub struct ChannelScope {
+    pub(crate) budget: Option<Arc<crate::budget::Budget>>,
     /// The window, already brought to the runs' relative scale: converting
     /// wall-clock bounds by anchors is the query's business, not the cursor's.
     pub bounds: Bounds,
@@ -1253,6 +1256,45 @@ impl ChannelCursor {
             inner: ChannelStorage::Raft(Box::new(RaftChannelCursor::new(backend, info, scope))),
         }
     }
+    pub(crate) fn open_snapshot(
+        backend: Arc<dduroc_engine::backend::ReadBackend>,
+        snapshot: dduroc_engine::backend::ChannelSnapshot,
+        scope: &ChannelScope,
+    ) -> Self {
+        let mut cursor = Self::open_backend(backend, snapshot.info.clone(), scope);
+        if let ChannelStorage::Raft(inner) = &mut cursor.inner {
+            inner.snapshot = Some(snapshot);
+        }
+        cursor
+    }
+    pub(crate) fn required_index(&self) -> Option<u64> {
+        match &self.inner {
+            ChannelStorage::Raft(c) if c.reverse => {
+                (c.next > c.first || c.pos < c.records.len()).then_some(c.first)
+            }
+            ChannelStorage::Raft(c) => c.current_index.or((c.next < c.end).then_some(c.next)),
+            ChannelStorage::Legacy(_) => None,
+        }
+    }
+    pub(crate) fn set_following(&mut self) {
+        if let ChannelStorage::Raft(cursor) = &mut self.inner {
+            cursor.scope.liveness = Liveness::Following;
+        }
+    }
+    pub(crate) fn validate_follow(&self) -> Result<()> {
+        let ChannelStorage::Raft(cursor) = &self.inner else {
+            return Ok(());
+        };
+        let Some(snapshot) = &cursor.snapshot else {
+            return Ok(());
+        };
+        let required = cursor.current_index.unwrap_or(cursor.next);
+        match cursor.backend.follow_status(snapshot, required)? {
+            dduroc_engine::backend::SnapshotStatus::Current => Ok(()),
+            dduroc_engine::backend::SnapshotStatus::Replaced => Err(ReadError::SnapshotExpired),
+            dduroc_engine::backend::SnapshotStatus::Evicted => Err(ReadError::RetentionGap),
+        }
+    }
     pub fn peek(&mut self) -> Option<&RawEntry> {
         match &mut self.inner {
             ChannelStorage::Legacy(c) => c.peek(),
@@ -1309,6 +1351,8 @@ struct RaftChannelCursor {
     damaged: Vec<Damage>,
     unanchored: Vec<BootCounter>,
     blocks_left: Option<usize>,
+    snapshot: Option<dduroc_engine::backend::ChannelSnapshot>,
+    current_index: Option<u64>,
 }
 impl std::fmt::Debug for RaftChannelCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1325,7 +1369,7 @@ impl RaftChannelCursor {
         info: dduroc_engine::backend::ChannelInfo,
         scope: &ChannelScope,
     ) -> Self {
-        let first = info.first_index.unwrap_or(1);
+        let first = info.first_index.unwrap_or(info.next_write_index);
         let end = info.last_index.map_or(first, |last| last.saturating_add(1));
         Self {
             backend,
@@ -1340,6 +1384,8 @@ impl RaftChannelCursor {
             damaged: Vec::new(),
             unanchored: Vec::new(),
             blocks_left: scope.max_segments.map(|n| n.saturating_mul(128)),
+            snapshot: None,
+            current_index: None,
         }
     }
     fn damage(&mut self, index: u64, reason: impl ToString) {
@@ -1353,9 +1399,37 @@ impl RaftChannelCursor {
         if !self.scope.liveness.is_following() {
             return false;
         }
+        if self
+            .scope
+            .budget
+            .as_ref()
+            .is_some_and(|budget| !budget.checkpoint())
+        {
+            return false;
+        }
+        if let (Some(snapshot), Some(budget)) = (&self.snapshot, &self.scope.budget) {
+            match self.backend.validate_snapshot(snapshot, None) {
+                Ok(true) => {}
+                Ok(false) => {
+                    budget.stop(crate::budget::Stop::Expired);
+                    return false;
+                }
+                Err(error) => {
+                    budget.stop(crate::budget::Stop::Backend(error.to_string()));
+                    return false;
+                }
+            }
+        }
         match self.backend.read_blocks(&self.key, 0, 0, 1, 1, false) {
             Ok(page) => {
                 let old = self.end;
+                if let Some(budget) = &self.scope.budget
+                    && (page.first_index.is_some_and(|first| first > self.next)
+                        || (page.first_index.is_none() && page.next_write_index > self.next))
+                {
+                    budget.stop(crate::budget::Stop::RetentionGap);
+                    return false;
+                }
                 self.end = page.last_index.map_or(self.end, |i| i.saturating_add(1));
                 self.first = page.first_index.unwrap_or(self.first);
                 self.next = self.next.max(self.first);
@@ -1385,6 +1459,7 @@ impl RaftChannelCursor {
             // allocation for a block it has already handed out completely.
             self.records = Vec::new();
             self.pos = 0;
+            self.current_index = None;
         }
         record
     }
@@ -1396,6 +1471,14 @@ impl RaftChannelCursor {
         } else {
             self.next < self.end
         } {
+            if self
+                .scope
+                .budget
+                .as_ref()
+                .is_some_and(|budget| !budget.block())
+            {
+                return false;
+            }
             if self.blocks_left == Some(0) {
                 return false;
             }
@@ -1406,9 +1489,40 @@ impl RaftChannelCursor {
             } else {
                 (self.next, self.next.saturating_add(1))
             };
-            let page =
+            let page = if let Some(snapshot) = &self.snapshot {
+                let read = if self.scope.liveness.is_following() {
+                    self.backend.read_generation_block(snapshot, begin)
+                } else {
+                    self.backend.read_snapshot_block(snapshot, begin)
+                };
+                match read {
+                    Ok(Some(page)) => Ok(page),
+                    Ok(None) => {
+                        if let Some(budget) = &self.scope.budget {
+                            let why = if self
+                                .backend
+                                .validate_snapshot(snapshot, None)
+                                .unwrap_or(false)
+                            {
+                                crate::budget::Stop::RetentionGap
+                            } else {
+                                crate::budget::Stop::Expired
+                            };
+                            budget.stop(why);
+                        }
+                        return false;
+                    }
+                    Err(error) => {
+                        if let Some(budget) = &self.scope.budget {
+                            budget.stop(crate::budget::Stop::Backend(error.to_string()));
+                        }
+                        return false;
+                    }
+                }
+            } else {
                 self.backend
-                    .read_blocks(&self.key, begin, end, 1, 4 * 1024 * 1024, self.reverse);
+                    .read_blocks(&self.key, begin, end, 1, 4 * 1024 * 1024, self.reverse)
+            };
             self.next = if self.reverse { begin } else { end };
             let page = match page {
                 Ok(page) => page,
@@ -1424,6 +1538,20 @@ impl RaftChannelCursor {
                 }
             }
             for stored in page.blocks {
+                if let Some(budget) = &self.scope.budget {
+                    if !budget.compressed(stored.bytes.len() as u64) {
+                        return false;
+                    }
+                    match dduroc_format::block::BlockHeader::parse(&stored.bytes) {
+                        Ok(Some(header)) if !budget.decoded(u64::from(header.raw_len)) => {
+                            return false;
+                        }
+                        _ => {}
+                    }
+                    if !budget.checkpoint() {
+                        return false;
+                    }
+                }
                 if self.scope.boot.is_some_and(|boot| boot != stored.boot) {
                     continue;
                 }
@@ -1475,6 +1603,14 @@ impl RaftChannelCursor {
                 let mut first_error = None;
                 let mut in_window = false;
                 for item in block.records() {
+                    if self
+                        .scope
+                        .budget
+                        .as_ref()
+                        .is_some_and(|budget| !budget.record())
+                    {
+                        return false;
+                    }
                     let (at, record) = match item {
                         Ok(item) => item,
                         Err(err) => {
@@ -1516,6 +1652,9 @@ impl RaftChannelCursor {
                 }
                 if let Some(error) = first_error {
                     self.damage(stored.index, error);
+                }
+                if !self.records.is_empty() {
+                    self.current_index = Some(stored.index);
                 }
             }
             if self.reverse {

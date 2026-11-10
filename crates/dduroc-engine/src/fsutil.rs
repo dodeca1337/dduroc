@@ -1,22 +1,109 @@
 //! File primitives with explicit durability semantics.
 //!
-//! The rules the whole engine obeys:
+//! These helpers use `fdatasync` for file contents and `fsync` for parent
+//! directories after rename. The live raft backend uses upstream sync behavior,
+//! including `sync_all`; these rules describe this module's helpers only.
 //!
-//! - **`fdatasync`, not `fsync`.** Segments reserve their space up front
-//!   (`fallocate`), so an append does not change the file size and there is no
-//!   reason to sync inode metadata. The exception is files that grow
-//!   (metadata): `fdatasync` is enough there too — it syncs the metadata
-//!   needed to read the data, the size included.
-//! - **A file name is durable only after an `fsync` of the directory.**
-//!   Without it, a file may exist after a power loss but have no name.
-//! - **Replacing a file goes through `rename` only.** Overwriting in place
-//!   leaves a window in which the file is half old and half new.
-
 use crate::error::{IoContext, Result};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+// Synthetic boundary failures are private to unit tests and the calling thread.
+// They do not intercept raft-engine I/O or model a physical power loss.
+#[cfg(test)]
+mod fault {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FaultStage {
+        Create,
+        Write,
+        FileSync,
+        Rename,
+        DirectorySync,
+    }
+
+    struct Armed {
+        stage: FaultStage,
+        errno: i32,
+        consumed: Rc<Cell<bool>>,
+    }
+
+    thread_local! {
+        static NEXT: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    }
+
+    // Rc deliberately keeps a guard on its originating thread.
+    #[derive(Debug)]
+    pub(crate) struct FaultGuard {
+        consumed: Rc<Cell<bool>>,
+    }
+
+    impl FaultGuard {
+        pub(crate) fn consumed(&self) -> bool {
+            self.consumed.get()
+        }
+    }
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            NEXT.with(|slot| {
+                let mut pending = slot.borrow_mut();
+                if pending
+                    .as_ref()
+                    .is_some_and(|fault| Rc::ptr_eq(&fault.consumed, &self.consumed))
+                {
+                    pending.take();
+                }
+            });
+        }
+    }
+
+    pub(crate) fn fail_next(stage: FaultStage, errno: i32) -> FaultGuard {
+        assert!(
+            matches!(errno, 5 | 28),
+            "only synthetic EIO and ENOSPC are supported"
+        );
+        let consumed = Rc::new(Cell::new(false));
+        NEXT.with(|slot| {
+            let mut pending = slot.borrow_mut();
+            assert!(
+                pending.is_none(),
+                "a filesystem fault is already armed on this thread"
+            );
+            *pending = Some(Armed {
+                stage,
+                errno,
+                consumed: consumed.clone(),
+            });
+        });
+        FaultGuard { consumed }
+    }
+
+    pub(super) fn check(stage: FaultStage) -> std::io::Result<()> {
+        let armed = NEXT.with(|slot| {
+            let mut pending = slot.borrow_mut();
+            if pending.as_ref().is_some_and(|fault| fault.stage == stage) {
+                pending.take()
+            } else {
+                None
+            }
+        });
+        match armed {
+            Some(fault) => {
+                fault.consumed.set(true);
+                Err(std::io::Error::from_raw_os_error(fault.errno))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use fault::{FaultGuard, FaultStage, fail_next};
 
 /// Permissions on created files: read and write for the owner, read for the
 /// group, **nothing for anyone else**.
@@ -39,6 +126,8 @@ pub const DIR_MODE: u32 = 0o750;
 /// Sync a directory: this makes operations on **names** durable (creating,
 /// renaming and deleting files inside it).
 pub fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    fault::check(FaultStage::DirectorySync).ctx_path("fsync of a directory", dir)?;
     let f = File::open(dir).ctx_path("opening a directory", dir)?;
     // Some filesystems do not support fsync on a directory (certain network
     // ones, for example); EINVAL there means "nothing to sync", not a failure.
@@ -50,6 +139,8 @@ pub fn sync_dir(dir: &Path) -> Result<()> {
 
 /// `fdatasync` a file.
 pub fn sync_data(file: &File, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    fault::check(FaultStage::FileSync).ctx_path("fdatasync", path)?;
     rustix::fs::fdatasync(file).ctx_path("fdatasync", path)
 }
 
@@ -90,6 +181,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = tmp_path(path);
 
     {
+        #[cfg(test)]
+        fault::check(FaultStage::Create).ctx_path("creating a temporary file", &tmp)?;
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
@@ -97,13 +190,19 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             .mode(FILE_MODE)
             .open(&tmp)
             .ctx_path("creating a temporary file", &tmp)?;
+        #[cfg(test)]
+        fault::check(FaultStage::Write).ctx_path("writing", &tmp)?;
         f.write_all(bytes).ctx_path("writing", &tmp)?;
         sync_data(&f, &tmp)?;
     }
 
     // A rename error must not be swallowed: the temporary file would stay
     // behind as litter while the caller believed the data was written.
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    #[cfg(test)]
+    let renamed = fault::check(FaultStage::Rename).and_then(|()| std::fs::rename(&tmp, path));
+    #[cfg(not(test))]
+    let renamed = std::fs::rename(&tmp, path);
+    if let Err(e) = renamed {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).ctx_path("renaming into", path);
     }
@@ -119,11 +218,56 @@ fn tmp_path(path: &Path) -> PathBuf {
 }
 
 /// Read a whole file; `Ok(None)` if it does not exist.
+#[allow(dead_code)] // Kept for general callers; control metadata uses the bounded variant.
 pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).ctx_path("reading", path),
+    }
+}
+
+/// Shared ceiling for ordinary control metadata and format markers.
+pub(crate) const CONTROL_METADATA_MAX_BYTES: usize = 256 * 1024;
+
+/// Read no more than the control metadata ceiling; missing files remain absent.
+pub(crate) fn read_optional_bounded(path: &Path) -> Result<Option<Vec<u8>>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).ctx_path("opening", path),
+    };
+    let mut bytes = Vec::new();
+    file.take((CONTROL_METADATA_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ctx_path("reading", path)?;
+    if bytes.len() > CONTROL_METADATA_MAX_BYTES {
+        return Err(crate::Error::Corrupt {
+            path: path.to_owned(),
+            reason: "control metadata exceeds byte limit".into(),
+        });
+    }
+    Ok(Some(bytes))
+}
+
+pub(crate) fn read_required_bounded(path: &Path) -> Result<Vec<u8>> {
+    read_optional_bounded(path)?.ok_or_else(|| crate::Error::Io {
+        context: format!("reading {}", path.display()),
+        source: std::io::Error::from(std::io::ErrorKind::NotFound),
+    })
+}
+
+/// Decode exactly one complete metadata value, rejecting trailing bytes.
+pub(crate) fn decode_metadata<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<T> {
+    match postcard::take_from_bytes(bytes) {
+        Ok((value, [])) => Ok(value),
+        _ => Err(crate::Error::Corrupt {
+            path: path.to_owned(),
+            reason: "control metadata does not parse completely".into(),
+        }),
     }
 }
 
@@ -168,6 +312,62 @@ pub fn sweep_tmp(dir: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_fault_is_one_shot_and_local_to_the_arming_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta");
+        let guard: FaultGuard = fail_next(FaultStage::Create, 5);
+        let other = dir.path().join("other-thread");
+        std::thread::spawn(move || write_atomic(&other, b"unaffected"))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(!guard.consumed());
+        let error = write_atomic(&path, b"rejected").unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Io { source, .. } if source.raw_os_error() == Some(5))
+        );
+        assert!(guard.consumed());
+        write_atomic(&path, b"accepted").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"accepted");
+    }
+
+    #[test]
+    fn dropping_an_unused_fault_guard_disarms_only_that_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta");
+        drop(fail_next(FaultStage::Write, 28));
+        write_atomic(&path, b"accepted").unwrap();
+        let first = fail_next(FaultStage::Create, 5);
+        assert!(write_atomic(&path, b"rejected").is_err());
+        let second = fail_next(FaultStage::Create, 28);
+        drop(first);
+        let error = write_atomic(&path, b"still-rejected").unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Io { source, .. } if source.raw_os_error() == Some(28))
+        );
+        assert!(second.consumed());
+    }
+
+    #[test]
+    fn bounded_control_read_handles_missing_exact_limit_and_oversize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dduroc-raft-v1");
+        assert!(read_optional_bounded(&path).unwrap().is_none());
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(CONTROL_METADATA_MAX_BYTES as u64).unwrap();
+        assert_eq!(
+            read_optional_bounded(&path).unwrap().unwrap().len(),
+            CONTROL_METADATA_MAX_BYTES
+        );
+        file.set_len((CONTROL_METADATA_MAX_BYTES + 1) as u64)
+            .unwrap();
+        assert!(matches!(
+            read_optional_bounded(&path),
+            Err(crate::Error::Corrupt { .. })
+        ));
+    }
 
     #[test]
     fn atomic_write_replaces_content() {

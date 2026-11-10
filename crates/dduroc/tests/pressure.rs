@@ -8,6 +8,8 @@
 //! in the tests at all, although writing from many threads is the library's
 //! main mode of operation.
 
+#![cfg(feature = "read")]
+
 use dduroc::prelude::*;
 use dduroc::{
     ChannelConfig, ChannelOverride, GroupPolicy, NsQuota, QueueSizes, StorageClass, StoreConfig,
@@ -16,6 +18,24 @@ use dduroc_read::{EntryKind, Order, Query, Reader};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Retry only a pre-admission queue refusal, with a bounded test deadline.
+fn retry_queue_full(mut write: impl FnMut() -> dduroc::Result<()>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        match write() {
+            Ok(()) => return,
+            Err(dduroc::Error::QueueFull) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "write queue did not drain"
+                );
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("test write failed: {error}"),
+        }
+    }
+}
 
 dduroc::schema! {
     name: pressure,
@@ -361,9 +381,7 @@ fn many_threads_write_one_namespace_without_losing_or_duplicating() {
                     // The queue overflows — we wait for room rather than lose:
                     // this test is about preservation, not about behaviour on
                     // failure.
-                    while seq.try_sample(t * PER_THREAD + i).is_err() {
-                        std::thread::yield_now();
-                    }
+                    retry_queue_full(|| seq.try_sample(t * PER_THREAD + i));
                 }
             });
         }
@@ -409,9 +427,7 @@ fn reading_a_live_store_never_takes_back_what_it_already_showed() {
             let seq = ns.series(pressure::metrics::Seq).unwrap();
             s.spawn(move || {
                 for i in 0..N {
-                    while seq.try_sample(i).is_err() {
-                        std::thread::yield_now();
-                    }
+                    retry_queue_full(|| seq.try_sample(i));
                     written.store(i + 1, Ordering::Release);
                 }
                 done.store(true, Ordering::Release);

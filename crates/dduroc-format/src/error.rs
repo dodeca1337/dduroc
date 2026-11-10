@@ -54,6 +54,9 @@ pub enum Error {
     #[error("failed to decompress a block: {0}")]
     Decompress(&'static str),
 
+    #[error("block record count mismatch: expected {expected}, decoded {actual}")]
+    RecordCountMismatch { expected: u16, actual: u32 },
+
     #[error("attempt to finish an empty block")]
     EmptyBlock,
 

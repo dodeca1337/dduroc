@@ -16,7 +16,7 @@
 //! ```
 //!
 //! The parameter is a marker rather than a stored value, so [`Metric`] stays
-//! `Copy` and fits in the same four bytes as `MetricId`.
+//! `Copy`; the runtime schema binding is independent of its value type.
 
 use crate::staged::OwnedValue;
 use dduroc_format::MetricId;
@@ -24,21 +24,38 @@ use std::marker::PhantomData;
 
 /// A metric declared with value type `T`.
 ///
-/// Produced by the schema macro; needed by hand only by those who describe a
-/// schema without the macro.
+/// Produced with a schema binding by the macro. Manual schemas use explicit
+/// raw MetricId APIs; an unbound value from [`Metric::new`] does not grant a
+/// typed binding by matching an identifier.
 pub struct Metric<T> {
     id: MetricId,
+    identity: Option<crate::schema::SchemaIdentity>,
     /// `fn() -> T` rather than `T`: the marker affects neither `Copy` nor
     /// `Send` nor variance — a metric stores no value.
     _value: PhantomData<fn() -> T>,
 }
 
 impl<T> Metric<T> {
+    /// Unbound descriptor for explicit raw/manual use; typed namespace methods refuse it.
     pub const fn new(id: MetricId) -> Self {
         Self {
             id,
+            identity: None,
             _value: PhantomData,
         }
+    }
+
+    /// A generated, schema-bound descriptor.
+    pub const fn bound(id: MetricId, identity: crate::schema::SchemaIdentity) -> Self {
+        Self {
+            id,
+            identity: Some(identity),
+            _value: PhantomData,
+        }
+    }
+
+    pub const fn identity(self) -> Option<crate::schema::SchemaIdentity> {
+        self.identity
     }
 
     pub const fn id(self) -> MetricId {
@@ -56,7 +73,7 @@ impl<T> Copy for Metric<T> {}
 
 impl<T> PartialEq for Metric<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.id == other.id && self.identity == other.identity
     }
 }
 
@@ -204,11 +221,10 @@ mod tests {
     use dduroc_format::ValueType;
 
     #[test]
-    fn marker_costs_nothing() {
+    fn marker_is_copy_and_carries_runtime_binding() {
         assert_eq!(
             std::mem::size_of::<Metric<f32>>(),
-            std::mem::size_of::<MetricId>(),
-            "the type marker must take no space"
+            std::mem::size_of::<Metric<Vec<u8>>>()
         );
         // Copy in a generic context too: the marker takes no part in auto
         // traits.

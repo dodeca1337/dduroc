@@ -4,69 +4,13 @@
 //! Everything is static: the schema lies wholly in `.rodata` and costs nothing
 //! at runtime.
 //!
-//! ```ignore
-//! dduroc::schema! {
-//!     name: radio,
-//!     version: 1,
-//!     languages: [en, ru],
+//! Complete declarations are compiled with the application facade:
 //!
-//!     events {
-//!         PowerSet = 0x01 {
-//!             level: Info,
-//!             store: critical,
-//!             tags: [rf],
-//!             en: "power set to {dbm} dBm",
-//!             ru: "мощность {dbm} дБм",
-//!             dbm: f32,
-//!         },
-//!         // With no fields it is a unit struct: `ns.log(events::Started)`.
-//!         Started = 0x02 { level: Info, en: "started", ru: "запущено" },
-//!     }
-//!
-//!     metrics {
-//!         // Ranges of what is NORMAL are data: drawable, updatable at runtime.
-//!         Temp = 0x01 { type: f32, unit: "°C", tags: [sensor],
-//!                       warn: -40.0..=70.0, alarm: -40.0..=85.0 },
-//!         // A shape a range cannot express is a TRIGGER predicate (`v` is the
-//!         // value): the polarity is the opposite, hence a different key.
-//!         Vswr = 0x02 { type: f32, warn_if: v > 1.5,
-//!                       alarm_if: v > 3.0 || v < 1.0 },
-//!         // An enum: severity goes in front; without it a state is normal.
-//!         Link = 0x03 { states: [alarm Los = 0, warn Sync = 1, Lock = 2] },
-//!     }
-//!
-//!     spans {
-//!         Calibration = 0x01,
-//!     }
-//!
-//!     // The layouts of earlier versions — what the migration steps consume.
-//!     history {
-//!         1 { events { PowerSet = 0x01 { dbm: i8 } } }
-//!     }
-//!
-//!     // Step N brings records of version N up to version N+1.
-//!     migrations {
-//!         1 => {
-//!             // A typed rule: decoding the old layout, encoding the new one and
-//!             // the dispatcher are all generated, and the affected types are
-//!             // inferred from the keys — there is nothing for them to drift
-//!             // apart from the actual behaviour on.
-//!             v1::PowerSet: |old| events::PowerSet { dbm: f32::from(old.dbm) },
-//!             event(0x05): drop,               // the type is gone — so is its name
-//!             metric(0x07): metrics::Temp,     // an id remap, the value as it was
-//!             // A value is self-describing: the closure names the type itself,
-//!             // and a metric needs no history.
-//!             metrics::Vswr: |v: u64| v as f32 / 10.0,
-//!             // Only a span's kind changes: the number and the parent are the
-//!             // record's identity, and a rule will not let its start be deleted.
-//!             span(0x07): spans::Calibration,
-//!         },
-//!         // The hatch: a raw fn. The affected types are declared by hand; if
-//!         // they are not, the step counts as touching everything.
-//!         2 => migrate_v2,
-//!     }
-//! }
-//! ```
+//! - [`dduroc::schema!` documentation](https://docs.rs/dduroc/0.2.0/dduroc/macro.schema.html)
+//!   and the [device writing example](https://github.com/dodeca1337/dduroc/blob/v0.2.0/crates/dduroc/examples/01_device_writes.rs)
+//!   cover events, metrics, states and spans;
+//! - the [schema migration example](https://github.com/dodeca1337/dduroc/blob/v0.2.0/crates/dduroc/examples/03_schema_grows.rs)
+//!   declares historical layouts and typed migration rules.
 //!
 //! Identifiers are **mandatory and explicit**. When an event was inserted into
 //! the middle of a list, the prototype's positional auto-numbering silently
@@ -491,6 +435,12 @@ fn parse_event(input: ParseStream) -> syn::Result<EventDef> {
     // the list of languages is not needed for such a check.
     let field_names: Vec<String> = fields.iter().map(|(n, _)| n.to_string()).collect();
     for (lang, tmpl) in &templates {
+        template::validate(&tmpl.value()).map_err(|message| {
+            syn::Error::new(
+                tmpl.span(),
+                format!("the `{lang}` template of event `{name}` is invalid: {message}"),
+            )
+        })?;
         for placeholder in template::placeholders(&tmpl.value()) {
             if !field_names.contains(&placeholder) {
                 return Err(syn::Error::new(
@@ -771,6 +721,9 @@ fn parse_rule_key(input: ParseStream) -> syn::Result<RuleKey> {
         syn::parenthesized!(content in input);
         let lit: LitInt = content.parse()?;
         let id = lit.base10_parse::<u16>()?;
+        if !content.is_empty() {
+            return Err(content.error("a raw migration key takes exactly one numeric identifier"));
+        }
         return match kind.to_string().as_str() {
             "event" => Ok(RuleKey::RawEvent {
                 id,
@@ -1036,9 +989,6 @@ fn marker_path(value_type: &Ident, states_enum: Option<&Ident>) -> syn::Result<T
 /// is the state code, that is, a `u64`. What matters to a migration rule is
 /// precisely what will lie on disk.
 fn wire_type(m: &MetricDef) -> syn::Result<TokenStream2> {
-    if !m.states.is_empty() {
-        return Ok(quote!(u64));
-    }
     let Some(value_type) = &m.value_type else {
         return Ok(quote!(u64));
     };
@@ -1325,10 +1275,17 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 quote!(#i => ::std::format!(#fmt #(, #args)*),)
             })
             .collect();
+        let bounded_render_arms: Vec<TokenStream2> = templates.iter().enumerate().map(|(i,tmpl)| {
+            let (fmt,order)=template::rewrite(&tmpl.value());
+            let args:Vec<TokenStream2>=order.iter().map(|field|{let id=format_ident!("{}",field);quote!(value.#id)}).collect();
+            quote!(#i => ::dduroc::render_bounded(::std::format_args!(#fmt #(, #args)*), max_bytes),)
+        }).collect();
         let first_template = templates[0];
 
         let decoder_render = format_ident!("__render_{}", name);
         let decoder_json = format_ident!("__json_{}", name);
+        let decoder_fields = format_ident!("__fields_{}", name);
+        let decoder_bounded = format_ident!("__bounded_{}", name);
 
         event_structs.push(quote! {
             #[derive(Debug, Clone, PartialEq, ::dduroc::serde::Serialize, ::dduroc::serde::Deserialize)]
@@ -1336,6 +1293,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             #struct_decl
 
             impl ::dduroc::Event for #name {
+                const SCHEMA: ::dduroc::SchemaIdentity = super::IDENTITY;
                 const ID: ::dduroc::EventId = ::dduroc::EventId(#id);
                 const LEVEL: ::dduroc::Level = #level;
                 const NAME: &'static str = #name_str;
@@ -1352,6 +1310,19 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                     #(#render_arms)*
                     _ => ::std::string::String::from(#first_template),
                 })
+            }
+
+            #[doc(hidden)]
+            pub fn #decoder_bounded(bytes: &[u8], language: usize, limits: ::dduroc::DecodedValueLimits, max_bytes: usize) -> ::core::result::Result<::std::string::String, ::dduroc::DecodeError> {
+                let value: #name = ::dduroc::decode_payload_bounded(bytes, limits)?;
+                let _ = &value;
+                match language { #(#bounded_render_arms)* _ => ::core::result::Result::Err(::dduroc::DecodeError) }
+            }
+
+            #[doc(hidden)]
+            pub fn #decoder_fields(bytes: &[u8], limits: ::dduroc::DecodedValueLimits) -> ::core::result::Result<::dduroc::DecodedValue, ::dduroc::DecodeError> {
+                let value: #name = ::dduroc::decode_payload_bounded(bytes, limits)?;
+                ::dduroc::decode_fields(&value, limits)
             }
 
             #[doc(hidden)]
@@ -1376,6 +1347,8 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
                 decoders: ::core::option::Option::Some(::dduroc::EventDecoders {
                     render: events::#decoder_render,
                     json: events::#decoder_json,
+                    fields: ::core::option::Option::Some(events::#decoder_fields),
+                    render_bounded: ::core::option::Option::Some(events::#decoder_bounded),
                 }),
             }
         });
@@ -1438,7 +1411,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         )?;
         metric_consts.push(quote! {
             pub const #name: ::dduroc::Metric<#marker> =
-                ::dduroc::Metric::new(::dduroc::MetricId(#id));
+                ::dduroc::Metric::bound(::dduroc::MetricId(#id), super::IDENTITY);
         });
 
         // The static state labels: the names and the severities live in the
@@ -1547,7 +1520,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
         let id = s.id;
         let class = class_path(s.store.as_ref())?;
         span_consts.push(quote! {
-            pub const #name: ::dduroc::SpanKindId = ::dduroc::SpanKindId(#id);
+            pub const #name: ::dduroc::SpanKind = ::dduroc::SpanKind::new(::dduroc::SpanKindId(#id), super::IDENTITY);
         });
         span_descs.push(quote! {
             ::dduroc::SpanDesc {
@@ -1572,6 +1545,10 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
             // require writing `super::migrate_v2` — the step function lies next
             // to the declaration but expands inside the generated module.
             use super::*;
+
+            #[doc(hidden)]
+            pub struct SchemaMarker;
+            const IDENTITY: ::dduroc::SchemaIdentity = ::dduroc::SchemaIdentity::of::<SchemaMarker>(::dduroc::ProtocolVersion(#version));
 
             /// This schema's event types.
             pub mod events {
@@ -1603,6 +1580,7 @@ fn codegen(input: &SchemaInput) -> syn::Result<TokenStream2> {
 
             /// The namespace schema.
             pub const SCHEMA: ::dduroc::Schema = ::dduroc::Schema {
+                identity: ::core::option::Option::Some(IDENTITY),
                 name: #schema_name,
                 version: ::dduroc::ProtocolVersion(#version),
                 languages: LANGUAGES,
@@ -1682,6 +1660,7 @@ fn codegen_history(input: &SchemaInput) -> syn::Result<Vec<TokenStream2>> {
                     #decl
 
                     impl ::dduroc::EventShape for #name {
+                        const SHAPE_SCHEMA: ::dduroc::SchemaIdentity = super::IDENTITY;
                         const SHAPE_ID: ::dduroc::EventId = ::dduroc::EventId(#id);
                     }
                 }
@@ -2041,7 +2020,7 @@ fn resolve_rule(
                 arm: quote! {
                     #old_id => {
                         let __old: #ty = __r.decode()?;
-                        ::dduroc::__migrate_map(#expr, __old)
+                        ::dduroc::__migrate_map(#expr, __old, IDENTITY)
                     }
                 },
             });
@@ -2377,6 +2356,21 @@ mod tests {
         let e = err(r#"name: radio, version: 1, languages: [en, ru],
                events { Boom = 0x01 { level: Error, en: "x" } }"#);
         assert!(e.contains("ru"), "it names which language is missing: {e}");
+    }
+
+    #[test]
+    fn malformed_template_braces_are_refused() {
+        for template in ["value {v", "value {v:.2", "value }", "value {{v}"] {
+            let e = err(&format!(
+                "name: radio, version: 1, languages: [en], events {{ E = 1 {{ level: Info, en: {template:?}, v: f32 }} }}"
+            ));
+            assert!(e.contains("template") && e.contains("brace"), "{e}");
+        }
+        check(
+            r#"name: radio, version: 1, languages: [en],
+            events { E = 1 { level: Info, en: "{{{v:界>8}}}", v: u32 } }"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2791,6 +2785,13 @@ mod tests {
 
     #[test]
     fn rule_keys_are_validated_syntactically() {
+        for key in ["event(1 + 2)", "metric(1, 2)", "span(1 extra)"] {
+            let e = err(&format!(
+                "name: radio, version: 2, languages: [en], migrations {{ 1 => {{ {key}: drop }} }}"
+            ));
+            assert!(e.contains("exactly one"), "{key}: {e}");
+        }
+
         let e = err(r#"name: radio, version: 2, languages: [en],
                events { E = 0x01 { level: Info, en: "x" } }
                migrations { 1 => { foo::E: drop } }"#);

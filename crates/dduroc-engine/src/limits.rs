@@ -181,6 +181,14 @@ impl LimitsRegistry {
         let (index, desc) = resolve(schema, metric)?;
 
         if let Some(l) = &limits {
+            if l.thresholds.is_some_and(|t| !t.is_unset())
+                && desc.value_type == dduroc_format::ValueType::Blob
+            {
+                return Err(Error::BadLimits {
+                    metric_name: desc.name,
+                    reason: "numeric bounds on a blob metric: the value cannot be reduced to a number",
+                });
+            }
             if l.thresholds.is_some_and(|t| !t.is_unset()) && !desc.states.is_empty() {
                 return Err(Error::BadLimits {
                     metric_name: desc.name,
@@ -205,7 +213,10 @@ impl LimitsRegistry {
                 }
             }
             if let Some(t) = l.thresholds {
-                check_nesting(desc.name, &t)?;
+                validate_thresholds(&t).map_err(|reason| Error::BadLimits {
+                    metric_name: desc.name,
+                    reason,
+                })?;
             }
         }
 
@@ -317,17 +328,22 @@ fn resolve(schema: &Schema, metric: MetricId) -> Result<(usize, &'static MetricD
     })
 }
 
-/// `alarm` has to contain `warn`: a quantity first leaves what is normal and
-/// only then what is permissible.
-pub(crate) fn check_nesting(metric_name: &'static str, t: &Thresholds) -> Result<()> {
+/// Shared validation for schema defaults and runtime numeric overrides.
+/// `alarm` contains `warn`; NaN and inverted ranges cannot define bounds.
+pub(crate) fn validate_thresholds(t: &Thresholds) -> std::result::Result<(), &'static str> {
+    for range in [t.warn, t.alarm] {
+        if range.min.is_some_and(f64::is_nan) || range.max.is_some_and(f64::is_nan) {
+            return Err("a range bound is NaN: comparisons with it are always false");
+        }
+        if matches!((range.min, range.max), (Some(low), Some(high)) if low > high) {
+            return Err("the range is inverted: min exceeds max");
+        }
+    }
     let bad_low = matches!((t.warn.min, t.alarm.min), (Some(w), Some(c)) if c > w);
     let bad_high = matches!((t.warn.max, t.alarm.max), (Some(w), Some(c)) if c < w);
     if bad_low || bad_high {
-        return Err(Error::BadLimits {
-            metric_name,
-            reason: "the alarm range has to contain the warning one: otherwise \
-                     a value would be alarming without being a warning",
-        });
+        return Err("the alarm range has to contain the warning one: otherwise \
+                     a value would be alarming without being a warning");
     }
     Ok(())
 }
@@ -398,6 +414,7 @@ mod tests {
 
     fn schema() -> Schema {
         Schema {
+            identity: None,
             name: "radio",
             version: ProtocolVersion(1),
             languages: LANGS,
@@ -483,6 +500,55 @@ mod tests {
         r.set(&s, MetricId(1), None).unwrap();
         assert_eq!(sev(45.0), Severity::Normal);
         assert!(!r.effective(&s, MetricId(1)).unwrap().overridden);
+    }
+
+    #[test]
+    fn malformed_runtime_ranges_do_not_replace_a_valid_override() {
+        let (schema, registry) = (schema(), registry());
+        registry
+            .set(
+                &schema,
+                MetricId(1),
+                Some(MetricLimits::numeric(Thresholds::new(..=40.0, ..=50.0))),
+            )
+            .unwrap();
+        let before = registry.effective(&schema, MetricId(1)).unwrap();
+        for range in [
+            Range {
+                min: Some(10.0),
+                max: Some(0.0),
+            },
+            Range {
+                min: Some(f64::NAN),
+                max: None,
+            },
+            Range {
+                min: None,
+                max: Some(f64::NAN),
+            },
+        ] {
+            for thresholds in [
+                Thresholds {
+                    warn: range,
+                    alarm: Range::NONE,
+                },
+                Thresholds {
+                    warn: Range::NONE,
+                    alarm: range,
+                },
+            ] {
+                assert!(
+                    registry
+                        .set(
+                            &schema,
+                            MetricId(1),
+                            Some(MetricLimits::numeric(thresholds))
+                        )
+                        .is_err()
+                );
+                assert_eq!(registry.effective(&schema, MetricId(1)).unwrap(), before);
+            }
+        }
     }
 
     #[test]
@@ -730,6 +796,15 @@ mod tests {
             ..schema()
         };
         let r = registry();
+        assert!(
+            r.set(
+                &s,
+                MetricId(1),
+                Some(MetricLimits::numeric(Thresholds::new(..=1.0, ..=2.0)))
+            )
+            .is_err()
+        );
+        assert!(!r.effective(&s, MetricId(1)).unwrap().overridden);
         let err = r
             .set_fn(&s, MetricId(1), Some(Box::new(|_| Severity::Alarm)))
             .unwrap_err();
